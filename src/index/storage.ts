@@ -55,7 +55,7 @@ export class ObsidianIndexStorage extends StrictIndexStorage {
       write(path: string, data: string): Promise<void>;
       remove(path: string): Promise<void>;
     },
-    root = ".local-vault-assistant/index"
+    root = ".trama/index"
   ) {
     super(root, {
       root,
@@ -131,7 +131,7 @@ export class ObsidianIndexStorage extends StrictIndexStorage {
 /** In-memory storage useful for tests and non-Obsidian composition. */
 export class MemoryIndexStorage implements IndexStorage {
   readonly files = new Map<string, string>();
-  constructor(readonly root = ".local-vault-assistant/index") {}
+  constructor(readonly root = ".trama/index") {}
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
   }

@@ -1,3 +1,3 @@
-import { LocalVaultAssistantPlugin } from "@/plugin/LocalVaultAssistantPlugin";
+import { TramaPlugin } from "@/plugin/TramaPlugin";
 
-export default LocalVaultAssistantPlugin;
+export default TramaPlugin;

@@ -5,7 +5,7 @@ export interface IndexStatus {
   readonly progress?: number;
   readonly message?: string;
 }
-/** Provides minimal native commands for rebuilding and cancelling the semantic index. */
+/** Provides minimal native commands for rebuilding and cancelling Filo's semantic index. */
 export class IndexStatusController {
   status: IndexStatus = { kind: "idle" };
   private controller = new AbortController();
@@ -15,13 +15,13 @@ export class IndexStatusController {
   ) {}
   register(): void {
     this.plugin.addCommand({
-      id: "rebuild-vault-index",
-      name: "Rebuild vault index",
+      id: "rebuild-filo-index",
+      name: "Rebuild Filo index",
       callback: () => void this.start(),
     });
     this.plugin.addCommand({
-      id: "cancel-vault-index-rebuild",
-      name: "Cancel vault index rebuild",
+      id: "cancel-filo-index-rebuild",
+      name: "Cancel Filo index rebuild",
       callback: () => this.cancel(),
     });
   }

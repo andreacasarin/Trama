@@ -6,7 +6,7 @@ import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
-import { DEFAULT_SETTINGS, LocalVaultAssistantSettings, SettingsStore } from "@/settings/Settings";
+import { DEFAULT_SETTINGS, SettingsStore, TramaSettings } from "@/settings/Settings";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import {
@@ -20,7 +20,7 @@ import {
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 /** Composes the desktop-only assistant and owns its lifecycle and vault event boundary. */
-export class LocalVaultAssistantPlugin extends Plugin {
+export class TramaPlugin extends Plugin {
   private desktopLoaded = false;
   private readonly settingsStore = new SettingsStore();
   private session?: ChatSession;
@@ -44,8 +44,8 @@ export class LocalVaultAssistantPlugin extends Plugin {
     if (typeof this.loadData === "function") this.settingsStore.load(await this.loadData());
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
-    const [{ ChatView, CHAT_VIEW_TYPE }, { LocalVaultAssistantSettingsTab }] = await Promise.all([
-      import("@/ui/chat/ChatView"),
+    const [{ VoceView, VOCE_VIEW_TYPE }, { TramaSettingsTab }] = await Promise.all([
+      import("@/ui/voce/VoceView"),
       import("@/ui/settings/SettingsTab"),
     ]);
     this.lifecycleAbort = new AbortController();
@@ -80,13 +80,13 @@ export class LocalVaultAssistantPlugin extends Plugin {
       }
     });
     this.indexStatus.register();
-    this.addSettingTab(new LocalVaultAssistantSettingsTab(app, this));
-    this.registerView(CHAT_VIEW_TYPE, (leaf) => new ChatView(leaf, this.session!));
+    this.addSettingTab(new TramaSettingsTab(app, this));
+    this.registerView(VOCE_VIEW_TYPE, (leaf) => new VoceView(leaf, this.session!));
     this.addCommand({
-      id: "open-chat",
-      name: "Open chat",
+      id: "open-voce",
+      name: "Open Voce",
       callback: () =>
-        void app.workspace.getLeaf(true).setViewState({ type: CHAT_VIEW_TYPE, active: true }),
+        void app.workspace.getLeaf(true).setViewState({ type: VOCE_VIEW_TYPE, active: true }),
     });
     this.registerVaultEvents(app.vault);
   }
@@ -104,7 +104,7 @@ export class LocalVaultAssistantPlugin extends Plugin {
   isDesktopLoaded(): boolean {
     return this.desktopLoaded;
   }
-  getSettings(): LocalVaultAssistantSettings {
+  getSettings(): TramaSettings {
     return this.settingsStore.get() ?? DEFAULT_SETTINGS;
   }
   getIndexStatusMessage(): string {
@@ -115,20 +115,16 @@ export class LocalVaultAssistantPlugin extends Plugin {
     );
   }
   saveSettings(
-    settings:
-      | LocalVaultAssistantSettings
-      | ((current: LocalVaultAssistantSettings) => LocalVaultAssistantSettings)
+    settings: TramaSettings | ((current: TramaSettings) => TramaSettings)
   ): Promise<void> {
     return this.enqueueSettingsUpdate(typeof settings === "function" ? settings : () => settings);
   }
-  private enqueueSettingsUpdate(
-    update: (current: LocalVaultAssistantSettings) => LocalVaultAssistantSettings
-  ): Promise<void> {
+  private enqueueSettingsUpdate(update: (current: TramaSettings) => TramaSettings): Promise<void> {
     const operation = this.saveQueue.then(() => this.performSave(update(this.settingsStore.get())));
     this.saveQueue = operation.catch(() => undefined);
     return operation;
   }
-  private async performSave(settings: LocalVaultAssistantSettings): Promise<void> {
+  private async performSave(settings: TramaSettings): Promise<void> {
     const before = this.settingsStore.get();
     const saved = this.settingsStore.stage(settings);
     if (typeof this.saveData === "function") await this.saveData(saved);
@@ -184,7 +180,7 @@ export class LocalVaultAssistantPlugin extends Plugin {
     }));
   }
 
-  private composeRuntime(app: any, settings: LocalVaultAssistantSettings): void {
+  private composeRuntime(app: any, settings: TramaSettings): void {
     const transport = new LmStudioTransport({
       policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
     });
@@ -242,7 +238,7 @@ export class LocalVaultAssistantPlugin extends Plugin {
 
   private composeChatSession(
     app: any,
-    settings: LocalVaultAssistantSettings,
+    settings: TramaSettings,
     existingRegistry?: ToolRegistry,
     existingTransport?: LmStudioTransport
   ): void {
@@ -263,7 +259,7 @@ export class LocalVaultAssistantPlugin extends Plugin {
       ]);
     this.chatModel = new LmStudioChatModel({ ...settings.chat, transport });
     this.session = new ChatSession(this.chatModel, registry);
-    for (const leaf of app.workspace.getLeavesOfType?.("local-vault-assistant-chat") ?? []) {
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
       const view = (leaf as { view?: { setSession?: (session: ChatSession) => void } }).view;
       view?.setSession?.(this.session);
     }
@@ -346,7 +342,7 @@ export class LocalVaultAssistantPlugin extends Plugin {
       /\.md$/i.test(path) &&
       !path.split("/").some((part) => part.startsWith(".")) &&
       !path.startsWith(`${configDir}/`) &&
-      !path.startsWith(".local-vault-assistant/")
+      !path.startsWith(".trama/")
     );
   }
 }

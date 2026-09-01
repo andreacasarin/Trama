@@ -1,15 +1,13 @@
 import { PluginSettingTab, Setting } from "obsidian";
 import { Plugin } from "obsidian";
 import { EndpointApproval } from "@/security/EndpointPolicy";
-import { LocalVaultAssistantSettings } from "@/settings/Settings";
+import { TramaSettings } from "@/settings/Settings";
 
 /** Callbacks supplied by composition to keep settings UI independent of runtime wiring. */
 export interface SettingsTabCallbacks {
-  getSettings(): LocalVaultAssistantSettings;
+  getSettings(): TramaSettings;
   saveSettings?(
-    settings:
-      | LocalVaultAssistantSettings
-      | ((current: LocalVaultAssistantSettings) => LocalVaultAssistantSettings)
+    settings: TramaSettings | ((current: TramaSettings) => TramaSettings)
   ): Promise<void>;
   updateChatEndpoint(value: string): Promise<void>;
   updateChatModel(value: string): Promise<void>;
@@ -30,9 +28,9 @@ export interface SettingsDraft {
 
 /** Projects locally edited endpoint and model fields onto the current persisted settings. */
 export function projectSettingsWithDraft(
-  settings: LocalVaultAssistantSettings,
+  settings: TramaSettings,
   draft: SettingsDraft
-): LocalVaultAssistantSettings {
+): TramaSettings {
   return {
     ...settings,
     chat: { ...settings.chat, endpoint: draft.chatEndpoint, modelId: draft.chatModelId },
@@ -45,7 +43,7 @@ export function projectSettingsWithDraft(
 }
 
 /** Presents independent LM Studio configuration and explicit endpoint/model actions. */
-export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
+export class TramaSettingsTab extends PluginSettingTab {
   private errorMessage = "";
   private draft?: SettingsDraft;
   private readonly discoveredModels: Partial<Record<"chat" | "embedding", readonly string[]>> = {};
@@ -61,7 +59,7 @@ export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
   }
   override display(): void {
     this.containerEl.empty();
-    this.containerEl.createEl("h2", { text: "Local Vault Assistant" });
+    this.containerEl.createEl("h2", { text: "Trama" });
     this.containerEl.createEl("p", {
       text: "LM Studio is contacted only after an explicit action.",
     });
@@ -73,10 +71,10 @@ export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
       embeddingEndpoint: settings.embedding.endpoint,
       embeddingModelId: settings.embedding.modelId,
     });
-    this.text("Chat endpoint", draft.chatEndpoint, (value) => {
+    this.text("Voce endpoint", draft.chatEndpoint, (value) => {
       draft.chatEndpoint = value;
     });
-    this.text("Chat model", draft.chatModelId, (value) => {
+    this.text("Voce model", draft.chatModelId, (value) => {
       draft.chatModelId = value;
     });
     this.text("Embedding endpoint", draft.embeddingEndpoint, (value) => {
@@ -122,11 +120,11 @@ export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
         );
     for (const target of ["chat", "embedding"] as const)
       new Setting(this.containerEl)
-        .setName(`${target === "chat" ? "Chat" : "Embedding"} model discovery`)
+        .setName(`${target === "chat" ? "Voce" : "Embedding"} model discovery`)
         .setDesc("Queries LM Studio only when you click Discover.")
         .addButton((button) =>
           button
-            .setButtonText(`Discover ${target === "chat" ? "Chat" : "Embedding"} Models`)
+            .setButtonText(`Discover ${target === "chat" ? "Voce" : "Embedding"} Models`)
             .onClick(
               () =>
                 void this.run(async () => {
@@ -141,7 +139,7 @@ export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
       const models = this.discoveredModels[target];
       if (!models) continue;
       this.containerEl.createEl("p", {
-        text: `${target === "chat" ? "Chat" : "Embedding"} models: ${models.length ? "" : "No models discovered."}`,
+        text: `${target === "chat" ? "Voce" : "Embedding"} models: ${models.length ? "" : "No models discovered."}`,
       });
       for (const modelId of models) {
         const row = this.containerEl.createDiv({ text: modelId });
@@ -154,7 +152,7 @@ export class LocalVaultAssistantSettingsTab extends PluginSettingTab {
       }
     }
     new Setting(this.containerEl)
-      .setName("Index")
+      .setName("Filo index")
       .setDesc(this.controller.getIndexStatusMessage?.() ?? "Not initialized");
     if (this.errorMessage)
       this.containerEl.createEl("p", { text: this.errorMessage, cls: "mod-warning" });

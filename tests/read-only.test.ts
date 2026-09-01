@@ -70,7 +70,7 @@ describe("read-only vault and tools module", () => {
           "/Notes/Source.md",
           "Notes/../Source.md",
           ".obsidian/app.md",
-          ".local-vault-assistant/index/x.md",
+          ".trama/index/x.md",
           ".private/secret.md",
           "notes/.archive/x.md",
           "Notes/file.txt",

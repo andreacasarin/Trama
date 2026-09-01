@@ -2,7 +2,7 @@ import { ItemView, WorkspaceLeaf } from "obsidian";
 import { ChatSession, ChatState } from "@/chat/ChatSession";
 import { ProvenanceRecord } from "@/domain/contracts";
 
-export const CHAT_VIEW_TYPE = "local-vault-assistant-chat";
+export const VOCE_VIEW_TYPE = "trama-voce";
 
 export function provenanceLabel(record: ProvenanceRecord): string {
   const hasRange = record.startLine !== undefined || record.endLine !== undefined;
@@ -12,7 +12,7 @@ export function provenanceLabel(record: ProvenanceRecord): string {
 }
 
 /** Native Obsidian view for the session's transient conversation and tool activity. */
-export class ChatView extends ItemView {
+export class VoceView extends ItemView {
   private unsubscribe: (() => void) | undefined;
   private input!: HTMLTextAreaElement;
   private transcript!: HTMLElement;
@@ -31,17 +31,17 @@ export class ChatView extends ItemView {
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
   }
   getViewType(): string {
-    return CHAT_VIEW_TYPE;
+    return VOCE_VIEW_TYPE;
   }
   getDisplayText(): string {
-    return "Local Vault Assistant";
+    return "Voce";
   }
 
   override onOpen(): Promise<void> {
     this.contentEl.empty();
-    this.contentEl.createEl("h2", { text: "Local Vault Assistant" });
-    this.transcript = this.contentEl.createDiv({ cls: "local-vault-assistant-chat-transcript" });
-    const form = this.contentEl.createDiv({ cls: "local-vault-assistant-chat-controls" });
+    this.contentEl.createEl("h2", { text: "Voce" });
+    this.transcript = this.contentEl.createDiv({ cls: "trama-voce-transcript" });
+    const form = this.contentEl.createDiv({ cls: "trama-voce-controls" });
     this.input = form.createEl("textarea", { attr: { rows: "3", ariaLabel: "Message" } });
     const send = form.createEl("button", { text: "Send" });
     this.stopButton = form.createEl("button", { text: "Stop" });

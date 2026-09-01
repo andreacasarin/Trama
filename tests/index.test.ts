@@ -116,14 +116,14 @@ describe("semantic index module", () => {
   describe("StrictIndexStorage", () => {
     it("rejects every path outside the configured root", async () => {
       const adapter = new MemoryIndexStorage();
-      const storage = new StrictIndexStorage(".local-vault-assistant/index", adapter);
+      const storage = new StrictIndexStorage(".trama/index", adapter);
       expect(() => storage.write("../escape", "x")).toThrow();
       expect(() => storage.write("/absolute", "x")).toThrow();
       await storage.write("generations/1.json", "ok");
-      expect(adapter.files.has(".local-vault-assistant/index/generations/1.json")).toBe(true);
+      expect(adapter.files.has(".trama/index/generations/1.json")).toBe(true);
     });
     it("restores the old pointer when atomic publication fails", async () => {
-      const files = new Map<string, string>([[".local-vault-assistant/index/active.json", "old"]]);
+      const files = new Map<string, string>([[".trama/index/active.json", "old"]]);
       let failure = "";
       const adapter = {
         exists: async (path: string) => files.has(path),
@@ -148,10 +148,10 @@ describe("semantic index module", () => {
       const storage = new ObsidianIndexStorage(adapter);
       failure = "rename";
       await expect(storage.activate("active.json", "new")).rejects.toThrow();
-      expect(files.get(".local-vault-assistant/index/active.json")).toBe("old");
+      expect(files.get(".trama/index/active.json")).toBe("old");
       failure = "write";
       await expect(storage.activate("active.json", "new")).rejects.toThrow();
-      expect(files.get(".local-vault-assistant/index/active.json")).toBe("old");
+      expect(files.get(".trama/index/active.json")).toBe("old");
     });
     it("leaves the active pointer untouched when rotating it to backup fails", async () => {
       const files = new Map<string, string>([["root/active.json", "old"]]);

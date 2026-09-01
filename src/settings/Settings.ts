@@ -14,14 +14,14 @@ export interface EmbeddingSettings {
   readonly dimensions: number;
   readonly batchSize: number;
 }
-export interface LocalVaultAssistantSettings {
+export interface TramaSettings {
   readonly schemaVersion: 1;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
 }
 
-export const DEFAULT_SETTINGS: LocalVaultAssistantSettings = Object.freeze({
+export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   schemaVersion: 1,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
@@ -40,9 +40,9 @@ export const DEFAULT_SETTINGS: LocalVaultAssistantSettings = Object.freeze({
 
 /** Owns the versioned, non-secret settings persisted through Obsidian plugin data. */
 export class SettingsStore {
-  private value: LocalVaultAssistantSettings = DEFAULT_SETTINGS;
+  private value: TramaSettings = DEFAULT_SETTINGS;
   /** Loads and sanitizes plugin data without performing network I/O. */
-  load(data: unknown): LocalVaultAssistantSettings {
+  load(data: unknown): TramaSettings {
     if (
       !data ||
       typeof data !== "object" ||
@@ -51,7 +51,7 @@ export class SettingsStore {
       this.value = DEFAULT_SETTINGS;
       return this.value;
     }
-    const input = data as Partial<LocalVaultAssistantSettings>;
+    const input = data as Partial<TramaSettings>;
     const rawChat = (input.chat && typeof input.chat === "object" ? input.chat : {}) as Record<
       string,
       unknown
@@ -89,7 +89,7 @@ export class SettingsStore {
       approvedOrigins: Object.freeze(
         approvals.map((v) => ({ scheme: v.scheme, host: v.host.toLowerCase(), port: v.port }))
       ),
-    } as LocalVaultAssistantSettings;
+    } as TramaSettings;
     return this.value;
   }
   private string(value: unknown, fallback: string): string {
@@ -151,11 +151,11 @@ export class SettingsStore {
     return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   }
   /** Returns the current settings snapshot for persistence or model construction. */
-  get(): LocalVaultAssistantSettings {
+  get(): TramaSettings {
     return this.value;
   }
   /** Normalizes and validates a candidate without changing the committed snapshot. */
-  stage(next: LocalVaultAssistantSettings): LocalVaultAssistantSettings {
+  stage(next: TramaSettings): TramaSettings {
     const approvals = this.sanitizeApprovals(next.approvedOrigins);
     const policy = new EndpointPolicy({ approvals });
     const chatEndpoint = policy.normalize(next.chat.endpoint);
@@ -168,12 +168,12 @@ export class SettingsStore {
     };
   }
   /** Commits a previously staged snapshot after its persistence succeeds. */
-  commit(next: LocalVaultAssistantSettings): LocalVaultAssistantSettings {
+  commit(next: TramaSettings): TramaSettings {
     this.value = next;
     return this.value;
   }
   /** Validates both independent endpoints and returns a persistable snapshot. */
-  save(next: LocalVaultAssistantSettings): LocalVaultAssistantSettings {
+  save(next: TramaSettings): TramaSettings {
     return this.commit(this.stage(next));
   }
 }

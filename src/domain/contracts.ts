@@ -47,7 +47,7 @@ export interface ChatModel {
   ): Promise<ChatResponse>;
 }
 
-/** The embedding model contract used by the future semantic index. */
+/** The embedding model contract used by Filo's semantic index. */
 export interface EmbeddingModel {
   embed(texts: readonly string[], signal: AbortSignal): Promise<readonly number[][]>;
   readonly dimensions: number;

@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-const PLUGIN_ID = "local-vault-assistant";
+const PLUGIN_ID = "trama";
 const REQUIRED_FILES = ["main.js", "manifest.json"];
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

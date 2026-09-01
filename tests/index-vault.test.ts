@@ -32,16 +32,13 @@ describe("ObsidianIndexVault", () => {
   it("filters hidden roots and non-Markdown files during enumeration", async () => {
     const files = [
       { path: ".obsidian/config.md" },
-      { path: ".local-vault-assistant/x.md" },
+      { path: ".trama/x.md" },
       { path: "image.png" },
       { path: "ok.md" },
     ] as any[];
     const vault = new ObsidianIndexVault(
       { getMarkdownFiles: () => files, getFileByPath: () => files[3], read: async () => "ok" },
-      (path) =>
-        /\.md$/i.test(path) &&
-        !path.startsWith(".obsidian/") &&
-        !path.startsWith(".local-vault-assistant/")
+      (path) => /\.md$/i.test(path) && !path.startsWith(".obsidian/") && !path.startsWith(".trama/")
     );
     await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual(["ok.md"]);
   });

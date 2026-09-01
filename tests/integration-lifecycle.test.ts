@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Platform } from "obsidian";
-import { LocalVaultAssistantPlugin } from "@/plugin/LocalVaultAssistantPlugin";
+import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 
 function deferred<T>() {
@@ -65,7 +65,7 @@ function projectedApp() {
 }
 
 function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SETTINGS) {
-  const plugin = new LocalVaultAssistantPlugin(undefined as never, undefined as never) as any;
+  const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
   plugin.app = app;
   plugin.loadData = vi.fn(async () => data);
   plugin.saveData = vi.fn(async () => undefined);
@@ -73,10 +73,10 @@ function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SE
   plugin.addSettingTab = vi.fn();
   plugin.registerView = vi.fn();
   plugin.registerEvent = vi.fn();
-  return plugin as LocalVaultAssistantPlugin & { app: typeof app };
+  return plugin as TramaPlugin & { app: typeof app };
 }
 
-describe("LocalVaultAssistantPlugin lifecycle integration", () => {
+describe("TramaPlugin lifecycle integration", () => {
   beforeEach(() => {
     Platform.isDesktopApp = true;
     vi.restoreAllMocks();
@@ -92,6 +92,12 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
     expect(plugin.isDesktopLoaded()).toBe(true);
     expect(plugin.addCommand).toHaveBeenCalledTimes(3);
     expect(plugin.registerView).toHaveBeenCalledTimes(1);
+    expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
+    expect(
+      (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
+        ([command]: [{ id: string }]) => command.id
+      )
+    ).toEqual(["rebuild-filo-index", "cancel-filo-index-rebuild", "open-voce"]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -257,7 +263,7 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-vault-index"
+      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
@@ -278,7 +284,7 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     vi.spyOn((plugin as any).index, "build").mockRejectedValue(new Error("cancelled"));
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-vault-index"
+      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
     )[0].callback;
     await rebuild();
     expect((plugin as any).indexReady).toBe(false);
@@ -295,7 +301,7 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
     vi.spyOn(index, "build").mockImplementation(async () => buildGate);
     const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-vault-index"
+      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((index as any).build).toHaveBeenCalled());
@@ -324,7 +330,7 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
       .mockResolvedValue(undefined);
     vi.spyOn(index, "search").mockRejectedValue(new Error("unavailable"));
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-vault-index"
+      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((index as any).build).toHaveBeenCalled());
@@ -393,13 +399,13 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
 
     emit("create", { path: "Note.md" });
     emit("modify", { path: "image.png" });
-    emit("modify", { path: ".local-vault-assistant/index.md" });
+    emit("modify", { path: ".trama/index.md" });
     emit("rename", { path: "Renamed.md" }, "Old.md");
     expect(queue).not.toHaveBeenCalledWith("Note.md");
     expect(queue).not.toHaveBeenCalledWith("Renamed.md");
     expect(queue).not.toHaveBeenCalledWith("Old.md");
     expect(queue).not.toHaveBeenCalledWith("image.png");
-    expect(queue).not.toHaveBeenCalledWith(".local-vault-assistant/index.md");
+    expect(queue).not.toHaveBeenCalledWith(".trama/index.md");
     expect(queue).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(150);
     plugin.onunload();

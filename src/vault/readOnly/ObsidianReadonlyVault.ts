@@ -23,7 +23,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     limits: Partial<ReadLimits> = {}
   ) {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
-    this.hidden = [".local-vault-assistant", this.vault.configDir || ".obsidian"];
+    this.hidden = [".trama", this.vault.configDir || ".obsidian"];
   }
 
   async currentNotePath(signal: AbortSignal): Promise<string | null> {

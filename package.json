@@ -1,7 +1,7 @@
 {
-  "name": "local-vault-assistant",
+  "name": "trama",
   "version": "0.1.0",
-  "description": "A local-only AI assistant for Obsidian vaults.",
+  "description": "Local-first AI for conversing with your vault through Voce and discovering related notes through Filo.",
   "main": "main.js",
   "scripts": {
     "build": "tsc --noEmit && node esbuild.config.mjs production",
