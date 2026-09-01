@@ -1,0 +1,27 @@
+{
+  "name": "local-vault-assistant",
+  "version": "0.1.0",
+  "description": "A local-only AI assistant for Obsidian vaults.",
+  "main": "main.js",
+  "scripts": {
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "format": "prettier --write '**/*.{js,mjs,ts,json,md}'",
+    "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.18.0",
+    "obsidian": "^1.8.7",
+    "prettier": "^3.8.3",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.68.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "@orama/orama": "^3.1.18"
+  }
+}

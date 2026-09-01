@@ -1,0 +1,6 @@
+node_modules/
+.ai/
+main.js
+coverage/
+.local-vault-assistant/
+.DS_Store

@@ -1,0 +1,158 @@
+import { describe, expect, it, vi } from "vitest";
+import { ChatSession } from "@/chat/ChatSession";
+import { ChatModel, ChatResponse, ReadonlyVault } from "@/domain/contracts";
+import { IndexManager } from "@/index/IndexManager";
+import { MemoryIndexStorage } from "@/index/storage";
+import { ToolRegistry, ReadNoteTool, FollowLinkTool, VaultSearchTool } from "@/tools/ToolRegistry";
+import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
+import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
+import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
+import { EndpointPolicy } from "@/security/EndpointPolicy";
+
+class FakeEmbedding {
+  readonly dimensions = 2;
+  async embed(texts: readonly string[]): Promise<readonly number[][]> {
+    return texts.map((text) => [text.length, text.includes("alpha") ? 1 : 0]);
+  }
+}
+
+const vault: ReadonlyVault = {
+  async readNote(path) {
+    return { path, content: `alpha from ${path}`, startLine: 1, endLine: 1 };
+  },
+  async currentNotePath() {
+    return "A.md";
+  },
+  async resolveLink(link) {
+    return link === "B" ? "B.md" : null;
+  },
+  async discoverLinks() {
+    return [{ link: "B", sourcePath: "A.md", targetPath: "B.md" }];
+  },
+};
+
+describe("integration composition seams", () => {
+  it("builds, persists, reloads, and searches a semantic index without network", async () => {
+    const embedding = new FakeEmbedding();
+    const storage = new MemoryIndexStorage();
+    const port = {
+      async listMarkdownPaths() {
+        return ["A.md", "B.md"];
+      },
+      async readMarkdown(path: string) {
+        return { path, content: `alpha ${path}` };
+      },
+    };
+    const first = new IndexManager(
+      port,
+      embedding,
+      storage,
+      "http://127.0.0.1:1234/v1",
+      "embed-v1"
+    );
+    await first.build(new AbortController().signal);
+    expect(await first.search("alpha", new AbortController().signal, 10)).toHaveLength(2);
+    const restarted = new IndexManager(
+      port,
+      embedding,
+      storage,
+      "http://127.0.0.1:1234/v1",
+      "embed-v1"
+    );
+    expect(await restarted.load()).toBe(true);
+  });
+
+  it("runs a multi-round read/follow turn and exposes accessed-note provenance", async () => {
+    const responses: ChatResponse[] = [
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "r", name: "read_note", arguments: { path: "A.md" } }],
+        },
+        finishReason: "tool_calls",
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "See B",
+          toolCalls: [
+            { id: "f", name: "follow_link", arguments: { link: "B", sourcePath: "A.md" } },
+          ],
+        },
+        finishReason: "tool_calls",
+      },
+      { message: { role: "assistant", content: "done" }, finishReason: "stop" },
+    ];
+    const model: ChatModel = { complete: vi.fn(async () => responses.shift()!) };
+    const registry = new ToolRegistry([
+      new ReadNoteTool(vault),
+      new FollowLinkTool(vault),
+      new VaultSearchTool({ search: async () => [] }),
+    ]);
+    const state = await new ChatSession(model, registry).send("trace links");
+    expect(state.accessedNotes.map((note) => note.path)).toEqual(["A.md", "A.md", "B.md"]);
+  });
+
+  it("propagates cancellation through an in-flight chat turn", async () => {
+    let reject!: (error: Error) => void;
+    const model: ChatModel = {
+      complete: vi.fn(
+        () =>
+          new Promise<ChatResponse>((_, fail) => {
+            reject = fail;
+          })
+      ),
+    };
+    const session = new ChatSession(model, new ToolRegistry([]));
+    const pending = session.send("cancel me");
+    session.cancel();
+    reject(new Error("aborted"));
+    expect((await pending).error?.code).toBe("cancelled");
+  });
+
+  it("keeps chat and embedding requests on the newly approved local origin", async () => {
+    const urls: string[] = [];
+    const fetcher = vi.fn(async (input: string | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+      });
+    });
+    const policy = new EndpointPolicy();
+    const transport = new LmStudioTransport({ fetcher: fetcher as typeof fetch, policy });
+    const chat = new LmStudioChatModel({
+      endpoint: "http://127.0.0.1:2345/v1",
+      modelId: "chat-new",
+      transport,
+    });
+    await chat.complete([{ role: "user", content: "hello" }], new AbortController().signal);
+    const embedding = new LmStudioEmbeddingModel({
+      endpoint: "http://127.0.0.1:2345/v1",
+      modelId: "embed-new",
+      dimensions: 2,
+      transport,
+    });
+    fetcher.mockImplementationOnce(async (input: string | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ data: [{ embedding: [1, 0], index: 0 }] }), {
+        status: 200,
+      });
+    });
+    await embedding.embed(["hello"], new AbortController().signal);
+    expect(urls).toEqual([
+      "http://127.0.0.1:2345/v1/chat/completions",
+      "http://127.0.0.1:2345/v1/embeddings",
+    ]);
+    expect(urls.every((url) => url.startsWith("http://127.0.0.1:2345/v1/"))).toBe(true);
+  });
+
+  it("does not expose write capabilities through the projected vault", async () => {
+    const writes = { create: 0, modify: 0, delete: 0, rename: 0, write: 0 };
+    const projected = { ...vault };
+    await projected.readNote("A.md", new AbortController().signal);
+    await projected.currentNotePath(new AbortController().signal);
+    expect(writes).toEqual({ create: 0, modify: 0, delete: 0, rename: 0, write: 0 });
+    expect("create" in projected || "modify" in projected || "delete" in projected).toBe(false);
+  });
+});

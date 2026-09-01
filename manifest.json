@@ -1,0 +1,9 @@
+{
+  "id": "local-vault-assistant",
+  "name": "Local Vault Assistant",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "A local-only AI assistant for Obsidian vaults.",
+  "author": "Local Vault Assistant contributors",
+  "isDesktopOnly": true
+}
