@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "install:plugin": "npm run build && node scripts/install-plugin.mjs",
     "format": "prettier --write '**/*.{js,mjs,ts,json,md}'",
     "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
     "lint": "eslint .",

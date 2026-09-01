@@ -12,6 +12,25 @@ The semantic index is stored at `<vault>/.local-vault-assistant/index/`. Configu
 
 ## Development
 
+Build and install the plugin into a vault with one command:
+
+```sh
+npm run install:plugin -- "/path/to/your/vault"
+```
+
+Alternatively, set the vault path through the environment:
+
+```sh
+OBSIDIAN_VAULT_PATH="/path/to/your/vault" npm run install:plugin
+```
+
+The installer verifies that the target is an Obsidian vault, then copies
+`main.js` and `manifest.json` into
+`<vault>/.obsidian/plugins/local-vault-assistant/`. Restart or reload Obsidian
+after installation.
+
+Run the development checks separately with:
+
 ```sh
 npm install
 npm run format
