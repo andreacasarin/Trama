@@ -1,12 +1,24 @@
 import { access, copyFile, mkdir } from "node:fs/promises";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const PLUGIN_ID = "local-vault-assistant";
 const REQUIRED_FILES = ["main.js", "manifest.json"];
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const vaultArgument = process.argv[2] ?? process.env.OBSIDIAN_VAULT_PATH;
+const runFile = promisify(execFile);
+
+async function installFile(source, destination) {
+  try {
+    await copyFile(source, destination);
+  } catch (error) {
+    if (process.platform !== "darwin" || error?.code !== "EPERM") throw error;
+    await runFile("/bin/cp", ["-f", source, destination]);
+  }
+}
 
 if (!vaultArgument) {
   throw new Error('Provide the Obsidian vault path: npm run install:plugin -- "/path/to/vault"');
@@ -29,7 +41,7 @@ for (const fileName of REQUIRED_FILES) {
 await mkdir(pluginDirectory, { recursive: true });
 
 for (const fileName of REQUIRED_FILES) {
-  await copyFile(path.join(projectRoot, fileName), path.join(pluginDirectory, fileName));
+  await installFile(path.join(projectRoot, fileName), path.join(pluginDirectory, fileName));
 }
 
 process.stdout.write(`Installed ${PLUGIN_ID} in ${pluginDirectory}\n`);

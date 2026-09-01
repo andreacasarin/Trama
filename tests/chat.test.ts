@@ -33,6 +33,27 @@ describe("ChatSession module", () => {
         expect(state.messages.map((m) => m.content)).toEqual(["Hello", "Hi"]);
       });
 
+      it("publishes incremental assistant text while the model is running", async () => {
+        let release!: () => void;
+        const model: ChatModel = {
+          complete: vi.fn(async (_messages, _signal, _tools, onText) => {
+            onText?.("Hello");
+            await new Promise<void>((resolve) => (release = resolve));
+            onText?.(" world");
+            return response({ role: "assistant", content: "Hello world" }, "stop");
+          }),
+        };
+        const session = new ChatSession(model, new ToolRegistry([]));
+        const states: string[][] = [];
+        session.subscribe((state) => states.push(state.messages.map((message) => message.content)));
+        const pending = session.send("go");
+        await vi.waitFor(() => expect(states).toContainEqual(["go", "Hello"]));
+        release();
+        const state = await pending;
+        expect(state.messages.map((message) => message.content)).toEqual(["go", "Hello world"]);
+        expect(states).toContainEqual(["go", "Hello world"]);
+      });
+
       it("executes tool calls across rounds and aggregates provenance", async () => {
         const model: ChatModel = {
           complete: vi

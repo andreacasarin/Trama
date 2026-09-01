@@ -42,7 +42,8 @@ export interface ChatModel {
   complete(
     messages: readonly ChatMessage[],
     signal: AbortSignal,
-    tools?: readonly ChatToolDefinition[]
+    tools?: readonly ChatToolDefinition[],
+    onText?: (text: string) => void
   ): Promise<ChatResponse>;
 }
 

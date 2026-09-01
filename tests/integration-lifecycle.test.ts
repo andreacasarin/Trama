@@ -118,7 +118,10 @@ describe("LocalVaultAssistantPlugin lifecycle integration", () => {
     const fetcher = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(
-        new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 })
+        new Response(
+          'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } }
+        )
       );
     await plugin.onload();
     expect(fetcher).not.toHaveBeenCalled();

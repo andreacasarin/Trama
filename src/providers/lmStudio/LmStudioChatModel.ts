@@ -17,13 +17,17 @@ export interface LmStudioChatOptions {
   readonly tools?: readonly ChatToolDefinition[];
   readonly transport?: LmStudioTransport;
 }
-interface ChatApiResponse {
+interface ChatStreamChunk {
   choices?: readonly {
-    message?: {
+    delta?: {
       content?: string | null;
-      tool_calls?: readonly { id?: string; function?: { name?: string; arguments?: string } }[];
+      tool_calls?: readonly {
+        index?: number;
+        id?: string;
+        function?: { name?: string; arguments?: string };
+      }[];
     };
-    finish_reason?: string;
+    finish_reason?: string | null;
   }[];
 }
 export interface LmStudioModelInfo {
@@ -67,13 +71,15 @@ export class LmStudioChatModel implements ChatModel {
   async complete(
     messages: readonly ChatMessage[],
     signal: AbortSignal,
-    requestTools?: readonly ChatToolDefinition[]
+    requestTools?: readonly ChatToolDefinition[],
+    onText?: (text: string) => void
   ): Promise<ChatResponse> {
     if (!this.options.modelId.trim())
       throw new StructuredError("invalid_request", "Chat model ID is required.", false);
     const body: Record<string, unknown> = {
       model: this.options.modelId,
       messages: serializeMessages(messages),
+      stream: true,
     };
     if (this.options.temperature !== undefined) body.temperature = this.options.temperature;
     if (this.options.maxTokens !== undefined) body.max_tokens = this.options.maxTokens;
@@ -81,23 +87,38 @@ export class LmStudioChatModel implements ChatModel {
     if (this.options.reasoning !== undefined) body.reasoning = this.options.reasoning;
     const tools = requestTools ?? this.options.tools;
     if (tools?.length) body.tools = tools.map((tool) => ({ type: "function", function: tool }));
-    const choice = (
-      await this.transport.request<ChatApiResponse>(
-        this.options.endpoint,
-        "/chat/completions",
-        body,
-        signal
-      )
-    ).choices?.[0];
-    if (!choice?.message)
-      throw new StructuredError("internal", "LM Studio returned an invalid chat response.", false);
+    let content = "";
+    let finishReason: string | null | undefined;
+    const streamedCalls = new Map<number, { id: string; name: string; arguments: string }>();
+    for await (const chunk of this.transport.stream<ChatStreamChunk>(
+      this.options.endpoint,
+      "/chat/completions",
+      body,
+      signal
+    )) {
+      const choice = chunk.choices?.[0];
+      if (!choice) continue;
+      if (typeof choice.delta?.content === "string") {
+        content += choice.delta.content;
+        onText?.(choice.delta.content);
+      }
+      for (const call of choice.delta?.tool_calls ?? []) {
+        if (call.index === undefined) continue;
+        const current = streamedCalls.get(call.index) ?? { id: "", name: "", arguments: "" };
+        current.id += call.id ?? "";
+        current.name += call.function?.name ?? "";
+        current.arguments += call.function?.arguments ?? "";
+        streamedCalls.set(call.index, current);
+      }
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+    }
     const toolCalls: ToolCall[] = [];
-    for (const call of choice.message.tool_calls ?? []) {
-      if (!call.id || !call.function?.name)
+    for (const call of [...streamedCalls.entries()].sort(([a], [b]) => a - b).map(([, v]) => v)) {
+      if (!call.id || !call.name)
         throw new StructuredError("internal", "LM Studio returned an invalid tool call.", false);
       let args: unknown;
       try {
-        args = JSON.parse(call.function.arguments ?? "{}");
+        args = JSON.parse(call.arguments || "{}");
       } catch {
         throw new StructuredError(
           "internal",
@@ -109,21 +130,17 @@ export class LmStudioChatModel implements ChatModel {
         throw new StructuredError("internal", "LM Studio returned invalid tool arguments.", false);
       toolCalls.push({
         id: call.id,
-        name: call.function.name,
+        name: call.name,
         arguments: args as Readonly<Record<string, unknown>>,
       });
     }
     return {
       message: {
         role: "assistant",
-        content: choice.message.content ?? "",
+        content,
         ...(toolCalls.length ? { toolCalls } : {}),
       },
-      finishReason: toolCalls.length
-        ? "tool_calls"
-        : choice.finish_reason === "length"
-          ? "length"
-          : "stop",
+      finishReason: toolCalls.length ? "tool_calls" : finishReason === "length" ? "length" : "stop",
     };
   }
 }

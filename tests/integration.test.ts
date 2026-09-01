@@ -115,9 +115,10 @@ describe("integration composition seams", () => {
     const urls: string[] = [];
     const fetcher = vi.fn(async (input: string | URL) => {
       urls.push(String(input));
-      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
-        status: 200,
-      });
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      );
     });
     const policy = new EndpointPolicy();
     const transport = new LmStudioTransport({ fetcher: fetcher as typeof fetch, policy });

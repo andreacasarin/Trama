@@ -10,26 +10,31 @@ const response = (body: unknown, init: ResponseInit = {}) =>
     headers: { "content-type": "application/json" },
     ...init,
   });
+const streamResponse = (...chunks: string[]) =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
 
 describe("LM Studio adapters module", () => {
   describe("LmStudioChatModel", () => {
     describe("complete()", () => {
       it("maps tool definitions and tool calls into the domain response", async () => {
-        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
-          response({
-            choices: [
-              {
-                message: {
-                  content: null,
-                  tool_calls: [
-                    { id: "c1", function: { name: "read", arguments: '{"path":"a.md"}' } },
-                  ],
-                },
-                finish_reason: "tool_calls",
-              },
-            ],
-          })
-        );
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(
+            streamResponse(
+              'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\\"path\\":"}}]}}]}\n\n',
+              'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"a.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+              "data: [DONE]\n\n"
+            )
+          );
         const model = new LmStudioChatModel({
           endpoint: "http://127.0.0.1:1234/v1",
           modelId: "local",
@@ -45,6 +50,33 @@ describe("LM Studio adapters module", () => {
         expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).tools[0].function.name).toBe(
           "read"
         );
+        expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).stream).toBe(true);
+      });
+
+      it("emits text as fragmented server-sent event chunks arrive", async () => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(
+            streamResponse(
+              'data: {"choices":[{"delta":{"content":"Hel',
+              'lo"}}]}\n\ndata: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}\n\n',
+              "data: [DONE]\n\n"
+            )
+          );
+        const model = new LmStudioChatModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "local",
+          transport: new LmStudioTransport({ fetcher }),
+        });
+        const deltas: string[] = [];
+        const result = await model.complete(
+          [{ role: "user", content: "go" }],
+          new AbortController().signal,
+          undefined,
+          (text) => deltas.push(text)
+        );
+        expect(deltas).toEqual(["Hello", " world"]);
+        expect(result.message.content).toBe("Hello world");
       });
     });
   });
@@ -121,6 +153,20 @@ describe("LM Studio adapters module", () => {
         await expect(
           cancelled.request("http://127.0.0.1:1234", "/models", {}, controller.signal)
         ).rejects.toBeInstanceOf(StructuredError);
+      });
+
+      it("invokes fetch with the browser global receiver and preserves connection details", async () => {
+        const fetcher = vi.fn(function (this: unknown) {
+          if (this !== globalThis) throw new TypeError("Illegal invocation");
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }) as unknown as typeof fetch;
+        const transport = new LmStudioTransport({ fetcher });
+        await expect(
+          transport.get("http://127.0.0.1:1234", "/models", new AbortController().signal)
+        ).rejects.toMatchObject({
+          code: "unavailable",
+          message: "LM Studio could not be reached. Failed to fetch",
+        });
       });
     });
   });

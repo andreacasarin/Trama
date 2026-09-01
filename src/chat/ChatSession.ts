@@ -99,10 +99,22 @@ export class ChatSession {
       let toolCalls = 0;
       let contentSize = 0;
       for (let round = 0; round < CHAT_LIMITS.maxRounds; round++) {
+        let streamedText = "";
         const response = await this.model.complete(
           Object.freeze([...messages]),
           controller.signal,
-          definitions
+          definitions,
+          (text) => {
+            if (!this.isCurrent(identity)) return;
+            streamedText += text;
+            this.publish(identity, {
+              ...this.state,
+              messages: Object.freeze([
+                ...messages,
+                Object.freeze({ role: "assistant" as const, content: streamedText }),
+              ]),
+            });
+          }
         );
         if (!this.isCurrent(identity)) return this.state;
         messages.push(Object.freeze(response.message));
@@ -155,7 +167,8 @@ export class ChatSession {
       )
         return this.cancelled(identity);
       const message = error instanceof Error ? error.message : "Chat turn failed.";
-      return this.fail(identity, messages, activities, provenance, { code: "internal", message });
+      const code = error instanceof StructuredError ? error.code : "internal";
+      return this.fail(identity, messages, activities, provenance, { code, message });
     } finally {
       if (this.active === controller) this.active = undefined;
     }
