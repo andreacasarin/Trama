@@ -54,9 +54,15 @@ export class ChatSession {
   private readonly listeners = new Set<(state: ChatState) => void>();
 
   constructor(
-    private readonly model: ChatModel,
+    private model: ChatModel,
     private readonly registry: ToolRegistry
   ) {}
+
+  /** Replaces the model for subsequent turns while retaining this conversation and tools. */
+  replaceModel(model: ChatModel): void {
+    this.cancel();
+    this.model = model;
+  }
 
   getState(): ChatState {
     return this.state;
@@ -135,6 +141,7 @@ export class ChatSession {
         for (let offset = 0; offset < calls.length; offset += CHAT_LIMITS.maxConcurrentTools) {
           const batch = calls.slice(offset, offset + CHAT_LIMITS.maxConcurrentTools);
           const results = await this.executeBatch(batch, activities, controller.signal, identity);
+          if (!this.isCurrent(identity)) return this.state;
           for (let i = 0; i < results.length; i++) {
             const result = results[i];
             provenance.push(...result.provenance);

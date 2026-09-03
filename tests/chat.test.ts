@@ -440,5 +440,76 @@ describe("ChatSession module", () => {
         expect(session.getState().messages.some((m) => m.content === "late")).toBe(false);
       });
     });
+
+    describe("replaceModel()", () => {
+      it("retains conversation history and the tool registry for the next model", async () => {
+        const first: ChatModel = {
+          complete: vi
+            .fn()
+            .mockResolvedValue(response({ role: "assistant", content: "first answer" }, "stop")),
+        };
+        const replacement: ChatModel = {
+          complete: vi
+            .fn()
+            .mockResolvedValue(response({ role: "assistant", content: "second answer" }, "stop")),
+        };
+        const session = new ChatSession(
+          first,
+          new ToolRegistry([tool("read", async () => ({ ok: true, provenance: [] }))])
+        );
+        await session.send("first question");
+
+        session.replaceModel(replacement);
+        const state = await session.send("second question");
+
+        expect(state.messages.map((message) => message.content)).toEqual([
+          "first question",
+          "first answer",
+          "second question",
+          "second answer",
+        ]);
+        expect(replacement.complete).toHaveBeenCalledWith(
+          expect.arrayContaining([
+            { role: "user", content: "first question" },
+            { role: "assistant", content: "first answer", provenance: [] },
+            { role: "user", content: "second question" },
+          ]),
+          expect.any(AbortSignal),
+          expect.arrayContaining([expect.objectContaining({ name: "read" })]),
+          expect.any(Function)
+        );
+      });
+
+      it("cancels the old request and suppresses its late output", async () => {
+        let release!: (value: ChatResponse) => void;
+        let signal!: AbortSignal;
+        const oldModel: ChatModel = {
+          complete: vi.fn((_messages, requestSignal) => {
+            signal = requestSignal;
+            return new Promise<ChatResponse>((resolve) => (release = resolve));
+          }),
+        };
+        const newModel: ChatModel = {
+          complete: vi
+            .fn()
+            .mockResolvedValue(response({ role: "assistant", content: "new output" }, "stop")),
+        };
+        const session = new ChatSession(oldModel, new ToolRegistry([]));
+        const pending = session.send("in flight");
+        await vi.waitFor(() => expect(oldModel.complete).toHaveBeenCalled());
+
+        session.replaceModel(newModel);
+        expect(signal.aborted).toBe(true);
+        release(response({ role: "assistant", content: "late old output" }, "stop"));
+        await pending;
+
+        expect(session.getState().messages.map((message) => message.content)).toEqual([
+          "in flight",
+        ]);
+        const state = await session.send("continue");
+        expect(state.messages.at(-1)?.content).toBe("new output");
+        expect(state.messages.some((message) => message.content === "late old output")).toBe(false);
+      });
+    });
   });
 });

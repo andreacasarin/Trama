@@ -22,8 +22,34 @@ export interface SettingsTabCallbacks {
 export interface SettingsDraft {
   chatEndpoint: string;
   chatModelId: string;
+  chatTemperature: number;
+  chatMaxOutputTokens: number;
+  chatReasoningEffort: string;
   embeddingEndpoint: string;
   embeddingModelId: string;
+}
+
+const REASONING_EFFORTS = ["auto", "none", "low", "medium", "high"] as const;
+
+/** Returns the first invalid chat-control draft value, or an empty string. */
+export function validateChatDraft(draft: SettingsDraft): string {
+  if (
+    !Number.isFinite(draft.chatTemperature) ||
+    draft.chatTemperature < 0 ||
+    draft.chatTemperature > 1 ||
+    !Number.isInteger(draft.chatTemperature * 10)
+  )
+    return "Temperature must be from 0 to 1 in increments of 0.1.";
+  if (
+    !Number.isSafeInteger(draft.chatMaxOutputTokens) ||
+    draft.chatMaxOutputTokens < 0 ||
+    draft.chatMaxOutputTokens > 131_072 ||
+    draft.chatMaxOutputTokens % 1024 !== 0
+  )
+    return "Maximum generated-output tokens must be Auto or a multiple of 1024 up to 131072.";
+  if (!REASONING_EFFORTS.includes(draft.chatReasoningEffort as (typeof REASONING_EFFORTS)[number]))
+    return "Reasoning effort must be Auto, None, Low, Medium, or High.";
+  return "";
 }
 
 /** Projects locally edited endpoint and model fields onto the current persisted settings. */
@@ -31,9 +57,16 @@ export function projectSettingsWithDraft(
   settings: TramaSettings,
   draft: SettingsDraft
 ): TramaSettings {
+  const chat = { ...settings.chat, endpoint: draft.chatEndpoint, modelId: draft.chatModelId };
+  chat.temperature = draft.chatTemperature;
+  if (draft.chatMaxOutputTokens) chat.maxOutputTokens = draft.chatMaxOutputTokens;
+  else delete chat.maxOutputTokens;
+  if (draft.chatReasoningEffort !== "auto")
+    chat.reasoningEffort = draft.chatReasoningEffort as "low" | "medium" | "high";
+  else delete chat.reasoningEffort;
   return {
     ...settings,
-    chat: { ...settings.chat, endpoint: draft.chatEndpoint, modelId: draft.chatModelId },
+    chat,
     embedding: {
       ...settings.embedding,
       endpoint: draft.embeddingEndpoint,
@@ -68,6 +101,9 @@ export class TramaSettingsTab extends PluginSettingTab {
     const draft = (this.draft ??= {
       chatEndpoint: settings.chat.endpoint,
       chatModelId: settings.chat.modelId,
+      chatTemperature: settings.chat.temperature ?? 0.7,
+      chatMaxOutputTokens: settings.chat.maxOutputTokens ?? 0,
+      chatReasoningEffort: settings.chat.reasoningEffort ?? "auto",
       embeddingEndpoint: settings.embedding.endpoint,
       embeddingModelId: settings.embedding.modelId,
     });
@@ -77,6 +113,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     this.text("Voce model", draft.chatModelId, (value) => {
       draft.chatModelId = value;
     });
+    this.chatControls(draft);
     this.text("Embedding endpoint", draft.embeddingEndpoint, (value) => {
       draft.embeddingEndpoint = value;
     });
@@ -88,6 +125,8 @@ export class TramaSettingsTab extends PluginSettingTab {
         () =>
           void this.run(async () => {
             const draftSnapshot = { ...draft };
+            const validation = validateChatDraft(draftSnapshot);
+            if (validation) throw new Error(validation);
             await this.controller.saveSettings?.((current) =>
               projectSettingsWithDraft(current, draftSnapshot)
             );
@@ -162,6 +201,42 @@ export class TramaSettingsTab extends PluginSettingTab {
       text.setValue(value);
       text.onChange(update);
     });
+  }
+
+  private chatControls(draft: SettingsDraft): void {
+    new Setting(this.containerEl)
+      .setName("Temperature")
+      .setDesc("Controls response variability from 0 to 1.")
+      .addSlider((slider) => {
+        slider.setLimits(0, 1, 0.1);
+        slider.setValue(draft.chatTemperature);
+        slider.setDynamicTooltip();
+        slider.onChange((value) => {
+          draft.chatTemperature = value;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Maximum generated-output tokens")
+      .setDesc("0 is Auto. Reasoning tokens count toward this limit where applicable.")
+      .addSlider((slider) => {
+        slider.setLimits(0, 131_072, 1024);
+        slider.setValue(draft.chatMaxOutputTokens);
+        slider.setDynamicTooltip();
+        slider.onChange((value) => {
+          draft.chatMaxOutputTokens = value;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Reasoning effort")
+      .setDesc("Auto uses the model default; available effort levels depend on the selected model.")
+      .addDropdown((dropdown) => {
+        for (const value of REASONING_EFFORTS)
+          dropdown.addOption(value, value[0].toUpperCase() + value.slice(1));
+        dropdown.setValue(draft.chatReasoningEffort);
+        dropdown.onChange((value) => {
+          draft.chatReasoningEffort = value;
+        });
+      });
   }
   private async run(action: () => Promise<void> | undefined): Promise<void> {
     try {

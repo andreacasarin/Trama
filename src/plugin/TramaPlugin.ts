@@ -130,12 +130,16 @@ export class TramaPlugin extends Plugin {
     if (typeof this.saveData === "function") await this.saveData(saved);
     this.settingsStore.commit(saved);
     const chatChanged =
-      before.chat.endpoint !== saved.chat.endpoint || before.chat.modelId !== saved.chat.modelId;
+      before.chat.endpoint !== saved.chat.endpoint ||
+      before.chat.modelId !== saved.chat.modelId ||
+      before.chat.temperature !== saved.chat.temperature ||
+      before.chat.maxOutputTokens !== saved.chat.maxOutputTokens ||
+      before.chat.reasoningEffort !== saved.chat.reasoningEffort;
     const embeddingChanged =
       before.embedding.endpoint !== saved.embedding.endpoint ||
       before.embedding.modelId !== saved.embedding.modelId ||
       before.embedding.dimensions !== saved.embedding.dimensions;
-    if (chatChanged || embeddingChanged) this.session?.cancel();
+    if (embeddingChanged) this.session?.cancel();
     if (embeddingChanged) {
       this.indexStatus?.cancel();
       const oldIndex = this.index;
@@ -151,7 +155,7 @@ export class TramaPlugin extends Plugin {
     }
     const app = (this as unknown as { app?: any }).app;
     if (app?.vault && app.workspace && app.metadataCache && this.session) {
-      if (chatChanged && !embeddingChanged) this.composeChatSession(app, saved);
+      if (chatChanged && !embeddingChanged) this.replaceChatModel(saved);
       else if (embeddingChanged) this.composeRuntime(app, saved);
     }
   }
@@ -234,6 +238,17 @@ export class TramaPlugin extends Plugin {
     manager.markUnavailable();
     this.indexReady = false;
     this.indexStatus?.markError(error);
+  }
+
+  private replaceChatModel(settings: TramaSettings): void {
+    const model = new LmStudioChatModel({
+      ...settings.chat,
+      transport: new LmStudioTransport({
+        policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
+      }),
+    });
+    this.chatModel = model;
+    this.session?.replaceModel(model);
   }
 
   private composeChatSession(

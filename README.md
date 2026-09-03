@@ -4,11 +4,35 @@ Trama is a desktop-only Obsidian plugin for local AI conversation and semantic c
 
 ## Setup
 
-1. Install and start [LM Studio](https://lmstudio.ai/), load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
+1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer**, load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
 2. Configure the chat model and embedding model independently in the plugin settings.
 3. Use **Rebuild Filo index** from the command palette, then open **Voce** with **Open Voce**.
 
 The semantic index is stored at `<vault>/.trama/index/`. Configure that directory in your sync tool's exclusions; it is generated data and can be rebuilt. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+
+## Voce chat
+
+Voce uses LM Studio's `/v1/responses` endpoint with streaming enabled. Each
+request includes the complete local conversation history and `store: false`,
+so LM Studio does not hold the conversation. Chats are kept only in memory and
+are not persisted.
+
+The settings page provides these chat controls:
+
+- **Temperature**: a required slider from **0** through **1** in **0.1**
+  increments, with a default of **0.7**.
+- **Maximum generated-output tokens**: **0** means **Auto**; larger values use
+  **1K** increments through **128K**. Reasoning tokens count toward this limit
+  where applicable.
+- **Reasoning effort**: **Auto**, **None**, **Low**, **Medium**, or **High**.
+  Auto leaves the value unset, while the explicit levels are sent to LM Studio
+  when selected.
+
+Voce's tools run in the plugin and are read-only: they can inspect the current
+note, search the vault, read notes, and discover or follow links. Answers show
+the accessed note paths and line ranges as provenance. Trama does not use
+Remote MCP or hosted tools; embeddings continue using LM Studio's existing
+`/v1/embeddings` endpoint.
 
 ## Development
 

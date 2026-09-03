@@ -95,7 +95,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
     expect(
       (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
-        ([command]: [{ id: string }]) => command.id
+        ([command]) => (command as { id: string }).id
       )
     ).toEqual(["rebuild-filo-index", "cancel-filo-index-rebuild", "open-voce"]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
@@ -125,7 +125,8 @@ describe("TramaPlugin lifecycle integration", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(
         new Response(
-          'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          'data: {"type":"response.output_text.delta","delta":"ok"}\n\n' +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
           { status: 200, headers: { "content-type": "text/event-stream" } }
         )
       );
@@ -148,7 +149,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).session).not.toBe(oldSession);
     expect(state.messages.at(-1)?.content).toBe("ok");
     expect(fetcher).toHaveBeenCalledWith(
-      "http://127.0.0.1:2345/v1/chat/completions",
+      "http://127.0.0.1:2345/v1/responses",
       expect.objectContaining({ body: expect.stringContaining('"model":"chat-v2"') })
     );
     await expect(oldIndex.search("old", new AbortController().signal, 1)).rejects.toMatchObject({
@@ -186,6 +187,46 @@ describe("TramaPlugin lifecycle integration", () => {
 
     expect(activate).toHaveBeenCalledTimes(1);
     expect(await index.search("anything", new AbortController().signal, 1)).toHaveLength(1);
+  });
+
+  it("applies parameter-only chat saves to the next request without replacing the conversation", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    const fetcher = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          'data: {"type":"response.output_text.delta","delta":"ok"}\n\n' +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } }
+        )
+      );
+    await plugin.onload();
+    const session = (plugin as any).session;
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      chat: {
+        ...DEFAULT_SETTINGS.chat,
+        modelId: "parameterized",
+        temperature: 0.4,
+        maxOutputTokens: 2048,
+        reasoningEffort: "high",
+      },
+    });
+
+    const state = await session.send("hello");
+    const body = JSON.parse(String(fetcher.mock.calls[0][1]?.body));
+    expect((plugin as any).session).toBe(session);
+    expect(state.messages.map((message: { content: string }) => message.content)).toEqual([
+      "hello",
+      "ok",
+    ]);
+    expect(body).toMatchObject({
+      model: "parameterized",
+      temperature: 0.4,
+      max_output_tokens: 2048,
+      reasoning: { effort: "high" },
+    });
   });
 
   it("cancels and awaits the old rebuild before replacing embedding composition", async () => {

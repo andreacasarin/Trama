@@ -116,7 +116,8 @@ describe("integration composition seams", () => {
     const fetcher = vi.fn(async (input: string | URL) => {
       urls.push(String(input));
       return new Response(
-        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        'data: {"type":"response.output_text.delta","delta":"ok"}\n\n' +
+          'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
         { status: 200, headers: { "content-type": "text/event-stream" } }
       );
     });
@@ -142,10 +143,80 @@ describe("integration composition seams", () => {
     });
     await embedding.embed(["hello"], new AbortController().signal);
     expect(urls).toEqual([
-      "http://127.0.0.1:2345/v1/chat/completions",
+      "http://127.0.0.1:2345/v1/responses",
       "http://127.0.0.1:2345/v1/embeddings",
     ]);
     expect(urls.every((url) => url.startsWith("http://127.0.0.1:2345/v1/"))).toBe(true);
+  });
+
+  it("replays a complete tool round with its matching function output", async () => {
+    const sse = (type: string, value: Record<string, unknown> = {}) =>
+      `data: ${JSON.stringify({ type, ...value })}\n\n`;
+    const firstResponse =
+      sse("response.output_item.added", {
+        item: { type: "function_call", id: "item-1", call_id: "call-1", name: "read_note" },
+      }) +
+      sse("response.function_call_arguments.done", {
+        call_id: "call-1",
+        item_id: "item-1",
+        arguments: '{"path":"A.md"}',
+      }) +
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          output: [
+            {
+              type: "function_call",
+              id: "item-1",
+              call_id: "call-1",
+              name: "read_note",
+              arguments: '{"path":"A.md"}',
+            },
+          ],
+        },
+      });
+    const secondResponse =
+      sse("response.output_text.delta", { delta: "done" }) +
+      sse("response.completed", { response: { status: "completed" } });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(firstResponse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(secondResponse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })
+      );
+    const transport = new LmStudioTransport({ fetcher });
+    const chat = new LmStudioChatModel({
+      endpoint: "http://127.0.0.1:2345/v1",
+      modelId: "chat-new",
+      transport,
+    });
+    const session = new ChatSession(
+      chat,
+      new ToolRegistry([new ReadNoteTool(vault), new VaultSearchTool({ search: async () => [] })])
+    );
+
+    const state = await session.send("read A");
+    const secondInput = JSON.parse(String(fetcher.mock.calls[1][1]?.body)).input;
+    expect(state.messages.at(-1)?.content).toBe("done");
+    expect(secondInput).toContainEqual({
+      type: "function_call",
+      call_id: "call-1",
+      name: "read_note",
+      arguments: '{"path":"A.md"}',
+    });
+    expect(secondInput).toContainEqual({
+      type: "function_call_output",
+      call_id: "call-1",
+      output: expect.any(String),
+    });
   });
 
   it("does not expose write capabilities through the projected vault", async () => {

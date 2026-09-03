@@ -6,9 +6,14 @@ export interface ChatMessage {
   readonly toolCallId?: string;
   /** Sources supporting a completed final assistant answer; absent on tool-call messages. */
   readonly provenance?: readonly ProvenanceRecord[];
+  /** Provider-neutral reasoning context retained for stateless replay. */
+  readonly reasoningContext?: string;
 }
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
+
+/** Provider-neutral reasoning control; omission remains the automatic default. */
+export type ReasoningEffort = "none" | "low" | "medium" | "high";
 
 /** A request for a named, read-only tool operation. */
 export interface ToolCall {
@@ -28,6 +33,14 @@ export interface ToolResult {
 export interface ChatResponse {
   readonly message: ChatMessage;
   readonly finishReason: "stop" | "tool_calls" | "length";
+  readonly usage?: ChatUsage;
+}
+
+/** Token accounting reported by a model when available. */
+export interface ChatUsage {
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
 }
 
 /** Tool metadata supplied to a model for one completion request. */
