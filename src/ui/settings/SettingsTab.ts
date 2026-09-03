@@ -110,16 +110,12 @@ export class TramaSettingsTab extends PluginSettingTab {
     this.text("Voce endpoint", draft.chatEndpoint, (value) => {
       draft.chatEndpoint = value;
     });
-    this.text("Voce model", draft.chatModelId, (value) => {
-      draft.chatModelId = value;
-    });
+    this.modelSelector("chat", draft);
     this.chatControls(draft);
     this.text("Embedding endpoint", draft.embeddingEndpoint, (value) => {
       draft.embeddingEndpoint = value;
     });
-    this.text("Embedding model", draft.embeddingModelId, (value) => {
-      draft.embeddingModelId = value;
-    });
+    this.modelSelector("embedding", draft);
     new Setting(this.containerEl).addButton((button) =>
       button.setButtonText("Save").onClick(
         () =>
@@ -157,39 +153,6 @@ export class TramaSettingsTab extends PluginSettingTab {
             .setButtonText("Remove")
             .onClick(() => void this.run(() => this.controller.removeApprovedOrigin?.(origin)))
         );
-    for (const target of ["chat", "embedding"] as const)
-      new Setting(this.containerEl)
-        .setName(`${target === "chat" ? "Voce" : "Embedding"} model discovery`)
-        .setDesc("Queries LM Studio only when you click Discover.")
-        .addButton((button) =>
-          button
-            .setButtonText(`Discover ${target === "chat" ? "Voce" : "Embedding"} Models`)
-            .onClick(
-              () =>
-                void this.run(async () => {
-                  const revision = ++this.discoveryRevisions[target];
-                  const models = (await this.controller.discoverModels?.(target)) ?? [];
-                  if (revision === this.discoveryRevisions[target])
-                    this.discoveredModels[target] = models;
-                })
-            )
-        );
-    for (const target of ["chat", "embedding"] as const) {
-      const models = this.discoveredModels[target];
-      if (!models) continue;
-      this.containerEl.createEl("p", {
-        text: `${target === "chat" ? "Voce" : "Embedding"} models: ${models.length ? "" : "No models discovered."}`,
-      });
-      for (const modelId of models) {
-        const row = this.containerEl.createDiv({ text: modelId });
-        const select = row.createEl("button", { text: `Use for ${target}` });
-        select.addEventListener("click", () => {
-          if (target === "chat") draft.chatModelId = modelId;
-          else draft.embeddingModelId = modelId;
-          this.display();
-        });
-      }
-    }
     new Setting(this.containerEl)
       .setName("Filo index")
       .setDesc(this.controller.getIndexStatusMessage?.() ?? "Not initialized");
@@ -201,6 +164,38 @@ export class TramaSettingsTab extends PluginSettingTab {
       text.setValue(value);
       text.onChange(update);
     });
+  }
+
+  private modelSelector(target: "chat" | "embedding", draft: SettingsDraft): void {
+    const isChat = target === "chat";
+    const selectedModel = isChat ? draft.chatModelId : draft.embeddingModelId;
+    const discoveredModels = this.discoveredModels[target] ?? [];
+    const models = selectedModel
+      ? [selectedModel, ...discoveredModels.filter((modelId) => modelId !== selectedModel)]
+      : discoveredModels;
+    new Setting(this.containerEl)
+      .setName(`${isChat ? "Chat" : "Embedding"} model`)
+      .setDesc("Click Discover to query LM Studio, then choose a model.")
+      .addDropdown((dropdown) => {
+        if (!selectedModel) dropdown.addOption("", "Select a model");
+        for (const modelId of models) dropdown.addOption(modelId, modelId);
+        dropdown.setValue(selectedModel);
+        dropdown.onChange((value) => {
+          if (isChat) draft.chatModelId = value;
+          else draft.embeddingModelId = value;
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Discover").onClick(
+          () =>
+            void this.run(async () => {
+              const revision = ++this.discoveryRevisions[target];
+              const models = (await this.controller.discoverModels?.(target)) ?? [];
+              if (revision === this.discoveryRevisions[target])
+                this.discoveredModels[target] = models;
+            })
+        )
+      );
   }
 
   private chatControls(draft: SettingsDraft): void {

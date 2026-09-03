@@ -18,12 +18,22 @@ interface SettingInstance {
     dynamicTooltip: boolean;
     emit(value: number): void;
   }>;
-  dropdownControls: Array<{ options: Record<string, string>; emit(value: string): void }>;
+  dropdownControls: Array<{
+    value: string;
+    options: Record<string, string>;
+    emit(value: string): void;
+  }>;
   buttonControls: Array<{ text: string; click(): void }>;
 }
 
 function settingInstances(): SettingInstance[] {
   return (Setting as unknown as { instances: SettingInstance[] }).instances;
+}
+
+function latestSetting(name: string): SettingInstance | undefined {
+  return settingInstances()
+    .filter((setting) => setting.name === name)
+    .at(-1);
 }
 
 const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
@@ -133,6 +143,62 @@ describe("Settings tab module", () => {
         medium: "Medium",
         high: "High",
       });
+    });
+
+    it("renders model selectors with Discover buttons and preserves configured models", () => {
+      const settings = {
+        ...DEFAULT_SETTINGS,
+        chat: { ...DEFAULT_SETTINGS.chat, modelId: "chat-current" },
+        embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed-current" },
+      };
+      const target = { ...controller(), getSettings: () => settings };
+      const tab = new TramaSettingsTab({} as never, target as never);
+
+      tab.display();
+
+      expect(latestSetting("Chat model")).toMatchObject({
+        description: expect.stringContaining("Discover"),
+        dropdownControls: [{ value: "chat-current", options: { "chat-current": "chat-current" } }],
+        buttonControls: [{ text: "Discover" }],
+      });
+      expect(latestSetting("Embedding model")).toMatchObject({
+        dropdownControls: [
+          { value: "embed-current", options: { "embed-current": "embed-current" } },
+        ],
+        buttonControls: [{ text: "Discover" }],
+      });
+      expect(target.discoverModels).not.toHaveBeenCalled();
+    });
+
+    it("discovers into only the matching selector and lets the user choose a model", async () => {
+      const target = controller();
+      target.discoverModels.mockImplementation(async (target: "chat" | "embedding") =>
+        target === "chat" ? ["chat-a", "chat-b"] : ["embed-a"]
+      );
+      const tab = new TramaSettingsTab({} as never, target as never);
+      tab.display();
+
+      latestSetting("Chat model")!.buttonControls[0].click();
+      await vi.waitFor(() => {
+        expect(latestSetting("Chat model")?.dropdownControls[0].options).toEqual({
+          "": "Select a model",
+          "chat-a": "chat-a",
+          "chat-b": "chat-b",
+        });
+      });
+
+      expect(latestSetting("Embedding model")?.dropdownControls[0].options).toEqual({
+        "": "Select a model",
+      });
+      latestSetting("Chat model")!.dropdownControls[0].emit("chat-b");
+      expect(target.discoverModels).toHaveBeenCalledWith("chat");
+
+      const save = latestSetting("")!;
+      save.buttonControls[0].click();
+      await vi.waitFor(() => expect(target.saveSettings).toHaveBeenCalledTimes(1));
+      const updater = target.saveSettings.mock.calls[0][0];
+      expect(updater(DEFAULT_SETTINGS).chat.modelId).toBe("chat-b");
+      expect(updater(DEFAULT_SETTINGS).embedding.modelId).toBe("");
     });
 
     it("projects slider values and explicit None without discovery", async () => {
