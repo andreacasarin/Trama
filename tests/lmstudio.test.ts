@@ -3,6 +3,7 @@ import { StructuredError } from "@/domain/contracts";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
+import { VoceDiagnosticRecord } from "@/chat/VoceDiagnostics";
 
 const ISSUE = "https://github.com/logancyang/obsidian-copilot/issues/3077";
 
@@ -60,6 +61,61 @@ describe("LM Studio adapters module", () => {
         expect(body).not.toHaveProperty("context");
         expect(body).not.toHaveProperty("previous_response_id");
         expect(body).not.toHaveProperty("conversation");
+      });
+
+      it("emits the exact Responses payloads without instrumenting shared transport", async () => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(
+            streamResponse(
+              sse("response.output_text.delta", { delta: "ok" }),
+              completed({ usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })
+            )
+          );
+        const records: VoceDiagnosticRecord[] = [];
+        const result = await model(fetcher, {
+          diagnostics: { emit: (record: VoceDiagnosticRecord) => records.push(record) },
+        }).complete([{ role: "user", content: "hello" }], new AbortController().signal);
+
+        expect(records).toEqual([
+          {
+            event: "responses_request",
+            body: {
+              model: "local",
+              input: [{ type: "message", role: "user", content: "hello" }],
+              stream: true,
+              store: false,
+            },
+          },
+          {
+            event: "responses_sse_event",
+            eventData: { type: "response.output_text.delta", delta: "ok" },
+          },
+          {
+            event: "responses_sse_event",
+            eventData: {
+              type: "response.completed",
+              response: {
+                status: "completed",
+                usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+              },
+            },
+          },
+          { event: "model_response", response: result },
+        ]);
+      });
+
+      it("emits model errors after malformed Responses events", async () => {
+        const records: VoceDiagnosticRecord[] = [];
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(streamResponse("data: {bad}\n\n"));
+
+        await expect(
+          model(fetcher, {
+            diagnostics: { emit: (record: VoceDiagnosticRecord) => records.push(record) },
+          }).complete([], new AbortController().signal)
+        ).rejects.toMatchObject({ code: "internal" });
+
+        expect(records.at(-1)).toMatchObject({ event: "model_error", error: { code: "internal" } });
       });
 
       it(`sends all explicit provider-neutral parameters under Responses wire names (${ISSUE})`, async () => {

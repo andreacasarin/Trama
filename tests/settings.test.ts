@@ -18,6 +18,40 @@ describe("Settings module", () => {
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
+        expect(loaded.detailedVoceDebug).toBe(false);
+      });
+
+      it("sanitizes detailed Voce debugging independently while preserving v2 settings", () => {
+        const persisted = {
+          schemaVersion: 2,
+          chat: {
+            endpoint: "http://127.0.0.1:1234/v1",
+            modelId: "chat-v1",
+            temperature: 0.4,
+            maxOutputTokens: 2048,
+            reasoningEffort: "high",
+          },
+          embedding: {
+            endpoint: "http://127.0.0.1:1234/v1",
+            modelId: "embed-v1",
+            dimensions: 1024,
+            batchSize: 16,
+          },
+          approvedOrigins: [{ scheme: "http", host: "192.168.1.20", port: 1234 }],
+          detailedVoceDebug: "yes",
+        };
+
+        const loaded = new SettingsStore().load(persisted);
+
+        expect(loaded).toMatchObject({
+          chat: persisted.chat,
+          embedding: persisted.embedding,
+          approvedOrigins: persisted.approvedOrigins,
+          detailedVoceDebug: false,
+        });
+        expect(new SettingsStore().load({ ...persisted, detailedVoceDebug: true })).toMatchObject({
+          detailedVoceDebug: true,
+        });
       });
 
       it("accepts exact v2 parameter boundaries and every reasoning effort", () => {
@@ -73,6 +107,7 @@ describe("Settings module", () => {
         expect(settings.schemaVersion).toBe(2);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
+        expect(settings.detailedVoceDebug).toBe(false);
       });
       it("rejects invalid staged chat controls without silently clearing them", () => {
         const store = new SettingsStore();

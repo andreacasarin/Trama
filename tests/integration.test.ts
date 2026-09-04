@@ -90,8 +90,13 @@ describe("integration composition seams", () => {
       new FollowLinkTool(vault),
       new VaultSearchTool({ search: async () => [] }),
     ]);
-    const state = await new ChatSession(model, registry).send("trace links");
-    expect(state.accessedNotes.map((note) => note.path)).toEqual(["A.md", "A.md", "B.md"]);
+    const state = await new ChatSession(model, registry, vault).send({
+      content: "trace links",
+      attachmentPaths: [],
+    });
+    expect(state.turns[1]).toMatchObject({
+      provenance: [{ path: "A.md" }, { path: "A.md" }, { path: "B.md" }],
+    });
   });
 
   it("propagates cancellation through an in-flight chat turn", async () => {
@@ -104,8 +109,9 @@ describe("integration composition seams", () => {
           })
       ),
     };
-    const session = new ChatSession(model, new ToolRegistry([]));
-    const pending = session.send("cancel me");
+    const session = new ChatSession(model, new ToolRegistry([]), vault);
+    const pending = session.send({ content: "cancel me", attachmentPaths: [] });
+    await vi.waitFor(() => expect(model.complete).toHaveBeenCalled());
     session.cancel();
     reject(new Error("aborted"));
     expect((await pending).error?.code).toBe("cancelled");
@@ -200,12 +206,13 @@ describe("integration composition seams", () => {
     });
     const session = new ChatSession(
       chat,
-      new ToolRegistry([new ReadNoteTool(vault), new VaultSearchTool({ search: async () => [] })])
+      new ToolRegistry([new ReadNoteTool(vault), new VaultSearchTool({ search: async () => [] })]),
+      vault
     );
 
-    const state = await session.send("read A");
+    const state = await session.send({ content: "read A", attachmentPaths: [] });
     const secondInput = JSON.parse(String(fetcher.mock.calls[1][1]?.body)).input;
-    expect(state.messages.at(-1)?.content).toBe("done");
+    expect(state.turns.at(-1)?.content).toBe("done");
     expect(secondInput).toContainEqual({
       type: "function_call",
       call_id: "call-1",

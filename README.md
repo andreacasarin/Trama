@@ -17,6 +17,30 @@ request includes the complete local conversation history and `store: false`,
 so LM Studio does not hold the conversation. Chats are kept only in memory and
 are not persisted.
 
+The visible transcript stays clean and compact: it shows only user and
+assistant conversation bubbles, a generic working state while Voce is busy,
+compact source chips for accessed notes, and user-actionable error text. Raw
+protocol roles, tool calls, tool arguments/results, and attached note contents
+are not rendered in the chat view. Each completed assistant response has an
+action row with a copy button; the row can accommodate additional response
+actions later without changing message rendering. Message bodies use
+Obsidian's reading-mode Markdown renderer, so their internal links follow the
+same navigation behavior as links in a rendered note.
+
+Use Obsidian wikilinks such as `[[Daily/Today]]` in the composer to attach one
+or more visible Markdown notes to the next turn, including unopened notes.
+Typing `@` opens the note picker as a shortcut and inserts the selected note as
+a visible wikilink. Full paths, aliases, headings, and unique note names are
+resolved deterministically; missing or ambiguous citations produce an error
+instead of silently omitting context. Attached notes also appear as removable
+chips, are sent only with that turn, and clear as soon as the send begins. Voce
+does not fall back to the active note automatically. A compact context strip
+above the composer suggests the most recently active visible Markdown note;
+click its tag to toggle it, or use the Plus button for the full picker. The
+strip can later include related-note suggestions without changing the
+composer. Enter sends the message, while Shift+Enter inserts a newline. Long
+messages are collapsed by default and can be expanded in place.
+
 The settings page provides these chat controls:
 
 - **Temperature**: a required slider from **0** through **1** in **0.1**
@@ -28,11 +52,19 @@ The settings page provides these chat controls:
   Auto leaves the value unset, while the explicit levels are sent to LM Studio
   when selected.
 
-Voce's tools run in the plugin and are read-only: they can inspect the current
-note, search the vault, read notes, and discover or follow links. Answers show
-the accessed note paths and line ranges as provenance. Trama does not use
-Remote MCP or hosted tools; embeddings continue using LM Studio's existing
-`/v1/embeddings` endpoint.
+Voce's tools run in the plugin and are read-only: they can search the vault,
+read notes, and discover or follow links. Answers show the accessed note paths
+and line ranges as provenance. Wikilinks inside an attached note can therefore
+lead Voce to related notes when the question requires them; traversal remains
+bounded by the existing tool-round and read limits rather than eagerly loading
+an entire link graph. Trama does not use Remote MCP or hosted tools; embeddings
+continue using LM Studio's existing `/v1/embeddings` endpoint.
+
+The settings page also includes **Detailed Voce debugging**, which is off by
+default. When enabled, Trama writes full Voce diagnostic payloads to the
+developer console only, including prompts, selected-note contents, requests,
+SSE events, tool arguments/results, and errors. No diagnostic file is created,
+so enable it only when you are comfortable with that console-visible data.
 
 ## Development
 
@@ -49,7 +81,7 @@ OBSIDIAN_VAULT_PATH="/path/to/your/vault" npm run install:plugin
 ```
 
 The installer verifies that the target is an Obsidian vault, then copies
-`main.js` and `manifest.json` into
+`main.js`, `manifest.json`, and `styles.css` into
 `<vault>/.obsidian/plugins/trama/`. Restart or reload Obsidian
 after installation.
 

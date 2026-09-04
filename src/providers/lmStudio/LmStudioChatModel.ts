@@ -8,6 +8,7 @@ import {
   StructuredError,
   ToolCall,
 } from "@/domain/contracts";
+import { NOOP_VOCE_DIAGNOSTICS, VoceDiagnostics } from "@/chat/VoceDiagnostics";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 
 export interface LmStudioChatOptions {
@@ -18,6 +19,7 @@ export interface LmStudioChatOptions {
   readonly reasoningEffort?: ReasoningEffort;
   readonly tools?: readonly ChatToolDefinition[];
   readonly transport?: LmStudioTransport;
+  readonly diagnostics?: VoceDiagnostics;
 }
 
 interface ResponseEvent {
@@ -134,10 +136,12 @@ function usageFrom(value: unknown): ChatUsage | undefined {
 export class LmStudioChatModel implements ChatModel {
   private readonly options: LmStudioChatOptions;
   private readonly transport: LmStudioTransport;
+  private readonly diagnostics: VoceDiagnostics;
 
   constructor(options: LmStudioChatOptions) {
     this.options = options;
     this.transport = options.transport ?? new LmStudioTransport();
+    this.diagnostics = options.diagnostics ?? NOOP_VOCE_DIAGNOSTICS;
   }
 
   /** Lists models only when explicitly requested by the settings UI. */
@@ -158,40 +162,50 @@ export class LmStudioChatModel implements ChatModel {
     requestTools?: readonly ChatToolDefinition[],
     onText?: (text: string) => void
   ): Promise<ChatResponse> {
-    if (!this.options.modelId.trim())
-      throw new StructuredError("invalid_request", "Chat model ID is required.", false);
-    const body: Record<string, unknown> = {
-      model: this.options.modelId,
-      input: serializeMessages(messages),
-      stream: true,
-      store: false,
-    };
-    if (this.options.temperature !== undefined) body.temperature = this.options.temperature;
-    if (this.options.maxOutputTokens !== undefined)
-      body.max_output_tokens = this.options.maxOutputTokens;
-    if (this.options.reasoningEffort !== undefined)
-      body.reasoning = { effort: this.options.reasoningEffort };
-    const tools = requestTools ?? this.options.tools;
-    if (tools?.length) {
-      body.tools = tools.map((tool) => ({
-        type: "function",
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parameters,
-      }));
-    }
+    try {
+      if (!this.options.modelId.trim())
+        throw new StructuredError("invalid_request", "Chat model ID is required.", false);
+      const body: Record<string, unknown> = {
+        model: this.options.modelId,
+        input: serializeMessages(messages),
+        stream: true,
+        store: false,
+      };
+      if (this.options.temperature !== undefined) body.temperature = this.options.temperature;
+      if (this.options.maxOutputTokens !== undefined)
+        body.max_output_tokens = this.options.maxOutputTokens;
+      if (this.options.reasoningEffort !== undefined)
+        body.reasoning = { effort: this.options.reasoningEffort };
+      const tools = requestTools ?? this.options.tools;
+      if (tools?.length) {
+        body.tools = tools.map((tool) => ({
+          type: "function",
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+        }));
+      }
 
-    const accumulator = new ResponsesAccumulator(onText);
-    for await (const event of this.transport.stream<ResponseEvent>(
-      this.options.endpoint,
-      "/responses",
-      body,
-      signal
-    )) {
-      accumulator.accept(event);
+      this.diagnostics.emit({ event: "responses_request", body });
+      const accumulator = new ResponsesAccumulator(onText);
+      for await (const event of this.transport.stream<ResponseEvent>(
+        this.options.endpoint,
+        "/responses",
+        body,
+        signal
+      )) {
+        this.diagnostics.emit({ event: "responses_sse_event", eventData: event });
+        accumulator.accept(event);
+      }
+      if (signal.aborted)
+        throw new StructuredError("cancelled", "The request was cancelled.", false);
+      const response = accumulator.finish();
+      this.diagnostics.emit({ event: "model_response", response });
+      return response;
+    } catch (error) {
+      this.diagnostics.emit({ event: "model_error", error });
+      throw error;
     }
-    if (signal.aborted) throw new StructuredError("cancelled", "The request was cancelled.", false);
-    return accumulator.finish();
   }
 }
 

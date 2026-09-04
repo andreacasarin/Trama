@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const PLUGIN_ID = "trama";
-const REQUIRED_FILES = ["main.js", "manifest.json"];
+const REQUIRED_FILES = ["main.js", "manifest.json", "styles.css"];
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const vaultArgument = process.argv[2] ?? process.env.OBSIDIAN_VAULT_PATH;

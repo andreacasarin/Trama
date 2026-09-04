@@ -18,6 +18,7 @@ export interface TramaSettings {
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
+  readonly detailedVoceDebug: boolean;
 }
 
 type ReasoningEffort = "none" | "low" | "medium" | "high";
@@ -60,6 +61,7 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
     batchSize: 32,
   }),
   approvedOrigins: Object.freeze([]),
+  detailedVoceDebug: false,
 });
 
 /** Owns the versioned, non-secret settings persisted through Obsidian plugin data. */
@@ -112,6 +114,7 @@ export class SettingsStore {
       approvedOrigins: Object.freeze(
         approvals.map((v) => ({ scheme: v.scheme, host: v.host.toLowerCase(), port: v.port }))
       ),
+      detailedVoceDebug: input.detailedVoceDebug === true,
     } as TramaSettings;
     return this.value;
   }
@@ -196,6 +199,7 @@ export class SettingsStore {
       }),
       embedding: Object.freeze({ ...next.embedding, endpoint: embeddingEndpoint }),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
+      detailedVoceDebug: next.detailedVoceDebug === true,
     };
   }
   private validateChatControls(

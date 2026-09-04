@@ -23,6 +23,7 @@ interface SettingInstance {
     options: Record<string, string>;
     emit(value: string): void;
   }>;
+  toggleControls: Array<{ value: boolean; emit(value: boolean): void }>;
   buttonControls: Array<{ text: string; click(): void }>;
 }
 
@@ -143,6 +144,11 @@ describe("Settings tab module", () => {
         medium: "Medium",
         high: "High",
       });
+      expect(latestSetting("Detailed Voce debugging")).toMatchObject({
+        description: expect.stringContaining("full prompts"),
+        toggleControls: [{ value: false }],
+      });
+      expect(latestSetting("Detailed Voce debugging")?.description).toContain("No diagnostic file");
     });
 
     it("renders model selectors with Discover buttons and preserves configured models", () => {
@@ -244,6 +250,18 @@ describe("Settings tab module", () => {
       const updater = saveSettings.mock.calls[0][0];
       expect(updater(DEFAULT_SETTINGS).chat).toMatchObject({ temperature: 0.7 });
       expect(updater(DEFAULT_SETTINGS).chat).not.toHaveProperty("maxOutputTokens");
+    });
+
+    it("persists the detailed Voce debugging toggle immediately", async () => {
+      const saveSettings = vi.fn().mockResolvedValue(undefined);
+      const tab = new TramaSettingsTab({} as never, controller(saveSettings) as never);
+      tab.display();
+
+      latestSetting("Detailed Voce debugging")!.toggleControls[0].emit(true);
+
+      await vi.waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+      const updater = saveSettings.mock.calls[0][0];
+      expect(updater(DEFAULT_SETTINGS)).toMatchObject({ detailedVoceDebug: true });
     });
   });
 });

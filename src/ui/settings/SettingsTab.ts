@@ -130,6 +130,20 @@ export class TramaSettingsTab extends PluginSettingTab {
           })
       )
     );
+    new Setting(this.containerEl)
+      .setName("Detailed Voce debugging")
+      .setDesc(
+        "Warning: full console diagnostic payloads include full prompts, selected-note contents, requests, SSE events, tool arguments/results, and errors. No diagnostic file is created."
+      )
+      .addToggle((toggle) => {
+        toggle.setValue(settings.detailedVoceDebug);
+        toggle.onChange(
+          (detailedVoceDebug) =>
+            void this.run(() =>
+              this.controller.saveSettings?.((current) => ({ ...current, detailedVoceDebug }))
+            )
+        );
+      });
     let approvalInput = "";
     new Setting(this.containerEl)
       .setName("Approved LAN origins")

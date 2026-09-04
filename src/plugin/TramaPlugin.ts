@@ -1,5 +1,6 @@
 import { Platform, Plugin, TAbstractFile } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
+import { VoceDiagnostics } from "@/chat/VoceDiagnostics";
 import { IndexManager, IndexVaultPort } from "@/index/IndexManager";
 import { ObsidianIndexStorage } from "@/index/storage";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
@@ -10,7 +11,6 @@ import { DEFAULT_SETTINGS, SettingsStore, TramaSettings } from "@/settings/Setti
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import {
-  CurrentNoteTool,
   DiscoverLinksTool,
   FollowLinkTool,
   ReadNoteTool,
@@ -37,6 +37,18 @@ export class TramaPlugin extends Plugin {
   private eventTimer?: ReturnType<typeof setTimeout>;
   private readonly eventRefs: Array<{ unsubscribe?: () => void }> = [];
   private saveQueue: Promise<void> = Promise.resolve();
+  private visibleMarkdownCatalog: () => readonly string[] = () => [];
+  private contextNoteSuggestions: () => readonly string[] = () => [];
+  private lastActiveMarkdownPath?: string;
+  private readonly voceDiagnostics: VoceDiagnostics = {
+    emit: (record) => {
+      if (this.settingsStore.get().detailedVoceDebug) {
+        // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
+        // eslint-disable-next-line no-console
+        console.debug("[Trama Voce]", record);
+      }
+    },
+  };
 
   override async onload(): Promise<void> {
     if (!Platform.isDesktopApp) return;
@@ -44,6 +56,20 @@ export class TramaPlugin extends Plugin {
     if (typeof this.loadData === "function") this.settingsStore.load(await this.loadData());
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
+    this.visibleMarkdownCatalog = () =>
+      app.vault
+        .getMarkdownFiles()
+        .map((file: { path: string }) => file.path)
+        .filter((path: string) => this.isVisibleMarkdown(path))
+        .sort((left: string, right: string) => left.localeCompare(right));
+    const rememberActiveMarkdown = (file: { path?: string } | null | undefined) => {
+      if (file?.path && this.isVisibleMarkdown(file.path)) this.lastActiveMarkdownPath = file.path;
+    };
+    rememberActiveMarkdown(app.workspace.getActiveFile());
+    this.contextNoteSuggestions = () =>
+      this.lastActiveMarkdownPath ? [this.lastActiveMarkdownPath] : [];
+    const fileOpenRef = app.workspace.on?.("file-open", rememberActiveMarkdown);
+    if (fileOpenRef) this.registerEvent(fileOpenRef);
     const [{ VoceView, VOCE_VIEW_TYPE }, { TramaSettingsTab }] = await Promise.all([
       import("@/ui/voce/VoceView"),
       import("@/ui/settings/SettingsTab"),
@@ -81,7 +107,11 @@ export class TramaPlugin extends Plugin {
     });
     this.indexStatus.register();
     this.addSettingTab(new TramaSettingsTab(app, this));
-    this.registerView(VOCE_VIEW_TYPE, (leaf) => new VoceView(leaf, this.session!));
+    this.registerView(
+      VOCE_VIEW_TYPE,
+      (leaf) =>
+        new VoceView(leaf, this.session!, this.visibleMarkdownCatalog, this.contextNoteSuggestions)
+    );
     this.addCommand({
       id: "open-voce",
       name: "Open Voce",
@@ -206,13 +236,12 @@ export class TramaPlugin extends Plugin {
     this.index = manager;
     const compositionRevision = ++this.compositionRevision;
     const registry = new ToolRegistry([
-      new CurrentNoteTool(readonlyVault),
       new ReadNoteTool(readonlyVault),
       new DiscoverLinksTool(readonlyVault),
       new FollowLinkTool(readonlyVault),
       new VaultSearchTool(this.index),
     ]);
-    this.composeChatSession(app, settings, registry, transport);
+    this.composeChatSession(app, settings, readonlyVault, registry, transport);
     this.indexLoaded = false;
     this.indexReady = false;
     const loadPromise = manager.load().catch(() => false);
@@ -246,6 +275,7 @@ export class TramaPlugin extends Plugin {
       transport: new LmStudioTransport({
         policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
       }),
+      diagnostics: this.voceDiagnostics,
     });
     this.chatModel = model;
     this.session?.replaceModel(model);
@@ -254,6 +284,7 @@ export class TramaPlugin extends Plugin {
   private composeChatSession(
     app: any,
     settings: TramaSettings,
+    readonlyVault: ObsidianReadonlyVault,
     existingRegistry?: ToolRegistry,
     existingTransport?: LmStudioTransport
   ): void {
@@ -262,18 +293,20 @@ export class TramaPlugin extends Plugin {
       new LmStudioTransport({
         policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
       });
-    const readonlyVault = new ObsidianReadonlyVault(app.vault, app.workspace, app.metadataCache);
     const registry =
       existingRegistry ??
       new ToolRegistry([
-        new CurrentNoteTool(readonlyVault),
         new ReadNoteTool(readonlyVault),
         new DiscoverLinksTool(readonlyVault),
         new FollowLinkTool(readonlyVault),
         new VaultSearchTool(this.index!),
       ]);
-    this.chatModel = new LmStudioChatModel({ ...settings.chat, transport });
-    this.session = new ChatSession(this.chatModel, registry);
+    this.chatModel = new LmStudioChatModel({
+      ...settings.chat,
+      transport,
+      diagnostics: this.voceDiagnostics,
+    });
+    this.session = new ChatSession(this.chatModel, registry, readonlyVault, this.voceDiagnostics);
     for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
       const view = (leaf as { view?: { setSession?: (session: ChatSession) => void } }).view;
       view?.setSession?.(this.session);

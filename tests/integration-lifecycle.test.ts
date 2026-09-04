@@ -86,6 +86,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
 
     await plugin.onload();
 
@@ -101,6 +102,8 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
     expect(fetchSpy).not.toHaveBeenCalled();
+    expect(debugSpy).not.toHaveBeenCalled();
+    expect(plugin.saveData).not.toHaveBeenCalled();
   });
 
   it("mobile activation registers no runtime surfaces and makes no fetch", async () => {
@@ -143,11 +146,11 @@ describe("TramaPlugin lifecycle integration", () => {
         modelId: "embed-v2",
       },
     });
-    const state = await (plugin as any).session.send("hello");
+    const state = await (plugin as any).session.send({ content: "hello", attachmentPaths: [] });
 
     expect(oldSession.getState().error?.code).not.toBe("internal");
     expect((plugin as any).session).not.toBe(oldSession);
-    expect(state.messages.at(-1)?.content).toBe("ok");
+    expect(state.turns.at(-1)?.content).toBe("ok");
     expect(fetcher).toHaveBeenCalledWith(
       "http://127.0.0.1:2345/v1/responses",
       expect.objectContaining({ body: expect.stringContaining('"model":"chat-v2"') })
@@ -214,10 +217,10 @@ describe("TramaPlugin lifecycle integration", () => {
       },
     });
 
-    const state = await session.send("hello");
+    const state = await session.send({ content: "hello", attachmentPaths: [] });
     const body = JSON.parse(String(fetcher.mock.calls[0][1]?.body));
     expect((plugin as any).session).toBe(session);
-    expect(state.messages.map((message: { content: string }) => message.content)).toEqual([
+    expect(state.turns.map((message: { content: string }) => message.content)).toEqual([
       "hello",
       "ok",
     ]);
@@ -294,6 +297,84 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).session).toBe(oldSession);
     expect((plugin as any).index).toBe(oldIndex);
     expect(oldSession.getState().error).toBeUndefined();
+  });
+
+  it("gates detailed Voce diagnostics at emission time without replacing composition", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    await plugin.onload();
+    const session = (plugin as any).session;
+    const model = (plugin as any).chatModel;
+    const index = (plugin as any).index;
+    const diagnostics = (plugin as any).voceDiagnostics;
+
+    diagnostics.emit({ event: "model_error", error: new Error("hidden") });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedVoceDebug: true });
+    diagnostics.emit({ event: "model_error", error: new Error("visible") });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedVoceDebug: false });
+    diagnostics.emit({ event: "model_error", error: new Error("hidden again") });
+
+    expect(plugin.saveData).toHaveBeenCalledTimes(2);
+    expect((plugin as any).session).toBe(session);
+    expect((plugin as any).chatModel).toBe(model);
+    expect((plugin as any).index).toBe(index);
+    expect(debugSpy).toHaveBeenCalledTimes(1);
+    expect(debugSpy).toHaveBeenCalledWith("[Trama Voce]", {
+      event: "model_error",
+      error: expect.objectContaining({ message: "visible" }),
+    });
+  });
+
+  it("keeps embeddings out of detailed Voce diagnostics", async () => {
+    const app = projectedApp();
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed", dimensions: 2 },
+    };
+    const plugin = projectedPlugin(app, settings);
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    await plugin.onload();
+    await plugin.saveSettings({ ...settings, detailedVoceDebug: true });
+
+    await (plugin as any).embeddingModel.embed(["private note"], new AbortController().signal);
+
+    expect(debugSpy).not.toHaveBeenCalled();
+  });
+
+  it("composes Voce without current_note and keeps a sorted visible Markdown catalog for its UI", async () => {
+    const app = projectedApp();
+    let fileOpen: ((file: { path: string }) => void) | undefined;
+    (app.workspace as any).on = (event: string, callback: (file: { path: string }) => void) => {
+      if (event === "file-open") fileOpen = callback;
+      return { event, active: true };
+    };
+    app.vault.getMarkdownFiles = () => [
+      { path: "zeta.md", name: "zeta.md" },
+      { path: ".hidden.md", name: ".hidden.md" },
+      { path: ".obsidian/Settings.md", name: "Settings.md" },
+      { path: ".trama/cache.md", name: "cache.md" },
+      { path: "Alpha.md", name: "Alpha.md" },
+      { path: "image.png", name: "image.png" },
+    ];
+    app.workspace.getActiveFile = () => ({ path: "Alpha.md", name: "Alpha.md" });
+    const plugin = projectedPlugin(app);
+
+    await plugin.onload();
+
+    expect(
+      (plugin as any).session.registry.definitions.map((tool: { name: string }) => tool.name)
+    ).not.toContain("current_note");
+    expect((plugin as any).visibleMarkdownCatalog()).toEqual(["Alpha.md", "zeta.md"]);
+    expect((plugin as any).contextNoteSuggestions()).toEqual(["Alpha.md"]);
+    fileOpen?.({ path: "zeta.md" });
+    expect((plugin as any).contextNoteSuggestions()).toEqual(["zeta.md"]);
   });
 
   it("marks a fresh index ready after explicit rebuild and reconciles a later modification", async () => {
