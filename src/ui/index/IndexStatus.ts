@@ -280,7 +280,6 @@ export class IndexStatusController {
         kind === "empty",
       canReindex:
         kind === "ready" ||
-        kind === "updating" ||
         kind === "stale" ||
         ((kind === "cancelled" || kind === "error" || kind === "empty") && hasLastGood),
       canCancel: kind === "building",

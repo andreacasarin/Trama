@@ -732,6 +732,46 @@ describe("TramaPlugin lifecycle integration", () => {
     });
   });
 
+  it("keeps the registered reindex command unavailable during incremental updating", async () => {
+    const plugin = { addCommand: vi.fn() };
+    const reindex = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<void>((_resolve, reject) =>
+          signal.addEventListener("abort", () => reject(new Error("cancelled")), {
+            once: true,
+          })
+        )
+    );
+    const status = new IndexStatusController(plugin as any, {
+      index: async () => undefined,
+      reindex,
+      cancel: () => undefined,
+    });
+    status.setReady();
+    status.register();
+    const command = plugin.addCommand.mock.calls
+      .map(([item]) => item as { id: string; checkCallback: (checking: boolean) => boolean })
+      .find((item) => item.id === "reindex-filo-vault")!;
+
+    expect(command.checkCallback(true)).toBe(true);
+    status.setUpdating();
+
+    expect(command.checkCallback(true)).toBe(false);
+    expect(command.checkCallback(false)).toBe(false);
+    expect(reindex).not.toHaveBeenCalled();
+
+    status.setReady();
+    expect(command.checkCallback(true)).toBe(true);
+    status.markError(new Error("failed"));
+    expect(command.checkCallback(true)).toBe(true);
+
+    status.setReady();
+    const run = status.run("reindex");
+    status.cancel();
+    await run;
+    expect(command.checkCallback(true)).toBe(true);
+  });
+
   it("estimates remaining embedding time from observed throughput", () => {
     let now = 0;
     const status = new IndexStatusController(
