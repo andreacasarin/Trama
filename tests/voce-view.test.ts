@@ -119,6 +119,12 @@ function lastOpenedModal(): TestModal {
 }
 
 describe("VoceView module", () => {
+  it("uses the shared native Voce icon", () => {
+    const subject = makeSession({ turns: [], running: false });
+    const view = new VoceView(fakeLeaf(), subject.session);
+    expect(view.getIcon()).toBe("message-circle");
+  });
+
   it("orders active, related, then selected extras without auto-selecting suggestions", async () => {
     const subject = makeSession({ turns: [], running: false });
     const related = relatedSubject();

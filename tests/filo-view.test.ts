@@ -81,6 +81,11 @@ const ready = {
 };
 
 describe("FiloView", () => {
+  it("uses the shared native Filo icon", () => {
+    const { view } = subject(ready);
+    expect(view.getIcon()).toBe("route");
+  });
+
   it("renders ordered unique related rows and excludes the active note", async () => {
     const { view } = subject(ready, ["Current.md", "Folder/One.md", "Folder/One.md", "Two.md"]);
     await view.onOpen();

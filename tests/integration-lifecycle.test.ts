@@ -136,6 +136,15 @@ describe("TramaPlugin lifecycle integration", () => {
       "open-voce",
       "open-filo",
     ]);
+    expect(
+      (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls
+        .map(([command]) => command as { id: string; icon?: string })
+        .filter(({ id }) => id === "open-voce" || id === "open-filo")
+        .map(({ id, icon }) => [id, icon])
+    ).toEqual([
+      ["open-voce", "message-circle"],
+      ["open-filo", "route"],
+    ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
     expect(fetchSpy).not.toHaveBeenCalled();

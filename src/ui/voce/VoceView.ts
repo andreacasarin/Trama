@@ -13,6 +13,8 @@ import { AssistantConversationTurn, CHAT_LIMITS, ChatSession, ChatState } from "
 import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReferences";
 import { ProvenanceRecord } from "@/domain/contracts";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
+import { TRAMA_ICONS } from "@/ui/icons";
+import type { IconName } from "obsidian";
 
 export const VOCE_VIEW_TYPE = "trama-voce";
 const COLLAPSIBLE_MESSAGE_LENGTH = 600;
@@ -142,6 +144,10 @@ export class VoceView extends ItemView {
 
   getDisplayText(): string {
     return "Voce";
+  }
+
+  getIcon(): IconName {
+    return TRAMA_ICONS.voce;
   }
 
   override onOpen(): Promise<void> {

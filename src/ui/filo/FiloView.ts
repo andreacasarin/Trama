@@ -1,6 +1,8 @@
 import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
 import { formatIndexProgress, IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
+import { TRAMA_ICONS } from "@/ui/icons";
+import type { IconName } from "obsidian";
 
 export const FILO_VIEW_TYPE = "trama-filo";
 
@@ -53,6 +55,9 @@ export class FiloView extends ItemView {
   }
   getDisplayText(): string {
     return "Filo";
+  }
+  getIcon(): IconName {
+    return TRAMA_ICONS.filo;
   }
 
   setDependencies(

@@ -20,6 +20,7 @@ import {
 } from "@/tools/ToolRegistry";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { RelatedNotes } from "@/index/RelatedNotes";
+import { TRAMA_ICONS } from "@/ui/icons";
 
 /** Composes the desktop-only assistant and owns its lifecycle and vault event boundary. */
 export class TramaPlugin extends Plugin {
@@ -125,12 +126,14 @@ export class TramaPlugin extends Plugin {
     this.addCommand({
       id: "open-voce",
       name: "Open Voce",
+      icon: TRAMA_ICONS.voce,
       callback: () =>
         void app.workspace.getLeaf(true).setViewState({ type: VOCE_VIEW_TYPE, active: true }),
     });
     this.addCommand({
       id: "open-filo",
       name: "Open Filo",
+      icon: TRAMA_ICONS.filo,
       callback: () =>
         void app.workspace.getLeaf(true).setViewState({ type: FILO_VIEW_TYPE, active: true }),
     });
