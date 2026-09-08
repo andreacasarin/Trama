@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
+import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -23,6 +24,7 @@ function projectedApp() {
     { path: "Other.md", name: "Other.md" },
   ];
   const adapterFiles = new Map<string, string>();
+  const adapterBinary = new Map<string, ArrayBuffer>();
   const vault = {
     configDir: ".obsidian",
     getMarkdownFiles: () => files,
@@ -46,8 +48,36 @@ function projectedApp() {
       write: async (path: string, value: string) => {
         adapterFiles.set(path, value);
       },
+      readBinary: async (path: string) => {
+        const value = adapterBinary.get(path);
+        if (!value) throw new Error("missing binary");
+        return value;
+      },
+      writeBinary: async (path: string, value: ArrayBuffer | Uint8Array) => {
+        const bytes = value instanceof Uint8Array ? value.slice().buffer : value.slice(0);
+        adapterBinary.set(path, bytes);
+      },
+      list: async (path: string) => ({
+        files: [...adapterFiles.keys(), ...adapterBinary.keys()]
+          .filter((file) => file.startsWith(path))
+          .map((file) => file.slice(path.length).replace(/^\//, "")),
+        folders: [],
+      }),
       remove: async (path: string) => {
         adapterFiles.delete(path);
+      },
+      activate: async (path: string, value: string) => {
+        adapterFiles.set(path, value);
+      },
+      rename: async (from: string, to: string) => {
+        if (adapterFiles.has(from)) {
+          adapterFiles.set(to, adapterFiles.get(from)!);
+          adapterFiles.delete(from);
+        }
+        if (adapterBinary.has(from)) {
+          adapterBinary.set(to, adapterBinary.get(from)!);
+          adapterBinary.delete(from);
+        }
       },
     },
   };
@@ -91,14 +121,21 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(3);
-    expect(plugin.registerView).toHaveBeenCalledTimes(1);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(5);
+    expect(plugin.registerView).toHaveBeenCalledTimes(2);
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
+    expect(plugin.registerView).toHaveBeenCalledWith("trama-filo", expect.any(Function));
     expect(
       (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
         ([command]) => (command as { id: string }).id
       )
-    ).toEqual(["rebuild-filo-index", "cancel-filo-index-rebuild", "open-voce"]);
+    ).toEqual([
+      "index-filo-vault",
+      "reindex-filo-vault",
+      "cancel-filo-indexing",
+      "open-voce",
+      "open-filo",
+    ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -162,6 +199,25 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).index.fingerprint().modelId).toBe("embed-v2");
   });
 
+  it("rebinds open Voce views to the replacement related-notes service", async () => {
+    const app = projectedApp();
+    const voceView = { setSession: vi.fn(), setRelatedNotes: vi.fn() };
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "trama-voce" ? ([{ view: voceView }] as any) : [];
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    const firstRelated = (plugin as any).relatedNotes;
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed-v2" },
+    });
+
+    const secondRelated = (plugin as any).relatedNotes;
+    expect(secondRelated).not.toBe(firstRelated);
+    expect(voceView.setRelatedNotes).toHaveBeenLastCalledWith(secondRelated);
+  });
+
   it("keeps the same index manager and writer during a chat-only save while rebuilding", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
@@ -175,7 +231,7 @@ describe("TramaPlugin lifecycle integration", () => {
       await gate;
       return texts.map(() => [1, ...Array(embedding.dimensions - 1).fill(0)]);
     });
-    const activate = vi.spyOn((index as any).storage, "activate");
+    const writes = vi.spyOn(app.vault.adapter, "write");
     const rebuild = index.build(new AbortController().signal);
     await vi.waitFor(() => expect(embedding.embed).toHaveBeenCalled());
 
@@ -188,7 +244,7 @@ describe("TramaPlugin lifecycle integration", () => {
     release();
     await rebuild;
 
-    expect(activate).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalled();
     expect(await index.search("anything", new AbortController().signal, 1)).toHaveLength(1);
   });
 
@@ -299,7 +355,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(oldSession.getState().error).toBeUndefined();
   });
 
-  it("gates detailed Voce diagnostics at emission time without replacing composition", async () => {
+  it("gates detailed diagnostics at emission time without replacing composition", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
@@ -307,26 +363,27 @@ describe("TramaPlugin lifecycle integration", () => {
     const session = (plugin as any).session;
     const model = (plugin as any).chatModel;
     const index = (plugin as any).index;
-    const diagnostics = (plugin as any).voceDiagnostics;
+    const diagnostics = (plugin as any).diagnostics;
 
-    diagnostics.emit({ event: "model_error", error: new Error("hidden") });
-    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedVoceDebug: true });
-    diagnostics.emit({ event: "model_error", error: new Error("visible") });
-    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedVoceDebug: false });
-    diagnostics.emit({ event: "model_error", error: new Error("hidden again") });
+    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("hidden") });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: true });
+    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("visible") });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: false });
+    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("hidden again") });
 
     expect(plugin.saveData).toHaveBeenCalledTimes(2);
     expect((plugin as any).session).toBe(session);
     expect((plugin as any).chatModel).toBe(model);
     expect((plugin as any).index).toBe(index);
     expect(debugSpy).toHaveBeenCalledTimes(1);
-    expect(debugSpy).toHaveBeenCalledWith("[Trama Voce]", {
+    expect(debugSpy).toHaveBeenCalledWith("[Trama]", {
+      area: "chat",
       event: "model_error",
       error: expect.objectContaining({ message: "visible" }),
     });
   });
 
-  it("keeps embeddings out of detailed Voce diagnostics", async () => {
+  it("keeps embeddings out of detailed diagnostics", async () => {
     const app = projectedApp();
     const settings = {
       ...DEFAULT_SETTINGS,
@@ -341,7 +398,7 @@ describe("TramaPlugin lifecycle integration", () => {
       })
     );
     await plugin.onload();
-    await plugin.saveSettings({ ...settings, detailedVoceDebug: true });
+    await plugin.saveSettings({ ...settings, detailedDebug: true });
 
     await (plugin as any).embeddingModel.embed(["private note"], new AbortController().signal);
 
@@ -361,6 +418,9 @@ describe("TramaPlugin lifecycle integration", () => {
       { path: ".obsidian/Settings.md", name: "Settings.md" },
       { path: ".trama/cache.md", name: "cache.md" },
       { path: "Alpha.md", name: "Alpha.md" },
+      { path: "Zed.md", name: "Zed.md" },
+      { path: "amber.md", name: "amber.md" },
+      { path: "Äther.md", name: "Äther.md" },
       { path: "image.png", name: "image.png" },
     ];
     app.workspace.getActiveFile = () => ({ path: "Alpha.md", name: "Alpha.md" });
@@ -371,7 +431,13 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(
       (plugin as any).session.registry.definitions.map((tool: { name: string }) => tool.name)
     ).not.toContain("current_note");
-    expect((plugin as any).visibleMarkdownCatalog()).toEqual(["Alpha.md", "zeta.md"]);
+    expect((plugin as any).visibleMarkdownCatalog()).toEqual([
+      "Alpha.md",
+      "Zed.md",
+      "amber.md",
+      "zeta.md",
+      "Äther.md",
+    ]);
     expect((plugin as any).contextNoteSuggestions()).toEqual(["Alpha.md"]);
     fileOpen?.({ path: "zeta.md" });
     expect((plugin as any).contextNoteSuggestions()).toEqual(["zeta.md"]);
@@ -379,24 +445,29 @@ describe("TramaPlugin lifecycle integration", () => {
 
   it("marks a fresh index ready after explicit rebuild and reconciles a later modification", async () => {
     const app = projectedApp();
+    const voceView = { refreshRelatedSuggestions: vi.fn() };
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "trama-voce" ? [{ view: voceView }] : [];
     const plugin = projectedPlugin(app);
     await plugin.onload();
     await (plugin as any).indexLoad;
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
+      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(1);
     const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
     };
     emit("modify", { path: "Note.md" });
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    await new Promise((resolve) => setTimeout(resolve, 1600));
     expect(reconcile).toHaveBeenCalled();
+    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a failed or cancelled explicit rebuild non-ready", async () => {
@@ -406,7 +477,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     vi.spyOn((plugin as any).index, "build").mockRejectedValue(new Error("cancelled"));
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
+      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
     )[0].callback;
     await rebuild();
     expect((plugin as any).indexReady).toBe(false);
@@ -419,16 +490,23 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     const index = (plugin as any).index;
     let release!: () => void;
+    let building = true;
     const buildGate = new Promise<void>((resolve) => (release = resolve));
     vi.spyOn(index, "build").mockImplementation(async () => buildGate);
+    vi.spyOn(index, "isBuilding").mockImplementation(() => building);
     const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((index as any).build).toHaveBeenCalled());
     for (const ref of app.listeners.filter((item) => item.active && item.event === "modify"))
       ref.callback({ path: "Note.md" });
+    expect((plugin as any).indexStatus.getStatus()).toMatchObject({
+      kind: "building",
+      canCancel: true,
+    });
+    building = false;
     release();
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledWith(expect.any(AbortSignal)));
     expect((plugin as any).index).toBe(index);
@@ -450,9 +528,8 @@ describe("TramaPlugin lifecycle integration", () => {
       .spyOn(index, "reconcileQueuedChanges")
       .mockRejectedValueOnce(new Error("v2 embedding failed"))
       .mockResolvedValue(undefined);
-    vi.spyOn(index, "search").mockRejectedValue(new Error("unavailable"));
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "rebuild-filo-index"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((index as any).build).toHaveBeenCalled());
@@ -460,10 +537,11 @@ describe("TramaPlugin lifecycle integration", () => {
       ref.callback({ path: "Note.md" });
     release();
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
-    expect((plugin as any).indexReady).toBe(false);
-    await expect(index.search("v1", new AbortController().signal, 1)).rejects.toThrow(
-      "unavailable"
-    );
+    expect((plugin as any).indexReady).toBe(true);
+    expect((plugin as any).indexStatus.getStatus()).toMatchObject({
+      kind: "stale",
+      hasLastGood: true,
+    });
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
     expect((index as any).build).toHaveBeenCalledTimes(2);
@@ -529,10 +607,163 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(queue).not.toHaveBeenCalledWith("image.png");
     expect(queue).not.toHaveBeenCalledWith(".trama/index.md");
     expect(queue).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(150);
+    await vi.advanceTimersByTimeAsync(1500);
     plugin.onunload();
     plugin.onunload();
     expect(app.listeners.every((ref) => !ref.active)).toBe(true);
     vi.useRealTimers();
+  });
+
+  it("exposes monotonic status/actions and coalesces typed edits after first indexing", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    vi.spyOn(index, "build").mockResolvedValue(undefined);
+    const statuses: string[] = [];
+    const status = (plugin as any).indexStatus;
+    status.subscribe((value: { kind: string; revision: number }) =>
+      statuses.push(`${value.kind}:${value.revision}`)
+    );
+    const indexCommand = (plugin as any).addCommand.mock.calls.find(
+      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
+    )[0];
+    expect(indexCommand.checkCallback(true)).toBe(true);
+    indexCommand.callback();
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
+    const emit = (event: string, ...args: any[]) => {
+      for (const ref of app.listeners.filter((item) => item.active && item.event === event))
+        ref.callback(...args);
+    };
+    emit("modify", { path: "Note.md" });
+    emit("modify", { path: "Note.md" });
+    expect(reconcile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(reconcile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+    expect(status.getStatus().kind).toBe("ready");
+    expect(statuses.map((entry) => Number(entry.split(":")[1]))).toEqual(
+      statuses.map((entry) => Number(entry.split(":")[1])).sort((a, b) => a - b)
+    );
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("delivers rename as one explicit old/new operation", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    vi.spyOn(index, "build").mockResolvedValue(undefined);
+    const command = (plugin as any).addCommand.mock.calls.find(
+      ([item]: [{ id: string }]) => item.id === "index-filo-vault"
+    )[0];
+    command.callback();
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const rename = vi.spyOn(index, "queueRename");
+    const ref = app.listeners.find((item) => item.event === "rename");
+    ref?.callback({ path: "Renamed.md" }, "Old.md");
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(rename).toHaveBeenCalledWith("Old.md", "Renamed.md");
+    plugin.onunload();
+  });
+
+  it("maps renames across the visibility boundary to delete or create", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    vi.spyOn(index, "build").mockResolvedValue(undefined);
+    const command = (plugin as any).addCommand.mock.calls.find(
+      ([item]: [{ id: string }]) => item.id === "index-filo-vault"
+    )[0];
+    command.callback();
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const operation = vi.spyOn(index, "queueOperation");
+    const rename = vi.spyOn(index, "queueRename");
+    const ref = app.listeners.find((item) => item.event === "rename");
+
+    ref?.callback({ path: ".hidden.md" }, "Visible.md");
+    ref?.callback({ path: "Visible.md" }, ".hidden.md");
+
+    expect(operation).toHaveBeenNthCalledWith(1, { kind: "delete", path: "Visible.md" });
+    expect(operation).toHaveBeenNthCalledWith(2, { kind: "create", path: "Visible.md" });
+    expect(rename).not.toHaveBeenCalled();
+    plugin.onunload();
+  });
+
+  it("publishes incremental progress while the status is updating", () => {
+    const status = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+    });
+    status.setReady();
+    status.setUpdating();
+
+    status.reportProgress({
+      operation: "incremental",
+      phase: "embed",
+      completed: 2,
+      total: 4,
+      unit: "texts",
+      determinate: true,
+    });
+
+    expect(status.getStatus()).toMatchObject({
+      kind: "updating",
+      message: "Creating embeddings — 2 of 4 texts",
+      progress: { operation: "incremental", phase: "embed", completed: 2, total: 4 },
+    });
+  });
+
+  it("estimates remaining embedding time from observed throughput", () => {
+    let now = 0;
+    const status = new IndexStatusController(
+      {} as any,
+      {
+        index: async () => undefined,
+        reindex: async () => undefined,
+        cancel: () => undefined,
+      },
+      undefined,
+      {
+        now: () => now,
+        setTimeout: (callback) => setTimeout(callback, 0),
+        clearTimeout: (timer) => clearTimeout(timer),
+      }
+    );
+    status.setReady();
+    status.setUpdating();
+    status.reportProgress({
+      operation: "incremental",
+      phase: "embed",
+      completed: 0,
+      total: 20,
+      unit: "texts",
+      determinate: true,
+      estimated: true,
+    });
+    now = 2_000;
+    status.reportProgress({
+      operation: "incremental",
+      phase: "embed",
+      completed: 4,
+      total: 20,
+      unit: "texts",
+      determinate: true,
+      estimated: true,
+    });
+
+    expect(status.getStatus()).toMatchObject({
+      etaSeconds: 8,
+      message: "Creating embeddings — 4 of about 20 texts · about 8 sec remaining",
+    });
   });
 });

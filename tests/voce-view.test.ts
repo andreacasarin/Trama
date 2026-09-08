@@ -96,11 +96,177 @@ function fakeLeaf(openLinkText = vi.fn().mockResolvedValue(undefined)): Workspac
   } as unknown as WorkspaceLeaf;
 }
 
+function relatedSubject() {
+  let listener: ((result: any) => void) | undefined;
+  const related = {
+    find: vi.fn(async () => undefined),
+    latest: vi.fn(() => ["Related/One.md", "Related/Two.md"]),
+    subscribe: vi.fn((next: (result: any) => void) => {
+      listener = next;
+      return () => {
+        listener = undefined;
+      };
+    }),
+    publish(result: any) {
+      listener?.(result);
+    },
+  };
+  return related;
+}
+
 function lastOpenedModal(): TestModal {
   return (FuzzySuggestModal as unknown as { lastOpened?: TestModal }).lastOpened!;
 }
 
 describe("VoceView module", () => {
+  it("orders active, related, then selected extras without auto-selecting suggestions", async () => {
+    const subject = makeSession({ turns: [], running: false });
+    const related = relatedSubject();
+    const openLinkText = vi.fn().mockResolvedValue(undefined);
+    const leaf = {
+      app: {
+        workspace: {
+          getActiveFile: () => ({ path: "Active.md" }),
+          on: () => ({}),
+          openLinkText,
+        },
+      },
+    } as unknown as WorkspaceLeaf;
+    const view = new VoceView(
+      leaf,
+      subject.session,
+      () => ["Active.md", "Related/One.md", "Selected.md"],
+      () => ["Active.md"],
+      undefined,
+      related as any
+    );
+    await view.onOpen();
+    const root = view.contentEl as unknown as TestElement;
+    const input = byClass(root, "trama-voce__input")[0];
+    input.value = "Context [[Selected.md]]";
+    input.dispatch("input");
+    (input as any).selectionStart = input.value.length;
+    (input as any).selectionEnd = input.value.length;
+    const tags = byClass(root, "trama-voce__context-tag");
+    expect(tags.map((tag) => tag.textContent)).toEqual(["Active", "One", "Selected"]);
+    expect(tags.slice(0, 2).every((tag) => tag.getAttribute("aria-pressed") === "false")).toBe(
+      true
+    );
+    tags[1].click();
+    byClass(root, "trama-voce__action")[0].click();
+    await flush();
+    expect(subject.send).toHaveBeenCalledWith({
+      content: "Context [[Selected.md]] [[Related/One.md]]",
+      attachmentPaths: ["Selected.md", "Related/One.md"],
+    });
+  });
+
+  it("rerenders shared async results, filters deleted paths, and stops updates after close", async () => {
+    const subject = makeSession({ turns: [], running: false });
+    const related = relatedSubject();
+    const leaf = {
+      app: {
+        workspace: {
+          getActiveFile: () => ({ path: "Active.md" }),
+          on: () => ({}),
+          openLinkText: vi.fn(),
+        },
+      },
+    } as unknown as WorkspaceLeaf;
+    const view = new VoceView(
+      leaf,
+      subject.session,
+      () => ["Active.md", "Live.md"],
+      () => ["Active.md"],
+      undefined,
+      related as any
+    );
+    await view.onOpen();
+    related.latest.mockReturnValue(["Live.md", "Deleted.md"]);
+    related.publish({ currentPath: "Active.md", results: [{ path: "Live.md" }] });
+    expect(
+      byClass(view.contentEl as any, "trama-voce__context-tag").map((tag) => tag.textContent)
+    ).toEqual(["Active", "Live"]);
+    await view.onClose();
+    related.latest.mockReturnValue(["Deleted.md"]);
+    related.publish({ currentPath: "Active.md", results: [{ path: "Deleted.md" }] });
+    expect(
+      byClass(view.contentEl as any, "trama-voce__context-tag").map((tag) => tag.textContent)
+    ).toEqual(["Active", "Live"]);
+  });
+
+  it("rebinds related-note suggestions for an already open view", async () => {
+    const subject = makeSession({ turns: [], running: false });
+    const oldUnsubscribe = vi.fn();
+    const oldRelated = {
+      find: vi.fn(async () => undefined),
+      latest: vi.fn(() => ["Old.md"]),
+      subscribe: vi.fn(() => oldUnsubscribe),
+    };
+    const newRelated = {
+      find: vi.fn(async () => undefined),
+      latest: vi.fn(() => ["New.md"]),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const leaf = {
+      app: {
+        workspace: {
+          getActiveFile: () => ({ path: "Active.md" }),
+          on: () => ({}),
+          openLinkText: vi.fn(),
+        },
+      },
+    } as unknown as WorkspaceLeaf;
+    const view = new VoceView(
+      leaf,
+      subject.session,
+      () => ["Active.md", "Old.md", "New.md"],
+      () => ["Active.md"],
+      undefined,
+      oldRelated as any
+    );
+    await view.onOpen();
+
+    view.setRelatedNotes(newRelated as any);
+
+    expect(oldUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(newRelated.subscribe).toHaveBeenCalledTimes(1);
+    expect(newRelated.find).toHaveBeenCalledWith("Active.md", expect.any(AbortSignal), 7);
+    expect(
+      byClass(view.contentEl as any, "trama-voce__context-tag").map((tag) => tag.textContent)
+    ).toEqual(["Active", "New"]);
+  });
+
+  it("refreshes an open view when a new index generation is announced", async () => {
+    const subject = makeSession({ turns: [], running: false });
+    const related = relatedSubject();
+    const leaf = {
+      app: {
+        workspace: {
+          getActiveFile: () => ({ path: "Active.md" }),
+          on: () => ({}),
+          openLinkText: vi.fn(),
+        },
+      },
+    } as unknown as WorkspaceLeaf;
+    const view = new VoceView(
+      leaf,
+      subject.session,
+      () => ["Active.md", "Related/One.md"],
+      () => ["Active.md"],
+      undefined,
+      related as any
+    );
+    await view.onOpen();
+    expect(related.find).toHaveBeenCalledTimes(1);
+
+    view.refreshRelatedSuggestions();
+
+    expect(related.find).toHaveBeenCalledTimes(2);
+    await view.onClose();
+    view.refreshRelatedSuggestions();
+    expect(related.find).toHaveBeenCalledTimes(2);
+  });
   describe("provenanceLabel()", () => {
     it("formats source ranges only when a line range is present", () => {
       expect(provenanceLabel({ path: "Notes/Alpha.md" })).toBe("Notes/Alpha.md");

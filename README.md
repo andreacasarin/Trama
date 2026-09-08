@@ -1,14 +1,45 @@
 # Trama
 
-Trama is a desktop-only Obsidian plugin for local AI conversation and semantic connections. **Voce** is the agent chat that can navigate linked notes, while **Filo** is the planned per-note view for discovering semantically related notes. Chat and embedding requests go only to a user-approved local LM Studio endpoint. Trama performs no network requests at startup; connection and model discovery are triggered by sending a message or rebuilding the index.
+Trama is a desktop-only Obsidian plugin for local AI conversation and semantic connections. **Voce** is the agent chat that can navigate linked notes, while **Filo** is the per-note view for discovering semantically related notes. Chat and embedding requests go only to a user-approved local LM Studio endpoint. Trama performs no network requests at startup; connection and model discovery are triggered by sending a message or indexing the vault.
 
 ## Setup
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer**, load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
 2. Configure the chat model and embedding model independently in the plugin settings.
-3. Use **Rebuild Filo index** from the command palette, then open **Voce** with **Open Voce**.
+3. Use **Index vault** from the command palette for the initial explicit index, then open **Voce** with **Open Voce** or **Filo** with **Open Filo**.
 
-The semantic index is stored at `<vault>/.trama/index/`. Configure that directory in your sync tool's exclusions; it is generated data and can be rebuilt. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+
+## Filo related notes
+
+Filo always shows the seven strongest unique visible Markdown notes related to the
+active note, then extends the list up to twenty for additional notes with cosine
+similarity of at least 0.30. It opens a result with Obsidian's native navigation. Ranking uses the active note's
+signal against conservative 384-character chunks with 64-character overlap; chunk
+scores are aggregated to unique notes. The same ordered results appear as optional
+suggestions in Voce after the active-note suggestion. Suggestions never attach
+themselves to a prompt. Filo presents results as a native disclosure list: the note
+title opens the note, the caret reveals the winning indexed passage and source lines,
+and cosine similarity is summarized as High (at least 0.72), Medium (at least 0.50),
+or Low using constants owned by the view.
+
+Indexing is explicit the first time. After a usable index exists, visible Markdown
+create, modify, delete, and rename events are coalesced for about 1.5 seconds and
+processed as per-note incremental updates. **Index vault** is the normal synchronization
+mode: it scans the current vault, compares committed content identities, and embeds only
+new or changed notes while removing deleted paths. **Reindex vault** remains the explicit
+forced rebuild for recovery or configuration refresh. If a note is moved or deleted while
+either pass is running, that stale path is logged and skipped, then the queued vault event
+is reconciled without failing the whole operation. Builds use an atomic last-good
+generation: a failed or cancelled operation does not expose a partial index, and the
+previous usable generation remains searchable.
+
+During a full rebuild, Filo estimates the number of embedding texts from file-size
+metadata calibrated by a deterministic sample of at most 32 notes passed through the
+real chunker. This keeps estimation fast while accounting for the vault's line and
+overlap patterns. Its single status row shows the current step, a stable approximate
+progress bar, and a throughput-based ETA; the final count is corrected when embedding
+finishes.
 
 ## Voce chat
 
@@ -36,9 +67,9 @@ instead of silently omitting context. Attached notes also appear as removable
 chips, are sent only with that turn, and clear as soon as the send begins. Voce
 does not fall back to the active note automatically. A compact context strip
 above the composer suggests the most recently active visible Markdown note;
-click its tag to toggle it, or use the Plus button for the full picker. The
-strip can later include related-note suggestions without changing the
-composer. Enter sends the message, while Shift+Enter inserts a newline. Long
+indexed related-note suggestions follow it in relevance order. Click a tag to
+toggle it, or use the Plus button for the full picker. Enter sends the message,
+while Shift+Enter inserts a newline. Long
 messages are collapsed by default and can be expanded in place.
 
 The settings page provides these chat controls:
@@ -60,11 +91,15 @@ bounded by the existing tool-round and read limits rather than eagerly loading
 an entire link graph. Trama does not use Remote MCP or hosted tools; embeddings
 continue using LM Studio's existing `/v1/embeddings` endpoint.
 
-The settings page also includes **Detailed Voce debugging**, which is off by
-default. When enabled, Trama writes full Voce diagnostic payloads to the
-developer console only, including prompts, selected-note contents, requests,
-SSE events, tool arguments/results, and errors. No diagnostic file is created,
-so enable it only when you are comfortable with that console-visible data.
+The settings page also includes **Detailed debugging**, which is off by default.
+When enabled, Trama writes one `[Trama]` console stream using the current
+committed setting; no diagnostic file is created. Rich chat diagnostics can
+contain full sensitive prompts, selected-note contents, requests, SSE events,
+tool arguments/results, and errors. Index and Filo diagnostics are metadata-only:
+they may include paths, counts, timings, generation/status information, and safe
+errors, but never note or chunk text, vectors, hashes, exact embedding inputs, or
+serialized index data. Enable the setting only when you are comfortable with the
+console-visible chat data.
 
 ## Development
 
@@ -95,4 +130,26 @@ npm test
 npm run build
 ```
 
-Do not run `npm run dev`; Obsidian loads the production `main.js`. Current limitations include large-vault indexing cost, the not-yet-implemented Filo view, and native (rather than React) UI. Trama is an independent, clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
+Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
+limitations include the cost of exact `Float32` scans and rebuilding the derived,
+non-persisted Orama BM25 index on large corpora. Hybrid retrieval uses reciprocal-rank
+fusion (RRF) over exact semantic and lexical candidates; there is no ANN/HNSW backend.
+The conservative 384/64 chunking is fingerprinted, so changing it requires an explicit
+full reindex. Filo and Voce use native (rather than React) UI. Trama is an independent,
+clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
+
+### Optional scale benchmark
+
+The benchmark is intentionally opt-in and is not part of normal tests. Run it with
+`npx vitest bench tests/index.bench.ts`; set `TRAMA_BENCH_CHUNKS=25000`, `50000`, or
+`100000`, `TRAMA_BENCH_DIMENSIONS` (default `768`), and `TRAMA_BENCH_SAMPLES` (default
+`7`) for a bounded deterministic fixture. The explicit `TRAMA_INDEX_BENCHMARK` summary
+reports p50 and p95 scan time plus the contiguous vector-buffer size; Vitest also reports
+its own timing distribution for the same raw exact semantic scan primitive.
+
+This probe does not build or open the persisted corpus, Orama lexical index, or hybrid
+retriever. It therefore does not measure startup, corpus artifact size, RSS, lexical or
+hybrid latency, cancellation latency, or prove the absence of generation-wide
+serialization. Validate those properties separately with focused implementation tests,
+code review, and a real-vault Obsidian/LM Studio smoke test. Do not use this benchmark as
+ANN evidence until an exact-oracle recall comparison is added.

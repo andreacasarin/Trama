@@ -8,7 +8,11 @@ import {
   StructuredError,
   ToolCall,
 } from "@/domain/contracts";
-import { NOOP_VOCE_DIAGNOSTICS, VoceDiagnostics } from "@/chat/VoceDiagnostics";
+import {
+  emitTramaDiagnostic,
+  NOOP_TRAMA_DIAGNOSTICS,
+  TramaDiagnostics,
+} from "@/diagnostics/TramaDiagnostics";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 
 export interface LmStudioChatOptions {
@@ -19,7 +23,7 @@ export interface LmStudioChatOptions {
   readonly reasoningEffort?: ReasoningEffort;
   readonly tools?: readonly ChatToolDefinition[];
   readonly transport?: LmStudioTransport;
-  readonly diagnostics?: VoceDiagnostics;
+  readonly diagnostics?: TramaDiagnostics;
 }
 
 interface ResponseEvent {
@@ -136,12 +140,13 @@ function usageFrom(value: unknown): ChatUsage | undefined {
 export class LmStudioChatModel implements ChatModel {
   private readonly options: LmStudioChatOptions;
   private readonly transport: LmStudioTransport;
-  private readonly diagnostics: VoceDiagnostics;
+  private readonly diagnostics: TramaDiagnostics;
 
   constructor(options: LmStudioChatOptions) {
     this.options = options;
     this.transport = options.transport ?? new LmStudioTransport();
-    this.diagnostics = options.diagnostics ?? NOOP_VOCE_DIAGNOSTICS;
+    const diagnostics = options.diagnostics ?? NOOP_TRAMA_DIAGNOSTICS;
+    this.diagnostics = { emit: (record) => emitTramaDiagnostic(diagnostics, record) };
   }
 
   /** Lists models only when explicitly requested by the settings UI. */
@@ -186,7 +191,7 @@ export class LmStudioChatModel implements ChatModel {
         }));
       }
 
-      this.diagnostics.emit({ event: "responses_request", body });
+      this.diagnostics.emit({ area: "chat", event: "responses_request", body });
       const accumulator = new ResponsesAccumulator(onText);
       for await (const event of this.transport.stream<ResponseEvent>(
         this.options.endpoint,
@@ -194,16 +199,16 @@ export class LmStudioChatModel implements ChatModel {
         body,
         signal
       )) {
-        this.diagnostics.emit({ event: "responses_sse_event", eventData: event });
+        this.diagnostics.emit({ area: "chat", event: "responses_sse_event", eventData: event });
         accumulator.accept(event);
       }
       if (signal.aborted)
         throw new StructuredError("cancelled", "The request was cancelled.", false);
       const response = accumulator.finish();
-      this.diagnostics.emit({ event: "model_response", response });
+      this.diagnostics.emit({ area: "chat", event: "model_response", response });
       return response;
     } catch (error) {
-      this.diagnostics.emit({ event: "model_error", error });
+      this.diagnostics.emit({ area: "chat", event: "model_error", error });
       throw error;
     }
   }

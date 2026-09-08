@@ -61,8 +61,43 @@ export interface ChatModel {
 }
 
 /** The embedding model contract used by Filo's semantic index. */
+export interface EmbeddingProgress {
+  readonly completed: number;
+  readonly total: number;
+  readonly unit: "texts";
+}
+
+export type IndexOperation = "full" | "incremental" | "startup";
+export type IndexProgressPhase =
+  | "discover"
+  | "read"
+  | "chunk"
+  | "embed"
+  | "encode-write"
+  | "validate"
+  | "build-vector"
+  | "build-lexical"
+  | "activate"
+  | "GC";
+
+export interface IndexProgress {
+  readonly operation: IndexOperation;
+  readonly phase: IndexProgressPhase;
+  readonly completed: number;
+  readonly total?: number;
+  readonly unit: "paths" | "notes" | "chunks" | "texts" | "segments" | "pages" | "artifacts";
+  readonly determinate: boolean;
+  /** True when total is a fast metadata-based estimate rather than a completed count. */
+  readonly estimated?: boolean;
+  readonly generationId?: string;
+}
+
 export interface EmbeddingModel {
-  embed(texts: readonly string[], signal: AbortSignal): Promise<readonly number[][]>;
+  embed(
+    texts: readonly string[],
+    signal: AbortSignal,
+    onProgress?: (progress: EmbeddingProgress) => void
+  ): Promise<readonly number[][]>;
   readonly dimensions: number;
 }
 

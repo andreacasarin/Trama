@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Setting } from "obsidian";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
+import { IndexStatusController } from "@/ui/index/IndexStatus";
 import {
   projectSettingsWithDraft,
   TramaSettingsTab,
@@ -144,11 +145,122 @@ describe("Settings tab module", () => {
         medium: "Medium",
         high: "High",
       });
-      expect(latestSetting("Detailed Voce debugging")).toMatchObject({
+      expect(latestSetting("Detailed debugging")).toMatchObject({
         description: expect.stringContaining("full prompts"),
         toggleControls: [{ value: false }],
       });
-      expect(latestSetting("Detailed Voce debugging")?.description).toContain("No diagnostic file");
+      expect(latestSetting("Detailed debugging")?.description).toContain("No diagnostic file");
+    });
+
+    it("does not recursively redraw when index status subscriptions emit immediately", () => {
+      let listener: ((status: any) => void) | undefined;
+      const target = {
+        ...controller(),
+        getIndexStatus: () => ({ revision: 1 }),
+        subscribeIndexStatus: vi.fn((next: (status: any) => void) => {
+          listener = next;
+          next({ revision: 1 });
+          return vi.fn();
+        }),
+      };
+      const tab = new TramaSettingsTab({} as never, target as never);
+
+      expect(() => tab.display()).not.toThrow();
+      expect(target.subscribeIndexStatus).toHaveBeenCalledTimes(1);
+
+      listener?.({ revision: 2 });
+      expect(target.subscribeIndexStatus).toHaveBeenCalledTimes(2);
+    });
+
+    it("redraws once per real status or progress emission when display resubscribes", () => {
+      const prototype = Setting.prototype as any;
+      Object.defineProperty(prototype, "descEl", {
+        configurable: true,
+        get() {
+          return { setText: (value: string) => (this.description = value) };
+        },
+      });
+      Object.defineProperty(prototype, "controlEl", {
+        configurable: true,
+        get() {
+          return this.containerEl;
+        },
+      });
+      try {
+        const status = new IndexStatusController({ addCommand: vi.fn() } as never, {
+          index: async () => undefined,
+          reindex: async () => undefined,
+          cancel: () => undefined,
+        });
+        const subscribeIndexStatus = vi.fn((listener: (value: any) => void) =>
+          status.subscribe(listener)
+        );
+        const target = {
+          ...controller(),
+          getIndexStatusMessage: () => status.getStatus().message ?? status.getStatus().kind,
+          getIndexStatus: () => status.getStatus(),
+          subscribeIndexStatus,
+        };
+        const tab = new TramaSettingsTab({} as never, target as never);
+        tab.display();
+        expect(subscribeIndexStatus).toHaveBeenCalledTimes(1);
+
+        expect(() => status.setUpdating()).not.toThrow();
+        expect(subscribeIndexStatus).toHaveBeenCalledTimes(2);
+
+        expect(() =>
+          status.reportProgress({
+            operation: "incremental",
+            phase: "embed",
+            completed: 2,
+            total: 4,
+            unit: "texts",
+            determinate: true,
+          })
+        ).not.toThrow();
+        expect(subscribeIndexStatus).toHaveBeenCalledTimes(3);
+        expect(latestSetting("Filo index")?.description).toBe("Creating embeddings — 2 of 4 texts");
+      } finally {
+        delete prototype.descEl;
+        delete prototype.controlEl;
+      }
+    });
+
+    it("shows the completed count for indeterminate index progress", () => {
+      const prototype = Setting.prototype as any;
+      Object.defineProperty(prototype, "descEl", {
+        configurable: true,
+        get() {
+          return { setText: (value: string) => (this.description = value) };
+        },
+      });
+      Object.defineProperty(prototype, "controlEl", {
+        configurable: true,
+        get() {
+          return this.containerEl;
+        },
+      });
+      try {
+        const target = {
+          ...controller(),
+          getIndexStatus: () => ({
+            progress: {
+              operation: "incremental",
+              phase: "embed",
+              completed: 37,
+              unit: "texts",
+              determinate: false,
+            },
+          }),
+        };
+
+        new TramaSettingsTab({} as never, target as never).display();
+
+        expect(latestSetting("Filo index")?.description).toBe("Creating embeddings — 37 texts");
+      } finally {
+        delete prototype.descEl;
+        delete prototype.controlEl;
+      }
     });
 
     it("renders model selectors with Discover buttons and preserves configured models", () => {
@@ -252,16 +364,16 @@ describe("Settings tab module", () => {
       expect(updater(DEFAULT_SETTINGS).chat).not.toHaveProperty("maxOutputTokens");
     });
 
-    it("persists the detailed Voce debugging toggle immediately", async () => {
+    it("persists the detailed debugging toggle immediately", async () => {
       const saveSettings = vi.fn().mockResolvedValue(undefined);
       const tab = new TramaSettingsTab({} as never, controller(saveSettings) as never);
       tab.display();
 
-      latestSetting("Detailed Voce debugging")!.toggleControls[0].emit(true);
+      latestSetting("Detailed debugging")!.toggleControls[0].emit(true);
 
       await vi.waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
       const updater = saveSettings.mock.calls[0][0];
-      expect(updater(DEFAULT_SETTINGS)).toMatchObject({ detailedVoceDebug: true });
+      expect(updater(DEFAULT_SETTINGS)).toMatchObject({ detailedDebug: true });
     });
   });
 });

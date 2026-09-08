@@ -249,3 +249,92 @@
     max-width: 100%;
   }
 }
+
+.trama-filo {
+  padding: 12px;
+  color: var(--text-normal);
+}
+.trama-filo__title {
+  margin: 0 0 12px;
+  font-size: var(--font-ui-large);
+}
+.trama-filo__message {
+  color: var(--text-muted);
+  margin: 8px 0;
+}
+.trama-filo__message--warning {
+  color: var(--text-error);
+}
+.trama-filo__progress-label {
+  color: var(--text-muted);
+  margin: 8px 0;
+}
+.trama-filo__progress {
+  display: block;
+  width: 100%;
+}
+.trama-filo__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.trama-filo__row {
+  align-items: center;
+  display: flex;
+  min-height: 28px;
+  width: 100%;
+}
+.trama-filo__caret {
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 2px;
+  width: 22px;
+}
+.trama-filo__link {
+  color: var(--text-normal);
+  cursor: pointer;
+  flex: 1 1 auto;
+  font: inherit;
+  min-width: 0;
+  overflow: hidden;
+  padding: 3px 4px;
+  text-align: left;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trama-filo__link:hover {
+  color: var(--text-accent-hover);
+}
+.trama-filo__relevance {
+  color: var(--text-faint);
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  margin-left: 8px;
+}
+.trama-filo__relevance--high {
+  color: var(--text-accent);
+}
+.trama-filo__detail {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  margin: 0 4px 6px 26px;
+  padding: 6px 8px;
+}
+.trama-filo__excerpt {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-normal);
+  white-space: pre-wrap;
+}
+.trama-filo__path {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+.trama-filo__action {
+  margin-top: 8px;
+}

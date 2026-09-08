@@ -8,7 +8,11 @@ import {
   StructuredError,
   ToolCall,
 } from "@/domain/contracts";
-import { NOOP_VOCE_DIAGNOSTICS, VoceDiagnostics } from "@/chat/VoceDiagnostics";
+import {
+  emitTramaDiagnostic,
+  NOOP_TRAMA_DIAGNOSTICS,
+  TramaDiagnostics,
+} from "@/diagnostics/TramaDiagnostics";
 import { ToolRegistry, ToolResult } from "@/tools/ToolRegistry";
 
 export const CHAT_LIMITS = Object.freeze({
@@ -109,8 +113,12 @@ export class ChatSession {
     private model: ChatModel,
     private readonly registry: ToolRegistry,
     private readonly vault: Pick<ReadonlyVault, "readNote">,
-    private readonly diagnostics: VoceDiagnostics = NOOP_VOCE_DIAGNOSTICS
-  ) {}
+    diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
+  ) {
+    this.diagnostics = { emit: (record) => emitTramaDiagnostic(diagnostics, record) };
+  }
+
+  private readonly diagnostics: TramaDiagnostics;
 
   /** Replaces the model for subsequent turns while retaining this conversation and tools. */
   replaceModel(model: ChatModel): void {
@@ -144,7 +152,7 @@ export class ChatSession {
     const controller = new AbortController();
     const identity = ++this.generation;
     this.active = controller;
-    this.diagnostics.emit({ event: "session_started", generation: identity });
+    this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
       const notes = await this.readAttachments(paths, controller.signal, identity);
@@ -152,6 +160,7 @@ export class ChatSession {
       const references = attachmentBlock(notes);
       if (references.length > CHAT_LIMITS.maxAttachmentContent) {
         this.diagnostics.emit({
+          area: "chat",
           event: "limit_reached",
           generation: identity,
           message: "Attached notes exceed the 32,000-character context limit.",
@@ -201,7 +210,14 @@ export class ChatSession {
         return this.cancelled(identity);
       const message = error instanceof Error ? error.message : "Chat turn failed.";
       const code = error instanceof StructuredError ? error.code : "internal";
-      this.diagnostics.emit({ event: "error", generation: identity, code, message, error });
+      this.diagnostics.emit({
+        area: "chat",
+        event: "error",
+        generation: identity,
+        code,
+        message,
+        error,
+      });
       return this.failure(identity, code, message);
     } finally {
       if (this.active === controller) this.active = undefined;
@@ -219,7 +235,7 @@ export class ChatSession {
       running: false,
       error: { code: "cancelled", message: "Chat turn cancelled." },
     });
-    this.diagnostics.emit({ event: "cancelled", generation: identity });
+    this.diagnostics.emit({ area: "chat", event: "cancelled", generation: identity });
     for (const listener of this.listeners) listener(this.state);
   }
 
@@ -245,6 +261,7 @@ export class ChatSession {
     for (let round = 0; round < CHAT_LIMITS.maxRounds; round++) {
       let streamedText = "";
       this.diagnostics.emit({
+        area: "chat",
         event: "model_round_started",
         generation: identity,
         round: round + 1,
@@ -256,12 +273,18 @@ export class ChatSession {
         (text) => {
           if (!this.isCurrent(identity)) return;
           streamedText += text;
-          this.diagnostics.emit({ event: "stream_delta", generation: identity, text });
+          this.diagnostics.emit({
+            area: "chat",
+            event: "stream_delta",
+            generation: identity,
+            text,
+          });
           this.updateAssistant(identity, assistantTurnId, streamedText, provenance, "working");
         }
       );
       if (!this.isCurrent(identity)) return this.state;
       this.diagnostics.emit({
+        area: "chat",
         event: "model_round_completed",
         generation: identity,
         round: round + 1,
@@ -342,6 +365,7 @@ export class ChatSession {
     identity: number
   ): Promise<readonly ReadonlyNote[]> {
     this.diagnostics.emit({
+      area: "chat",
       event: "attachment_preflight_started",
       generation: identity,
       count: paths.length,
@@ -356,6 +380,7 @@ export class ChatSession {
       notes.push(...(await Promise.all(batch.map((path) => this.vault.readNote(path, signal)))));
     }
     this.diagnostics.emit({
+      area: "chat",
       event: "attachment_preflight_completed",
       generation: identity,
       count: notes.length,
@@ -379,6 +404,7 @@ export class ChatSession {
         }
         const resolved = await result;
         this.diagnostics.emit({
+          area: "chat",
           event: "tool_completed",
           generation: identity,
           name: call.name,
@@ -455,7 +481,7 @@ export class ChatSession {
     provenance: ProvenanceRecord[],
     message: string
   ): ChatState {
-    this.diagnostics.emit({ event: "limit_reached", generation: identity, message });
+    this.diagnostics.emit({ area: "chat", event: "limit_reached", generation: identity, message });
     return this.finish(identity, assistantTurnId, message, provenance);
   }
 

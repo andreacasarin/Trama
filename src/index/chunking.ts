@@ -1,8 +1,8 @@
-export const INDEX_SCHEMA_VERSION = 1;
+export const INDEX_SCHEMA_VERSION = 3;
 export const EXTRACTION_VERSION = 1;
-export const CHUNK_ALGORITHM_VERSION = 1;
-export const CHUNK_SIZE = 800;
-export const CHUNK_OVERLAP = 120;
+export const CHUNK_ALGORITHM_VERSION = 2;
+export const CHUNK_SIZE = 384;
+export const CHUNK_OVERLAP = 64;
 
 export interface IndexChunk {
   readonly text: string;

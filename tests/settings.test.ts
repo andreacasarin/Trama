@@ -18,10 +18,10 @@ describe("Settings module", () => {
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
-        expect(loaded.detailedVoceDebug).toBe(false);
+        expect(loaded.detailedDebug).toBe(false);
       });
 
-      it("sanitizes detailed Voce debugging independently while preserving v2 settings", () => {
+      it("sanitizes detailed debugging independently while preserving v2 settings", () => {
         const persisted = {
           schemaVersion: 2,
           chat: {
@@ -38,7 +38,7 @@ describe("Settings module", () => {
             batchSize: 16,
           },
           approvedOrigins: [{ scheme: "http", host: "192.168.1.20", port: 1234 }],
-          detailedVoceDebug: "yes",
+          detailedDebug: "yes",
         };
 
         const loaded = new SettingsStore().load(persisted);
@@ -47,11 +47,20 @@ describe("Settings module", () => {
           chat: persisted.chat,
           embedding: persisted.embedding,
           approvedOrigins: persisted.approvedOrigins,
-          detailedVoceDebug: false,
+          detailedDebug: false,
         });
-        expect(new SettingsStore().load({ ...persisted, detailedVoceDebug: true })).toMatchObject({
+        expect(new SettingsStore().load({ ...persisted, detailedDebug: true })).toMatchObject({
+          detailedDebug: true,
+        });
+      });
+
+      it("ignores the removed detailedVoceDebug key without migration", () => {
+        const loaded = new SettingsStore().load({
+          schemaVersion: 2,
           detailedVoceDebug: true,
         });
+        expect(loaded.detailedDebug).toBe(false);
+        expect(loaded).not.toHaveProperty("detailedVoceDebug");
       });
 
       it("accepts exact v2 parameter boundaries and every reasoning effort", () => {
@@ -107,7 +116,7 @@ describe("Settings module", () => {
         expect(settings.schemaVersion).toBe(2);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
-        expect(settings.detailedVoceDebug).toBe(false);
+        expect(settings.detailedDebug).toBe(false);
       });
       it("rejects invalid staged chat controls without silently clearing them", () => {
         const store = new SettingsStore();

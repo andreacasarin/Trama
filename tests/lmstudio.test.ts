@@ -3,7 +3,7 @@ import { StructuredError } from "@/domain/contracts";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
-import { VoceDiagnosticRecord } from "@/chat/VoceDiagnostics";
+import { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 const ISSUE = "https://github.com/logancyang/obsidian-copilot/issues/3077";
 
@@ -72,13 +72,14 @@ describe("LM Studio adapters module", () => {
               completed({ usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })
             )
           );
-        const records: VoceDiagnosticRecord[] = [];
+        const records: TramaDiagnosticRecord[] = [];
         const result = await model(fetcher, {
-          diagnostics: { emit: (record: VoceDiagnosticRecord) => records.push(record) },
+          diagnostics: { emit: (record: TramaDiagnosticRecord) => records.push(record) },
         }).complete([{ role: "user", content: "hello" }], new AbortController().signal);
 
         expect(records).toEqual([
           {
+            area: "chat",
             event: "responses_request",
             body: {
               model: "local",
@@ -88,10 +89,12 @@ describe("LM Studio adapters module", () => {
             },
           },
           {
+            area: "chat",
             event: "responses_sse_event",
             eventData: { type: "response.output_text.delta", delta: "ok" },
           },
           {
+            area: "chat",
             event: "responses_sse_event",
             eventData: {
               type: "response.completed",
@@ -101,21 +104,34 @@ describe("LM Studio adapters module", () => {
               },
             },
           },
-          { event: "model_response", response: result },
+          { area: "chat", event: "model_response", response: result },
         ]);
       });
 
       it("emits model errors after malformed Responses events", async () => {
-        const records: VoceDiagnosticRecord[] = [];
+        const records: TramaDiagnosticRecord[] = [];
         const fetcher = vi.fn<typeof fetch>().mockResolvedValue(streamResponse("data: {bad}\n\n"));
 
         await expect(
           model(fetcher, {
-            diagnostics: { emit: (record: VoceDiagnosticRecord) => records.push(record) },
+            diagnostics: { emit: (record: TramaDiagnosticRecord) => records.push(record) },
           }).complete([], new AbortController().signal)
         ).rejects.toMatchObject({ code: "internal" });
 
         expect(records.at(-1)).toMatchObject({ event: "model_error", error: { code: "internal" } });
+      });
+
+      it("keeps the original response when the diagnostic sink throws", async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(streamResponse(completed()));
+        await expect(
+          model(fetcher, {
+            diagnostics: {
+              emit: () => {
+                throw new Error("diagnostics unavailable");
+              },
+            },
+          }).complete([], new AbortController().signal)
+        ).resolves.toMatchObject({ finishReason: "stop" });
       });
 
       it(`sends all explicit provider-neutral parameters under Responses wire names (${ISSUE})`, async () => {
@@ -387,6 +403,122 @@ describe("LM Studio adapters module", () => {
           [1, 0],
         ]);
         expect(fetcher).toHaveBeenCalledTimes(2);
+      });
+
+      it("reports monotonic progress after each validated batch", async () => {
+        const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+          const values = JSON.parse(String(init?.body)).input as string[];
+          return response({
+            data: values.map((_, index) => ({ index, embedding: [1, 0] })),
+          });
+        });
+        const progress: { completed: number; total: number; unit: "texts" }[] = [];
+        const embedding = new LmStudioEmbeddingModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "embed",
+          dimensions: 2,
+          batchSize: 2,
+          transport: new LmStudioTransport({ fetcher }),
+        });
+
+        await embedding.embed(["a", "b", "c", "d", "e"], new AbortController().signal, (value) =>
+          progress.push(value)
+        );
+
+        expect(progress).toEqual([
+          { completed: 0, total: 5, unit: "texts" },
+          { completed: 2, total: 5, unit: "texts" },
+          { completed: 4, total: 5, unit: "texts" },
+          { completed: 5, total: 5, unit: "texts" },
+        ]);
+      });
+
+      it("reports empty input without making an HTTP request", async () => {
+        const fetcher = vi.fn<typeof fetch>();
+        const progress: unknown[] = [];
+        const embedding = new LmStudioEmbeddingModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "embed",
+          dimensions: 2,
+          transport: new LmStudioTransport({ fetcher }),
+        });
+
+        await expect(
+          embedding.embed([], new AbortController().signal, (value) => progress.push(value))
+        ).resolves.toEqual([]);
+        expect(progress).toEqual([{ completed: 0, total: 0, unit: "texts" }]);
+        expect(fetcher).not.toHaveBeenCalled();
+      });
+
+      it("ignores progress callback exceptions", async () => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(response({ data: [{ index: 0, embedding: [1, 0] }] }));
+        const embedding = new LmStudioEmbeddingModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "embed",
+          dimensions: 2,
+          transport: new LmStudioTransport({ fetcher }),
+        });
+
+        await expect(
+          embedding.embed(["a"], new AbortController().signal, () => {
+            throw new Error("observer failed");
+          })
+        ).resolves.toEqual([[1, 0]]);
+      });
+
+      it("does not report later progress or false completion after cancellation", async () => {
+        const controller = new AbortController();
+        const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+          const values = JSON.parse(String(init?.body)).input as string[];
+          return response({
+            data: values.map((_, index) => ({ index, embedding: [1, 0] })),
+          });
+        });
+        const progress: number[] = [];
+        const embedding = new LmStudioEmbeddingModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "embed",
+          dimensions: 2,
+          batchSize: 2,
+          transport: new LmStudioTransport({ fetcher }),
+        });
+
+        await expect(
+          embedding.embed(["a", "b", "c"], controller.signal, ({ completed }) => {
+            progress.push(completed);
+            if (completed === 2) controller.abort();
+          })
+        ).rejects.toMatchObject({ code: "cancelled" });
+        expect(progress).toEqual([0, 2]);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not advance progress for malformed response indices", async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+          response({
+            data: [
+              { index: 0, embedding: [1, 0] },
+              { index: 0, embedding: [1, 0] },
+            ],
+          })
+        );
+        const progress: number[] = [];
+        const embedding = new LmStudioEmbeddingModel({
+          endpoint: "http://127.0.0.1:1234/v1",
+          modelId: "embed",
+          dimensions: 2,
+          batchSize: 2,
+          transport: new LmStudioTransport({ fetcher }),
+        });
+
+        await expect(
+          embedding.embed(["a", "b"], new AbortController().signal, ({ completed }) =>
+            progress.push(completed)
+          )
+        ).rejects.toMatchObject({ code: "internal" });
+        expect(progress).toEqual([0]);
       });
 
       it("rejects embeddings with the wrong dimensions", async () => {

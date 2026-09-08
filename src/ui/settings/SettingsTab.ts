@@ -2,6 +2,7 @@ import { PluginSettingTab, Setting } from "obsidian";
 import { Plugin } from "obsidian";
 import { EndpointApproval } from "@/security/EndpointPolicy";
 import { TramaSettings } from "@/settings/Settings";
+import { formatIndexProgress, type IndexStatus } from "@/ui/index/IndexStatus";
 
 /** Callbacks supplied by composition to keep settings UI independent of runtime wiring. */
 export interface SettingsTabCallbacks {
@@ -17,6 +18,8 @@ export interface SettingsTabCallbacks {
   removeApprovedOrigin(origin: EndpointApproval): Promise<void>;
   discoverModels(target: "chat" | "embedding"): Promise<readonly string[]>;
   getIndexStatusMessage(): string;
+  getIndexStatus?(): IndexStatus | undefined;
+  subscribeIndexStatus?(listener: (status: IndexStatus) => void): () => void;
 }
 
 export interface SettingsDraft {
@@ -84,6 +87,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     chat: 0,
     embedding: 0,
   };
+  private statusUnsubscribe?: () => void;
   constructor(
     app: ConstructorParameters<typeof PluginSettingTab>[0],
     private readonly controller: Plugin & Partial<SettingsTabCallbacks>
@@ -92,6 +96,8 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
   override display(): void {
     this.containerEl.empty();
+    this.statusUnsubscribe?.();
+    this.statusUnsubscribe = undefined;
     this.containerEl.createEl("h2", { text: "Trama" });
     this.containerEl.createEl("p", {
       text: "LM Studio is contacted only after an explicit action.",
@@ -131,16 +137,16 @@ export class TramaSettingsTab extends PluginSettingTab {
       )
     );
     new Setting(this.containerEl)
-      .setName("Detailed Voce debugging")
+      .setName("Detailed debugging")
       .setDesc(
-        "Warning: full console diagnostic payloads include full prompts, selected-note contents, requests, SSE events, tool arguments/results, and errors. No diagnostic file is created."
+        "Warning: detailed console diagnostics include sensitive rich chat data (full prompts, selected-note contents, requests/SSE events, tool arguments/results/errors) plus index metadata (paths, counts, timings, generation/status). No diagnostic file is created."
       )
       .addToggle((toggle) => {
-        toggle.setValue(settings.detailedVoceDebug);
+        toggle.setValue(settings.detailedDebug);
         toggle.onChange(
-          (detailedVoceDebug) =>
+          (detailedDebug) =>
             void this.run(() =>
-              this.controller.saveSettings?.((current) => ({ ...current, detailedVoceDebug }))
+              this.controller.saveSettings?.((current) => ({ ...current, detailedDebug }))
             )
         );
       });
@@ -167,11 +173,37 @@ export class TramaSettingsTab extends PluginSettingTab {
             .setButtonText("Remove")
             .onClick(() => void this.run(() => this.controller.removeApprovedOrigin?.(origin)))
         );
-    new Setting(this.containerEl)
+    const indexSetting = new Setting(this.containerEl)
       .setName("Filo index")
       .setDesc(this.controller.getIndexStatusMessage?.() ?? "Not initialized");
+    const status = this.controller.getIndexStatus?.();
+    const progress = status?.progress;
+    if (progress) {
+      const label = formatIndexProgress(progress, status?.etaSeconds);
+      indexSetting.descEl.setText(label);
+      indexSetting.controlEl.createEl("progress", {
+        attr: {
+          "aria-label": label,
+          ...(progress.determinate && progress.total !== undefined
+            ? { max: String(progress.total), value: String(progress.completed) }
+            : {}),
+        },
+      });
+    }
     if (this.errorMessage)
       this.containerEl.createEl("p", { text: this.errorMessage, cls: "mod-warning" });
+    let subscribing = true;
+    this.statusUnsubscribe = this.controller.subscribeIndexStatus?.(() => {
+      // IndexStatusController immediately emits its current value. Redraw only
+      // after subscription setup, otherwise display() would recursively subscribe.
+      if (!subscribing) this.display();
+    });
+    subscribing = false;
+  }
+
+  override hide(): void {
+    this.statusUnsubscribe?.();
+    this.statusUnsubscribe = undefined;
   }
   private text(name: string, value: string, update: (value: string) => void): void {
     new Setting(this.containerEl).setName(name).addText((text) => {

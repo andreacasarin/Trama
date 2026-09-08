@@ -1,7 +1,8 @@
 import { Platform, Plugin, TAbstractFile } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
-import { VoceDiagnostics } from "@/chat/VoceDiagnostics";
+import { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, IndexVaultPort } from "@/index/IndexManager";
+import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
 import { ObsidianIndexStorage } from "@/index/storage";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
@@ -18,6 +19,7 @@ import {
   VaultSearchTool,
 } from "@/tools/ToolRegistry";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { RelatedNotes } from "@/index/RelatedNotes";
 
 /** Composes the desktop-only assistant and owns its lifecycle and vault event boundary. */
 export class TramaPlugin extends Plugin {
@@ -28,6 +30,7 @@ export class TramaPlugin extends Plugin {
   private embeddingModel?: LmStudioEmbeddingModel;
   private index?: IndexManager;
   private indexStatus?: IndexStatusController;
+  private relatedNotes?: RelatedNotes;
   private lifecycleAbort?: AbortController;
   private indexLoad?: Promise<boolean>;
   private indexLoaded = false;
@@ -35,17 +38,23 @@ export class TramaPlugin extends Plugin {
   private compositionRevision = 0;
   private readonly pendingVaultChanges = new Set<string>();
   private eventTimer?: ReturnType<typeof setTimeout>;
+  private reconcilePromise?: Promise<void>;
+  private queuedWork = false;
   private readonly eventRefs: Array<{ unsubscribe?: () => void }> = [];
   private saveQueue: Promise<void> = Promise.resolve();
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
-  private readonly voceDiagnostics: VoceDiagnostics = {
+  private readonly diagnostics: TramaDiagnostics = {
     emit: (record) => {
-      if (this.settingsStore.get().detailedVoceDebug) {
+      if (this.settingsStore.get().detailedDebug) {
         // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
-        // eslint-disable-next-line no-console
-        console.debug("[Trama Voce]", record);
+        try {
+          // eslint-disable-next-line no-console
+          console.debug("[Trama]", record);
+        } catch {
+          // Console instrumentation is observational and must not break chat or indexing.
+        }
       }
     },
   };
@@ -61,7 +70,7 @@ export class TramaPlugin extends Plugin {
         .getMarkdownFiles()
         .map((file: { path: string }) => file.path)
         .filter((path: string) => this.isVisibleMarkdown(path))
-        .sort((left: string, right: string) => left.localeCompare(right));
+        .sort(compareCodeUnits);
     const rememberActiveMarkdown = (file: { path?: string } | null | undefined) => {
       if (file?.path && this.isVisibleMarkdown(file.path)) this.lastActiveMarkdownPath = file.path;
     };
@@ -70,47 +79,48 @@ export class TramaPlugin extends Plugin {
       this.lastActiveMarkdownPath ? [this.lastActiveMarkdownPath] : [];
     const fileOpenRef = app.workspace.on?.("file-open", rememberActiveMarkdown);
     if (fileOpenRef) this.registerEvent(fileOpenRef);
-    const [{ VoceView, VOCE_VIEW_TYPE }, { TramaSettingsTab }] = await Promise.all([
-      import("@/ui/voce/VoceView"),
-      import("@/ui/settings/SettingsTab"),
-    ]);
+    const [{ VoceView, VOCE_VIEW_TYPE }, { FiloView, FILO_VIEW_TYPE }, { TramaSettingsTab }] =
+      await Promise.all([
+        import("@/ui/voce/VoceView"),
+        import("@/ui/filo/FiloView"),
+        import("@/ui/settings/SettingsTab"),
+      ]);
     this.lifecycleAbort = new AbortController();
     const settings = this.settingsStore.get();
     this.composeRuntime(app, settings);
-    this.indexStatus = new IndexStatusController(this, async (signal) => {
-      const manager = this.index;
-      const pendingAtStart = new Set(this.pendingVaultChanges);
-      for (const path of pendingAtStart) manager?.queueChange(path);
-      await this.indexLoad;
-      if (this.index !== manager || !manager) throw new Error("Index was replaced during rebuild.");
-      try {
-        await manager.build(signal);
-      } catch (error) {
-        this.handleIndexFailure(manager, error);
-        throw error;
-      }
-      if (this.index === manager) {
-        for (const path of pendingAtStart) this.pendingVaultChanges.delete(path);
-        this.indexReady = true;
-        const late = [...this.pendingVaultChanges];
-        for (const path of late) manager.queueChange(path);
-        if (late.length) {
-          try {
-            await manager.reconcileQueuedChanges(signal);
-            for (const path of late) this.pendingVaultChanges.delete(path);
-          } catch (error) {
-            this.handleIndexFailure(manager, error);
-            throw error;
-          }
-        }
-      }
-    });
+    this.indexStatus = new IndexStatusController(
+      this,
+      {
+        index: (signal) => this.runIndex(signal, false),
+        reindex: (signal) => this.runFullIndex(signal),
+        cancel: () => undefined,
+      },
+      this.diagnostics
+    );
     this.indexStatus.register();
     this.addSettingTab(new TramaSettingsTab(app, this));
     this.registerView(
       VOCE_VIEW_TYPE,
       (leaf) =>
-        new VoceView(leaf, this.session!, this.visibleMarkdownCatalog, this.contextNoteSuggestions)
+        new VoceView(
+          leaf,
+          this.session!,
+          this.visibleMarkdownCatalog,
+          this.contextNoteSuggestions,
+          undefined,
+          this.relatedNotes
+        )
+    );
+    this.registerView(
+      FILO_VIEW_TYPE,
+      (leaf) =>
+        new FiloView(
+          leaf,
+          this.indexStatus!,
+          this.relatedNotes,
+          (kind) => this.indexStatus!.run(kind),
+          () => this.indexStatus!.cancel()
+        )
     );
     this.addCommand({
       id: "open-voce",
@@ -118,14 +128,23 @@ export class TramaPlugin extends Plugin {
       callback: () =>
         void app.workspace.getLeaf(true).setViewState({ type: VOCE_VIEW_TYPE, active: true }),
     });
+    this.addCommand({
+      id: "open-filo",
+      name: "Open Filo",
+      callback: () =>
+        void app.workspace.getLeaf(true).setViewState({ type: FILO_VIEW_TYPE, active: true }),
+    });
     this.registerVaultEvents(app.vault);
   }
 
   override onunload(): void {
+    this.indexReady = false;
     this.indexStatus?.cancel();
     this.lifecycleAbort?.abort();
     if (this.eventTimer) clearTimeout(this.eventTimer);
     this.eventTimer = undefined;
+    this.relatedNotes?.cancel();
+    this.relatedNotes = undefined;
     this.session?.cancel();
     for (const ref of this.eventRefs) ref.unsubscribe?.();
     this.eventRefs.length = 0;
@@ -169,7 +188,10 @@ export class TramaPlugin extends Plugin {
       before.embedding.endpoint !== saved.embedding.endpoint ||
       before.embedding.modelId !== saved.embedding.modelId ||
       before.embedding.dimensions !== saved.embedding.dimensions;
-    if (embeddingChanged) this.session?.cancel();
+    if (embeddingChanged) {
+      this.session?.cancel();
+      this.relatedNotes?.cancel();
+    }
     if (embeddingChanged) {
       this.indexStatus?.cancel();
       const oldIndex = this.index;
@@ -181,7 +203,7 @@ export class TramaPlugin extends Plugin {
         // The old build is intentionally cancelled before composing its replacement.
       }
       this.lifecycleAbort = new AbortController();
-      this.indexStatus?.markStale();
+      this.indexStatus?.markStale(false);
     }
     const app = (this as unknown as { app?: any }).app;
     if (app?.vault && app.workspace && app.metadataCache && this.session) {
@@ -230,10 +252,12 @@ export class TramaPlugin extends Plugin {
       new ObsidianIndexStorage(app.vault.adapter),
       settings.embedding.endpoint,
       settings.embedding.modelId,
-      {},
-      (error) => this.handleIndexFailure(manager, error)
+      { onProgress: (progress) => this.indexStatus?.reportProgress(progress) },
+      this.diagnostics
     );
     this.index = manager;
+    this.relatedNotes?.cancel();
+    this.relatedNotes = new RelatedNotes(manager, this.diagnostics);
     const compositionRevision = ++this.compositionRevision;
     const registry = new ToolRegistry([
       new ReadNoteTool(readonlyVault),
@@ -244,29 +268,27 @@ export class TramaPlugin extends Plugin {
     this.composeChatSession(app, settings, readonlyVault, registry, transport);
     this.indexLoaded = false;
     this.indexReady = false;
-    const loadPromise = manager.load().catch(() => false);
+    const loadPromise = manager.load({ emitDiagnostics: false }).catch(() => false);
     this.indexLoad = loadPromise;
     void loadPromise.then((loaded) => {
       if (this.index !== manager || compositionRevision !== this.compositionRevision) return;
       this.indexLoaded = true;
       this.indexReady = loaded;
-      if (!loaded) return;
+      if (!loaded) {
+        // The initial persisted-index decision is startup bookkeeping and must
+        // stay silent even if debugging is enabled immediately after onload.
+        this.indexStatus?.setIndexRequired(true);
+        return;
+      }
+      if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
+      else this.indexStatus?.setReady(true);
+      this.refreshOpenRelatedSuggestions(app);
       const hadPendingChanges = this.pendingVaultChanges.size > 0;
       for (const path of this.pendingVaultChanges) this.index?.queueChange(path);
       this.pendingVaultChanges.clear();
       const index = manager;
-      if (hadPendingChanges && index && this.lifecycleAbort)
-        void index.reconcileQueuedChanges(this.lifecycleAbort.signal).catch((error) => {
-          this.handleIndexFailure(index, error);
-        });
+      if (hadPendingChanges && index && this.lifecycleAbort) this.scheduleReconcile();
     });
-  }
-
-  private handleIndexFailure(manager: IndexManager, error: unknown): void {
-    if (this.index !== manager) return;
-    manager.markUnavailable();
-    this.indexReady = false;
-    this.indexStatus?.markError(error);
   }
 
   private replaceChatModel(settings: TramaSettings): void {
@@ -275,10 +297,17 @@ export class TramaPlugin extends Plugin {
       transport: new LmStudioTransport({
         policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
       }),
-      diagnostics: this.voceDiagnostics,
+      diagnostics: this.diagnostics,
     });
     this.chatModel = model;
     this.session?.replaceModel(model);
+  }
+
+  private refreshOpenRelatedSuggestions(app: any): void {
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
+      const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
+      view?.refreshRelatedSuggestions?.();
+    }
   }
 
   private composeChatSession(
@@ -304,12 +333,25 @@ export class TramaPlugin extends Plugin {
     this.chatModel = new LmStudioChatModel({
       ...settings.chat,
       transport,
-      diagnostics: this.voceDiagnostics,
+      diagnostics: this.diagnostics,
     });
-    this.session = new ChatSession(this.chatModel, registry, readonlyVault, this.voceDiagnostics);
+    this.session = new ChatSession(this.chatModel, registry, readonlyVault, this.diagnostics);
     for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
-      const view = (leaf as { view?: { setSession?: (session: ChatSession) => void } }).view;
+      const view = (
+        leaf as {
+          view?: {
+            setSession?: (session: ChatSession) => void;
+            setRelatedNotes?: (relatedNotes?: RelatedNotes) => void;
+          };
+        }
+      ).view;
       view?.setSession?.(this.session);
+      view?.setRelatedNotes?.(this.relatedNotes);
+    }
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
+      const view = (leaf as { view?: { setDependencies?: (status: any, related: any) => void } })
+        .view;
+      view?.setDependencies?.(this.indexStatus, this.relatedNotes);
     }
   }
 
@@ -349,14 +391,98 @@ export class TramaPlugin extends Plugin {
     return this.embeddingModel.discoverModels(signal);
   }
 
+  getRelatedNotes(): RelatedNotes | undefined {
+    return this.relatedNotes;
+  }
+  getIndexStatus(): ReturnType<IndexStatusController["getStatus"]> | undefined {
+    return this.indexStatus?.getStatus();
+  }
+  subscribeIndexStatus(listener: Parameters<IndexStatusController["subscribe"]>[0]): () => void {
+    return this.indexStatus?.subscribe(listener) ?? (() => undefined);
+  }
+
+  private async runFullIndex(signal: AbortSignal): Promise<void> {
+    return this.runIndex(signal, true);
+  }
+
+  private async runIndex(signal: AbortSignal, force: boolean): Promise<void> {
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+    const manager = this.index;
+    if (!manager) throw new Error("Index is not initialized.");
+    await this.indexLoad;
+    if (this.index !== manager) throw new Error("Index was replaced during indexing.");
+    try {
+      if (force) await manager.build(signal);
+      else await manager.synchronize(signal);
+      this.indexReady = true;
+      const app = (this as unknown as { app?: any }).app;
+      if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
+      this.pendingVaultChanges.clear();
+      if (this.queuedWork) await this.reconcileNow().catch(() => undefined);
+      else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
+      else this.indexStatus?.setReady();
+    } catch (error) {
+      // A failed/cancelled rebuild does not discard queued vault revisions. If
+      // a last-good generation remains, retry them through the normal debounce.
+      if (this.queuedWork && manager.hasUsableIndex()) this.scheduleReconcile();
+      throw error;
+    }
+  }
+
+  private scheduleReconcile(): void {
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = setTimeout(() => {
+      this.eventTimer = undefined;
+      void this.reconcileNow().catch(() => undefined);
+    }, 1500);
+  }
+
+  private async reconcileNow(): Promise<void> {
+    const manager = this.index;
+    if (!manager || !this.indexReady || !this.lifecycleAbort) return;
+    // Explicit builds own the user-facing state. The queued work remains in
+    // IndexManager and is picked up after the build commits or fails.
+    if (manager.isBuilding()) return;
+    if (this.reconcilePromise) return this.reconcilePromise;
+    this.queuedWork = false;
+    this.indexStatus?.setUpdating();
+    this.reconcilePromise = manager
+      .reconcileQueuedChanges(this.lifecycleAbort.signal)
+      .then(() => {
+        this.indexStatus?.setReady();
+        const app = (this as unknown as { app?: any }).app;
+        if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
+      })
+      .catch((error) => {
+        this.queuedWork = true;
+        if (this.index === manager) this.indexStatus?.markStale(true);
+        throw error;
+      })
+      .finally(() => {
+        this.reconcilePromise = undefined;
+        if (this.queuedWork && this.indexReady) this.scheduleReconcile();
+      });
+    return this.reconcilePromise;
+  }
+
   private registerVaultEvents(vault: any): void {
-    for (const event of ["create", "modify", "delete"])
-      this.registerVaultEvent(vault, event, (file: TAbstractFile) =>
-        this.queueVaultChange(file.path)
-      );
+    this.registerVaultEvent(vault, "create", (file: TAbstractFile) =>
+      this.queueVaultOperation({ kind: "create", path: file.path })
+    );
+    this.registerVaultEvent(vault, "modify", (file: TAbstractFile) =>
+      this.queueVaultOperation({ kind: "modify", path: file.path })
+    );
+    this.registerVaultEvent(vault, "delete", (file: TAbstractFile) =>
+      this.queueVaultOperation({ kind: "delete", path: file.path })
+    );
     this.registerVaultEvent(vault, "rename", (file: TAbstractFile, oldPath: string) => {
-      this.queueVaultChange(oldPath);
-      this.queueVaultChange(file.path);
+      const oldVisible = this.isVisibleMarkdown(oldPath);
+      const newVisible = this.isVisibleMarkdown(file.path);
+      if (oldVisible && newVisible)
+        this.queueVaultOperation({ kind: "rename", oldPath, path: file.path });
+      else if (oldVisible) this.queueVaultOperation({ kind: "delete", path: oldPath });
+      else if (newVisible) this.queueVaultOperation({ kind: "create", path: file.path });
     });
   }
   private registerVaultEvent(vault: any, event: string, callback: (...args: any[]) => void): void {
@@ -364,23 +490,28 @@ export class TramaPlugin extends Plugin {
     this.eventRefs.push(ref);
     this.registerEvent(ref);
   }
-  private queueVaultChange(path: string): void {
-    if (!this.isVisibleMarkdown(path) || !this.index) return;
+  private queueVaultOperation(
+    operation:
+      | { kind: "create" | "modify" | "delete" | "empty" | "unchanged"; path: string }
+      | { kind: "rename"; oldPath: string; path: string }
+  ): void {
+    const paths =
+      operation.kind === "rename" ? [operation.oldPath, operation.path] : [operation.path];
+    if (paths.every((path) => !this.isVisibleMarkdown(path)) || !this.index) return;
     if (!this.indexLoaded || !this.indexReady) {
-      this.pendingVaultChanges.add(path);
+      if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
+      else this.index.queueOperation(operation as any);
+      for (const path of paths) this.pendingVaultChanges.add(path);
+      this.queuedWork = true;
       return;
     }
-    this.index.queueChange(path);
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.eventTimer = setTimeout(() => {
-      this.eventTimer = undefined;
-      const index = this.index;
-      if (this.indexReady && index && this.lifecycleAbort)
-        void index.reconcileQueuedChanges(this.lifecycleAbort.signal).catch((error) => {
-          this.handleIndexFailure(index, error);
-        });
-    }, 150);
+    this.queuedWork = true;
+    if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
+    else this.index.queueOperation(operation as any);
+    if (!this.index.isBuilding()) this.indexStatus?.setUpdating();
+    this.scheduleReconcile();
   }
+
   private isVisibleMarkdown(path: string): boolean {
     const configDir = (
       (this as unknown as { app?: { vault?: { configDir?: string } } }).app?.vault?.configDir ??

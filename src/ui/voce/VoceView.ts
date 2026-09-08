@@ -12,6 +12,7 @@ import {
 import { AssistantConversationTurn, CHAT_LIMITS, ChatSession, ChatState } from "@/chat/ChatSession";
 import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReferences";
 import { ProvenanceRecord } from "@/domain/contracts";
+import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
 
 export const VOCE_VIEW_TYPE = "trama-voce";
 const COLLAPSIBLE_MESSAGE_LENGTH = 600;
@@ -87,6 +88,10 @@ export class VoceView extends ItemView {
   private localError?: string;
   private attachmentPickerGeneration = 0;
   private isViewOpen = false;
+  private relatedUnsubscribe?: () => void;
+  private relatedAbort?: AbortController;
+  private relatedRequestGeneration = 0;
+  private relatedRequestKey?: string;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -94,7 +99,8 @@ export class VoceView extends ItemView {
     private readonly noteCatalog: () => readonly string[] = () => [],
     private readonly noteSuggestions: () => readonly string[] = () => [],
     private readonly copyText: (content: string) => Promise<void> = (content) =>
-      navigator.clipboard.writeText(content)
+      navigator.clipboard.writeText(content),
+    private relatedNotes?: RelatedNotes
   ) {
     super(leaf);
   }
@@ -105,6 +111,29 @@ export class VoceView extends ItemView {
     this.session = session;
     this.expandedTurnIds.clear();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
+  }
+
+  /** Rebinds related-note suggestions when embedding settings replace the index graph. */
+  setRelatedNotes(relatedNotes?: RelatedNotes): void {
+    this.relatedUnsubscribe?.();
+    this.relatedUnsubscribe = undefined;
+    this.relatedAbort?.abort();
+    this.relatedAbort = undefined;
+    this.relatedRequestGeneration++;
+    this.relatedRequestKey = undefined;
+    this.relatedNotes = relatedNotes;
+    if (!this.isViewOpen) return;
+    this.relatedUnsubscribe = relatedNotes?.subscribe((result: RelatedNotesResult) => {
+      if (this.acceptsRelatedResult(result)) this.renderAttachments();
+    });
+    this.refreshRelated();
+    this.renderAttachments();
+  }
+
+  /** Refreshes suggestions after the index publishes a new committed generation. */
+  refreshRelatedSuggestions(): void {
+    if (!this.isViewOpen) return;
+    this.refreshRelated();
   }
 
   getViewType(): string {
@@ -158,7 +187,16 @@ export class VoceView extends ItemView {
       }
       void this.submit();
     });
-    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.renderAttachments()));
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        this.renderAttachments();
+        this.refreshRelated();
+      })
+    );
+    this.relatedUnsubscribe = this.relatedNotes?.subscribe((result: RelatedNotesResult) => {
+      if (this.acceptsRelatedResult(result)) this.renderAttachments();
+    });
+    this.refreshRelated();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
     return Promise.resolve();
   }
@@ -173,6 +211,12 @@ export class VoceView extends ItemView {
     this.session.cancel();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.relatedUnsubscribe?.();
+    this.relatedUnsubscribe = undefined;
+    this.relatedRequestGeneration++;
+    this.relatedRequestKey = undefined;
+    this.relatedAbort?.abort();
+    this.relatedAbort = undefined;
     return Promise.resolve();
   }
 
@@ -367,8 +411,16 @@ export class VoceView extends ItemView {
   private renderAttachments(): void {
     this.attachments.empty();
     const selected = new Set(this.selectedAttachmentPaths);
+    const relatedSuggestions = this.relatedNotes?.latest?.(this.activePath()) ?? [];
+    const activeSuggestions = this.noteSuggestions().filter((path) =>
+      this.noteCatalog().includes(path)
+    );
     const suggestions = [
-      ...new Set(this.noteSuggestions().filter((path) => this.noteCatalog().includes(path))),
+      ...new Set(
+        [...activeSuggestions, ...relatedSuggestions].filter((path) =>
+          this.noteCatalog().includes(path)
+        )
+      ),
     ];
     const paths = [
       ...suggestions,
@@ -413,6 +465,43 @@ export class VoceView extends ItemView {
     setIcon(addButton, "plus");
     setTooltip(addButton, "Choose note");
     addButton.addEventListener("click", () => this.openAttachmentPicker());
+  }
+
+  private refreshRelated(): void {
+    const path = this.activePath();
+    this.relatedAbort?.abort();
+    const generation = ++this.relatedRequestGeneration;
+    this.relatedRequestKey =
+      path && typeof (this.relatedNotes as any)?.snapshotKey === "function"
+        ? this.relatedNotes?.snapshotKey(path)
+        : undefined;
+    this.renderAttachments();
+    if (!path || !this.relatedNotes) return;
+    const controller = new AbortController();
+    this.relatedAbort = controller;
+    void this.relatedNotes
+      .find(path, controller.signal, 7)
+      .then((result) => {
+        if (generation !== this.relatedRequestGeneration || controller.signal.aborted) return;
+        if (this.acceptsRelatedResult(result)) this.renderAttachments();
+      })
+      .catch(() => undefined);
+  }
+
+  private acceptsRelatedResult(result: RelatedNotesResult): boolean {
+    if (result.currentPath !== this.activePath()) return false;
+    const expected = `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
+    const current =
+      typeof (this.relatedNotes as any)?.snapshotKey === "function"
+        ? this.relatedNotes?.snapshotKey(result.currentPath)
+        : undefined;
+    return current
+      ? current === expected
+      : !this.relatedRequestKey || this.relatedRequestKey === expected;
+  }
+
+  private activePath(): string {
+    return (this.app as any)?.workspace?.getActiveFile?.()?.path ?? "";
   }
 
   private noteLabel(path: string): string {

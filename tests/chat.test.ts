@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ChatMessage, ChatModel, ChatResponse, ReadonlyNote } from "@/domain/contracts";
 import { CHAT_LIMITS, ChatSession, dedupeProvenance, SendTurnInput } from "@/chat/ChatSession";
-import { VoceDiagnosticRecord } from "@/chat/VoceDiagnostics";
+import { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 import { ReadonlyTool, ToolRegistry } from "@/tools/ToolRegistry";
 
 const input = (content: string, attachmentPaths: readonly string[] = []): SendTurnInput => ({
@@ -142,7 +142,7 @@ describe("ChatSession module", () => {
 
       it("rejects excessive selections and attachment context before adding a turn or calling the model", async () => {
         const complete = vi.fn();
-        const records: VoceDiagnosticRecord[] = [];
+        const records: TramaDiagnosticRecord[] = [];
         const session = new ChatSession(
           { complete },
           new ToolRegistry([]),
@@ -164,6 +164,7 @@ describe("ChatSession module", () => {
         expect(state.error).toMatchObject({ code: "limit_exceeded" });
         expect(complete).not.toHaveBeenCalled();
         expect(records).toContainEqual({
+          area: "chat",
           event: "limit_reached",
           generation: 1,
           message: "Attached notes exceed the 32,000-character context limit.",
@@ -383,7 +384,7 @@ describe("ChatSession module", () => {
 
     describe("diagnostics", () => {
       it("emits typed session lifecycle records without retaining them", async () => {
-        const records: VoceDiagnosticRecord[] = [];
+        const records: TramaDiagnosticRecord[] = [];
         await new ChatSession(
           {
             complete: vi
@@ -405,7 +406,7 @@ describe("ChatSession module", () => {
       });
 
       it("emits exact tool and session-error payloads", async () => {
-        const records: VoceDiagnosticRecord[] = [];
+        const records: TramaDiagnosticRecord[] = [];
         const call = { id: "read", name: "read", arguments: { path: "A.md" } };
         const result = {
           ok: true,
@@ -442,6 +443,30 @@ describe("ChatSession module", () => {
         ).send(input("question"));
 
         expect(records.find((record) => record.event === "error")).toMatchObject({ error });
+      });
+
+      it("keeps a successful turn intact when the diagnostic sink throws", async () => {
+        const session = new ChatSession(
+          {
+            complete: vi
+              .fn()
+              .mockResolvedValue(response({ role: "assistant", content: "done" }, "stop")),
+          },
+          new ToolRegistry([]),
+          vault(async (path) => ({ path, content: "note" })),
+          {
+            emit: () => {
+              throw new Error("diagnostics unavailable");
+            },
+          }
+        );
+
+        const state = await session.send(input("question"));
+        expect(state.running).toBe(false);
+        expect(state.turns.find((turn) => turn.role === "assistant")).toMatchObject({
+          content: "done",
+          status: "complete",
+        });
       });
     });
   });
