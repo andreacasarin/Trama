@@ -33,11 +33,13 @@ function yieldMacrotask(): Promise<void> {
 /** Exact, immutable Float32 segment scan. The snapshot is pinned for this index's lifetime. */
 export class ExactVectorIndex implements VectorIndex {
   readonly snapshot: CorpusSnapshot;
+  readonly dimensions?: number;
   private readonly segments: readonly SegmentRef[];
   private closed = false;
 
   private constructor(snapshot: CorpusSnapshot, segments: readonly SegmentRef[]) {
     this.snapshot = snapshot;
+    this.dimensions = segments[0]?.view.segment.dimensions;
     this.segments = segments;
   }
 
@@ -106,6 +108,7 @@ export class ExactVectorIndex implements VectorIndex {
     const dimensions = this.segments[0]?.view.segment.dimensions ?? query.length;
     if (query.length !== dimensions) throw new Error("Query vector dimensions mismatch");
     const heap: VectorSearchHit[] = [];
+    const bestByPath = options.distinctPaths ? new Map<string, VectorSearchHit>() : undefined;
     let lastYield = Date.now();
     let seen = 0;
     for (const ref of this.segments) {
@@ -130,12 +133,17 @@ export class ExactVectorIndex implements VectorIndex {
           ordinal: ref.ordinalBase + segment.records[i].ordinal,
           score,
         };
-        if (heap.length < limit) {
-          heap.push(hit);
-          heap.sort(compareWorst);
-        } else if (compareBetter(hit, heap[0]) > 0) {
-          heap[0] = hit;
-          heap.sort(compareWorst);
+        if (bestByPath) {
+          const previous = bestByPath.get(hit.path);
+          if (!previous || compareBetter(hit, previous) > 0) bestByPath.set(hit.path, hit);
+        } else {
+          if (heap.length < limit) {
+            heap.push(hit);
+            heap.sort(compareWorst);
+          } else if (compareBetter(hit, heap[0]) > 0) {
+            heap[0] = hit;
+            heap.sort(compareWorst);
+          }
         }
         if (Date.now() - lastYield >= 8) {
           await yieldMacrotask();
@@ -144,6 +152,8 @@ export class ExactVectorIndex implements VectorIndex {
         }
       }
     }
+    if (bestByPath)
+      return [...bestByPath.values()].sort((a, b) => -compareBetter(a, b)).slice(0, limit);
     heap.sort((a, b) => -compareBetter(a, b));
     return heap;
   }

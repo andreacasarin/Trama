@@ -21,6 +21,8 @@ import {
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { RelatedNotes } from "@/index/RelatedNotes";
 import { TRAMA_ICONS } from "@/ui/icons";
+import { LenteSearch } from "@/index/LenteSearch";
+import { ObsidianLenteNoteStats } from "@/vault/readOnly/ObsidianLenteNoteStats";
 
 /** Composes the desktop-only assistant and owns its lifecycle and vault event boundary. */
 export class TramaPlugin extends Plugin {
@@ -32,6 +34,7 @@ export class TramaPlugin extends Plugin {
   private index?: IndexManager;
   private indexStatus?: IndexStatusController;
   private relatedNotes?: RelatedNotes;
+  private lenteSearch?: LenteSearch;
   private lifecycleAbort?: AbortController;
   private indexLoad?: Promise<boolean>;
   private indexLoaded = false;
@@ -80,12 +83,17 @@ export class TramaPlugin extends Plugin {
       this.lastActiveMarkdownPath ? [this.lastActiveMarkdownPath] : [];
     const fileOpenRef = app.workspace.on?.("file-open", rememberActiveMarkdown);
     if (fileOpenRef) this.registerEvent(fileOpenRef);
-    const [{ VoceView, VOCE_VIEW_TYPE }, { FiloView, FILO_VIEW_TYPE }, { TramaSettingsTab }] =
-      await Promise.all([
-        import("@/ui/voce/VoceView"),
-        import("@/ui/filo/FiloView"),
-        import("@/ui/settings/SettingsTab"),
-      ]);
+    const [
+      { VoceView, VOCE_VIEW_TYPE },
+      { FiloView, FILO_VIEW_TYPE },
+      { LenteView, LENTE_VIEW_TYPE },
+      { TramaSettingsTab },
+    ] = await Promise.all([
+      import("@/ui/voce/VoceView"),
+      import("@/ui/filo/FiloView"),
+      import("@/ui/lente/LenteView"),
+      import("@/ui/settings/SettingsTab"),
+    ]);
     this.lifecycleAbort = new AbortController();
     const settings = this.settingsStore.get();
     this.composeRuntime(app, settings);
@@ -123,6 +131,18 @@ export class TramaPlugin extends Plugin {
           () => this.indexStatus!.cancel()
         )
     );
+    this.registerView(
+      LENTE_VIEW_TYPE,
+      (leaf) =>
+        new LenteView(
+          leaf,
+          this.lenteSearch ?? {
+            search: async () => {
+              throw new Error("Lente is not initialized.");
+            },
+          }
+        )
+    );
     this.addCommand({
       id: "open-voce",
       name: "Open Voce",
@@ -136,6 +156,13 @@ export class TramaPlugin extends Plugin {
       icon: TRAMA_ICONS.filo,
       callback: () =>
         void app.workspace.getLeaf(true).setViewState({ type: FILO_VIEW_TYPE, active: true }),
+    });
+    this.addCommand({
+      id: "open-lente",
+      name: "Open Lente",
+      icon: TRAMA_ICONS.lente,
+      callback: () =>
+        void app.workspace.getLeaf(true).setViewState({ type: LENTE_VIEW_TYPE, active: true }),
     });
     this.registerVaultEvents(app.vault);
   }
@@ -261,6 +288,11 @@ export class TramaPlugin extends Plugin {
     this.index = manager;
     this.relatedNotes?.cancel();
     this.relatedNotes = new RelatedNotes(manager, this.diagnostics);
+    this.lenteSearch = new LenteSearch(
+      manager,
+      new ObsidianLenteNoteStats(app.vault),
+      this.diagnostics
+    );
     const compositionRevision = ++this.compositionRevision;
     const registry = new ToolRegistry([
       new ReadNoteTool(readonlyVault),
@@ -313,6 +345,13 @@ export class TramaPlugin extends Plugin {
     }
   }
 
+  private refreshOpenLente(app: any): void {
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
+      const view = (leaf as { view?: { refreshSubmitted?: () => void } }).view;
+      view?.refreshSubmitted?.();
+    }
+  }
+
   private composeChatSession(
     app: any,
     settings: TramaSettings,
@@ -355,6 +394,10 @@ export class TramaPlugin extends Plugin {
       const view = (leaf as { view?: { setDependencies?: (status: any, related: any) => void } })
         .view;
       view?.setDependencies?.(this.indexStatus, this.relatedNotes);
+    }
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
+      const view = (leaf as { view?: { setSearch?: (search: LenteSearch) => void } }).view;
+      if (this.lenteSearch) view?.setSearch?.(this.lenteSearch);
     }
   }
 
@@ -416,11 +459,13 @@ export class TramaPlugin extends Plugin {
     await this.indexLoad;
     if (this.index !== manager) throw new Error("Index was replaced during indexing.");
     try {
-      if (force) await manager.build(signal);
-      else await manager.synchronize(signal);
+      const published = force
+        ? (await manager.build(signal), true)
+        : await manager.synchronizeWithPublication(signal);
       this.indexReady = true;
       const app = (this as unknown as { app?: any }).app;
       if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
+      if (published && app?.workspace) this.refreshOpenLente(app);
       this.pendingVaultChanges.clear();
       if (this.queuedWork) await this.reconcileNow().catch(() => undefined);
       else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
@@ -453,9 +498,11 @@ export class TramaPlugin extends Plugin {
     this.reconcilePromise = manager
       .reconcileQueuedChanges(this.lifecycleAbort.signal)
       .then(() => {
+        const published = manager.getLastReconciliationPublished();
         this.indexStatus?.setReady();
         const app = (this as unknown as { app?: any }).app;
         if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
+        if (published && app?.workspace) this.refreshOpenLente(app);
       })
       .catch((error) => {
         this.queuedWork = true;

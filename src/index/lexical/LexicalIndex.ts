@@ -6,7 +6,10 @@ export interface LexicalSearchOptions {
   readonly visiblePaths?: readonly string[] | ReadonlySet<string>;
   readonly excludePath?: string;
   readonly signal?: AbortSignal;
+  readonly profile?: LexicalProfile;
 }
+
+export type LexicalProfile = "default" | "lente";
 
 export interface LexicalHit {
   readonly id: string;
@@ -25,11 +28,13 @@ export interface LexicalProgress {
 export interface LexicalBuildOptions {
   readonly signal?: AbortSignal;
   readonly onProgress?: (event: LexicalProgress) => void;
+  readonly profile?: LexicalProfile;
 }
 
 export interface LexicalIndex {
   readonly generationId: string;
   readonly fingerprint: string;
+  readonly profile?: LexicalProfile;
   search(query: string, options?: LexicalSearchOptions): Promise<readonly LexicalHit[]>;
   close(): Promise<void>;
 }

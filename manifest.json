@@ -3,7 +3,7 @@
   "name": "Trama",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Local-first AI for conversing with your vault through Voce and discovering related notes through Filo.",
+  "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
   "author": "Andrea Casarin",
   "isDesktopOnly": true
 }

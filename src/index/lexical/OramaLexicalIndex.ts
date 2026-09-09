@@ -6,6 +6,7 @@ import type {
   LexicalHit,
   LexicalIndex,
   LexicalSearchOptions,
+  LexicalProfile,
 } from "./LexicalIndex";
 
 const BATCH_SIZE = 256;
@@ -13,7 +14,15 @@ const cancelled = () => new Error("Lexical operation cancelled");
 function check(signal?: AbortSignal): void {
   if (signal?.aborted) throw cancelled();
 }
-type LexicalDocument = { id: string; text: string; path: string; ordinal: number };
+type LexicalDocument = {
+  id: string;
+  text: string;
+  path: string;
+  ordinal: number;
+  filename?: string;
+  pathText?: string;
+  body?: string;
+};
 type LexicalDb = AnyOrama;
 
 function paths(value: LexicalSearchOptions["visiblePaths"]): readonly string[] | undefined {
@@ -28,7 +37,9 @@ export class OramaLexicalIndex implements LexicalIndex {
     private readonly db: LexicalDb,
     private readonly snapshot: CorpusSnapshot,
     readonly generationId: string,
-    readonly fingerprint: string
+    readonly fingerprint: string,
+    readonly profile: LexicalProfile,
+    private readonly documentCount: number
   ) {}
 
   static async build(
@@ -37,9 +48,21 @@ export class OramaLexicalIndex implements LexicalIndex {
   ): Promise<OramaLexicalIndex> {
     check(options.signal);
     const snapshot = source.pin();
+    const profile = options.profile ?? "default";
     try {
       const db = await create({
-        schema: { id: "string", text: "string", path: "string", ordinal: "number" },
+        schema:
+          profile === "lente"
+            ? {
+                id: "string",
+                text: "string",
+                path: "string",
+                ordinal: "number",
+                filename: "string",
+                pathText: "string",
+                body: "string",
+              }
+            : { id: "string", text: "string", path: "string", ordinal: "number" },
       });
       const total = snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0);
       let completed = 0;
@@ -60,19 +83,34 @@ export class OramaLexicalIndex implements LexicalIndex {
           for (const record of segment.segment.records) {
             check(options.signal);
             const ordinal = noteOffset + record.ordinal;
-            batch.push({
+            const document: LexicalDocument = {
               id: `${note.path}:${ordinal}`,
               text: record.text,
               path: note.path,
               ordinal,
-            });
+              filename: note.path.slice(note.path.lastIndexOf("/") + 1),
+              pathText: note.path,
+              body: record.text,
+            };
+            batch.push(
+              profile === "lente"
+                ? document
+                : { id: document.id, text: document.text, path: document.path, ordinal }
+            );
             if (batch.length >= BATCH_SIZE) await flush();
           }
           noteOffset += segment.segment.records.length;
         }
       }
       await flush();
-      return new OramaLexicalIndex(db, snapshot, snapshot.generationId, snapshot.fingerprint);
+      return new OramaLexicalIndex(
+        db,
+        snapshot,
+        snapshot.generationId,
+        snapshot.fingerprint,
+        profile,
+        total
+      );
     } catch (error) {
       await snapshot.release();
       throw error;
@@ -89,14 +127,29 @@ export class OramaLexicalIndex implements LexicalIndex {
     const where: Record<string, unknown>[] = [];
     if (visible) where.push({ path: visible });
     if (options.excludePath) where.push({ not: { path: options.excludePath } });
+    const profile: LexicalProfile = options.profile ?? "default";
     const params: Record<string, unknown> = {
       term: query,
-      properties: ["text"],
+      properties: profile === "lente" ? ["filename", "pathText", "body"] : ["text"],
       limit: candidateLimit,
     };
+    if (profile === "lente") params.boost = { filename: 3, pathText: 2, body: 1 };
     if (where.length === 1) params.where = where[0];
     else if (where.length > 1) params.where = { and: where };
-    const result = await search(this.db, params as never);
+    let result;
+    if (profile === "lente" && candidateLimit > 0) {
+      let searchLimit = Math.min(this.documentCount, Math.max(32, candidateLimit));
+      result = await search(this.db, { ...params, limit: searchLimit } as never);
+      while (distinctPathCount(result.hits) < Math.min(candidateLimit, this.documentCount)) {
+        check(options.signal);
+        if (searchLimit >= this.documentCount) break;
+        searchLimit = Math.min(this.documentCount, searchLimit * 2);
+        result = await search(this.db, { ...params, limit: searchLimit } as never);
+        check(options.signal);
+      }
+    } else {
+      result = await search(this.db, params as never);
+    }
     check(options.signal);
     const hits: LexicalHit[] = result.hits
       .map((hit) => {
@@ -111,7 +164,16 @@ export class OramaLexicalIndex implements LexicalIndex {
           a.ordinal - b.ordinal ||
           compareCodeUnits(a.id, b.id)
       );
-    return hits.slice(0, limit);
+    if (profile !== "lente") return hits.slice(0, limit);
+    const distinct: LexicalHit[] = [];
+    const seen = new Set<string>();
+    for (const hit of hits) {
+      if (seen.has(hit.path)) continue;
+      seen.add(hit.path);
+      distinct.push(hit);
+      if (distinct.length >= limit) break;
+    }
+    return distinct;
   }
 
   async close(): Promise<void> {
@@ -119,4 +181,13 @@ export class OramaLexicalIndex implements LexicalIndex {
     this.closed = true;
     await this.snapshot.release();
   }
+}
+
+function distinctPathCount(hits: readonly { document: unknown }[]): number {
+  const paths = new Set<string>();
+  for (const hit of hits) {
+    const path = (hit.document as { path?: unknown }).path;
+    if (typeof path === "string") paths.add(path);
+  }
+  return paths.size;
 }

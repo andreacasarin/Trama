@@ -62,6 +62,50 @@ function manager(
 }
 
 describe("semantic index module", () => {
+  it("exposes a generation-leased Lente pool beyond the seven-note RAG default", async () => {
+    const contents = Object.fromEntries(
+      Array.from({ length: 40 }, (_, index) => [`note-${index}.md`, `needle body ${index}`])
+    );
+    const setup = manager(contents);
+    await setup.manager.build(signal);
+    const lease = setup.manager.acquireLenteLease();
+    expect(lease).not.toBeNull();
+    const results = await lease!.search("needle", "lexical", signal);
+    expect(results).toHaveLength(40);
+    await lease!.release();
+  });
+
+  it("keeps distinct notes in both Lente channels when one note has over 160 chunks", async () => {
+    const contents = {
+      "heavy.md": "needle ".repeat(3_000),
+      "other-a.md": "needle other a",
+      "other-b.md": "needle other b",
+    };
+    const setup = manager(contents);
+    await setup.manager.build(signal);
+    const lease = setup.manager.acquireLenteLease();
+    expect(lease).not.toBeNull();
+    const lexical = await lease!.search("needle", "lexical", signal);
+    const semantic = await lease!.retriever.search({
+      query: "needle",
+      mode: "semantic",
+      resultShape: "notes",
+      limit: 160,
+      semanticCandidateLimit: 160,
+      lexicalCandidateLimit: 160,
+      lexicalProfile: "lente",
+      feature: "lente",
+      signal,
+    });
+    expect(new Set(lexical.map((result) => result.path))).toEqual(
+      new Set(["heavy.md", "other-a.md", "other-b.md"])
+    );
+    expect(new Set(semantic.map((result) => result.path))).toEqual(
+      new Set(["heavy.md", "other-a.md", "other-b.md"])
+    );
+    await lease!.release();
+  });
+
   it("handles a bounded 1,000-chunk 768D corpus without generation JSON", async () => {
     const dimensions = 768;
     const content = Array.from(

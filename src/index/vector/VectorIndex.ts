@@ -17,10 +17,14 @@ export interface VectorSearchOptions {
   readonly visiblePaths?: ReadonlySet<string>;
   /** Optional visibility predicate for callers that do not maintain a set. */
   readonly isVisible?: (path: string) => boolean;
+  /** Feature-specific path grouping used by Lente; defaults preserve chunk search. */
+  readonly distinctPaths?: boolean;
 }
 
 export interface VectorIndex {
   readonly snapshot: CorpusSnapshot;
+  /** Dimension of committed vectors when the backend can expose it. */
+  readonly dimensions?: number;
   search(
     vector: readonly number[],
     options?: VectorSearchOptions

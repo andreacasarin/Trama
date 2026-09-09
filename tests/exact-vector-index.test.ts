@@ -135,12 +135,77 @@ async function multiFixture(count = 20) {
   };
 }
 
+async function multiPathFixture() {
+  const notes = [
+    { path: "heavy.md", contentId: id("7"), count: 200, vector: [1, 0] },
+    { path: "other-a.md", contentId: id("8"), count: 1, vector: [0.8, 0.6] },
+    { path: "other-b.md", contentId: id("9"), count: 1, vector: [0.8, 0.6] },
+  ];
+  const views = new Map<string, CorpusSegmentView>();
+  const manifestNotes = [];
+  for (const note of notes) {
+    const records = Array.from({ length: note.count }, (_, ordinal) => ({
+      ordinal,
+      startLine: ordinal + 1,
+      endLine: ordinal + 1,
+      text: `${note.path}:${ordinal}`,
+      vector: note.vector,
+    }));
+    const descriptors = [];
+    for (let offset = 0; offset < records.length; offset += 100) {
+      const encoded = await encodeBinarySegment({
+        dimensions: 2,
+        noteContentId: note.contentId,
+        records: records
+          .slice(offset, offset + 100)
+          .map((record, index) => ({ ...record, ordinal: index })),
+      });
+      views.set(encoded.segmentId, {
+        id: encoded.segmentId,
+        checksum: encoded.checksum,
+        chunkCount: encoded.records.length,
+        segment: encoded,
+      });
+      descriptors.push({
+        id: encoded.segmentId,
+        checksum: encoded.checksum,
+        chunkCount: encoded.records.length,
+        firstOrdinal: offset,
+      });
+    }
+    manifestNotes.push({
+      path: note.path,
+      contentId: note.contentId,
+      chunkCount: note.count,
+      segments: descriptors,
+    });
+  }
+  const snapshot = {
+    generationId: id("1"),
+    fingerprint: id("2"),
+    root: {} as never,
+    notes: manifestNotes,
+    pin() {
+      return this;
+    },
+    async release() {},
+    getNote: () => undefined,
+    readSegment: async (segmentId: string) => views.get(segmentId)!,
+    hydrateNote: async () => [...views.values()],
+    hydrateChunk: async () => undefined,
+  } as unknown as CorpusSnapshot;
+  return { snapshot };
+}
+
 describe("ExactVectorIndex", () => {
   it("scans normalized Float32 vectors in deterministic order and releases its pin", async () => {
     const state = await fixture();
     const index = await ExactVectorIndex.open(state.snapshot);
     expect((await index.search([1, 0], { limit: 10 })).map((hit) => hit.ordinal)).toEqual([0, 1]);
     expect((await index.search([1, 0], { currentPath: "A.md" })).length).toBe(0);
+    expect(
+      (await index.search([1, 0], { distinctPaths: true, limit: 10 })).map((hit) => hit.ordinal)
+    ).toEqual([0]);
     await index.close();
     await index.close();
     expect(state.releases).toBe(1);
@@ -153,6 +218,15 @@ describe("ExactVectorIndex", () => {
     expect((await index.search([1, 0], { limit: 5000 })).length).toBe(2);
     await expect(index.search([0, 0])).rejects.toThrow();
     await expect(index.search([1])).rejects.toThrow("dimensions");
+    await index.close();
+  });
+
+  it("caps distinct paths after scanning all chunks and keeps lower-ranked notes", async () => {
+    const state = await multiPathFixture();
+    const index = await ExactVectorIndex.open(state.snapshot);
+    const results = await index.search([1, 0], { distinctPaths: true, limit: 160 });
+    expect(results.map((result) => result.path)).toEqual(["heavy.md", "other-a.md", "other-b.md"]);
+    expect(results.find((result) => result.path === "heavy.md")?.ordinal).toBe(0);
     await index.close();
   });
 

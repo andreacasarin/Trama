@@ -1,12 +1,12 @@
 # Trama
 
-Trama is a desktop-only Obsidian plugin for local AI conversation and semantic connections. **Voce** is the agent chat that can navigate linked notes, while **Filo** is the per-note view for discovering semantically related notes. Chat and embedding requests go only to a user-approved local LM Studio endpoint. Trama performs no network requests at startup; connection and model discovery are triggered by sending a message or indexing the vault.
+Trama is a desktop-only Obsidian plugin for local AI conversation and semantic connections. **Voce** is the agent chat that can navigate linked notes, **Filo** discovers semantically related notes, and **Lente** searches indexed visible Markdown notes. Chat and embedding requests go only to a user-approved local LM Studio endpoint. Trama performs no network requests at startup; connection and model discovery are triggered by sending a message or indexing the vault.
 
 ## Setup
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer**, load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
 2. Configure the chat model and embedding model independently in the plugin settings.
-3. Use **Index vault** from the command palette for the initial explicit index, then open **Voce** with **Open Voce** or **Filo** with **Open Filo**.
+3. Use **Index vault** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
 
 The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
 
@@ -22,6 +22,15 @@ themselves to a prompt. Filo presents results as a native disclosure list: the n
 title opens the note, the caret reveals the winning indexed passage and source lines,
 and cosine similarity is summarized as High (at least 0.72), Medium (at least 0.50),
 or Low using constants owned by the view.
+
+## Lente search
+
+Lente searches indexed visible Markdown only after Enter or Search is pressed.
+Results are unique notes with their winning passage. Relevant uses deterministic
+hybrid vector/BM25 ranking; Updated uses live note modification times. If query
+embeddings are unavailable, Lente retries lexical filename, path, and body
+matching and labels the result degraded. Its derived lexical index is in memory
+and does not alter the authoritative schema-3 corpus.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and

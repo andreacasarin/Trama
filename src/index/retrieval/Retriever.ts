@@ -3,11 +3,14 @@ import type { BinarySegmentRecord } from "@/index/corpus/BinarySegment";
 import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
 import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
 import { chunkId } from "@/index/corpus/Hash";
-import type { LexicalHit, LexicalIndex } from "@/index/lexical/LexicalIndex";
+import type { LexicalHit, LexicalIndex, LexicalProfile } from "@/index/lexical/LexicalIndex";
 import type { VectorIndex, VectorSearchHit } from "@/index/vector/VectorIndex";
+import { QueryEmbeddingError, isQueryEmbeddingError } from "./QueryEmbeddingError";
 
-export type RetrievalMode = "hybrid" | "semantic" | "related";
+export type RetrievalMode = "hybrid" | "semantic" | "related" | "lexical";
 export type RetrievalShape = "chunks" | "notes";
+
+export { QueryEmbeddingError, isQueryEmbeddingError } from "./QueryEmbeddingError";
 
 export interface RetrievalSnapshot {
   readonly corpus: CorpusSnapshot;
@@ -22,7 +25,7 @@ export interface RetrieverOptions {
   readonly snapshot: CorpusSnapshot;
   readonly vector: VectorIndex;
   readonly lexical: LexicalIndex;
-  readonly embedding?: Pick<EmbeddingModel, "embed">;
+  readonly embedding?: Pick<EmbeddingModel, "embed"> & Partial<Pick<EmbeddingModel, "dimensions">>;
 }
 
 export interface RetrievalRequest {
@@ -33,6 +36,9 @@ export interface RetrievalRequest {
   readonly limit?: number;
   readonly semanticCandidateLimit?: number;
   readonly lexicalCandidateLimit?: number;
+  readonly lexicalProfile?: LexicalProfile;
+  /** Explicit feature contract; only Lente may request more than seven notes. */
+  readonly feature?: "lente";
   readonly currentPath?: string | null;
   readonly excludePath?: string;
   readonly visiblePaths?: ReadonlySet<string> | readonly string[];
@@ -56,7 +62,8 @@ export interface RetrievalResult {
 export class Retriever {
   readonly snapshot: RetrievalSnapshot;
   private closed = false;
-  private readonly embedding?: Pick<EmbeddingModel, "embed">;
+  private readonly embedding?: Pick<EmbeddingModel, "embed"> &
+    Partial<Pick<EmbeddingModel, "dimensions">>;
 
   constructor(options: RetrieverOptions) {
     const { snapshot, vector, lexical } = options;
@@ -105,7 +112,7 @@ export class Retriever {
       throw new StructuredError("invalid_request", "Search query must not be empty.", false);
     const limit = checkedLimit(
       request.limit ?? (mode === "related" || shape === "notes" ? 7 : 20),
-      shape === "notes" ? 7 : mode === "related" ? 1_000 : 20
+      shape === "notes" ? (request.feature === "lente" ? 160 : 7) : mode === "related" ? 1_000 : 20
     );
     const semanticLimit = checkedCandidate(
       request.semanticCandidateLimit ?? (mode === "related" ? 128 : 80)
@@ -117,24 +124,45 @@ export class Retriever {
     check(signal);
     this.validateGeneration();
     let vector = request.queryVector;
-    if (!vector) {
-      if (!this.embedding)
-        throw new StructuredError("unavailable", "Query embedding is unavailable.", true);
-      const embedded = await this.embedding.embed([query], signal ?? new AbortController().signal);
+    if (mode !== "lexical" && !vector) {
+      if (!this.embedding) throw new QueryEmbeddingError();
+      let embedded: readonly (readonly number[])[];
+      try {
+        embedded = await this.embedding.embed([query], signal ?? new AbortController().signal);
+      } catch (error) {
+        if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
+        if (isAbortError(error) || isCancellationError(error)) throw error;
+        throw new QueryEmbeddingError();
+      }
       check(signal);
+      if (!Array.isArray(embedded) || embedded.length === 0) throw new QueryEmbeddingError();
       vector = embedded[0];
-      if (!vector)
-        throw new StructuredError("internal", "Embedding returned no query vector.", false);
+      const expectedDimensions = this.embedding.dimensions ?? this.snapshot.vector.dimensions;
+      const normSquared = Array.isArray(vector)
+        ? vector.reduce((sum, value) => sum + value * value, 0)
+        : Number.NaN;
+      const norm = Math.sqrt(normSquared);
+      if (
+        !Array.isArray(vector) ||
+        (expectedDimensions !== undefined && vector.length !== expectedDimensions) ||
+        vector.some((value) => !Number.isFinite(value)) ||
+        !(norm > 1e-12)
+      )
+        throw new QueryEmbeddingError();
     }
     const visible = request.visiblePaths;
     const excluded =
       request.excludePath ?? (mode === "related" ? (request.currentPath ?? undefined) : undefined);
-    const vectorPromise = this.snapshot.vector.search(vector!, {
-      signal,
-      limit: semanticLimit,
-      visiblePaths: toSet(visible),
-      excludePath: excluded,
-    });
+    const vectorPromise =
+      mode === "lexical"
+        ? Promise.resolve([] as readonly VectorSearchHit[])
+        : this.snapshot.vector.search(vector!, {
+            signal,
+            limit: semanticLimit,
+            visiblePaths: toSet(visible),
+            excludePath: excluded,
+            distinctPaths: request.feature === "lente",
+          });
     const lexicalPromise =
       mode === "semantic"
         ? Promise.resolve([] as readonly LexicalHit[])
@@ -144,6 +172,7 @@ export class Retriever {
             candidateLimit: lexicalLimit,
             visiblePaths: visible,
             excludePath: excluded,
+            profile: request.lexicalProfile,
           });
     let semantic: readonly VectorSearchHit[];
     let lexical: readonly LexicalHit[];
@@ -162,7 +191,10 @@ export class Retriever {
       0,
       lexicalLimit
     );
-    const merged = fuse(filteredSemantic, filteredLexical);
+    const merged =
+      request.feature === "lente"
+        ? fuseLenteByPath(filteredSemantic, filteredLexical)
+        : fuse(filteredSemantic, filteredLexical);
     const selected = shape === "notes" ? uniqueNotes(merged, limit) : merged.slice(0, limit);
     const hydrated: RetrievalResult[] = [];
     try {
@@ -244,6 +276,16 @@ function normalizeError(error: unknown, signal?: AbortSignal): Error {
     ? error
     : new StructuredError("internal", "Retrieval failed.", false);
 }
+function isAbortError(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError"
+  );
+}
+function isCancellationError(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && (error as { code?: unknown }).code === "cancelled"
+  );
+}
 
 interface Fused {
   id: string;
@@ -252,6 +294,46 @@ interface Fused {
   semanticScore?: number;
   lexicalScore?: number;
   fusedScore: number;
+  evidenceRank?: number;
+  evidenceChannel?: 0 | 1;
+  evidenceScore?: number;
+}
+
+/** Lente fuses channel ranks by note path, retaining one deterministic passage. */
+function fuseLenteByPath(
+  semantic: readonly VectorSearchHit[],
+  lexical: readonly LexicalHit[]
+): Fused[] {
+  const map = new Map<string, Fused>();
+  const add = (hit: VectorSearchHit | LexicalHit, rank: number, channel: 0 | 1): void => {
+    const old = map.get(hit.path);
+    const evidenceIsBetter =
+      !old ||
+      rank < (old.evidenceRank ?? Number.POSITIVE_INFINITY) ||
+      (rank === old.evidenceRank &&
+        (channel < (old.evidenceChannel ?? 1) ||
+          (channel === old.evidenceChannel &&
+            (hit.score > (old.evidenceScore ?? -Infinity) ||
+              (hit.score === (old.evidenceScore ?? -Infinity) && hit.ordinal < old.ordinal)))));
+    const next: Fused = {
+      ...old,
+      id: evidenceIsBetter ? hit.id : (old?.id ?? hit.id),
+      path: hit.path,
+      ordinal: evidenceIsBetter ? hit.ordinal : (old?.ordinal ?? hit.ordinal),
+      fusedScore: (old?.fusedScore ?? 0) + 1 / (60 + rank + 1),
+      ...(evidenceIsBetter
+        ? { evidenceRank: rank, evidenceChannel: channel, evidenceScore: hit.score }
+        : old?.evidenceRank === undefined
+          ? { evidenceRank: rank, evidenceChannel: channel, evidenceScore: hit.score }
+          : {}),
+    };
+    if (channel === 0) next.semanticScore = hit.score;
+    else next.lexicalScore = hit.score;
+    map.set(hit.path, next);
+  };
+  semantic.forEach((hit, rank) => add(hit, rank, 0));
+  lexical.forEach((hit, rank) => add(hit, rank, 1));
+  return [...map.values()].sort(compareFused);
 }
 function fuse(semantic: readonly VectorSearchHit[], lexical: readonly LexicalHit[]): Fused[] {
   const map = new Map<string, Fused>();
@@ -278,22 +360,24 @@ function fuse(semantic: readonly VectorSearchHit[], lexical: readonly LexicalHit
       fusedScore: (old?.fusedScore ?? 0) + 1 / (60 + i + 1),
     });
   });
-  return [...map.values()].sort(
-    (a, b) =>
-      b.fusedScore - a.fusedScore ||
-      (b.semanticScore === undefined
-        ? -1
-        : a.semanticScore === undefined
-          ? 1
-          : b.semanticScore - a.semanticScore) ||
-      (b.lexicalScore === undefined
-        ? -1
-        : a.lexicalScore === undefined
-          ? 1
-          : b.lexicalScore - a.lexicalScore) ||
-      compareCodeUnits(a.path, b.path) ||
-      a.ordinal - b.ordinal ||
-      compareCodeUnits(a.id, b.id)
+  return [...map.values()].sort(compareFused);
+}
+function compareFused(a: Fused, b: Fused): number {
+  return (
+    b.fusedScore - a.fusedScore ||
+    (b.semanticScore === undefined
+      ? -1
+      : a.semanticScore === undefined
+        ? 1
+        : b.semanticScore - a.semanticScore) ||
+    (b.lexicalScore === undefined
+      ? -1
+      : a.lexicalScore === undefined
+        ? 1
+        : b.lexicalScore - a.lexicalScore) ||
+    compareCodeUnits(a.path, b.path) ||
+    a.ordinal - b.ordinal ||
+    compareCodeUnits(a.id, b.id)
   );
 }
 function uniqueNotes(hits: readonly Fused[], limit: number): Fused[] {

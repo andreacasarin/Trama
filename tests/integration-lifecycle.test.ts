@@ -112,6 +112,58 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.restoreAllMocks();
   });
 
+  it("refreshes Lente only when reconciliation publishes a generation", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const refreshSubmitted = vi.fn();
+    plugin.app = {
+      workspace: {
+        getLeavesOfType: (type: string) =>
+          type === "trama-lente" ? [{ view: { refreshSubmitted } }] : [],
+      },
+    };
+    plugin.indexReady = true;
+    plugin.lifecycleAbort = new AbortController();
+    plugin.indexStatus = { setUpdating: vi.fn(), setReady: vi.fn(), markStale: vi.fn() };
+    const published = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    plugin.index = {
+      isBuilding: () => false,
+      reconcileQueuedChanges: vi.fn(async () => undefined),
+      getLastReconciliationPublished: published,
+    };
+    await plugin.reconcileNow();
+    expect(refreshSubmitted).not.toHaveBeenCalled();
+    plugin.queuedWork = true;
+    await plugin.reconcileNow();
+    expect(refreshSubmitted).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refresh Lente after load or replacement, but refreshes after publication", async () => {
+    const app = projectedApp();
+    const refreshSubmitted = vi.fn();
+    const setSearch = vi.fn();
+    const getLeavesOfType = app.workspace.getLeavesOfType;
+    app.workspace.getLeavesOfType = ((type?: string) =>
+      type === "trama-lente"
+        ? [{ view: { refreshSubmitted, setSearch } }]
+        : getLeavesOfType()) as any;
+    const plugin = projectedPlugin(app) as any;
+    vi.spyOn(
+      (await import("@/index/IndexManager")).IndexManager.prototype,
+      "load"
+    ).mockResolvedValue(true);
+    plugin.lifecycleAbort = new AbortController();
+    plugin.composeRuntime(app, DEFAULT_SETTINGS);
+    await plugin.indexLoad;
+    await Promise.resolve();
+    expect(setSearch).toHaveBeenCalled();
+    expect(refreshSubmitted).not.toHaveBeenCalled();
+
+    const index = plugin.index;
+    vi.spyOn(index, "synchronizeWithPublication").mockResolvedValue(true);
+    await plugin.runIndex(new AbortController().signal, false);
+    expect(refreshSubmitted).toHaveBeenCalledTimes(1);
+  });
+
   it("cold desktop startup registers shell surfaces and listeners without fetch or discovery", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
@@ -121,10 +173,11 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(5);
-    expect(plugin.registerView).toHaveBeenCalledTimes(2);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(6);
+    expect(plugin.registerView).toHaveBeenCalledTimes(3);
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
     expect(plugin.registerView).toHaveBeenCalledWith("trama-filo", expect.any(Function));
+    expect(plugin.registerView).toHaveBeenCalledWith("trama-lente", expect.any(Function));
     expect(
       (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
         ([command]) => (command as { id: string }).id
@@ -135,15 +188,17 @@ describe("TramaPlugin lifecycle integration", () => {
       "cancel-filo-indexing",
       "open-voce",
       "open-filo",
+      "open-lente",
     ]);
     expect(
       (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls
         .map(([command]) => command as { id: string; icon?: string })
-        .filter(({ id }) => id === "open-voce" || id === "open-filo")
+        .filter(({ id }) => id === "open-voce" || id === "open-filo" || id === "open-lente")
         .map(({ id, icon }) => [id, icon])
     ).toEqual([
       ["open-voce", "message-circle"],
       ["open-filo", "route"],
+      ["open-lente", "search"],
     ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);

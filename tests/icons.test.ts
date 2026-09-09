@@ -7,6 +7,7 @@ describe("TRAMA_ICONS", () => {
       trama: "network",
       filo: "route",
       voce: "message-circle",
+      lente: "search",
     });
   });
 });

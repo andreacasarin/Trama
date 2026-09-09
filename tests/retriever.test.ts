@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
 import { Retriever } from "@/index/retrieval/Retriever";
+import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
+import { StructuredError } from "@/domain/contracts";
 
 function fixture() {
   const record = { ordinal: 0, startLine: 4, endLine: 5, text: "x".repeat(600), vector: [1, 0] };
@@ -145,6 +147,48 @@ describe("Retriever", () => {
     ).toEqual(["a.md", "b.md"]);
   });
 
+  it("fuses Lente channel ranks by path and keeps one deterministic winning passage", async () => {
+    const f = fixture();
+    const notes = [
+      { path: "a.md", contentId: "a".repeat(64), chunkCount: 2, segments: [] },
+      { path: "b.md", contentId: "b".repeat(64), chunkCount: 1, segments: [] },
+    ];
+    Object.assign(f.snapshot, { notes });
+    f.snapshot.getNote = (path: string) => notes.find((note) => note.path === path);
+    f.hydrateChunk.mockImplementation(async (_path: string, ordinal: number) => ({
+      ordinal,
+      startLine: ordinal + 1,
+      endLine: ordinal + 1,
+      text: `passage ${ordinal}`,
+      vector: [1, 0],
+    }));
+    f.vector.search.mockResolvedValue([
+      { id: "a-semantic", path: "a.md", ordinal: 0, score: 0.9 },
+      { id: "b-semantic", path: "b.md", ordinal: 0, score: 0.8 },
+    ]);
+    f.lexical.search.mockResolvedValue([
+      { id: "a-lexical", path: "a.md", ordinal: 1, score: 2 },
+      { id: "b-lexical", path: "b.md", ordinal: 0, score: 1 },
+    ]);
+    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
+    const results = await retriever.search({
+      query: "x",
+      feature: "lente",
+      resultShape: "notes",
+      limit: 2,
+      semanticCandidateLimit: 2,
+      lexicalCandidateLimit: 2,
+    });
+    expect(results.map((result) => result.path)).toEqual(["a.md", "b.md"]);
+    expect(results[0]).toMatchObject({
+      ordinal: 0,
+      semanticScore: 0.9,
+      lexicalScore: 2,
+      fusedScore: 2 / 61,
+    });
+    await retriever.close();
+  });
+
   it("uses locale-independent code-unit ordering for equal retrieval hits", async () => {
     const f = fixture();
     f.vector.search.mockResolvedValue([
@@ -187,6 +231,62 @@ describe("Retriever", () => {
     await expect(retriever.search({ query: "x", semanticCandidateLimit: 0 })).rejects.toThrow(
       "hydrate failed"
     );
+    await retriever.close();
+  });
+
+  it("classifies missing, nonfinite, wrong-dimension, and near-zero Lente query vectors", async () => {
+    for (const embedded of [[], undefined]) {
+      const f = fixture();
+      const retriever = new Retriever({
+        ...f,
+        embedding: { dimensions: 2, embed: vi.fn(async () => embedded as never) },
+      });
+      await expect(retriever.search({ query: "x" })).rejects.toBeInstanceOf(QueryEmbeddingError);
+      await retriever.close();
+    }
+    for (const vector of [
+      [Number.NaN, 0],
+      [1, 0, 0],
+      [0, 0],
+      [1e-13, 0],
+    ]) {
+      const f = fixture();
+      const retriever = new Retriever({
+        ...f,
+        embedding: { dimensions: 2, embed: vi.fn(async () => [vector]) },
+      });
+      await expect(
+        retriever.search({ query: "x", feature: "lente", resultShape: "notes" })
+      ).rejects.toBeInstanceOf(QueryEmbeddingError);
+      await retriever.close();
+    }
+  });
+
+  it("does not classify AbortError as a query-embedding fallback", async () => {
+    const f = fixture();
+    const retriever = new Retriever({
+      ...f,
+      embedding: {
+        dimensions: 2,
+        embed: vi.fn(async () => {
+          throw new DOMException("aborted", "AbortError");
+        }),
+      },
+    });
+    await expect(retriever.search({ query: "x" })).rejects.toMatchObject({ name: "AbortError" });
+    await retriever.close();
+  });
+
+  it("preserves structured embedding cancellation without starting retrieval", async () => {
+    const f = fixture();
+    const cancelled = new StructuredError("cancelled", "Search cancelled.", true);
+    const retriever = new Retriever({
+      ...f,
+      embedding: { embed: vi.fn(async () => Promise.reject(cancelled)) },
+    });
+    await expect(retriever.search({ query: "x" })).rejects.toBe(cancelled);
+    expect(f.vector.search).not.toHaveBeenCalled();
+    expect(f.lexical.search).not.toHaveBeenCalled();
     await retriever.close();
   });
 });

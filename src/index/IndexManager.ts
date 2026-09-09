@@ -93,6 +93,20 @@ interface Bundle {
   readonly snapshot: CorpusSnapshot;
   readonly retriever: Retriever;
   readonly number: number;
+  leases: number;
+  retired: boolean;
+  closePromise?: Promise<void>;
+}
+
+export interface LenteBundleLease {
+  readonly generationId: string;
+  readonly retriever: Retriever;
+  search(
+    query: string,
+    mode: "hybrid" | "lexical",
+    signal?: AbortSignal
+  ): Promise<readonly RetrievalResult[]>;
+  release(): Promise<void>;
 }
 interface FullIndexPlan {
   readonly paths: readonly string[];
@@ -139,6 +153,7 @@ export class IndexManager implements VaultSearchPort {
   private epoch = 0;
   private revision = 0;
   private readonly queued = new Map<string, Queued>();
+  private lastReconciliationPublished = false;
   private readonly corpus: CorpusStore;
   private readonly onProgress?: (progress: IndexProgress) => void;
   constructor(
@@ -259,6 +274,7 @@ export class IndexManager implements VaultSearchPort {
       );
       const lexical = await OramaLexicalIndex.build(snapshot, {
         signal,
+        profile: "lente",
         onProgress: (progress) =>
           this.reportProgress(
             {
@@ -278,6 +294,8 @@ export class IndexManager implements VaultSearchPort {
           snapshot,
           retriever: new Retriever({ snapshot, vector, lexical, embedding: this.embedding }),
           number,
+          leases: 0,
+          retired: false,
         };
       } catch (e) {
         await lexical.close();
@@ -300,10 +318,17 @@ export class IndexManager implements VaultSearchPort {
   }
   /** Synchronizes the committed corpus, embedding only notes whose content changed. */
   async synchronize(signal: AbortSignal): Promise<void> {
+    await this.synchronizeWithPublication(signal);
+  }
+
+  async synchronizeWithPublication(signal: AbortSignal): Promise<boolean> {
     if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
     check(signal);
     if (!this.loaded) await this.load();
-    if (!this.active || this.unavailable) return this.build(signal);
+    if (!this.active || this.unavailable) {
+      await this.build(signal);
+      return true;
+    }
 
     const paths = [...(await this.vault.listMarkdownPaths(signal))].map(normalizePath).sort();
     const present = new Set(paths);
@@ -311,7 +336,7 @@ export class IndexManager implements VaultSearchPort {
       this.queueOperation({ kind: this.active.snapshot.getNote(path) ? "modify" : "create", path });
     for (const note of this.active.snapshot.notes)
       if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
-    await this.reconcileQueuedChanges(signal);
+    return this.reconcileQueuedChangesWithPublication(signal);
   }
   async waitForBuild(): Promise<void> {
     await this.buildPromise;
@@ -548,7 +573,62 @@ export class IndexManager implements VaultSearchPort {
   private async swap(bundle: Bundle): Promise<void> {
     const old = this.active;
     this.active = bundle;
-    if (old) await old.retriever.close();
+    if (old) await this.retireBundle(old);
+  }
+
+  /** Acquires a generation-stable reader for Lente. Retired bundles remain alive until release. */
+  acquireLenteLease(): LenteBundleLease | null {
+    const bundle = this.active;
+    if (!bundle || this.unavailable) return null;
+    bundle.leases++;
+    let released = false;
+    return {
+      generationId: bundle.snapshot.generationId,
+      retriever: bundle.retriever,
+      search: (query, mode, signal) =>
+        bundle.retriever.search({
+          query,
+          mode,
+          resultShape: "notes",
+          limit: 160,
+          feature: "lente",
+          semanticCandidateLimit: 160,
+          lexicalCandidateLimit: 160,
+          lexicalProfile: "lente",
+          signal,
+        }),
+      release: async () => {
+        if (released) return;
+        released = true;
+        bundle.leases = Math.max(0, bundle.leases - 1);
+        if (bundle.retired && bundle.leases === 0) await this.closeBundle(bundle);
+      },
+    };
+  }
+
+  /** Feature-specific Lente retrieval entry point; RAG search remains unchanged. */
+  async searchLente(
+    query: string,
+    mode: "hybrid" | "lexical" = "hybrid",
+    signal?: AbortSignal
+  ): Promise<readonly RetrievalResult[]> {
+    const lease = this.acquireLenteLease();
+    if (!lease) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
+    try {
+      return await lease.search(query, mode, signal);
+    } finally {
+      await lease.release();
+    }
+  }
+
+  private async closeBundle(bundle: Bundle): Promise<void> {
+    if (!bundle.closePromise) bundle.closePromise = bundle.retriever.close();
+    await bundle.closePromise;
+  }
+
+  private async retireBundle(bundle: Bundle): Promise<void> {
+    bundle.retired = true;
+    if (bundle.leases === 0) await this.closeBundle(bundle);
   }
   queueChange(path: string): void {
     this.queueOperation({ kind: "modify", path });
@@ -562,21 +642,34 @@ export class IndexManager implements VaultSearchPort {
     this.queueOperation({ kind: "rename", oldPath, path });
   }
   async reconcileQueuedChanges(signal: AbortSignal): Promise<void> {
-    if (!this.queued.size) return;
+    this.lastReconciliationPublished = await this.reconcileQueuedChangesWithPublication(signal);
+  }
+
+  getLastReconciliationPublished(): boolean {
+    return this.lastReconciliationPublished;
+  }
+
+  async reconcileQueuedChangesWithPublication(signal: AbortSignal): Promise<boolean> {
+    if (!this.queued.size) return false;
     if (this.building) {
       await this.buildPromise;
-      return this.reconcileQueuedChanges(signal);
+      return this.reconcileQueuedChangesWithPublication(signal);
     }
-    if (!this.active || this.unavailable) return this.build(signal);
+    if (!this.active || this.unavailable) {
+      await this.build(signal);
+      return true;
+    }
     const run = this.reconcileIncremental(signal);
-    this.buildPromise = run;
+    const pending = run.then(() => undefined);
+    this.buildPromise = pending;
+    void pending.catch(() => undefined);
     try {
-      await run;
+      return await run;
     } finally {
-      if (this.buildPromise === run) this.buildPromise = undefined;
+      if (this.buildPromise === pending) this.buildPromise = undefined;
     }
   }
-  private async reconcileIncremental(signal: AbortSignal): Promise<void> {
+  private async reconcileIncremental(signal: AbortSignal): Promise<boolean> {
     if (this.building)
       throw new StructuredError("busy", "Index reconciliation is already running.", true);
     const captured = new Map(this.queued);
@@ -777,7 +870,7 @@ export class IndexManager implements VaultSearchPort {
           stage: "completed",
           counts: { changes: 0 },
         });
-        return;
+        return false;
       }
       tx = await this.corpus.stageIncremental(base, changes, fingerprint, {
         signal,
@@ -859,6 +952,7 @@ export class IndexManager implements VaultSearchPort {
         generation: tx.snapshot.generationId,
         counts: { changes: captured.size },
       });
+      return true;
     } catch (error) {
       if (bundle) await bundle.retriever.close().catch(() => undefined);
       if (tx) await tx.abort().catch(() => undefined);
@@ -979,11 +1073,15 @@ export class IndexManager implements VaultSearchPort {
   invalidate(): void {
     this.epoch++;
     this.unavailable = true;
+    const old = this.active;
     this.active = null;
+    if (old) void this.retireBundle(old);
   }
   markUnavailable(): void {
     this.unavailable = true;
+    const old = this.active;
     this.active = null;
+    if (old) void this.retireBundle(old);
   }
   private provenance(r: RetrievalResult): ProvenanceRecord {
     return {

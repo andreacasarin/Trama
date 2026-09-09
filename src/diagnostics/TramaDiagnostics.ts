@@ -129,6 +129,16 @@ export type TramaDiagnosticRecord =
       readonly durationMs?: number;
       readonly cancelled?: boolean;
       readonly error?: SafeDiagnosticError;
+    }
+  | {
+      readonly area: "index";
+      readonly event: "lente_search";
+      readonly generation?: string;
+      readonly mode: "hybrid" | "lexical";
+      readonly resultCount: number;
+      readonly durationMs?: number;
+      readonly cancelled?: boolean;
+      readonly error?: SafeDiagnosticError;
     };
 
 /** Receives transient diagnostics without buffering or persisting them. */
@@ -167,6 +177,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
       "unavailable",
       "limit_exceeded",
       "internal",
+      "query_embedding_failed",
     ]);
     const name = candidate.name;
     const code = candidate.code;
