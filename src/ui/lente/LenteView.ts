@@ -3,16 +3,18 @@ import {
   sortLenteResults,
   type LenteBatch,
   type LenteResult,
+  type LenteSearchOptions,
   type LenteSearch,
   type LenteSort,
 } from "@/index/LenteSearch";
+import { isExcludedPath } from "@/settings/Settings";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
 
 interface LenteSearchPort {
-  search(query: string, options?: { sort?: LenteSort; signal?: AbortSignal }): Promise<LenteBatch>;
+  search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
 }
 
 /** Native Obsidian view for explicit-submit hybrid vault search. */
@@ -67,6 +69,26 @@ export class LenteView extends ItemView {
   /** Reruns the last submitted query after a newly published generation. */
   refreshSubmitted(): void {
     if (this.submitted && this.opened) void this.runQuery(this.submitted);
+  }
+
+  /** Immediately hides excluded rows while the replacement search is pending. */
+  invalidateExcludedPaths(paths: readonly string[]): void {
+    if (!paths.length) return;
+    this.cancel();
+    this.canonicalResults = this.canonicalResults.filter(
+      (result) => !isExcludedPath(result.path, paths)
+    );
+    if (this.batch) {
+      this.batch = {
+        ...this.batch,
+        results: sortLenteResults(this.canonicalResults, this.sort, this.batch.displayLimit),
+      };
+      if (this.announcementEl)
+        this.announcementEl.textContent = this.batch.results.length
+          ? `${this.batch.results.length} results`
+          : "No matching notes found.";
+    }
+    this.render();
   }
 
   override onOpen(): Promise<void> {
@@ -133,7 +155,7 @@ export class LenteView extends ItemView {
         if (this.batch) {
           this.batch = {
             ...this.batch,
-            results: sortLenteResults(this.canonicalResults, this.sort, 20),
+            results: sortLenteResults(this.canonicalResults, this.sort, this.batch.displayLimit),
           };
           this.renderRows();
         }
@@ -187,10 +209,10 @@ export class LenteView extends ItemView {
       this.canonicalResults = batch.canonicalResults ?? batch.results;
       this.batch = {
         ...batch,
-        results: sortLenteResults(this.canonicalResults, this.sort, 20),
+        results: sortLenteResults(this.canonicalResults, this.sort, batch.displayLimit),
       };
-      this.announcementEl.textContent = batch.results.length
-        ? `${batch.results.length} results`
+      this.announcementEl.textContent = this.batch.results.length
+        ? `${this.batch.results.length} results`
         : "No matching notes found.";
       this.render();
     } catch (error) {

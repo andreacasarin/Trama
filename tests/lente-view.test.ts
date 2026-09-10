@@ -32,6 +32,7 @@ function batch(results: readonly LenteResult[], degraded = false): LenteBatch {
     generationId: "g1",
     mode: degraded ? "lexical" : "hybrid",
     degraded,
+    displayLimit: 20,
     results,
     durationMs: 1,
   };
@@ -215,6 +216,24 @@ describe("LenteView", () => {
     await vi.waitFor(() => expect(textOf(view.contentEl)).toContain("A-refreshed"));
   });
 
+  it("hides an already-rendered excluded row synchronously", async () => {
+    const search = vi.fn(async () =>
+      batch([result("Private/Secret.md", 1), result("Public.md", 2)])
+    );
+    const { view } = subject(search);
+    await view.onOpen();
+    const input = byTag(view.contentEl, "input");
+    input.value = "needle";
+    input.dispatch("input", { target: input });
+    input.dispatch("keydown", { key: "Enter", isComposing: false });
+    await vi.waitFor(() => expect(textOf(view.contentEl)).toContain("Secret"));
+
+    (view as any).invalidateExcludedPaths(["Private"]);
+
+    expect(textOf(view.contentEl)).not.toContain("Secret");
+    expect(textOf(view.contentEl)).toContain("Public");
+  });
+
   it("reorders cached results for Updated without searching again", async () => {
     const search = vi.fn(async () => batch([result("Old.md", 1), result("New.md", 2)]));
     const { view } = subject(search);
@@ -256,6 +275,30 @@ describe("LenteView", () => {
     byText(view.contentEl, "Relevant").click();
     expect(rows.children[0].children[0].textContent).toBe("Note-0");
     expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors the batch display limit when initially rendering and resorting", async () => {
+    const canonical = Array.from({ length: 25 }, (_, index) =>
+      result(`Note-${index}.md`, index === 24 ? 10_000 : 1, 1 - index / 100)
+    );
+    const search = vi.fn(async () => ({
+      ...batch(canonical.slice(0, 5)),
+      displayLimit: 5,
+      canonicalResults: canonical,
+    }));
+    const { view } = subject(search);
+    await view.onOpen();
+    const input = byTag(view.contentEl, "input");
+    input.value = "needle";
+    input.dispatch("input", { target: input });
+    input.dispatch("keydown", { key: "Enter", isComposing: false });
+    await vi.waitFor(() => expect(textOf(view.contentEl)).toContain("Note-0"));
+    const rows = byClass(view.contentEl, "trama-lente__rows");
+    expect(rows.children).toHaveLength(5);
+    expect(byClass(view.contentEl, "trama-lente__announcement").textContent).toBe("5 results");
+    byText(view.contentEl, "Updated").click();
+    expect(rows.children).toHaveLength(5);
+    expect(rows.children[0].children[0].textContent).toBe("Note-24");
   });
 
   it("shows degraded lexical-only state and supports navigation", async () => {

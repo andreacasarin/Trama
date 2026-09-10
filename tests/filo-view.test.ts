@@ -2,6 +2,16 @@ import { describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "obsidian";
 import { FiloView } from "@/ui/filo/FiloView";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 function subject(
   status: any,
   results: readonly (
@@ -15,18 +25,21 @@ function subject(
         endLine?: number;
       }
   )[] = [],
-  runIndex: (kind: "index" | "reindex") => Promise<void> = async () => {}
+  runIndex: (kind: "index" | "reindex") => Promise<void> = async () => {},
+  findOverride?: any
 ) {
   const listeners = new Set<(value: any) => void>();
   const related = {
-    find: vi.fn(async (path: string) => ({
-      generationId: "g1",
-      currentPath: path,
-      contentHash: "g1:" + path,
-      results: results.map((result) =>
-        typeof result === "string" ? { path: result, score: 1 } : result
-      ),
-    })),
+    find:
+      findOverride ??
+      vi.fn(async (path: string) => ({
+        generationId: "g1",
+        currentPath: path,
+        contentHash: "g1:" + path,
+        results: results.map((result) =>
+          typeof result === "string" ? { path: result, score: 1 } : result
+        ),
+      })),
     subscribe: (listener: (value: any) => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -129,6 +142,41 @@ describe("FiloView", () => {
     expect(related.find).toHaveBeenCalledTimes(1);
   });
 
+  it("hides an already-rendered excluded row synchronously", async () => {
+    const { view } = subject(ready, ["Private/Secret.md", "Public.md"]);
+    await view.onOpen();
+    expect(textOf(view.contentEl as any)).toContain("Secret");
+
+    (view as any).invalidateExcludedPaths(["Private"]);
+
+    expect(textOf(view.contentEl as any)).not.toContain("Secret");
+    expect(textOf(view.contentEl as any)).toContain("Public");
+  });
+
+  it("recovers a pending request after exclusion without showing a load error", async () => {
+    const pending = deferred<any>();
+    const find = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValueOnce({
+      generationId: "g1",
+      currentPath: "Current.md",
+      contentHash: "g1:Current.md",
+      results: [],
+    });
+    const { view } = subject(ready, [], async () => {}, find);
+    await view.onOpen();
+    await vi.waitFor(() => expect(find).toHaveBeenCalledTimes(1));
+
+    view.invalidateExcludedPaths(["Private"]);
+    pending.reject(new Error("cancelled"));
+    await Promise.resolve();
+    expect(textOf(view.contentEl as any)).not.toContain("could not be loaded");
+
+    view.refreshRelatedSuggestions();
+    await vi.waitFor(() => expect(find).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(textOf(view.contentEl as any)).not.toContain("could not be loaded")
+    );
+  });
+
   it("labels cosine similarity using the class thresholds", async () => {
     const { view } = subject(ready, [
       { path: "High.md", score: 0.03, similarity: FiloView.HIGH_SIMILARITY_THRESHOLD },
@@ -180,6 +228,36 @@ describe("FiloView", () => {
     });
     await view.onOpen();
     expect(textOf(view.contentEl as any)).toContain("Index vault");
+  });
+
+  it("uses incremental indexing for stale state while keeping forced reindex available", async () => {
+    const runIndex = vi.fn(async () => {});
+    const { view } = subject(
+      {
+        ...ready,
+        kind: "stale",
+        message: "Index has changes; update required.",
+        canIndex: true,
+        canReindex: true,
+      },
+      [],
+      runIndex
+    );
+
+    await view.onOpen();
+
+    expect(textOf(view.contentEl as any)).toContain("Index has changes; update required.");
+    const buttons = (view.contentEl as any).children[0].children.filter(
+      (child: any) => child.tagName === "button"
+    );
+    expect(buttons.map((button: any) => button.textContent)).toEqual([
+      "Index vault",
+      "Reindex vault",
+    ]);
+    buttons[0].click();
+    expect(runIndex).toHaveBeenCalledWith("index");
+    buttons[1].click();
+    expect(runIndex).toHaveBeenCalledWith("reindex");
   });
 
   it("renders structured progress while an incremental update is running", async () => {

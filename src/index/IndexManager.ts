@@ -40,6 +40,8 @@ export interface IndexVaultDocument {
 export interface IndexVaultPort {
   listMarkdownPaths(signal: AbortSignal): Promise<readonly string[]>;
   readMarkdown(path: string, signal: AbortSignal): Promise<IndexVaultDocument>;
+  /** Live plugin-owned index eligibility; omitted by non-Obsidian test ports. */
+  isIndexEligible?(path: string): boolean;
   isMarkdownAvailable?(path: string, signal: AbortSignal): Promise<boolean>;
   estimateMarkdownTextCount?(
     paths: readonly string[],
@@ -100,7 +102,7 @@ interface Bundle {
 
 export interface LenteBundleLease {
   readonly generationId: string;
-  readonly retriever: Retriever;
+  readonly retriever: Pick<Retriever, "search">;
   search(
     query: string,
     mode: "hybrid" | "lexical",
@@ -148,7 +150,7 @@ export class IndexManager implements VaultSearchPort {
   private loaded = false;
   private unavailable = false;
   private loadPromise?: Promise<boolean>;
-  private buildPromise?: Promise<void>;
+  private buildPromise?: Promise<void | boolean>;
   private generation = 0;
   private epoch = 0;
   private revision = 0;
@@ -165,6 +167,8 @@ export class IndexManager implements VaultSearchPort {
     private readonly options: {
       readonly size?: number;
       readonly overlap?: number;
+      /** Optional live override for plugin-owned index eligibility. */
+      readonly isIndexEligible?: (path: string) => boolean;
       readonly onProgress?: (progress: IndexProgress) => void;
     } = {},
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
@@ -194,31 +198,57 @@ export class IndexManager implements VaultSearchPort {
     return this.loadPromise;
   }
   private async loadPersisted(emit: boolean): Promise<boolean> {
+    const started = Date.now();
+    const observable = emit || this.diagnostics !== NOOP_TRAMA_DIAGNOSTICS;
+    if (observable)
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "load",
+        stage: "started",
+        phase: "validate-corpus",
+      });
     try {
       const snapshot = await this.corpus.load();
-      if (snapshot.fingerprint !== (await this.fingerprintId()))
-        throw new Error("Index fingerprint mismatch");
-      this.active = await this.derive(snapshot, 0, undefined, "startup");
-      this.generation = 1;
-      this.unavailable = false;
-      if (emit)
+      if (observable)
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "completed",
+          phase: "validate-corpus",
+          durationMs: Date.now() - started,
+          generation: snapshot.generationId,
+          counts: {
+            notes: snapshot.notes.length,
+            chunks: snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0),
+          },
+        });
+      if (snapshot.fingerprint !== (await this.fingerprintId()))
+        throw new Error("Index fingerprint mismatch");
+      this.active = await this.derive(snapshot, 0, undefined, "startup");
+      this.generation = 1;
+      this.unavailable = false;
+      if (observable)
+        this.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "load",
+          stage: "completed",
+          durationMs: Date.now() - started,
           generation: snapshot.generationId,
         });
       return true;
     } catch (error) {
       this.active = null;
       this.unavailable = false;
-      if (emit)
+      if (observable)
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "failed",
+          durationMs: Date.now() - started,
           error: projectDiagnosticError(error),
         });
       return false;
@@ -233,12 +263,23 @@ export class IndexManager implements VaultSearchPort {
     operation: "full" | "incremental" | "startup" = "full"
   ): Promise<Bundle> {
     check(signal ?? new AbortController().signal);
+    const chunkCount = snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0);
+    const vectorStarted = Date.now();
+    this.emit({
+      area: "index",
+      event: "index_operation",
+      operation,
+      stage: "started",
+      phase: "build-vector",
+      counts: { notes: snapshot.notes.length, chunks: chunkCount },
+      generation: snapshot.generationId,
+    });
     this.reportProgress(
       {
         operation,
         phase: "build-vector",
         completed: 0,
-        total: snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0),
+        total: chunkCount,
         unit: "chunks",
         determinate: true,
         generationId: snapshot.generationId,
@@ -246,7 +287,16 @@ export class IndexManager implements VaultSearchPort {
       operation !== "startup"
     );
     const vector = await ExactVectorIndex.open(snapshot);
-    const chunkCount = snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0);
+    this.emit({
+      area: "index",
+      event: "index_operation",
+      operation,
+      stage: "completed",
+      phase: "build-vector",
+      durationMs: Date.now() - vectorStarted,
+      counts: { chunks: chunkCount },
+      generation: snapshot.generationId,
+    });
     this.reportProgress(
       {
         operation,
@@ -260,6 +310,16 @@ export class IndexManager implements VaultSearchPort {
       operation !== "startup"
     );
     try {
+      const lexicalStarted = Date.now();
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation,
+        stage: "started",
+        phase: "build-lexical",
+        counts: { chunks: chunkCount },
+        generation: snapshot.generationId,
+      });
       this.reportProgress(
         {
           operation,
@@ -288,6 +348,16 @@ export class IndexManager implements VaultSearchPort {
             },
             operation !== "startup"
           ),
+      });
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation,
+        stage: "completed",
+        phase: "build-lexical",
+        durationMs: Date.now() - lexicalStarted,
+        counts: { chunks: chunkCount },
+        generation: snapshot.generationId,
       });
       try {
         return {
@@ -330,7 +400,10 @@ export class IndexManager implements VaultSearchPort {
       return true;
     }
 
-    const paths = [...(await this.vault.listMarkdownPaths(signal))].map(normalizePath).sort();
+    const paths = [...(await this.vault.listMarkdownPaths(signal))]
+      .map(normalizePath)
+      .filter((path) => this.isIndexEligible(path))
+      .sort();
     const present = new Set(paths);
     for (const path of paths)
       this.queueOperation({ kind: this.active.snapshot.getNote(path) ? "modify" : "create", path });
@@ -338,6 +411,89 @@ export class IndexManager implements VaultSearchPort {
       if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
     return this.reconcileQueuedChangesWithPublication(signal);
   }
+
+  /**
+   * Removes committed notes which are no longer index-eligible without reading,
+   * chunking, or embedding them. Queued revisions are deliberately untouched.
+   */
+  async pruneExcludedPaths(signal: AbortSignal): Promise<boolean> {
+    check(signal);
+    if (this.building) {
+      await this.buildPromise;
+      return this.pruneExcludedPaths(signal);
+    }
+    if (!this.loaded) await this.load();
+    const base = this.active;
+    if (!base || this.unavailable) return false;
+    const deleted = base.snapshot.notes
+      .filter((note) => !this.isIndexEligible(note.path))
+      .map((note) => ({ type: "delete" as const, path: note.path }));
+    if (!deleted.length) return false;
+
+    const run = this.pruneExcludedPathsInternal(base, deleted, signal);
+    this.buildPromise = run;
+    try {
+      return await run;
+    } finally {
+      if (this.buildPromise === run) this.buildPromise = undefined;
+    }
+  }
+
+  /** Alias for callers that use the eligibility terminology. */
+  async pruneIneligiblePaths(signal: AbortSignal): Promise<boolean> {
+    return this.pruneExcludedPaths(signal);
+  }
+
+  private async pruneExcludedPathsInternal(
+    base: Bundle,
+    deleted: readonly IncrementalChange[],
+    signal: AbortSignal
+  ): Promise<boolean> {
+    this.building = true;
+    this.corpus.enableDiagnostics();
+    const epoch = ++this.epoch;
+    let tx: CorpusTransaction | undefined;
+    let bundle: Bundle | undefined;
+    try {
+      tx = await this.corpus.stageIncremental(base.snapshot, deleted, await this.fingerprintId(), {
+        signal,
+      });
+      check(signal);
+      if (epoch !== this.epoch)
+        throw new StructuredError("cancelled", "Index pruning cancelled.", true);
+      bundle = await this.derive(tx.snapshot, ++this.generation, signal, "incremental");
+      check(signal);
+      await tx.commit();
+      const published = bundle;
+      bundle = undefined;
+      await this.swap(published);
+      this.unavailable = false;
+      await this.collectGarbage("incremental", tx.snapshot.generationId);
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "incremental",
+        stage: "published",
+        generation: tx.snapshot.generationId,
+        counts: { changes: deleted.length, pruned: deleted.length },
+      });
+      return true;
+    } catch (error) {
+      if (bundle) await bundle.retriever.close().catch(() => undefined);
+      if (tx) await tx.abort().catch(() => undefined);
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "incremental",
+        stage: signal.aborted ? "cancelled" : "failed",
+        error: projectDiagnosticError(error),
+      });
+      throw error;
+    } finally {
+      this.building = false;
+    }
+  }
+
   async waitForBuild(): Promise<void> {
     await this.buildPromise;
   }
@@ -451,7 +607,10 @@ export class IndexManager implements VaultSearchPort {
     }
   }
   private async planFullIndex(signal: AbortSignal): Promise<FullIndexPlan> {
-    const paths = [...(await this.vault.listMarkdownPaths(signal))].map(normalizePath).sort();
+    const paths = [...(await this.vault.listMarkdownPaths(signal))]
+      .map(normalizePath)
+      .filter((path) => this.isIndexEligible(path))
+      .sort();
     this.reportProgress({
       operation: "full",
       phase: "discover",
@@ -516,6 +675,7 @@ export class IndexManager implements VaultSearchPort {
     });
     for (const path of plan.paths) {
       check(signal);
+      if (!this.isIndexEligible(path)) continue;
       const doc = await this.readMarkdownIfAvailable(path, signal, "full");
       if (!doc) continue;
       const chunks = chunkMarkdown(
@@ -582,11 +742,23 @@ export class IndexManager implements VaultSearchPort {
     if (!bundle || this.unavailable) return null;
     bundle.leases++;
     let released = false;
+    const retriever: Pick<Retriever, "search"> = {
+      search: async (request) => {
+        const results = await bundle.retriever.search({
+          ...request,
+          visiblePaths: this.intersectVisiblePaths(
+            request.visiblePaths,
+            this.eligiblePaths(bundle.snapshot)
+          ),
+        });
+        return results.filter((result) => this.isIndexEligible(result.path));
+      },
+    };
     return {
       generationId: bundle.snapshot.generationId,
-      retriever: bundle.retriever,
+      retriever,
       search: (query, mode, signal) =>
-        bundle.retriever.search({
+        retriever.search({
           query,
           mode,
           resultShape: "notes",
@@ -693,7 +865,11 @@ export class IndexManager implements VaultSearchPort {
       const base = this.active?.snapshot;
       if (!base) throw new Error("Index base is unavailable");
       const fingerprint = await this.fingerprintId();
-      const present = new Set((await this.vault.listMarkdownPaths(signal)).map(normalizePath));
+      const present = new Set(
+        (await this.vault.listMarkdownPaths(signal))
+          .map(normalizePath)
+          .filter((path) => this.isIndexEligible(path))
+      );
       const virtualNotes = new Map(base.notes.map((note) => [note.path, note.contentId]));
       const changes: IncrementalChange[] = [];
       const operations = [...captured.values()].sort((a, b) => a.revision - b.revision);
@@ -773,7 +949,11 @@ export class IndexManager implements VaultSearchPort {
         }
         const path = normalizePath(readableOperation.path);
         if (readableOperation.kind === "unchanged") continue;
-        if (readableOperation.kind === "delete" || !present.has(path)) {
+        if (
+          readableOperation.kind === "delete" ||
+          !present.has(path) ||
+          !this.isIndexEligible(path)
+        ) {
           changes.push({ type: "delete", path });
           virtualNotes.delete(path);
           continue;
@@ -984,14 +1164,18 @@ export class IndexManager implements VaultSearchPort {
       limit: Math.min(20, Math.max(0, limit)),
       semanticCandidateLimit: 80,
       lexicalCandidateLimit: 80,
+      visiblePaths: this.eligiblePaths(bundle.snapshot),
       signal,
     });
-    return results.map((r) => this.provenance(r));
+    return results
+      .filter((result) => this.isIndexEligible(result.path))
+      .map((r) => this.provenance(r));
   }
   relatedSnapshot(path: string): RelatedIndexSnapshot | null {
     const bundle = this.active;
     if (!bundle || this.unavailable) return null;
     const currentPath = normalizePath(path);
+    if (!this.isIndexEligible(currentPath)) return null;
     const note = bundle.snapshot.getNote(currentPath);
     if (!note) return null;
     return {
@@ -1000,6 +1184,7 @@ export class IndexManager implements VaultSearchPort {
       contentHash: note.contentId,
       prepareQuery: async (signal) => {
         check(signal);
+        if (!this.isIndexEligible(currentPath)) return null;
         const textParts: string[] = [];
         let textLength = 0;
         let vectorSum: Float64Array | undefined;
@@ -1040,26 +1225,35 @@ export class IndexManager implements VaultSearchPort {
         return { text: textParts.join(""), vector };
       },
       search: async (query, vector, signal, limit) =>
-        (
-          await bundle.retriever.search({
-            query,
-            queryVector: vector,
-            mode: "related",
-            resultShape: "chunks",
-            currentPath,
-            limit: Math.min(128, limit),
-            semanticCandidateLimit: 128,
-            lexicalCandidateLimit: 128,
-            signal,
-          })
-        ).map((r) => ({
-          path: r.path,
-          score: r.fusedScore,
-          ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
-          excerpt: r.excerpt,
-          startLine: r.startLine,
-          endLine: r.endLine,
-        })),
+        !this.isIndexEligible(currentPath)
+          ? []
+          : (
+              await bundle.retriever.search({
+                query,
+                queryVector: vector,
+                // Related-note lookup runs automatically when the active note
+                // changes. Use its committed aggregate vector so this path
+                // never invokes Orama's synchronous whole-index text search
+                // on Obsidian's renderer thread.
+                mode: "related",
+                resultShape: "chunks",
+                currentPath,
+                limit: Math.min(128, limit),
+                semanticCandidateLimit: 128,
+                lexicalCandidateLimit: 0,
+                visiblePaths: this.eligiblePaths(bundle.snapshot),
+                signal,
+              })
+            )
+              .filter((result) => this.isIndexEligible(result.path))
+              .map((r) => ({
+                path: r.path,
+                score: r.fusedScore,
+                ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
+                excerpt: r.excerpt,
+                startLine: r.startLine,
+                endLine: r.endLine,
+              })),
     };
   }
   async upsert(path: string, signal: AbortSignal): Promise<void> {
@@ -1092,6 +1286,40 @@ export class IndexManager implements VaultSearchPort {
       score: r.fusedScore,
     };
   }
+
+  /** Eligibility is live and fail-closed if a plugin predicate misbehaves. */
+  private isIndexEligible(path: string): boolean {
+    try {
+      const normalized = normalizePath(path);
+      return (
+        this.options.isIndexEligible?.(normalized) ??
+        this.vault.isIndexEligible?.(normalized) ??
+        true
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private eligiblePaths(snapshot: CorpusSnapshot): ReadonlySet<string> {
+    return new Set(
+      snapshot.notes.map((note) => note.path).filter((path) => this.isIndexEligible(path))
+    );
+  }
+
+  private intersectVisiblePaths(
+    requested: ReadonlySet<string> | readonly string[] | undefined,
+    eligible: ReadonlySet<string>
+  ): ReadonlySet<string> {
+    if (!requested) return eligible;
+    const visible = requested instanceof Set ? requested : new Set(requested);
+    return new Set(
+      [...visible]
+        .map(normalizePath)
+        .filter((path) => eligible.has(path) && this.isIndexEligible(path))
+    );
+  }
+
   private emit(record: TramaDiagnosticRecord): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
@@ -1101,6 +1329,7 @@ export class IndexManager implements VaultSearchPort {
     signal: AbortSignal,
     operation: "full" | "incremental"
   ): Promise<IndexVaultDocument | undefined> {
+    if (!this.isIndexEligible(path)) return undefined;
     try {
       return await this.vault.readMarkdown(path, signal);
     } catch (error) {

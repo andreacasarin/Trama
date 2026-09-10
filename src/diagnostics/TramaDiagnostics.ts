@@ -123,6 +123,7 @@ export type TramaDiagnosticRecord =
   | {
       readonly area: "filo";
       readonly event: "related_search";
+      readonly stage?: "started" | "prepare-completed" | "retrieve-completed" | "completed";
       readonly path?: string;
       readonly generation?: string;
       readonly resultCount: number;

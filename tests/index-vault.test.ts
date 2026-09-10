@@ -43,6 +43,34 @@ describe("ObsidianIndexVault", () => {
     await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual(["ok.md"]);
   });
 
+  it("keeps base visibility separate from live index eligibility", async () => {
+    let excluded = new Set(["private", "exact.md"]);
+    const files = [{ path: "ok.md" }, { path: "private/note.md" }, { path: "exact.md" }] as any[];
+    const vault = new ObsidianIndexVault(
+      {
+        getMarkdownFiles: () => files,
+        getFileByPath: (path) => files.find((f) => f.path === path) ?? null,
+        read: async () => "ok",
+      },
+      {
+        isBaseVisible: (path) => path.endsWith(".md"),
+        isIndexEligible: (path) =>
+          ![...excluded].some((entry) => path === entry || path.startsWith(`${entry}/`)),
+      }
+    );
+
+    await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual(["ok.md"]);
+    await expect(
+      vault.readMarkdown("private/note.md", new AbortController().signal)
+    ).rejects.toThrow();
+    excluded = new Set();
+    await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual([
+      "ok.md",
+      "private/note.md",
+      "exact.md",
+    ]);
+  });
+
   it("reports whether a Markdown path is still available after a move", async () => {
     const file = { path: "new.md" } as any;
     const vault = new ObsidianIndexVault(

@@ -78,6 +78,9 @@ const cancelled = () => new Error("Corpus operation cancelled");
 function check(signal?: AbortSignal): void {
   if (signal?.aborted) throw cancelled();
 }
+function yieldMacrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 function reportProgress(
   callback: CorpusBuildOptions["onProgress"],
   event: { phase: string; completed: number; total?: number; unit: string }
@@ -580,9 +583,12 @@ export class CorpusStore {
     );
     // A generation is usable only when every artifact it references is intact. This
     // lets startup safely fall back from a corrupt current generation to previous.
+    let validatedSegments = 0;
     for (const note of notes)
-      for (const descriptor of note.segments)
+      for (const descriptor of note.segments) {
         await this.validateSegmentArtifact(descriptor.id, descriptor, note.contentId);
+        if ((++validatedSegments & 31) === 0) await yieldMacrotask();
+      }
     const snapshot = new Snapshot(this, root, notes, parsed);
     this.snapshots.add(snapshot);
     return snapshot;

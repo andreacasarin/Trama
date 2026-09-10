@@ -10,6 +10,14 @@ import { isQueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 
 export type LenteSort = "relevant" | "updated";
 export type LenteRetrievalMode = "hybrid" | "lexical";
+export type LenteSearchMethod = "hybrid" | "keyword";
+
+export interface LenteSearchOptions {
+  readonly searchMethod?: LenteSearchMethod;
+  readonly maxResults?: number;
+  readonly sort?: LenteSort;
+  readonly signal?: AbortSignal;
+}
 
 export interface LenteRetrievalPort {
   acquireLenteLease(): LenteRetrievalLease | null;
@@ -69,6 +77,7 @@ export interface LenteBatch {
   readonly generationId: string;
   readonly mode: LenteRetrievalMode;
   readonly degraded: boolean;
+  readonly displayLimit: number;
   readonly results: readonly LenteResult[];
   /** Full deterministic candidate pool retained for local sort/display projection. */
   readonly canonicalResults?: readonly LenteResult[];
@@ -89,10 +98,7 @@ export class LenteSearch {
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {}
 
-  async search(
-    query: string,
-    options: { readonly sort?: LenteSort; readonly signal?: AbortSignal } = {}
-  ): Promise<LenteBatch> {
+  async search(query: string, options: LenteSearchOptions = {}): Promise<LenteBatch> {
     const normalized = query.trim();
     if (!normalized)
       throw new StructuredError("invalid_request", "Search query must not be empty.", false);
@@ -101,14 +107,18 @@ export class LenteSearch {
     if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
     const lease = this.retrieval.acquireLenteLease();
     if (!lease) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
-    let mode: LenteRetrievalMode = "hybrid";
+    const method = options.searchMethod ?? "hybrid";
+    const displayLimit = appliedDisplayLimit(options.maxResults);
+    let mode: LenteRetrievalMode = method === "keyword" ? "lexical" : "hybrid";
+    let degraded = false;
     try {
       let raw: readonly LenteHit[];
       try {
-        raw = await this.retrieve(lease, normalized, "hybrid", signal);
+        raw = await this.retrieve(lease, normalized, mode, signal);
       } catch (error) {
-        if (!this.canFallback(error, signal)) throw error;
+        if (mode !== "hybrid" || !this.canFallback(error, signal)) throw error;
         mode = "lexical";
+        degraded = true;
         raw = await this.retrieve(lease, normalized, "lexical", signal);
       }
       if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
@@ -119,11 +129,12 @@ export class LenteSearch {
         "relevant",
         MAX_CANDIDATES
       );
-      const results = sortLenteResults(canonicalResults, options.sort ?? "relevant", MAX_RESULTS);
+      const results = sortLenteResults(canonicalResults, options.sort ?? "relevant", displayLimit);
       const batch = {
         generationId: lease.generationId,
         mode,
-        degraded: mode === "lexical",
+        degraded,
+        displayLimit,
         results,
         canonicalResults,
         durationMs: Date.now() - started,
@@ -190,6 +201,12 @@ function isCancelled(error: unknown): boolean {
     ((error as { code?: unknown }).code === "cancelled" ||
       (error as { cancelled?: unknown }).cancelled === true)
   );
+}
+
+function appliedDisplayLimit(value: number | undefined): number {
+  return Number.isSafeInteger(value)
+    ? Math.max(0, Math.min(MAX_CANDIDATES, value as number))
+    : MAX_RESULTS;
 }
 
 /** Pure, deterministic note collapse and ordering used by the service and tests. */

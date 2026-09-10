@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, SettingsStore } from "@/settings/Settings";
+import {
+  DEFAULT_SETTINGS,
+  isExcludedPath,
+  normalizeExcludedPath,
+  normalizeExcludedPaths,
+  SettingsStore,
+} from "@/settings/Settings";
 
 describe("Settings module", () => {
   describe("SettingsStore", () => {
@@ -10,15 +16,45 @@ describe("Settings module", () => {
         expect(Object.isFrozen(DEFAULT_SETTINGS.approvedOrigins)).toBe(true);
       });
 
-      it("uses v2 defaults with max tokens and reasoning in Auto state", () => {
+      it("migrates v2 defaults with max tokens and reasoning in Auto state", () => {
         const store = new SettingsStore();
         const loaded = store.load({ schemaVersion: 2, chat: {}, embedding: {} });
 
-        expect(loaded.schemaVersion).toBe(2);
+        expect(loaded.schemaVersion).toBe(3);
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
+        expect(loaded.lente).toEqual({ searchMethod: "hybrid", maxResults: 20 });
+        expect(loaded.filo).toEqual({ automaticUpdates: false, excludedPaths: [] });
         expect(loaded.detailedDebug).toBe(false);
+      });
+
+      it("sanitizes Lente and Filo settings while keeping defaults immutable", () => {
+        const loaded = new SettingsStore().load({
+          schemaVersion: 3,
+          lente: { searchMethod: "keyword", maxResults: 35 },
+          filo: {
+            automaticUpdates: true,
+            excludedPaths: [" ./Projects\\ ", "Projects", "private//notes/", "../outside", ""],
+          },
+        });
+
+        expect(loaded.lente).toEqual({ searchMethod: "keyword", maxResults: 35 });
+        expect(loaded.filo).toEqual({
+          automaticUpdates: false,
+          excludedPaths: ["Projects", "private/notes"],
+        });
+        expect(Object.isFrozen(DEFAULT_SETTINGS.lente)).toBe(true);
+        expect(Object.isFrozen(DEFAULT_SETTINGS.filo)).toBe(true);
+        expect(Object.isFrozen(DEFAULT_SETTINGS.filo.excludedPaths)).toBe(true);
+      });
+
+      it("falls back independently for invalid Lente settings", () => {
+        const loaded = new SettingsStore().load({
+          schemaVersion: 3,
+          lente: { searchMethod: "semantic", maxResults: 21 },
+        });
+        expect(loaded.lente).toEqual(DEFAULT_SETTINGS.lente);
       });
 
       it("sanitizes detailed debugging independently while preserving v2 settings", () => {
@@ -113,7 +149,7 @@ describe("Settings module", () => {
           chat: { ...DEFAULT_SETTINGS.chat, endpoint: "http://127.0.0.1:1234" },
           embedding: { ...DEFAULT_SETTINGS.embedding, endpoint: "http://127.0.0.1:4321/v1" },
         });
-        expect(settings.schemaVersion).toBe(2);
+        expect(settings.schemaVersion).toBe(3);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
         expect(settings.detailedDebug).toBe(false);
@@ -222,6 +258,36 @@ describe("Settings module", () => {
           expect(loaded.chat.endpoint).toBe(`http://[${host}]:1234/v1`);
           expect(loaded.embedding.endpoint).toBe(`http://[${host}]:1234/v1`);
         }
+      });
+
+      it("validates Lente settings on explicit Save", () => {
+        const store = new SettingsStore();
+        expect(() =>
+          store.stage({
+            ...DEFAULT_SETTINGS,
+            lente: { ...DEFAULT_SETTINGS.lente, maxResults: 21 },
+          })
+        ).toThrow();
+        expect(() =>
+          store.stage({
+            ...DEFAULT_SETTINGS,
+            lente: { ...DEFAULT_SETTINGS.lente, searchMethod: "semantic" as never },
+          })
+        ).toThrow();
+      });
+
+      it("normalizes and matches excluded files and directories purely", () => {
+        expect(normalizeExcludedPath(" ./folder\\sub// ")).toBe("folder/sub");
+        expect(normalizeExcludedPath("/folder")).toBeUndefined();
+        expect(normalizeExcludedPath("folder/./note")).toBeUndefined();
+        expect(normalizeExcludedPath("folder/../note")).toBeUndefined();
+        expect(normalizeExcludedPath("C:\\folder")).toBeUndefined();
+        expect(normalizeExcludedPath("folder\0note")).toBeUndefined();
+        expect(normalizeExcludedPaths(["z", "a/", "./a", "z", "a//b"])).toEqual(["a", "a/b", "z"]);
+        expect(isExcludedPath("folder/note.md", ["folder"])).toBe(true);
+        expect(isExcludedPath("folder", ["folder"])).toBe(true);
+        expect(isExcludedPath("folderish/note.md", ["folder"])).toBe(false);
+        expect(isExcludedPath("Folder/note.md", ["folder"])).toBe(false);
       });
     });
   });

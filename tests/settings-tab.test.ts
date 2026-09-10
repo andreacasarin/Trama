@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Setting } from "obsidian";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
 import {
   projectSettingsWithDraft,
   TramaSettingsTab,
@@ -12,6 +11,7 @@ import {
 interface SettingInstance {
   name: string;
   description: string;
+  isHeading: boolean;
   textControls: Array<{ emit(value: string): void }>;
   sliderControls: Array<{
     value: number;
@@ -38,6 +38,14 @@ function latestSetting(name: string): SettingInstance | undefined {
     .at(-1);
 }
 
+function saveButton(tab: TramaSettingsTab): { click(): void } {
+  const button = (tab.containerEl as any).children.find(
+    (child: any) => child.tagName === "button" && child.textContent === "Save"
+  );
+  expect(button).toBeDefined();
+  return button;
+}
+
 const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   chatEndpoint: DEFAULT_SETTINGS.chat.endpoint,
   chatModelId: "chat-v1",
@@ -46,6 +54,9 @@ const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   chatReasoningEffort: "auto",
   embeddingEndpoint: DEFAULT_SETTINGS.embedding.endpoint,
   embeddingModelId: "embed-v1",
+  lenteSearchMethod: "hybrid",
+  lenteMaxResults: 20,
+  filoExcludedPaths: [],
   ...overrides,
 });
 
@@ -53,14 +64,9 @@ function controller(saveSettings = vi.fn().mockResolvedValue(undefined)) {
   return {
     getSettings: () => DEFAULT_SETTINGS,
     saveSettings,
-    updateChatEndpoint: vi.fn().mockResolvedValue(undefined),
-    updateChatModel: vi.fn().mockResolvedValue(undefined),
-    updateEmbeddingEndpoint: vi.fn().mockResolvedValue(undefined),
-    updateEmbeddingModel: vi.fn().mockResolvedValue(undefined),
     addApprovedOrigin: vi.fn().mockResolvedValue(undefined),
     removeApprovedOrigin: vi.fn().mockResolvedValue(undefined),
     discoverModels: vi.fn().mockResolvedValue([]),
-    getIndexStatusMessage: () => "Ready",
   };
 }
 
@@ -70,24 +76,24 @@ describe("Settings tab module", () => {
   });
 
   describe("projectSettingsWithDraft()", () => {
-    it("keeps character-by-character endpoint edits local until the projected save", () => {
-      const draft = {
-        chatEndpoint: "http://127.0.0.1:1234/v1",
+    it("keeps local edits local until the projected save", () => {
+      const localDraft = draft({
+        chatEndpoint: "http://127.0.0.1:5678/v1",
         chatModelId: "chat-v2",
-        chatTemperature: 0.7,
-        chatMaxOutputTokens: 0,
-        chatReasoningEffort: "auto",
         embeddingEndpoint: "http://127.0.0.1:4321/v1",
         embeddingModelId: "embed-v2",
-      };
-      const oldEndpoint = projectSettingsWithDraft(DEFAULT_SETTINGS, draft);
-      draft.chatEndpoint = "http://127.0.0.1:5678/v1";
+        lenteSearchMethod: "keyword",
+        lenteMaxResults: 35,
+        filoExcludedPaths: [" ./Projects\\Private/ "],
+      });
+      const projected = projectSettingsWithDraft(DEFAULT_SETTINGS, localDraft);
 
       expect(DEFAULT_SETTINGS.chat.endpoint).toBe("http://127.0.0.1:1234/v1");
-      expect(oldEndpoint.chat.endpoint).toBe("http://127.0.0.1:1234/v1");
-      expect(projectSettingsWithDraft(DEFAULT_SETTINGS, draft)).toMatchObject({
+      expect(projected).toMatchObject({
         chat: { endpoint: "http://127.0.0.1:5678/v1", modelId: "chat-v2" },
         embedding: { endpoint: "http://127.0.0.1:4321/v1", modelId: "embed-v2" },
+        lente: { searchMethod: "keyword", maxResults: 35 },
+        filo: { automaticUpdates: false, excludedPaths: ["Projects/Private"] },
       });
     });
   });
@@ -102,184 +108,65 @@ describe("Settings tab module", () => {
       ["output tokens off slider step", { chatMaxOutputTokens: 1536 }],
       ["output tokens above maximum", { chatMaxOutputTokens: 132096 }],
       ["invalid reasoning effort", { chatReasoningEffort: "minimal" }],
-    ])(
-      "rejects %s (https://github.com/logancyang/obsidian-copilot/issues/3077)",
-      (_name, values) => {
-        expect(validateChatDraft(draft(values))).not.toBe("");
-      }
-    );
+    ])("rejects %s", (_name, values) => {
+      expect(validateChatDraft(draft(values))).not.toBe("");
+    });
 
-    it.each([0, 0.7, 1])(
-      "accepts temperature slider value %s (https://github.com/logancyang/obsidian-copilot/issues/3077)",
-      (chatTemperature) => {
-        expect(validateChatDraft(draft({ chatTemperature, chatMaxOutputTokens: 131072 }))).toBe("");
-      }
-    );
+    it.each([0, 0.7, 1])("accepts temperature slider value %s", (chatTemperature) => {
+      expect(validateChatDraft(draft({ chatTemperature, chatMaxOutputTokens: 131072 }))).toBe("");
+    });
   });
 
   describe("TramaSettingsTab", () => {
-    it("renders control labels, descriptions, and all reasoning options", () => {
+    it("renders the four headings in order with Lente controls and an unboxed Save button", () => {
       const tab = new TramaSettingsTab({} as never, controller() as never);
       tab.display();
-      const temperature = settingInstances().find((setting) => setting.name === "Temperature");
-      const tokens = settingInstances().find(
-        (setting) => setting.name === "Maximum generated-output tokens"
+
+      expect(
+        settingInstances()
+          .filter((setting) => setting.isHeading)
+          .map((setting) => setting.name)
+      ).toEqual(["Lente", "Voce", "Filo", "Advanced"]);
+      expect(settingInstances().some((setting) => setting.name === "General")).toBe(false);
+      expect(latestSetting("Search method")?.dropdownControls[0]).toMatchObject({
+        value: "hybrid",
+        options: { hybrid: "Hybrid", keyword: "Keyword only" },
+      });
+      expect(latestSetting("Maximum displayed results")?.sliderControls[0]).toMatchObject({
+        value: 20,
+        limits: { min: 5, max: 50, step: 5 },
+        dynamicTooltip: true,
+      });
+      expect(latestSetting("Automatic updates")).toBeUndefined();
+      expect(latestSetting("Approved LAN origins")?.description).toContain("leave this device");
+      expect((tab.containerEl as any).children.some((child: any) => child.tagName === "p")).toBe(
+        false
       );
-      const effort = settingInstances().find((setting) => setting.name === "Reasoning effort");
-      expect(temperature?.sliderControls[0]).toMatchObject({
-        value: 0.7,
-        limits: { min: 0, max: 1, step: 0.1 },
-        dynamicTooltip: true,
-      });
-      expect(tokens?.description).toContain("Reasoning tokens");
-      expect(tokens?.sliderControls[0]).toMatchObject({
-        value: 0,
-        limits: { min: 0, max: 131072, step: 1024 },
-        dynamicTooltip: true,
-      });
-      expect(effort?.description).toContain("model");
-      expect(effort?.dropdownControls[0].options).toEqual({
-        auto: "Auto",
-        none: "None",
-        low: "Low",
-        medium: "Medium",
-        high: "High",
-      });
-      expect(latestSetting("Detailed debugging")).toMatchObject({
-        description: expect.stringContaining("full prompts"),
-        toggleControls: [{ value: false }],
-      });
-      expect(latestSetting("Detailed debugging")?.description).toContain("No diagnostic file");
+      expect(
+        settingInstances().some((setting) =>
+          setting.buttonControls.some((button) => button.text === "Save")
+        )
+      ).toBe(false);
+      expect(saveButton(tab)).toBeDefined();
+      expect(settingInstances().some((setting) => setting.name === "Filo index")).toBe(false);
     });
 
-    it("does not recursively redraw when index status subscriptions emit immediately", () => {
-      let listener: ((status: any) => void) | undefined;
-      const target = {
-        ...controller(),
-        getIndexStatus: () => ({ revision: 1 }),
-        subscribeIndexStatus: vi.fn((next: (status: any) => void) => {
-          listener = next;
-          next({ revision: 1 });
-          return vi.fn();
-        }),
-      };
-      const tab = new TramaSettingsTab({} as never, target as never);
-
-      expect(() => tab.display()).not.toThrow();
-      expect(target.subscribeIndexStatus).toHaveBeenCalledTimes(1);
-
-      listener?.({ revision: 2 });
-      expect(target.subscribeIndexStatus).toHaveBeenCalledTimes(2);
-    });
-
-    it("redraws once per real status or progress emission when display resubscribes", () => {
-      const prototype = Setting.prototype as any;
-      Object.defineProperty(prototype, "descEl", {
-        configurable: true,
-        get() {
-          return { setText: (value: string) => (this.description = value) };
-        },
-      });
-      Object.defineProperty(prototype, "controlEl", {
-        configurable: true,
-        get() {
-          return this.containerEl;
-        },
-      });
-      try {
-        const status = new IndexStatusController({ addCommand: vi.fn() } as never, {
-          index: async () => undefined,
-          reindex: async () => undefined,
-          cancel: () => undefined,
-        });
-        const subscribeIndexStatus = vi.fn((listener: (value: any) => void) =>
-          status.subscribe(listener)
-        );
-        const target = {
-          ...controller(),
-          getIndexStatusMessage: () => status.getStatus().message ?? status.getStatus().kind,
-          getIndexStatus: () => status.getStatus(),
-          subscribeIndexStatus,
-        };
-        const tab = new TramaSettingsTab({} as never, target as never);
-        tab.display();
-        expect(subscribeIndexStatus).toHaveBeenCalledTimes(1);
-
-        expect(() => status.setUpdating()).not.toThrow();
-        expect(subscribeIndexStatus).toHaveBeenCalledTimes(2);
-
-        expect(() =>
-          status.reportProgress({
-            operation: "incremental",
-            phase: "embed",
-            completed: 2,
-            total: 4,
-            unit: "texts",
-            determinate: true,
-          })
-        ).not.toThrow();
-        expect(subscribeIndexStatus).toHaveBeenCalledTimes(3);
-        expect(latestSetting("Filo index")?.description).toBe("Creating embeddings — 2 of 4 texts");
-      } finally {
-        delete prototype.descEl;
-        delete prototype.controlEl;
-      }
-    });
-
-    it("shows the completed count for indeterminate index progress", () => {
-      const prototype = Setting.prototype as any;
-      Object.defineProperty(prototype, "descEl", {
-        configurable: true,
-        get() {
-          return { setText: (value: string) => (this.description = value) };
-        },
-      });
-      Object.defineProperty(prototype, "controlEl", {
-        configurable: true,
-        get() {
-          return this.containerEl;
-        },
-      });
-      try {
-        const target = {
-          ...controller(),
-          getIndexStatus: () => ({
-            progress: {
-              operation: "incremental",
-              phase: "embed",
-              completed: 37,
-              unit: "texts",
-              determinate: false,
-            },
-          }),
-        };
-
-        new TramaSettingsTab({} as never, target as never).display();
-
-        expect(latestSetting("Filo index")?.description).toBe("Creating embeddings — 37 texts");
-      } finally {
-        delete prototype.descEl;
-        delete prototype.controlEl;
-      }
-    });
-
-    it("renders model selectors with Discover buttons and preserves configured models", () => {
+    it("keeps Discover on the same row as each model selector and never discovers on display", () => {
       const settings = {
         ...DEFAULT_SETTINGS,
         chat: { ...DEFAULT_SETTINGS.chat, modelId: "chat-current" },
         embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed-current" },
       };
       const target = { ...controller(), getSettings: () => settings };
-      const tab = new TramaSettingsTab({} as never, target as never);
+      new TramaSettingsTab({} as never, target as never).display();
 
-      tab.display();
-
-      expect(latestSetting("Chat model")).toMatchObject({
+      expect(latestSetting("AI model")).toMatchObject({
         description: expect.stringContaining("Discover"),
         dropdownControls: [{ value: "chat-current", options: { "chat-current": "chat-current" } }],
         buttonControls: [{ text: "Discover" }],
       });
       expect(latestSetting("Embedding model")).toMatchObject({
+        description: expect.stringContaining("Filo indexing"),
         dropdownControls: [
           { value: "embed-current", options: { "embed-current": "embed-current" } },
         ],
@@ -288,80 +175,65 @@ describe("Settings tab module", () => {
       expect(target.discoverModels).not.toHaveBeenCalled();
     });
 
-    it("discovers into only the matching selector and lets the user choose a model", async () => {
+    it("discovers only after an explicit action and lets the user choose a model", async () => {
       const target = controller();
-      target.discoverModels.mockImplementation(async (target: "chat" | "embedding") =>
-        target === "chat" ? ["chat-a", "chat-b"] : ["embed-a"]
+      target.discoverModels.mockImplementation(async (kind: "chat" | "embedding") =>
+        kind === "chat" ? ["chat-a", "chat-b"] : ["embed-a"]
       );
       const tab = new TramaSettingsTab({} as never, target as never);
       tab.display();
 
-      latestSetting("Chat model")!.buttonControls[0].click();
+      latestSetting("AI model")!.buttonControls[0].click();
       await vi.waitFor(() => {
-        expect(latestSetting("Chat model")?.dropdownControls[0].options).toEqual({
+        expect(latestSetting("AI model")?.dropdownControls[0].options).toEqual({
           "": "Select a model",
           "chat-a": "chat-a",
           "chat-b": "chat-b",
         });
       });
-
       expect(latestSetting("Embedding model")?.dropdownControls[0].options).toEqual({
         "": "Select a model",
       });
-      latestSetting("Chat model")!.dropdownControls[0].emit("chat-b");
+      latestSetting("AI model")!.dropdownControls[0].emit("chat-b");
       expect(target.discoverModels).toHaveBeenCalledWith("chat");
-
-      const save = latestSetting("")!;
-      save.buttonControls[0].click();
-      await vi.waitFor(() => expect(target.saveSettings).toHaveBeenCalledTimes(1));
-      const updater = target.saveSettings.mock.calls[0][0];
-      expect(updater(DEFAULT_SETTINGS).chat.modelId).toBe("chat-b");
-      expect(updater(DEFAULT_SETTINGS).embedding.modelId).toBe("");
     });
 
-    it("projects slider values and explicit None without discovery", async () => {
+    it("keeps chat, Lente, Filo, and exclusion edits as drafts until the single Save", async () => {
       const saveSettings = vi.fn().mockResolvedValue(undefined);
       const target = controller(saveSettings);
       const tab = new TramaSettingsTab({} as never, target as never);
       tab.display();
-      const temperature = settingInstances().find((setting) => setting.name === "Temperature")!;
-      const tokens = settingInstances().find(
-        (setting) => setting.name === "Maximum generated-output tokens"
-      )!;
-      const effort = settingInstances().find((setting) => setting.name === "Reasoning effort")!;
-      temperature.sliderControls[0].emit(0.4);
-      tokens.sliderControls[0].emit(2048);
-      effort.dropdownControls[0].emit("none");
-      const save = settingInstances().find(
-        (setting) => setting.buttonControls[0]?.text === "Save"
-      )!;
-      save.buttonControls[0].click();
-      await Promise.resolve();
-      expect(saveSettings).toHaveBeenCalledTimes(1);
+
+      latestSetting("Search method")!.dropdownControls[0].emit("keyword");
+      latestSetting("Maximum displayed results")!.sliderControls[0].emit(35);
+      latestSetting("Excluded files and directories")!.textControls[0].emit("./Projects\\Private/");
+      latestSetting("Excluded files and directories")!.buttonControls[0].click();
+      await vi.waitFor(() => expect(latestSetting("Projects/Private")).toBeDefined());
+
+      saveButton(tab).click();
+      await vi.waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
       const updater = saveSettings.mock.calls[0][0];
       expect(updater(DEFAULT_SETTINGS)).toMatchObject({
-        chat: { temperature: 0.4, maxOutputTokens: 2048, reasoningEffort: "none" },
+        lente: { searchMethod: "keyword", maxResults: 35 },
+        filo: { automaticUpdates: false, excludedPaths: ["Projects/Private"] },
       });
-      expect(target.discoverModels).not.toHaveBeenCalled();
     });
 
-    it("projects a zero output slider value as Auto", async () => {
+    it("projects chat controls and preserves Auto output tokens", async () => {
       const saveSettings = vi.fn().mockResolvedValue(undefined);
-      const tab = new TramaSettingsTab({} as never, controller(saveSettings) as never);
+      const target = controller(saveSettings);
+      const tab = new TramaSettingsTab({} as never, target as never);
       tab.display();
-      const tokens = settingInstances().find(
-        (setting) => setting.name === "Maximum generated-output tokens"
-      )!;
-      tokens.sliderControls[0].emit(0);
-      const save = settingInstances().find(
-        (setting) => setting.buttonControls[0]?.text === "Save"
-      )!;
-      save.buttonControls[0].click();
-      await Promise.resolve();
-      expect(saveSettings).toHaveBeenCalledTimes(1);
+      latestSetting("Temperature")!.sliderControls[0].emit(0.4);
+      latestSetting("Maximum generated-output tokens")!.sliderControls[0].emit(2048);
+      latestSetting("Reasoning effort")!.dropdownControls[0].emit("none");
+      latestSetting("Maximum generated-output tokens")!.sliderControls[0].emit(0);
+      saveButton(tab).click();
+      await vi.waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
       const updater = saveSettings.mock.calls[0][0];
-      expect(updater(DEFAULT_SETTINGS).chat).toMatchObject({ temperature: 0.7 });
+      expect(updater(DEFAULT_SETTINGS).chat).toMatchObject({ temperature: 0.4 });
       expect(updater(DEFAULT_SETTINGS).chat).not.toHaveProperty("maxOutputTokens");
+      expect(updater(DEFAULT_SETTINGS).chat).toMatchObject({ reasoningEffort: "none" });
     });
 
     it("persists the detailed debugging toggle immediately", async () => {

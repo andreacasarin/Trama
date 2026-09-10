@@ -8,7 +8,12 @@ import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
-import { DEFAULT_SETTINGS, SettingsStore, TramaSettings } from "@/settings/Settings";
+import {
+  DEFAULT_SETTINGS,
+  isExcludedPath,
+  SettingsStore,
+  TramaSettings,
+} from "@/settings/Settings";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import {
@@ -21,8 +26,12 @@ import {
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { RelatedNotes } from "@/index/RelatedNotes";
 import { TRAMA_ICONS } from "@/ui/icons";
-import { LenteSearch } from "@/index/LenteSearch";
+import { LenteBatch, LenteSearch, LenteSearchOptions } from "@/index/LenteSearch";
 import { ObsidianLenteNoteStats } from "@/vault/readOnly/ObsidianLenteNoteStats";
+
+interface LenteSearchPort {
+  search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
+}
 
 /** Composes the desktop-only assistant and owns its lifecycle and vault event boundary. */
 export class TramaPlugin extends Plugin {
@@ -34,8 +43,11 @@ export class TramaPlugin extends Plugin {
   private index?: IndexManager;
   private indexStatus?: IndexStatusController;
   private relatedNotes?: RelatedNotes;
-  private lenteSearch?: LenteSearch;
+  private lenteSearch?: LenteSearchPort;
   private lifecycleAbort?: AbortController;
+  private automaticAbort?: AbortController;
+  private automaticReschedulePending = false;
+  private suppressNextAutomaticLenteRefresh = false;
   private indexLoad?: Promise<boolean>;
   private indexLoaded = false;
   private indexReady = false;
@@ -55,7 +67,7 @@ export class TramaPlugin extends Plugin {
         // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
         try {
           // eslint-disable-next-line no-console
-          console.debug("[Trama]", record);
+          console.info("[Trama]", record);
         } catch {
           // Console instrumentation is observational and must not break chat or indexing.
         }
@@ -171,8 +183,7 @@ export class TramaPlugin extends Plugin {
     this.indexReady = false;
     this.indexStatus?.cancel();
     this.lifecycleAbort?.abort();
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.eventTimer = undefined;
+    this.stopAutomaticWork(false);
     this.relatedNotes?.cancel();
     this.relatedNotes = undefined;
     this.session?.cancel();
@@ -185,13 +196,6 @@ export class TramaPlugin extends Plugin {
   }
   getSettings(): TramaSettings {
     return this.settingsStore.get() ?? DEFAULT_SETTINGS;
-  }
-  getIndexStatusMessage(): string {
-    return (
-      this.indexStatus?.getStatus().message ??
-      this.indexStatus?.getStatus().kind ??
-      "Not initialized"
-    );
   }
   saveSettings(
     settings: TramaSettings | ((current: TramaSettings) => TramaSettings)
@@ -218,7 +222,31 @@ export class TramaPlugin extends Plugin {
       before.embedding.endpoint !== saved.embedding.endpoint ||
       before.embedding.modelId !== saved.embedding.modelId ||
       before.embedding.dimensions !== saved.embedding.dimensions;
+    const lenteChanged =
+      before.lente.searchMethod !== saved.lente.searchMethod ||
+      before.lente.maxResults !== saved.lente.maxResults;
+    const addedExclusions = saved.filo.excludedPaths.filter(
+      (path) => !before.filo.excludedPaths.includes(path)
+    );
+    const removedExclusions = before.filo.excludedPaths.filter(
+      (path) => !saved.filo.excludedPaths.includes(path)
+    );
+    const app = (this as unknown as { app?: any }).app;
+
+    if (!saved.filo.automaticUpdates)
+      this.stopAutomaticWork(true, before.filo.automaticUpdates && !saved.filo.automaticUpdates);
+    else if (!before.filo.automaticUpdates) this.armAutomaticWork();
+
+    if (addedExclusions.length) {
+      // A live eligibility change must stop an in-flight background operation
+      // before the deletion-only prune examines the committed snapshot.
+      this.stopAutomaticWork();
+      this.cancelExplicitIndexForEligibilityChange();
+      this.relatedNotes?.invalidateExcludedPaths(addedExclusions);
+      this.invalidateOpenExcludedResults(app, addedExclusions);
+    }
     if (embeddingChanged) {
+      this.stopAutomaticWork(false);
       this.session?.cancel();
       this.relatedNotes?.cancel();
     }
@@ -235,10 +263,27 @@ export class TramaPlugin extends Plugin {
       this.lifecycleAbort = new AbortController();
       this.indexStatus?.markStale(false);
     }
-    const app = (this as unknown as { app?: any }).app;
     if (app?.vault && app.workspace && app.metadataCache && this.session) {
       if (chatChanged && !embeddingChanged) this.replaceChatModel(saved);
       else if (embeddingChanged) this.composeRuntime(app, saved);
+    }
+
+    if (lenteChanged && !embeddingChanged && this.index) {
+      this.replaceLenteSearch(app, addedExclusions.length === 0);
+    }
+    const exclusionsPruned = addedExclusions.length ? await this.pruneAddedExclusions() : true;
+    if (removedExclusions.length) this.queueRemovedExclusions(before.filo.excludedPaths);
+
+    if (
+      exclusionsPruned &&
+      this.getSettings().filo.automaticUpdates &&
+      this.queuedWork &&
+      this.indexReady
+    ) {
+      if (addedExclusions.length) this.suppressNextAutomaticLenteRefresh = true;
+      this.scheduleReconcile();
+    } else if (addedExclusions.length) {
+      this.suppressNextAutomaticLenteRefresh = false;
     }
   }
   updateChatEndpoint(value: string): Promise<void> {
@@ -271,9 +316,10 @@ export class TramaPlugin extends Plugin {
       policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
     });
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.workspace, app.metadataCache);
-    const indexVault: IndexVaultPort = new ObsidianIndexVault(app.vault, (path) =>
-      this.isVisibleMarkdown(path)
-    );
+    const indexVault: IndexVaultPort = new ObsidianIndexVault(app.vault, {
+      isBaseVisible: (path) => this.isVisibleMarkdown(path),
+      isIndexEligible: (path) => this.isIndexEligible(path),
+    });
     const embedding = new LmStudioEmbeddingModel({ ...settings.embedding, transport });
     this.embeddingModel = embedding;
     const manager = new IndexManager(
@@ -282,17 +328,16 @@ export class TramaPlugin extends Plugin {
       new ObsidianIndexStorage(app.vault.adapter),
       settings.embedding.endpoint,
       settings.embedding.modelId,
-      { onProgress: (progress) => this.indexStatus?.reportProgress(progress) },
+      {
+        isIndexEligible: (path) => this.isIndexEligible(path),
+        onProgress: (progress) => this.indexStatus?.reportProgress(progress),
+      },
       this.diagnostics
     );
     this.index = manager;
     this.relatedNotes?.cancel();
     this.relatedNotes = new RelatedNotes(manager, this.diagnostics);
-    this.lenteSearch = new LenteSearch(
-      manager,
-      new ObsidianLenteNoteStats(app.vault),
-      this.diagnostics
-    );
+    this.lenteSearch = this.createLenteSearch(manager, app, settings);
     const compositionRevision = ++this.compositionRevision;
     const registry = new ToolRegistry([
       new ReadNoteTool(readonlyVault),
@@ -309,6 +354,9 @@ export class TramaPlugin extends Plugin {
       if (this.index !== manager || compositionRevision !== this.compositionRevision) return;
       this.indexLoaded = true;
       this.indexReady = loaded;
+      const hadPendingChanges = this.pendingVaultChanges.size > 0;
+      for (const path of this.pendingVaultChanges) manager.queueChange(path);
+      this.pendingVaultChanges.clear();
       if (!loaded) {
         // The initial persisted-index decision is startup bookkeeping and must
         // stay silent even if debugging is enabled immediately after onload.
@@ -318,12 +366,39 @@ export class TramaPlugin extends Plugin {
       if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
       else this.indexStatus?.setReady(true);
       this.refreshOpenRelatedSuggestions(app);
-      const hadPendingChanges = this.pendingVaultChanges.size > 0;
-      for (const path of this.pendingVaultChanges) this.index?.queueChange(path);
-      this.pendingVaultChanges.clear();
-      const index = manager;
-      if (hadPendingChanges && index && this.lifecycleAbort) this.scheduleReconcile();
+      if (hadPendingChanges) {
+        if (this.getSettings().filo.automaticUpdates) this.scheduleReconcile();
+        else this.markQueuedWorkStale();
+      }
     });
+  }
+
+  private createLenteSearch(
+    manager: IndexManager,
+    app: any,
+    settings: TramaSettings
+  ): LenteSearchPort {
+    const search = new LenteSearch(
+      manager,
+      new ObsidianLenteNoteStats(app.vault),
+      this.diagnostics
+    );
+    return {
+      search: (query, options = {}) =>
+        search.search(query, {
+          ...options,
+          searchMethod: settings.lente.searchMethod,
+          maxResults: settings.lente.maxResults,
+        }),
+    };
+  }
+
+  private replaceLenteSearch(app: any, refreshSubmitted = true): void {
+    const manager = this.index;
+    if (!manager || !app?.vault) return;
+    this.lenteSearch = this.createLenteSearch(manager, app, this.getSettings());
+    this.composeLenteViews(app);
+    if (refreshSubmitted) this.refreshOpenLente(app);
   }
 
   private replaceChatModel(settings: TramaSettings): void {
@@ -342,6 +417,30 @@ export class TramaPlugin extends Plugin {
     for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
       const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
       view?.refreshRelatedSuggestions?.();
+    }
+  }
+
+  private refreshOpenFilo(app: any): void {
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
+      const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
+      view?.refreshRelatedSuggestions?.();
+    }
+  }
+
+  private invalidateOpenExcludedResults(app: any, paths: readonly string[]): void {
+    if (!app?.workspace) return;
+    this.refreshOpenRelatedSuggestions(app);
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
+      const view = (
+        leaf as { view?: { invalidateExcludedPaths?: (paths: readonly string[]) => void } }
+      ).view;
+      view?.invalidateExcludedPaths?.(paths);
+    }
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
+      const view = (
+        leaf as { view?: { invalidateExcludedPaths?: (paths: readonly string[]) => void } }
+      ).view;
+      view?.invalidateExcludedPaths?.(paths);
     }
   }
 
@@ -396,7 +495,14 @@ export class TramaPlugin extends Plugin {
       view?.setDependencies?.(this.indexStatus, this.relatedNotes);
     }
     for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
-      const view = (leaf as { view?: { setSearch?: (search: LenteSearch) => void } }).view;
+      const view = (leaf as { view?: { setSearch?: (search: LenteSearchPort) => void } }).view;
+      if (this.lenteSearch) view?.setSearch?.(this.lenteSearch);
+    }
+  }
+
+  private composeLenteViews(app: any): void {
+    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
+      const view = (leaf as { view?: { setSearch?: (search: LenteSearchPort) => void } }).view;
       if (this.lenteSearch) view?.setSearch?.(this.lenteSearch);
     }
   }
@@ -440,11 +546,93 @@ export class TramaPlugin extends Plugin {
   getRelatedNotes(): RelatedNotes | undefined {
     return this.relatedNotes;
   }
-  getIndexStatus(): ReturnType<IndexStatusController["getStatus"]> | undefined {
-    return this.indexStatus?.getStatus();
+
+  private armAutomaticWork(): void {
+    if (this.getSettings().filo.automaticUpdates && this.queuedWork && this.indexReady)
+      this.scheduleReconcile();
   }
-  subscribeIndexStatus(listener: Parameters<IndexStatusController["subscribe"]>[0]): () => void {
-    return this.indexStatus?.subscribe(listener) ?? (() => undefined);
+
+  private stopAutomaticWork(markStale = true, rescheduleAfterAbort = false): void {
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+    if (this.automaticAbort) {
+      this.automaticAbort.abort();
+      this.automaticAbort = undefined;
+      if (rescheduleAfterAbort) this.automaticReschedulePending = true;
+      this.queuedWork = true;
+    }
+    if (markStale && this.queuedWork) this.markQueuedWorkStale();
+  }
+
+  private cancelExplicitIndexForEligibilityChange(): void {
+    const status = (
+      this.indexStatus as { getStatus?: () => { kind?: string } } | undefined
+    )?.getStatus?.();
+    if (status?.kind === "building" || status?.kind === "cancelling") this.indexStatus?.cancel();
+  }
+
+  private markQueuedWorkStale(): void {
+    if (!this.indexStatus) return;
+    const manager = this.index as (IndexManager & { hasUsableIndex?: () => boolean }) | undefined;
+    const hasLastGood = manager?.hasUsableIndex?.() ?? this.indexReady;
+    this.indexStatus.markStale(hasLastGood);
+  }
+
+  private async pruneAddedExclusions(): Promise<boolean> {
+    const manager = this.index;
+    if (!manager) return true;
+    const signal = this.lifecycleAbort?.signal ?? new AbortController().signal;
+    let published = false;
+    let failed = false;
+    const wasBuilding = manager.isBuilding();
+    try {
+      published = await manager.pruneExcludedPaths(signal);
+    } catch {
+      // An automatic operation may have been cancelled immediately before the
+      // prune call. Let that operation settle once, then retry this one local
+      // deletion-only pass exactly once.
+      if (wasBuilding) {
+        try {
+          await manager.waitForBuild().catch(() => undefined);
+          published = await manager.pruneExcludedPaths(signal);
+        } catch {
+          published = false;
+        }
+      }
+      failed = !published;
+      if (failed && this.index === manager) {
+        this.queuedWork = true;
+        this.markQueuedWorkStale();
+      }
+    }
+    if (this.index !== manager) return false;
+    this.relatedNotes?.cancel();
+    const app = (this as unknown as { app?: any }).app;
+    if (!app?.workspace) return !failed;
+    this.refreshOpenRelatedSuggestions(app);
+    this.refreshOpenFilo(app);
+    return !failed;
+  }
+
+  private queueRemovedExclusions(previousExcludedPaths: readonly string[]): void {
+    const manager = this.index;
+    const app = (this as unknown as { app?: any }).app;
+    if (!manager || !app?.vault?.getMarkdownFiles) return;
+    for (const file of app.vault.getMarkdownFiles()) {
+      const path = file.path;
+      if (
+        !this.isVisibleMarkdown(path) ||
+        !this.isIndexEligible(path) ||
+        !isExcludedPath(path, previousExcludedPaths)
+      )
+        continue;
+      manager.queueOperation({ kind: "create", path });
+      if (!this.indexLoaded || !this.indexReady) this.pendingVaultChanges.add(path);
+      this.queuedWork = true;
+    }
+    if (!this.queuedWork) return;
+    if (this.getSettings().filo.automaticUpdates && this.indexReady) this.scheduleReconcile();
+    else this.markQueuedWorkStale();
   }
 
   private async runFullIndex(signal: AbortSignal): Promise<void> {
@@ -454,39 +642,49 @@ export class TramaPlugin extends Plugin {
   private async runIndex(signal: AbortSignal, force: boolean): Promise<void> {
     if (this.eventTimer) clearTimeout(this.eventTimer);
     this.eventTimer = undefined;
+    this.stopAutomaticWork(false);
     const manager = this.index;
     if (!manager) throw new Error("Index is not initialized.");
     await this.indexLoad;
     if (this.index !== manager) throw new Error("Index was replaced during indexing.");
-    try {
-      const published = force
-        ? (await manager.build(signal), true)
-        : await manager.synchronizeWithPublication(signal);
-      this.indexReady = true;
-      const app = (this as unknown as { app?: any }).app;
-      if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-      if (published && app?.workspace) this.refreshOpenLente(app);
-      this.pendingVaultChanges.clear();
-      if (this.queuedWork) await this.reconcileNow().catch(() => undefined);
-      else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
-      else this.indexStatus?.setReady();
-    } catch (error) {
-      // A failed/cancelled rebuild does not discard queued vault revisions. If
-      // a last-good generation remains, retry them through the normal debounce.
-      if (this.queuedWork && manager.hasUsableIndex()) this.scheduleReconcile();
-      throw error;
-    }
+    const published = force
+      ? (await manager.build(signal), true)
+      : await manager.synchronizeWithPublication(signal);
+    this.indexReady = true;
+    const app = (this as unknown as { app?: any }).app;
+    if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
+    if (published && app?.workspace) this.refreshOpenLente(app);
+    this.pendingVaultChanges.clear();
+    if (this.queuedWork) await this.reconcileNow("explicit", signal).catch(() => undefined);
+    else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
+    else this.indexStatus?.setReady();
   }
 
   private scheduleReconcile(): void {
+    if (!this.getSettings().filo.automaticUpdates) return;
     if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.diagnostics.emit({
+      area: "index",
+      event: "index_operation",
+      operation: "incremental",
+      stage: "scheduled",
+      durationMs: 1500,
+      counts: { queued: this.queuedWork ? 1 : 0 },
+    });
     this.eventTimer = setTimeout(() => {
       this.eventTimer = undefined;
-      void this.reconcileNow().catch(() => undefined);
+      void this.reconcileNow("automatic").catch(() => undefined);
     }, 1500);
   }
 
-  private async reconcileNow(): Promise<void> {
+  private async reconcileNow(
+    source: "automatic" | "explicit" = "explicit",
+    explicitSignal?: AbortSignal
+  ): Promise<void> {
+    if (source === "automatic") {
+      if (!this.getSettings().filo.automaticUpdates) return;
+      if (!this.automaticAbort) this.automaticAbort = new AbortController();
+    }
     const manager = this.index;
     if (!manager || !this.indexReady || !this.lifecycleAbort) return;
     // Explicit builds own the user-facing state. The queued work remains in
@@ -494,15 +692,24 @@ export class TramaPlugin extends Plugin {
     if (manager.isBuilding()) return;
     if (this.reconcilePromise) return this.reconcilePromise;
     this.queuedWork = false;
-    this.indexStatus?.setUpdating();
+    if (source === "automatic") this.indexStatus?.setUpdating();
+    const operationSignal =
+      source === "automatic"
+        ? this.automaticAbort!.signal
+        : (explicitSignal ?? this.lifecycleAbort.signal);
+    let completed = false;
     this.reconcilePromise = manager
-      .reconcileQueuedChanges(this.lifecycleAbort.signal)
+      .reconcileQueuedChanges(operationSignal)
       .then(() => {
+        completed = true;
         const published = manager.getLastReconciliationPublished();
+        const suppressLenteRefresh =
+          source === "automatic" && this.suppressNextAutomaticLenteRefresh;
+        if (suppressLenteRefresh) this.suppressNextAutomaticLenteRefresh = false;
         this.indexStatus?.setReady();
         const app = (this as unknown as { app?: any }).app;
         if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-        if (published && app?.workspace) this.refreshOpenLente(app);
+        if (published && !suppressLenteRefresh && app?.workspace) this.refreshOpenLente(app);
       })
       .catch((error) => {
         this.queuedWork = true;
@@ -511,7 +718,20 @@ export class TramaPlugin extends Plugin {
       })
       .finally(() => {
         this.reconcilePromise = undefined;
-        if (this.queuedWork && this.indexReady) this.scheduleReconcile();
+        const shouldResumeAfterCancellation =
+          source === "automatic" && this.automaticReschedulePending;
+        if (
+          source === "automatic" &&
+          (completed || shouldResumeAfterCancellation) &&
+          this.queuedWork &&
+          this.indexReady &&
+          this.getSettings().filo.automaticUpdates
+        ) {
+          this.automaticReschedulePending = false;
+          this.scheduleReconcile();
+        }
+        if (source === "automatic" && this.automaticAbort?.signal === operationSignal)
+          this.automaticAbort = undefined;
       });
     return this.reconcilePromise;
   }
@@ -527,12 +747,12 @@ export class TramaPlugin extends Plugin {
       this.queueVaultOperation({ kind: "delete", path: file.path })
     );
     this.registerVaultEvent(vault, "rename", (file: TAbstractFile, oldPath: string) => {
-      const oldVisible = this.isVisibleMarkdown(oldPath);
-      const newVisible = this.isVisibleMarkdown(file.path);
-      if (oldVisible && newVisible)
+      const oldEligible = this.isIndexEligible(oldPath);
+      const newEligible = this.isIndexEligible(file.path);
+      if (oldEligible && newEligible)
         this.queueVaultOperation({ kind: "rename", oldPath, path: file.path });
-      else if (oldVisible) this.queueVaultOperation({ kind: "delete", path: oldPath });
-      else if (newVisible) this.queueVaultOperation({ kind: "create", path: file.path });
+      else if (oldEligible) this.queueVaultOperation({ kind: "delete", path: oldPath });
+      else if (newEligible) this.queueVaultOperation({ kind: "create", path: file.path });
     });
   }
   private registerVaultEvent(vault: any, event: string, callback: (...args: any[]) => void): void {
@@ -547,7 +767,15 @@ export class TramaPlugin extends Plugin {
   ): void {
     const paths =
       operation.kind === "rename" ? [operation.oldPath, operation.path] : [operation.path];
-    if (paths.every((path) => !this.isVisibleMarkdown(path)) || !this.index) return;
+    if (paths.every((path) => !this.isIndexEligible(path)) || !this.index) return;
+    this.diagnostics.emit({
+      area: "index",
+      event: "index_operation",
+      operation: "incremental",
+      stage: "queued",
+      path: operation.path,
+      counts: { automatic: this.getSettings().filo.automaticUpdates ? 1 : 0 },
+    });
     if (!this.indexLoaded || !this.indexReady) {
       if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
       else this.index.queueOperation(operation as any);
@@ -558,8 +786,18 @@ export class TramaPlugin extends Plugin {
     this.queuedWork = true;
     if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
     else this.index.queueOperation(operation as any);
-    if (!this.index.isBuilding()) this.indexStatus?.setUpdating();
-    this.scheduleReconcile();
+    if (this.getSettings().filo.automaticUpdates) {
+      if (!this.index.isBuilding()) this.indexStatus?.setUpdating();
+      this.scheduleReconcile();
+    } else {
+      this.markQueuedWorkStale();
+    }
+  }
+
+  private isIndexEligible(path: string): boolean {
+    return (
+      this.isVisibleMarkdown(path) && !isExcludedPath(path, this.getSettings().filo.excludedPaths)
+    );
   }
 
   private isVisibleMarkdown(path: string): boolean {

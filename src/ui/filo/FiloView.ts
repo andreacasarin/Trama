@@ -1,5 +1,6 @@
 import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
+import { isExcludedPath } from "@/settings/Settings";
 import { formatIndexProgress, IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
@@ -100,6 +101,11 @@ export class FiloView extends ItemView {
     return Promise.resolve();
   }
 
+  /** Refreshes the active note's suggestions after an index/prune settlement. */
+  refreshRelatedSuggestions(): void {
+    if (this.isViewOpen) this.refreshRelated();
+  }
+
   private teardown(): void {
     this.requestGeneration++;
     this.requestAbort?.abort();
@@ -169,6 +175,24 @@ export class FiloView extends ItemView {
     return !key || key === `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
   }
 
+  /** Immediately removes excluded cached rows before prune/refresh completes. */
+  invalidateExcludedPaths(paths: readonly string[]): void {
+    if (!paths.length) return;
+    this.requestGeneration++;
+    this.requestAbort?.abort();
+    this.requestAbort = undefined;
+    this.requestKey = undefined;
+    this.relatedError = false;
+    if (this.related)
+      this.related = {
+        ...this.related,
+        results: isExcludedPath(this.related.currentPath, paths)
+          ? []
+          : this.related.results.filter((result) => !isExcludedPath(result.path, paths)),
+      };
+    this.render();
+  }
+
   private render(): void {
     if (!this.root) return;
     this.root.empty();
@@ -203,11 +227,21 @@ export class FiloView extends ItemView {
       if (status.canCancel) this.actionButton("Cancel", "cancel");
       return;
     }
-    if (status.kind === "error" || status.kind === "stale") {
+    if (status.kind === "stale") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "trama-filo__message trama-filo__message--warning",
-        text: status.message ?? "Index is stale.",
+        text: status.message ?? "Index has changes; update required.",
+      });
+      if (status.canIndex) this.actionButton("Index vault", "index");
+      if (status.canReindex) this.actionButton("Reindex vault", "reindex");
+      return;
+    }
+    if (status.kind === "error") {
+      if (status.hasLastGood && this.related) this.renderRows();
+      this.root.createDiv({
+        cls: "trama-filo__message trama-filo__message--warning",
+        text: status.message ?? "Indexing failed.",
       });
       if (status.canReindex) this.actionButton("Reindex vault", "reindex");
       else if (status.canIndex) this.actionButton("Index vault", "index");

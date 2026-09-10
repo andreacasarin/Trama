@@ -155,6 +155,35 @@ describe("LenteSearch", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it("uses keyword retrieval without marking the result degraded", async () => {
+    const search = vi.fn(async () => [hit("note.md", 1)]);
+    const service = new LenteSearch(
+      { acquireLenteLease: () => ({ generationId: "g1", search, release: async () => undefined }) },
+      { getMtime: () => 1 }
+    );
+    await expect(service.search("needle", { searchMethod: "keyword" })).resolves.toMatchObject({
+      mode: "lexical",
+      degraded: false,
+      displayLimit: 20,
+    });
+    expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
+  });
+
+  it("applies a configured display limit without shrinking the candidate pool", async () => {
+    const candidates = Array.from({ length: 30 }, (_, index) =>
+      hit(`note-${index}.md`, 1 - index / 100)
+    );
+    const search = vi.fn(async () => candidates);
+    const service = new LenteSearch(
+      { acquireLenteLease: () => ({ generationId: "g1", search, release: async () => undefined }) },
+      { getMtime: () => 1 }
+    );
+    const result = await service.search("needle", { maxResults: 5 });
+    expect(result.displayLimit).toBe(5);
+    expect(result.results).toHaveLength(5);
+    expect(result.canonicalResults).toHaveLength(30);
+  });
+
   it("uses the retriever lease shape with a 160-candidate request", async () => {
     const candidates = Array.from({ length: 30 }, (_, index) =>
       hit(`note-${index}.md`, 1 - index / 100)

@@ -150,7 +150,7 @@ export class IndexStatusController {
     this.set("updating", true, "Updating index…");
   }
   markStale(hasLastGood = this.status.hasLastGood): void {
-    this.set("stale", hasLastGood, "Index is stale; reindex required.");
+    this.set("stale", hasLastGood, "Index has changes; update required.");
   }
   markError(error: unknown): void {
     this.set(

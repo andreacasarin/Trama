@@ -82,6 +82,7 @@ export class ExactVectorIndex implements VectorIndex {
             vectors,
           });
           base = Math.max(base, (descriptor.firstOrdinal ?? base) + descriptor.chunkCount);
+          if ((segments.length & 31) === 0) await yieldMacrotask();
         }
         if (base !== note.chunkCount) throw new Error("Corpus note count mismatch");
       }

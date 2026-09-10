@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
 import { OramaLexicalIndex } from "@/index/lexical/OramaLexicalIndex";
 
@@ -119,19 +119,22 @@ describe("OramaLexicalIndex", () => {
     await index.close();
   });
 
-  it("bounds candidates and inserts in 256-document batches", async () => {
-    const records = Array.from({ length: 513 }, (_, ordinal) => ({
+  it("bounds candidates and yields between small document batches", async () => {
+    const records = Array.from({ length: 65 }, (_, ordinal) => ({
       ordinal,
       text: `needle ${ordinal}`,
     }));
     const source = snapshot(records);
     const progress: number[] = [];
+    const timers = vi.spyOn(globalThis, "setTimeout");
     const index = await OramaLexicalIndex.build(source, {
       onProgress: (event) => progress.push(event.completed),
     });
-    expect(progress).toEqual([256, 512, 513]);
+    expect(progress).toEqual([32, 64, 65]);
+    expect(timers).toHaveBeenCalledTimes(3);
     expect((await index.search("needle", { candidateLimit: 3, limit: 100 })).length).toBe(3);
     await index.close();
+    timers.mockRestore();
   });
 
   it("releases its pin when build is cancelled", async () => {

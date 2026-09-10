@@ -1,5 +1,6 @@
 import { RelatedIndexSnapshot } from "@/index/IndexManager";
 import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { isExcludedPath } from "@/settings/Settings";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
@@ -73,13 +74,6 @@ export class RelatedNotes {
     if (signal.aborted) throw new Error("Operation cancelled");
     const cap = Math.max(0, Math.min(RelatedNotes.MAX_RESULTS, Math.floor(limit)));
     const snapshot = this.index.relatedSnapshot(currentPath);
-    this.emitDiagnostic({
-      area: "filo",
-      event: "related_search",
-      path: currentPath,
-      generation: snapshot?.generationId,
-      resultCount: 0,
-    });
     if (!snapshot || cap === 0) {
       const result = {
         generationId: snapshot?.generationId ?? "",
@@ -103,20 +97,30 @@ export class RelatedNotes {
       return this.forConsumer(existing.promise, signal, cap, key, currentPath);
     if (existing?.controller.signal.aborted) this.inFlight.delete(key);
     const controller = new AbortController();
+    this.emitDiagnostic({
+      area: "filo",
+      event: "related_search",
+      stage: "started",
+      path: currentPath,
+      generation: snapshot.generationId,
+      resultCount: 0,
+    });
     const run = this.compute(snapshot, controller.signal, RelatedNotes.MAX_RESULTS)
       .then((result) => {
-        if (!controller.signal.aborted && this.snapshotKey(result.currentPath) === key) {
+        if (controller.signal.aborted) throw new Error("Operation cancelled");
+        if (this.snapshotKey(result.currentPath) === key) {
           this.cache.set(key, result);
           this.publish(result, key);
           this.emitDiagnostic({
             area: "filo",
             event: "related_search",
+            stage: "completed",
             path: result.currentPath,
             generation: result.generationId,
             resultCount: result.results.length,
             durationMs: Date.now() - started,
           });
-        } else if (!controller.signal.aborted) {
+        } else {
           this.emitDiagnostic({
             area: "filo",
             event: "related_search",
@@ -139,6 +143,26 @@ export class RelatedNotes {
 
   cancel(): void {
     this.cancelAll();
+  }
+
+  /**
+   * Synchronously removes newly excluded notes from all published and cached
+   * suggestions before the index prune or a replacement search completes.
+   */
+  invalidateExcludedPaths(paths: readonly string[]): void {
+    if (!paths.length) return;
+    this.cancelAll();
+    const filter = (result: RelatedNotesResult): RelatedNotesResult => ({
+      ...result,
+      results: isExcludedPath(result.currentPath, paths)
+        ? []
+        : result.results.filter((item) => !isExcludedPath(item.path, paths)),
+    });
+    for (const [key, result] of this.cache) this.cache.set(key, filter(result));
+    if (this.latestResult) {
+      this.latestResult = filter(this.latestResult);
+      for (const listener of this.listeners) listener(this.latestResult);
+    }
   }
 
   private cancelAll(): void {
@@ -205,7 +229,17 @@ export class RelatedNotes {
     limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) throw new Error("Operation cancelled");
+    const prepareStarted = Date.now();
     const prepared = await snapshot.prepareQuery(signal);
+    this.emitDiagnostic({
+      area: "filo",
+      event: "related_search",
+      stage: "prepare-completed",
+      path: snapshot.currentPath,
+      generation: snapshot.generationId,
+      resultCount: 0,
+      durationMs: Date.now() - prepareStarted,
+    });
     if (!prepared || !prepared.text) {
       return {
         generationId: snapshot.generationId,
@@ -214,7 +248,17 @@ export class RelatedNotes {
         results: [],
       };
     }
+    const retrieveStarted = Date.now();
     const hits = await snapshot.search(prepared.text, prepared.vector, signal, 128);
+    this.emitDiagnostic({
+      area: "filo",
+      event: "related_search",
+      stage: "retrieve-completed",
+      path: snapshot.currentPath,
+      generation: snapshot.generationId,
+      resultCount: hits.length,
+      durationMs: Date.now() - retrieveStarted,
+    });
     const best = new Map<string, RelatedNoteResult>();
     for (const hit of hits) {
       if (hit.path === snapshot.currentPath) continue;

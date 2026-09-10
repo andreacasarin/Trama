@@ -1,8 +1,12 @@
 import { PluginSettingTab, Setting } from "obsidian";
 import { Plugin } from "obsidian";
 import { EndpointApproval } from "@/security/EndpointPolicy";
-import { TramaSettings } from "@/settings/Settings";
-import { formatIndexProgress, type IndexStatus } from "@/ui/index/IndexStatus";
+import {
+  normalizeExcludedPaths,
+  normalizeExcludedPath,
+  type LenteSearchMethod,
+  TramaSettings,
+} from "@/settings/Settings";
 
 /** Callbacks supplied by composition to keep settings UI independent of runtime wiring. */
 export interface SettingsTabCallbacks {
@@ -17,9 +21,6 @@ export interface SettingsTabCallbacks {
   addApprovedOrigin(endpoint: string): Promise<void>;
   removeApprovedOrigin(origin: EndpointApproval): Promise<void>;
   discoverModels(target: "chat" | "embedding"): Promise<readonly string[]>;
-  getIndexStatusMessage(): string;
-  getIndexStatus?(): IndexStatus | undefined;
-  subscribeIndexStatus?(listener: (status: IndexStatus) => void): () => void;
 }
 
 export interface SettingsDraft {
@@ -30,6 +31,9 @@ export interface SettingsDraft {
   chatReasoningEffort: string;
   embeddingEndpoint: string;
   embeddingModelId: string;
+  lenteSearchMethod: LenteSearchMethod;
+  lenteMaxResults: number;
+  filoExcludedPaths: readonly string[];
 }
 
 const REASONING_EFFORTS = ["auto", "none", "low", "medium", "high"] as const;
@@ -75,6 +79,14 @@ export function projectSettingsWithDraft(
       endpoint: draft.embeddingEndpoint,
       modelId: draft.embeddingModelId,
     },
+    lente: {
+      searchMethod: draft.lenteSearchMethod,
+      maxResults: draft.lenteMaxResults,
+    },
+    filo: {
+      automaticUpdates: false,
+      excludedPaths: normalizeExcludedPaths(draft.filoExcludedPaths),
+    },
   };
 }
 
@@ -87,7 +99,6 @@ export class TramaSettingsTab extends PluginSettingTab {
     chat: 0,
     embedding: 0,
   };
-  private statusUnsubscribe?: () => void;
   constructor(
     app: ConstructorParameters<typeof PluginSettingTab>[0],
     private readonly controller: Plugin & Partial<SettingsTabCallbacks>
@@ -96,12 +107,6 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
   override display(): void {
     this.containerEl.empty();
-    this.statusUnsubscribe?.();
-    this.statusUnsubscribe = undefined;
-    this.containerEl.createEl("h2", { text: "Trama" });
-    this.containerEl.createEl("p", {
-      text: "LM Studio is contacted only after an explicit action.",
-    });
     const settings = this.controller.getSettings?.();
     if (!settings) return;
     const draft = (this.draft ??= {
@@ -112,98 +117,71 @@ export class TramaSettingsTab extends PluginSettingTab {
       chatReasoningEffort: settings.chat.reasoningEffort ?? "auto",
       embeddingEndpoint: settings.embedding.endpoint,
       embeddingModelId: settings.embedding.modelId,
+      lenteSearchMethod: settings.lente.searchMethod,
+      lenteMaxResults: settings.lente.maxResults,
+      filoExcludedPaths: [...settings.filo.excludedPaths],
     });
-    this.text("Voce endpoint", draft.chatEndpoint, (value) => {
+
+    this.sectionHeading("Lente");
+    new Setting(this.containerEl)
+      .setName("Search method")
+      .setDesc("Hybrid combines semantic and keyword search; Keyword only never uses embeddings.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("hybrid", "Hybrid");
+        dropdown.addOption("keyword", "Keyword only");
+        dropdown.setValue(draft.lenteSearchMethod);
+        dropdown.onChange((value) => {
+          draft.lenteSearchMethod = value as LenteSearchMethod;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Maximum displayed results")
+      .setDesc("Controls how many unique notes Lente displays.")
+      .addSlider((slider) => {
+        slider.setLimits(5, 50, 5);
+        slider.setValue(draft.lenteMaxResults);
+        slider.setDynamicTooltip();
+        slider.onChange((value) => {
+          draft.lenteMaxResults = value;
+        });
+      });
+
+    this.sectionHeading("Voce");
+    this.text("Chat endpoint", draft.chatEndpoint, (value) => {
       draft.chatEndpoint = value;
     });
     this.modelSelector("chat", draft);
     this.chatControls(draft);
+
+    this.sectionHeading("Filo");
     this.text("Embedding endpoint", draft.embeddingEndpoint, (value) => {
       draft.embeddingEndpoint = value;
     });
     this.modelSelector("embedding", draft);
-    new Setting(this.containerEl).addButton((button) =>
-      button.setButtonText("Save").onClick(
-        () =>
-          void this.run(async () => {
-            const draftSnapshot = { ...draft };
-            const validation = validateChatDraft(draftSnapshot);
-            if (validation) throw new Error(validation);
-            await this.controller.saveSettings?.((current) =>
-              projectSettingsWithDraft(current, draftSnapshot)
-            );
-            this.draft = undefined;
-          })
-      )
-    );
-    new Setting(this.containerEl)
-      .setName("Detailed debugging")
-      .setDesc(
-        "Warning: detailed console diagnostics include sensitive rich chat data (full prompts, selected-note contents, requests/SSE events, tool arguments/results/errors) plus index metadata (paths, counts, timings, generation/status). No diagnostic file is created."
-      )
-      .addToggle((toggle) => {
-        toggle.setValue(settings.detailedDebug);
-        toggle.onChange(
-          (detailedDebug) =>
-            void this.run(() =>
-              this.controller.saveSettings?.((current) => ({ ...current, detailedDebug }))
-            )
-        );
-      });
-    let approvalInput = "";
-    new Setting(this.containerEl)
-      .setName("Approved LAN origins")
-      .setDesc("Warning: note excerpts leave this device for the approved LAN host.")
-      .addText((text) => {
-        text.setPlaceholder("http://192.168.1.20:1234/v1");
-        text.onChange((value) => {
-          approvalInput = value;
-        });
-      })
-      .addButton((button) =>
-        button
-          .setButtonText("Approve")
-          .onClick(() => void this.run(() => this.controller.addApprovedOrigin?.(approvalInput)))
-      );
-    for (const origin of settings.approvedOrigins)
-      new Setting(this.containerEl)
-        .setName(`${origin.scheme}://${origin.host}:${origin.port}`)
-        .addButton((button) =>
-          button
-            .setButtonText("Remove")
-            .onClick(() => void this.run(() => this.controller.removeApprovedOrigin?.(origin)))
-        );
-    const indexSetting = new Setting(this.containerEl)
-      .setName("Filo index")
-      .setDesc(this.controller.getIndexStatusMessage?.() ?? "Not initialized");
-    const status = this.controller.getIndexStatus?.();
-    const progress = status?.progress;
-    if (progress) {
-      const label = formatIndexProgress(progress, status?.etaSeconds);
-      indexSetting.descEl.setText(label);
-      indexSetting.controlEl.createEl("progress", {
-        attr: {
-          "aria-label": label,
-          ...(progress.determinate && progress.total !== undefined
-            ? { max: String(progress.total), value: String(progress.completed) }
-            : {}),
-        },
-      });
-    }
+    this.exclusions(draft);
+
+    this.sectionHeading("Advanced");
+    this.advanced(settings);
     if (this.errorMessage)
       this.containerEl.createEl("p", { text: this.errorMessage, cls: "mod-warning" });
-    let subscribing = true;
-    this.statusUnsubscribe = this.controller.subscribeIndexStatus?.(() => {
-      // IndexStatusController immediately emits its current value. Redraw only
-      // after subscription setup, otherwise display() would recursively subscribe.
-      if (!subscribing) this.display();
-    });
-    subscribing = false;
+    const saveButton = this.containerEl.createEl("button", { text: "Save", cls: "mod-cta" });
+    saveButton.addEventListener(
+      "click",
+      () =>
+        void this.run(async () => {
+          const draftSnapshot = { ...draft };
+          const validation = validateChatDraft(draftSnapshot);
+          if (validation) throw new Error(validation);
+          await this.controller.saveSettings?.((current) =>
+            projectSettingsWithDraft(current, draftSnapshot)
+          );
+          this.draft = undefined;
+        })
+    );
   }
 
   override hide(): void {
-    this.statusUnsubscribe?.();
-    this.statusUnsubscribe = undefined;
+    // Drafts intentionally survive a temporary Settings hide/reopen.
   }
   private text(name: string, value: string, update: (value: string) => void): void {
     new Setting(this.containerEl).setName(name).addText((text) => {
@@ -220,8 +198,12 @@ export class TramaSettingsTab extends PluginSettingTab {
       ? [selectedModel, ...discoveredModels.filter((modelId) => modelId !== selectedModel)]
       : discoveredModels;
     new Setting(this.containerEl)
-      .setName(`${isChat ? "Chat" : "Embedding"} model`)
-      .setDesc("Click Discover to query LM Studio, then choose a model.")
+      .setName(isChat ? "AI model" : "Embedding model")
+      .setDesc(
+        isChat
+          ? "Click Discover to query LM Studio, then choose an AI model."
+          : "Used by Filo indexing and Hybrid Lente search; changing it requires a full reindex. Click Discover to query LM Studio."
+      )
       .addDropdown((dropdown) => {
         if (!selectedModel) dropdown.addOption("", "Select a model");
         for (const modelId of models) dropdown.addOption(modelId, modelId);
@@ -242,6 +224,86 @@ export class TramaSettingsTab extends PluginSettingTab {
             })
         )
       );
+  }
+
+  private sectionHeading(name: string): void {
+    new Setting(this.containerEl).setName(name).setHeading();
+  }
+
+  private exclusions(draft: SettingsDraft): void {
+    let input = "";
+    new Setting(this.containerEl)
+      .setName("Excluded files and directories")
+      .setDesc("Vault-relative Filo paths excluded from indexing and Lente results.")
+      .addText((text) => {
+        text.setPlaceholder("Projects/Private");
+        text.onChange((value) => {
+          input = value;
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Add").onClick(() => {
+          void this.run(async () => {
+            const normalized = normalizeExcludedPath(input);
+            if (!normalized)
+              throw new Error("Enter a valid vault-relative file or directory path.");
+            draft.filoExcludedPaths = normalizeExcludedPaths([
+              ...draft.filoExcludedPaths,
+              normalized,
+            ]);
+            input = "";
+          });
+        })
+      );
+    for (const path of draft.filoExcludedPaths)
+      new Setting(this.containerEl).setName(path).addButton((button) =>
+        button.setButtonText("Remove").onClick(() => {
+          draft.filoExcludedPaths = draft.filoExcludedPaths.filter((value) => value !== path);
+          this.display();
+        })
+      );
+  }
+
+  private advanced(settings: TramaSettings): void {
+    new Setting(this.containerEl)
+      .setName("Detailed debugging")
+      .setDesc(
+        "Warning: detailed console diagnostics include sensitive rich chat data (full prompts, selected-note contents, requests/SSE events, tool arguments/results/errors) plus index metadata (paths, counts, timings, generation/status). No diagnostic file is created."
+      )
+      .addToggle((toggle) => {
+        toggle.setValue(settings.detailedDebug);
+        toggle.onChange(
+          (detailedDebug) =>
+            void this.run(() =>
+              this.controller.saveSettings?.((current) => ({ ...current, detailedDebug }))
+            )
+        );
+      });
+    let approvalInput = "";
+    new Setting(this.containerEl)
+      .setName("Approved LAN origins")
+      .setDesc(
+        "Approved origins allow note excerpts to leave this device for a LAN host. Add only hosts you trust; LAN endpoints require explicit approval."
+      )
+      .addText((text) => {
+        text.setPlaceholder("http://192.168.1.20:1234/v1");
+        text.onChange((value) => {
+          approvalInput = value;
+        });
+      })
+      .addButton((button) =>
+        button
+          .setButtonText("Approve")
+          .onClick(() => void this.run(() => this.controller.addApprovedOrigin?.(approvalInput)))
+      );
+    for (const origin of settings.approvedOrigins)
+      new Setting(this.containerEl)
+        .setName(`${origin.scheme}://${origin.host}:${origin.port}`)
+        .addButton((button) =>
+          button
+            .setButtonText("Remove")
+            .onClick(() => void this.run(() => this.controller.removeApprovedOrigin?.(origin)))
+        );
   }
 
   private chatControls(draft: SettingsDraft): void {

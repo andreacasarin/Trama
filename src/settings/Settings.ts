@@ -13,15 +13,75 @@ export interface EmbeddingSettings {
   readonly dimensions: number;
   readonly batchSize: number;
 }
+export type LenteSearchMethod = "hybrid" | "keyword";
+export interface LenteSettings {
+  readonly searchMethod: LenteSearchMethod;
+  readonly maxResults: number;
+}
+export interface FiloSettings {
+  readonly automaticUpdates: boolean;
+  readonly excludedPaths: readonly string[];
+}
 export interface TramaSettings {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
+  readonly lente: LenteSettings;
+  readonly filo: FiloSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
   readonly detailedDebug: boolean;
 }
 
 type ReasoningEffort = "none" | "low" | "medium" | "high";
+const LENTE_SEARCH_METHODS = ["hybrid", "keyword"] as const;
+
+function isLenteSearchMethod(value: unknown): value is LenteSearchMethod {
+  return LENTE_SEARCH_METHODS.includes(value as LenteSearchMethod);
+}
+
+function isValidLenteMaxResults(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 5 &&
+    value <= 50 &&
+    value % 5 === 0
+  );
+}
+
+/** Normalizes one vault-relative file or directory path, or returns undefined when invalid. */
+export function normalizeExcludedPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.includes("\0")) return undefined;
+  let raw = value.trim().replace(/\\/g, "/");
+  while (raw.startsWith("./")) raw = raw.slice(2);
+  if (!raw || raw.startsWith("/") || /^[A-Za-z]:/.test(raw)) return undefined;
+  const parts = raw
+    .split("/")
+    .map((part: string) => part.trim())
+    .filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) return undefined;
+  return parts.join("/");
+}
+
+/** Normalizes, sorts, and deduplicates vault-relative exclusions without touching the vault. */
+export function normalizeExcludedPaths(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(value.map(normalizeExcludedPath).filter((path): path is string => !!path)),
+  ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** Returns whether a vault-relative file is itself or below an excluded file/directory path. */
+export function isExcludedPath(path: unknown, excludedPaths: readonly string[]): boolean {
+  const normalizedPath = normalizeExcludedPath(path);
+  if (!normalizedPath) return false;
+  return normalizeExcludedPaths(excludedPaths).some(
+    (excluded) => normalizedPath === excluded || normalizedPath.startsWith(`${excluded}/`)
+  );
+}
+
+// Descriptive aliases keep the pure helpers convenient at call sites.
+export const matchesExcludedPath = isExcludedPath;
 
 function isValidTemperature(value: unknown): value is number {
   return (
@@ -48,7 +108,7 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
-  schemaVersion: 2,
+  schemaVersion: 3,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
     modelId: "",
@@ -59,6 +119,14 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
     modelId: "",
     dimensions: 768,
     batchSize: 32,
+  }),
+  lente: Object.freeze({
+    searchMethod: "hybrid",
+    maxResults: 20,
+  }),
+  filo: Object.freeze({
+    automaticUpdates: false,
+    excludedPaths: Object.freeze([]),
   }),
   approvedOrigins: Object.freeze([]),
   detailedDebug: false,
@@ -72,7 +140,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      (data as { schemaVersion?: unknown }).schemaVersion !== 2
+      ![2, 3].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -85,6 +153,14 @@ export class SettingsStore {
     const rawEmbedding = (
       input.embedding && typeof input.embedding === "object" ? input.embedding : {}
     ) as Record<string, unknown>;
+    const rawLente = (input.lente && typeof input.lente === "object" ? input.lente : {}) as Record<
+      string,
+      unknown
+    >;
+    const rawFilo = (input.filo && typeof input.filo === "object" ? input.filo : {}) as Record<
+      string,
+      unknown
+    >;
     const chatEndpoint = this.string(rawChat.endpoint, DEFAULT_SETTINGS.chat.endpoint);
     const embeddingEndpoint = this.string(
       rawEmbedding.endpoint,
@@ -107,10 +183,27 @@ export class SettingsStore {
       dimensions: this.positiveInt(rawEmbedding.dimensions, DEFAULT_SETTINGS.embedding.dimensions),
       batchSize: this.positiveInt(rawEmbedding.batchSize, DEFAULT_SETTINGS.embedding.batchSize),
     };
+    const lente = {
+      searchMethod: isLenteSearchMethod(rawLente.searchMethod)
+        ? rawLente.searchMethod
+        : DEFAULT_SETTINGS.lente.searchMethod,
+      maxResults: isValidLenteMaxResults(rawLente.maxResults)
+        ? rawLente.maxResults
+        : DEFAULT_SETTINGS.lente.maxResults,
+    };
+    const filo = {
+      // Automatic reconciliation currently rebuilds the full derived lexical
+      // index, so persisted opt-in is disabled until that work is incremental
+      // or moved off the renderer thread.
+      automaticUpdates: false,
+      excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
+    };
     this.value = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       chat: Object.freeze(chat),
       embedding: Object.freeze(embedding),
+      lente: Object.freeze(lente),
+      filo: Object.freeze(filo),
       approvedOrigins: Object.freeze(
         approvals.map((v) => ({ scheme: v.scheme, host: v.host.toLowerCase(), port: v.port }))
       ),
@@ -190,17 +283,32 @@ export class SettingsStore {
     const chatEndpoint = policy.normalize(next.chat.endpoint);
     const embeddingEndpoint = policy.normalize(next.embedding.endpoint);
     const chatControls = this.validateChatControls(next.chat);
+    const lente = this.validateLente(next.lente);
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       chat: Object.freeze({
         endpoint: chatEndpoint,
         modelId: next.chat.modelId,
         ...chatControls,
       }),
       embedding: Object.freeze({ ...next.embedding, endpoint: embeddingEndpoint }),
+      lente: Object.freeze(lente),
+      filo: Object.freeze({
+        automaticUpdates: next.filo.automaticUpdates === true,
+        excludedPaths: Object.freeze(normalizeExcludedPaths(next.filo.excludedPaths)),
+      }),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
       detailedDebug: next.detailedDebug === true,
     };
+  }
+  private validateLente(lente: LenteSettings): LenteSettings {
+    if (!isLenteSearchMethod(lente.searchMethod)) {
+      throw new Error("Lente search method must be hybrid or keyword.");
+    }
+    if (!isValidLenteMaxResults(lente.maxResults)) {
+      throw new Error("Lente maximum displayed results must be from 5 to 50 in increments of 5.");
+    }
+    return { searchMethod: lente.searchMethod, maxResults: lente.maxResults };
   }
   private validateChatControls(
     chat: ChatSettings

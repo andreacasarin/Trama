@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   decodeBinarySegment,
   encodeBinarySegment,
@@ -111,4 +111,18 @@ describe("TRAMASEG v1", () => {
     expect(parts.every((part) => part.bytes.length <= 8 * 1024 * 1024)).toBe(true);
     expect(elapsed).toBeLessThan(20_000);
   }, 30_000);
+
+  it("yields while validating a large decoded segment", async () => {
+    const records = Array.from({ length: 65 }, (_, ordinal) => ({
+      ...record(`row-${ordinal}`),
+      ordinal,
+    }));
+    const encoded = await encodeBinarySegment({ dimensions: 2, noteContentId: id, records });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+
+    await decodeBinarySegment(encoded.bytes);
+
+    expect(timers).toHaveBeenCalled();
+    timers.mockRestore();
+  });
 });

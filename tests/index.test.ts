@@ -768,7 +768,7 @@ describe("semantic index module", () => {
             query: expect.stringContaining("alpha current"),
             queryVector: expect.any(Array),
             semanticCandidateLimit: 128,
-            lexicalCandidateLimit: 128,
+            lexicalCandidateLimit: 0,
           })
         );
         search.mockRestore();
@@ -776,7 +776,7 @@ describe("semantic index module", () => {
           expect.arrayContaining([expect.objectContaining({ path: "related.md" })])
         );
       });
-      it("loads silently without embedding or detailed diagnostics", async () => {
+      it("loads without embedding and emits metadata-only phase diagnostics", async () => {
         const setup = manager({ "a.md": "alpha" });
         await setup.manager.build(signal);
         const records: TramaDiagnosticRecord[] = [];
@@ -794,7 +794,15 @@ describe("semantic index module", () => {
         await expect(restarted.load()).resolves.toBe(true);
 
         expect(model.embed).not.toHaveBeenCalled();
-        expect(records).toEqual([]);
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ operation: "load", stage: "started" }),
+            expect.objectContaining({ operation: "startup", phase: "build-vector" }),
+            expect.objectContaining({ operation: "startup", phase: "build-lexical" }),
+            expect.objectContaining({ operation: "load", stage: "completed" }),
+          ])
+        );
+        expect(records.some((record) => "text" in record || "vector" in record)).toBe(false);
       });
       it("recovers from a corrupt active pointer on restart", async () => {
         const setup = manager({ "a.md": "alpha" });
@@ -851,7 +859,7 @@ describe("semantic index module", () => {
         });
         await expect(setup.manager.build(signal)).rejects.toBeInstanceOf(StructuredError);
       });
-      it("passes the real related-note query through and overfetches 128 chunks", async () => {
+      it("uses semantic-only related-note retrieval and overfetches 128 chunks", async () => {
         const setup = manager({ "current.md": "alpha", "other.md": "alpha" });
         await setup.manager.build(signal);
         const search = vi.spyOn(Retriever.prototype, "search");
@@ -859,7 +867,14 @@ describe("semantic index module", () => {
           const snapshot = setup.manager.relatedSnapshot("current.md")!;
           await snapshot.search("alpha", [1, 0], signal, 128);
           expect(search).toHaveBeenLastCalledWith(
-            expect.objectContaining({ query: "alpha", limit: 128, resultShape: "chunks" })
+            expect.objectContaining({
+              query: "alpha",
+              queryVector: [1, 0],
+              mode: "related",
+              limit: 128,
+              lexicalCandidateLimit: 0,
+              resultShape: "chunks",
+            })
           );
         } finally {
           search.mockRestore();
@@ -1104,6 +1119,82 @@ describe("semantic index module", () => {
 
         expect(setup.model.embed).not.toHaveBeenCalled();
         expect(JSON.parse((await setup.storage.read("active.json"))!).previous).toBeTruthy();
+      });
+
+      it("prunes newly excluded committed notes without embedding and fails closed on stale hits", async () => {
+        const contents: Record<string, string> = {
+          "keep.md": "alpha keep",
+          "private/note.md": "beta private",
+        };
+        let eligible = true;
+        const setup = manager(contents);
+        const vault = {
+          ...fixture(contents),
+          isIndexEligible: (path: string) => eligible || path === "keep.md",
+        };
+        const indexed = new IndexManager(
+          vault,
+          setup.model,
+          setup.storage,
+          "HTTP://127.0.0.1:1234/v1/",
+          "embed",
+          { size: 100, overlap: 10 }
+        );
+        await indexed.build(signal);
+        setup.model.embed.mockClear();
+        eligible = false;
+
+        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
+          expect.objectContaining({ path: "private/note.md" })
+        );
+        setup.model.embed.mockClear();
+        await expect(indexed.pruneExcludedPaths(signal)).resolves.toBe(true);
+        expect(setup.model.embed).not.toHaveBeenCalled();
+        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
+          expect.objectContaining({ path: "private/note.md" })
+        );
+        await expect(indexed.search("alpha", signal, 5)).resolves.toMatchObject([
+          { path: "keep.md" },
+        ]);
+      });
+
+      it("preserves unrelated queued work when exclusion pruning fails", async () => {
+        const contents: Record<string, string> = {
+          "keep.md": "alpha keep",
+          "private/note.md": "beta private",
+        };
+        let eligible = true;
+        const setup = manager(contents);
+        const indexed = new IndexManager(
+          {
+            ...fixture(contents),
+            isIndexEligible: (path: string) => eligible || path === "keep.md",
+          },
+          setup.model,
+          setup.storage,
+          "http://127.0.0.1:1234/v1",
+          "embed",
+          { size: 100, overlap: 10 }
+        );
+        await indexed.build(signal);
+        contents["keep.md"] = "gamma changed";
+        indexed.queueChange("keep.md");
+        eligible = false;
+        const stage = vi
+          .spyOn(CorpusStore.prototype, "stageIncremental")
+          .mockRejectedValueOnce(new Error("prune failed"));
+        try {
+          await expect(indexed.pruneExcludedPaths(signal)).rejects.toThrow("prune failed");
+        } finally {
+          stage.mockRestore();
+        }
+        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
+          expect.objectContaining({ path: "private/note.md" })
+        );
+        await indexed.reconcileQueuedChanges(signal);
+        await expect(indexed.search("gamma", signal, 5)).resolves.toMatchObject([
+          { path: "keep.md" },
+        ]);
       });
 
       it("commits empty-note changes without embedding", async () => {

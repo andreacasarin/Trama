@@ -39,6 +39,9 @@ export interface BinarySegment {
 function fail(message: string): never {
   throw new Error(`Invalid binary segment: ${message}`);
 }
+function yieldMacrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 function u32(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff)
     fail(`${label} out of range`);
@@ -269,12 +272,16 @@ export async function decodeBinarySegment(data: ArrayBuffer | Uint8Array): Promi
     const text = utf8DecodeFatal(textBytes.slice(offset, offset + length));
     usedTextLength = Math.max(usedTextLength, offset + length);
     const vector = vectorBytes.subarray(i * dimensions, (i + 1) * dimensions);
-    validateVector(vector, dimensions);
     let normSquared = 0;
-    for (const value of vector) normSquared += value * value;
+    for (const value of vector) {
+      if (!Number.isFinite(value)) fail("vector contains non-finite value");
+      normSquared += value * value;
+    }
     const norm = Math.sqrt(normSquared);
+    if (!(norm > 1e-12)) fail("zero vector");
     if (Math.abs(norm - 1) > 1e-4) fail("vector is not normalized");
     records.push({ ordinal, startLine, endLine, text, vector });
+    if ((i & 63) === 63) await yieldMacrotask();
   }
   if (textBytes.slice(usedTextLength).some((value) => value !== 0)) fail("text padding");
   return {

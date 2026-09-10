@@ -256,6 +256,7 @@ export class Setting {
   readonly buttonControls: ButtonComponent[] = [];
   name = "";
   description = "";
+  isHeading = false;
   constructor(public containerEl: unknown) {
     Setting.instances.push(this);
   }
@@ -265,6 +266,10 @@ export class Setting {
   }
   setDesc(_description: string) {
     this.description = _description;
+    return this;
+  }
+  setHeading() {
+    this.isHeading = true;
     return this;
   }
   addText(callback: (text: TextComponent) => void) {

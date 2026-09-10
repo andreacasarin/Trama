@@ -3,6 +3,7 @@ import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { LenteSearch } from "@/index/LenteSearch";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -106,6 +107,14 @@ function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SE
   return plugin as TramaPlugin & { app: typeof app };
 }
 
+async function optInToAutomaticUpdates(plugin: TramaPlugin): Promise<void> {
+  const current = plugin.getSettings();
+  await plugin.saveSettings({
+    ...current,
+    filo: { ...current.filo, automaticUpdates: true },
+  });
+}
+
 describe("TramaPlugin lifecycle integration", () => {
   beforeEach(() => {
     Platform.isDesktopApp = true;
@@ -168,7 +177,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     const fetchSpy = vi.spyOn(globalThis, "fetch");
-    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const debugSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
 
     await plugin.onload();
 
@@ -205,6 +214,153 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(debugSpy).not.toHaveBeenCalled();
     expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("keeps default-off vault events queued and stale without scheduling or contacting LM Studio", async () => {
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    const queue = vi.spyOn(index, "queueOperation");
+    (index as any).hasUsableIndex = vi.fn(() => true);
+    const modify = app.listeners.find((ref) => ref.event === "modify");
+
+    modify?.callback({ path: "Note.md" });
+
+    expect(queue).toHaveBeenCalledWith({ kind: "modify", path: "Note.md" });
+    expect((plugin as any).eventTimer).toBeUndefined();
+    expect((plugin as any).indexStatus.getStatus()).toMatchObject({
+      kind: "stale",
+      hasLastGood: true,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    load.mockRestore();
+  });
+
+  it("rebinds only Lente when Lente settings change and applies the configured search options", async () => {
+    const search = vi.spyOn(LenteSearch.prototype, "search").mockResolvedValue({
+      generationId: "g1",
+      mode: "lexical",
+      degraded: false,
+      displayLimit: 35,
+      results: [],
+      canonicalResults: [],
+      durationMs: 0,
+    });
+    const app = projectedApp();
+    const setSearch = vi.fn();
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "trama-lente" ? [{ view: { setSearch, refreshSubmitted: vi.fn() } }] : [];
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const oldSession = (plugin as any).session;
+    const oldIndex = (plugin as any).index;
+    const oldLente = (plugin as any).lenteSearch;
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      lente: { searchMethod: "keyword", maxResults: 35 },
+    });
+
+    expect((plugin as any).session).toBe(oldSession);
+    expect((plugin as any).index).toBe(oldIndex);
+    expect((plugin as any).lenteSearch).not.toBe(oldLente);
+    await (plugin as any).lenteSearch.search("needle", { sort: "updated" });
+    expect(search).toHaveBeenLastCalledWith(
+      "needle",
+      expect.objectContaining({ searchMethod: "keyword", maxResults: 35, sort: "updated" })
+    );
+  });
+
+  it("changes the live index gate, prunes exclusions without embeddings, and keeps Voce reads base-visible", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
+    const index = (plugin as any).index;
+    const prune = vi.spyOn(index, "pruneExcludedPaths").mockResolvedValue(true);
+    const embed = vi.spyOn((index as any).embedding, "embed");
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, excludedPaths: ["Note.md"] },
+    });
+
+    expect(prune).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(embed).not.toHaveBeenCalled();
+    expect((plugin as any).isVisibleMarkdown("Note.md")).toBe(true);
+    expect((index as any).isIndexEligible("Note.md")).toBe(false);
+    const read = await (plugin as any).session.registry
+      .get("read_note")
+      .execute({ path: "Note.md" }, new AbortController().signal);
+    expect(read.ok).toBe(true);
+  });
+
+  it("invalidates open result views before a failed exclusion prune settles", async () => {
+    const app = projectedApp();
+    const voceView = { refreshRelatedSuggestions: vi.fn() };
+    const filoView = { invalidateExcludedPaths: vi.fn() };
+    const lenteView = { invalidateExcludedPaths: vi.fn(), refreshSubmitted: vi.fn() };
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "trama-voce"
+        ? [{ view: voceView }]
+        : type === "trama-filo"
+          ? [{ view: filoView }]
+          : type === "trama-lente"
+            ? [{ view: lenteView }]
+            : [];
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const prune = vi
+      .spyOn((plugin as any).index, "pruneExcludedPaths")
+      .mockRejectedValue(new Error("prune failed"));
+
+    const saving = plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, excludedPaths: ["Private"] },
+    });
+    await vi.waitFor(() => expect(prune).toHaveBeenCalled());
+    expect(filoView.invalidateExcludedPaths).toHaveBeenCalledWith(["Private"]);
+    expect(lenteView.invalidateExcludedPaths).toHaveBeenCalledWith(["Private"]);
+    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalled();
+
+    await saving;
+    expect((plugin as any).indexStatus.getStatus().kind).toBe("stale");
+    expect(filoView.invalidateExcludedPaths).toHaveBeenCalledTimes(1);
+    expect(lenteView.invalidateExcludedPaths).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rerun submitted Lente or embed while saving an exclusion", async () => {
+    const app = projectedApp();
+    const lenteView = { invalidateExcludedPaths: vi.fn(), refreshSubmitted: vi.fn() };
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "trama-lente" ? [{ view: lenteView }] : [];
+    const plugin = projectedPlugin(app);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
+    const index = (plugin as any).index;
+    const embed = vi.spyOn((index as any).embedding, "embed");
+    vi.spyOn(index, "pruneExcludedPaths").mockRejectedValue(new Error("prune failed"));
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, excludedPaths: ["Private"] },
+    });
+
+    expect(lenteView.invalidateExcludedPaths).toHaveBeenCalledWith(["Private"]);
+    expect(lenteView.refreshSubmitted).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
   });
 
   it("mobile activation registers no runtime surfaces and makes no fetch", async () => {
@@ -422,7 +578,7 @@ describe("TramaPlugin lifecycle integration", () => {
   it("gates detailed diagnostics at emission time without replacing composition", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
-    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const debugSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
     await plugin.onload();
     const session = (plugin as any).session;
     const model = (plugin as any).chatModel;
@@ -439,12 +595,18 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).session).toBe(session);
     expect((plugin as any).chatModel).toBe(model);
     expect((plugin as any).index).toBe(index);
-    expect(debugSpy).toHaveBeenCalledTimes(1);
-    expect(debugSpy).toHaveBeenCalledWith("[Trama]", {
-      area: "chat",
-      event: "model_error",
-      error: expect.objectContaining({ message: "visible" }),
-    });
+    expect(
+      debugSpy.mock.calls.filter(([, record]) => (record as { area?: string }).area === "chat")
+    ).toEqual([
+      [
+        "[Trama]",
+        {
+          area: "chat",
+          event: "model_error",
+          error: expect.objectContaining({ message: "visible" }),
+        },
+      ],
+    ]);
   });
 
   it("keeps embeddings out of detailed diagnostics", async () => {
@@ -454,7 +616,7 @@ describe("TramaPlugin lifecycle integration", () => {
       embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed", dimensions: 2 },
     };
     const plugin = projectedPlugin(app, settings);
-    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const debugSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
         status: 200,
@@ -466,7 +628,9 @@ describe("TramaPlugin lifecycle integration", () => {
 
     await (plugin as any).embeddingModel.embed(["private note"], new AbortController().signal);
 
-    expect(debugSpy).not.toHaveBeenCalled();
+    expect(
+      debugSpy.mock.calls.some(([, record]) => JSON.stringify(record).includes("private note"))
+    ).toBe(false);
   });
 
   it("composes Voce without current_note and keeps a sorted visible Markdown catalog for its UI", async () => {
@@ -512,9 +676,13 @@ describe("TramaPlugin lifecycle integration", () => {
     const voceView = { refreshRelatedSuggestions: vi.fn() };
     (app.workspace as any).getLeavesOfType = (type: string) =>
       type === "trama-voce" ? [{ view: voceView }] : [];
-    const plugin = projectedPlugin(app);
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
     await plugin.onload();
     await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
@@ -552,6 +720,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const plugin = projectedPlugin(app);
     await plugin.onload();
     await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
     let release!: () => void;
     let building = true;
@@ -582,6 +751,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const plugin = projectedPlugin(app);
     await plugin.onload();
     await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -654,8 +824,10 @@ describe("TramaPlugin lifecycle integration", () => {
     const plugin = projectedPlugin(app);
     await plugin.onload();
     await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
-    const queue = vi.spyOn(index, "queueChange");
+    const queue = vi.spyOn(index, "queueOperation");
+    const rename = vi.spyOn(index, "queueRename");
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -665,12 +837,11 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "image.png" });
     emit("modify", { path: ".trama/index.md" });
     emit("rename", { path: "Renamed.md" }, "Old.md");
-    expect(queue).not.toHaveBeenCalledWith("Note.md");
-    expect(queue).not.toHaveBeenCalledWith("Renamed.md");
-    expect(queue).not.toHaveBeenCalledWith("Old.md");
-    expect(queue).not.toHaveBeenCalledWith("image.png");
-    expect(queue).not.toHaveBeenCalledWith(".trama/index.md");
-    expect(queue).not.toHaveBeenCalled();
+    expect(queue).toHaveBeenCalledWith({ kind: "create", path: "Note.md" });
+    expect(rename).toHaveBeenCalledWith("Old.md", "Renamed.md");
+    expect(queue).not.toHaveBeenCalledWith({ kind: "modify", path: "image.png" });
+    expect(queue).not.toHaveBeenCalledWith({ kind: "modify", path: ".trama/index.md" });
+    expect((plugin as any).eventTimer).toBeUndefined();
     await vi.advanceTimersByTimeAsync(1500);
     plugin.onunload();
     plugin.onunload();
@@ -678,12 +849,196 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.useRealTimers();
   });
 
+  it("coalesces opted-in edits, does not retry a failed background pass, and retries on a later event", async () => {
+    vi.useFakeTimers();
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
+    const index = (plugin as any).index;
+    const reconcile = vi
+      .spyOn(index, "reconcileQueuedChanges")
+      .mockRejectedValueOnce(new Error("embedding failed"))
+      .mockResolvedValue(undefined);
+    const modify = app.listeners.find((ref) => ref.event === "modify");
+
+    modify?.callback({ path: "Note.md" });
+    modify?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(1500);
+    await Promise.resolve();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    modify?.callback({ path: "Other.md" });
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(2));
+    load.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("opt-out clears the debounce, aborts automatic work, and preserves queued stale work", async () => {
+    vi.useFakeTimers();
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
+    const index = (plugin as any).index;
+    const pending = deferred<void>();
+    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockReturnValue(pending.promise);
+    const modify = app.listeners.find((ref) => ref.event === "modify");
+    modify?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+    const signal = reconcile.mock.calls[0][0] as AbortSignal;
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: false },
+    });
+    expect(signal.aborted).toBe(true);
+    expect((plugin as any).eventTimer).toBeUndefined();
+    expect((plugin as any).queuedWork).toBe(true);
+    expect((plugin as any).indexStatus.getStatus().kind).toBe("stale");
+    pending.resolve();
+    await Promise.resolve();
+    load.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("resumes queued automatic work after a slow cancelled pass and rapid re-opt-in", async () => {
+    vi.useFakeTimers();
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
+    const index = (plugin as any).index;
+    const reconcile = vi
+      .spyOn(index, "reconcileQueuedChanges")
+      .mockImplementationOnce(
+        (signal) =>
+          new Promise<void>((_resolve, reject) =>
+            (signal as AbortSignal).addEventListener(
+              "abort",
+              () => setTimeout(() => reject(new Error("cancelled")), 100),
+              { once: true }
+            )
+          )
+      )
+      .mockResolvedValue(undefined);
+    const modify = app.listeners.find((ref) => ref.event === "modify");
+    modify?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: false },
+    });
+    const optIn = plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
+    await optIn;
+    await vi.advanceTimersByTimeAsync(100);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(2));
+
+    load.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("removing an exclusion queues newly eligible notes with or without background consent", async () => {
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    app.vault.getMarkdownFiles = () => [
+      { path: "Note.md", name: "Note.md" },
+      { path: "Private/Secret.md", name: "Secret.md" },
+    ];
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, excludedPaths: ["Private"] },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    (index as any).hasUsableIndex = vi.fn(() => true);
+    const queue = vi.spyOn(index, "queueOperation");
+
+    await plugin.saveSettings(DEFAULT_SETTINGS);
+
+    expect(queue).toHaveBeenCalledWith({ kind: "create", path: "Private/Secret.md" });
+    expect((plugin as any).eventTimer).toBeUndefined();
+    expect((plugin as any).indexStatus.getStatus()).toMatchObject({
+      kind: "stale",
+      hasLastGood: true,
+    });
+    load.mockRestore();
+  });
+
+  it("removing an exclusion with opt-in schedules the normal incremental pass", async () => {
+    vi.useFakeTimers();
+    const load = vi
+      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
+      .mockResolvedValue(true);
+    const app = projectedApp();
+    app.vault.getMarkdownFiles = () => [
+      { path: "Note.md", name: "Note.md" },
+      { path: "Private/Secret.md", name: "Secret.md" },
+    ];
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { automaticUpdates: true, excludedPaths: ["Private"] },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const index = (plugin as any).index;
+    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      filo: { automaticUpdates: true, excludedPaths: [] },
+    });
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+    load.mockRestore();
+    vi.useRealTimers();
+  });
+
   it("exposes monotonic status/actions and coalesces typed edits after first indexing", async () => {
     vi.useFakeTimers();
     const app = projectedApp();
-    const plugin = projectedPlugin(app);
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+    });
     await plugin.onload();
     await (plugin as any).indexLoad;
+    await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const statuses: string[] = [];

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RelatedNotes } from "@/index/RelatedNotes";
 import type { RelatedIndexHit, RelatedIndexSnapshot } from "@/index/IndexManager";
+import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 const signal = new AbortController().signal;
 function snapshot(path: string, text: string, hits: RelatedIndexHit[], generationId = "1") {
@@ -112,6 +113,23 @@ describe("RelatedNotes", () => {
     expect(current.prepareQuery).toHaveBeenCalledOnce();
   });
 
+  it("reports preparation and retrieval timings for the single shared computation", async () => {
+    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const records: TramaDiagnosticRecord[] = [];
+    const service = new RelatedNotes(
+      { relatedSnapshot: () => current.value },
+      { emit: (record) => records.push(record) }
+    );
+
+    await Promise.all([service.find("current.md", signal), service.find("current.md", signal)]);
+
+    expect(
+      records
+        .filter((record) => record.area === "filo" && record.event === "related_search")
+        .map((record) => record.stage)
+    ).toEqual(["started", "prepare-completed", "retrieve-completed", "completed"]);
+  });
+
   it("caches twenty candidates while preserving the default seven-result consumer cap", async () => {
     const hits = Array.from({ length: 25 }, (_, index) => ({
       path: `note-${index.toString().padStart(2, "0")}.md`,
@@ -145,6 +163,41 @@ describe("RelatedNotes", () => {
     expect(service.latest("current.md")).toEqual(["a.md", "b.md"]);
     expect(service.latest("other.md")).toEqual([]);
     unsubscribe();
+  });
+
+  it("synchronously hides excluded cached suggestions and notifies subscribers", async () => {
+    const current = snapshot("current.md", "query", [
+      { path: "Private/Secret.md", score: 1 },
+      { path: "Public.md", score: 0.5 },
+    ]);
+    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const updates: string[][] = [];
+    service.subscribe((result) => updates.push(result.results.map((item) => item.path)));
+
+    await service.find("current.md", signal, 20);
+    service.invalidateExcludedPaths(["Private"]);
+
+    expect(service.latest("current.md")).toEqual(["Public.md"]);
+    expect(updates).toEqual([["Private/Secret.md", "Public.md"], ["Public.md"]]);
+    await expect(service.find("current.md", signal, 20)).resolves.toMatchObject({
+      results: [{ path: "Public.md" }],
+    });
+    expect(current.prepareQuery).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an aborted related computation republish after invalidation", async () => {
+    let release!: () => void;
+    const current = snapshot("current.md", "query", [{ path: "Private.md", score: 1 }]);
+    current.prepareQuery.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ text: "query", vector: [1, 0] })))
+    );
+    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const pending = service.find("current.md", signal);
+    service.invalidateExcludedPaths(["Private.md"]);
+    release();
+
+    await expect(pending).rejects.toThrow("cancelled");
+    expect(service.latest("current.md")).toEqual([]);
   });
 
   it("uses locale-independent code-unit ordering for equal-score paths", async () => {

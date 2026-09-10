@@ -9,10 +9,13 @@ import type {
   LexicalProfile,
 } from "./LexicalIndex";
 
-const BATCH_SIZE = 256;
+const BATCH_SIZE = 32;
 const cancelled = () => new Error("Lexical operation cancelled");
 function check(signal?: AbortSignal): void {
   if (signal?.aborted) throw cancelled();
+}
+function yieldMacrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 type LexicalDocument = {
   id: string;
@@ -75,6 +78,11 @@ export class OramaLexicalIndex implements LexicalIndex {
         await insertMultiple(db, docs, BATCH_SIZE);
         completed += docs.length;
         options.onProgress?.({ phase: "build-lexical", completed, total, unit: "chunks" });
+        // Orama's resolved promises remain in the microtask queue. Yield to a
+        // macrotask between batches so a large vault cannot monopolize the
+        // Obsidian renderer while rebuilding this derived index.
+        await yieldMacrotask();
+        check(options.signal);
       };
       for (const note of snapshot.notes) {
         check(options.signal);
