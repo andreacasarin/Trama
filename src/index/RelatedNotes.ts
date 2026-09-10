@@ -1,6 +1,5 @@
 import { RelatedIndexSnapshot } from "@/index/IndexManager";
 import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
-import { isExcludedPath } from "@/settings/Settings";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
@@ -143,26 +142,6 @@ export class RelatedNotes {
 
   cancel(): void {
     this.cancelAll();
-  }
-
-  /**
-   * Synchronously removes newly excluded notes from all published and cached
-   * suggestions before the index prune or a replacement search completes.
-   */
-  invalidateExcludedPaths(paths: readonly string[]): void {
-    if (!paths.length) return;
-    this.cancelAll();
-    const filter = (result: RelatedNotesResult): RelatedNotesResult => ({
-      ...result,
-      results: isExcludedPath(result.currentPath, paths)
-        ? []
-        : result.results.filter((item) => !isExcludedPath(item.path, paths)),
-    });
-    for (const [key, result] of this.cache) this.cache.set(key, filter(result));
-    if (this.latestResult) {
-      this.latestResult = filter(this.latestResult);
-      for (const listener of this.listeners) listener(this.latestResult);
-    }
   }
 
   private cancelAll(): void {

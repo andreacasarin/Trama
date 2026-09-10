@@ -234,7 +234,9 @@ export class TramaSettingsTab extends PluginSettingTab {
     let input = "";
     new Setting(this.containerEl)
       .setName("Excluded files and directories")
-      .setDesc("Vault-relative Filo paths excluded from indexing and Lente results.")
+      .setDesc(
+        "Vault-relative paths omitted from the Filo index and Lente search. After changing this list, reindex the vault to apply it."
+      )
       .addText((text) => {
         text.setPlaceholder("Projects/Private");
         text.onChange((value) => {

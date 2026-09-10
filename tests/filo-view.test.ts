@@ -2,16 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "obsidian";
 import { FiloView } from "@/ui/filo/FiloView";
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((done, fail) => {
-    resolve = done;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
-
 function subject(
   status: any,
   results: readonly (
@@ -112,6 +102,7 @@ describe("FiloView", () => {
     const { view, openLinkText } = subject(ready, ["One.md"]);
     await view.onOpen();
     const link = byClass(view.contentEl, "trama-filo__link");
+    expect(link.classes.has("internal-link")).toBe(true);
     expect(link.tagName).toBe("a");
     link.dispatch("click", { ctrlKey: true });
     expect(openLinkText).toHaveBeenCalledWith("One.md", "Current.md", true);
@@ -140,41 +131,6 @@ describe("FiloView", () => {
       "chevron-down"
     );
     expect(related.find).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides an already-rendered excluded row synchronously", async () => {
-    const { view } = subject(ready, ["Private/Secret.md", "Public.md"]);
-    await view.onOpen();
-    expect(textOf(view.contentEl as any)).toContain("Secret");
-
-    (view as any).invalidateExcludedPaths(["Private"]);
-
-    expect(textOf(view.contentEl as any)).not.toContain("Secret");
-    expect(textOf(view.contentEl as any)).toContain("Public");
-  });
-
-  it("recovers a pending request after exclusion without showing a load error", async () => {
-    const pending = deferred<any>();
-    const find = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValueOnce({
-      generationId: "g1",
-      currentPath: "Current.md",
-      contentHash: "g1:Current.md",
-      results: [],
-    });
-    const { view } = subject(ready, [], async () => {}, find);
-    await view.onOpen();
-    await vi.waitFor(() => expect(find).toHaveBeenCalledTimes(1));
-
-    view.invalidateExcludedPaths(["Private"]);
-    pending.reject(new Error("cancelled"));
-    await Promise.resolve();
-    expect(textOf(view.contentEl as any)).not.toContain("could not be loaded");
-
-    view.refreshRelatedSuggestions();
-    await vi.waitFor(() => expect(find).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() =>
-      expect(textOf(view.contentEl as any)).not.toContain("could not be loaded")
-    );
   });
 
   it("labels cosine similarity using the class thresholds", async () => {
@@ -227,7 +183,7 @@ describe("FiloView", () => {
       canIndex: true,
     });
     await view.onOpen();
-    expect(textOf(view.contentEl as any)).toContain("Index vault");
+    expect(textOf(view.contentEl as any)).toContain("Build index");
   });
 
   it("uses incremental indexing for stale state while keeping forced reindex available", async () => {
@@ -251,8 +207,8 @@ describe("FiloView", () => {
       (child: any) => child.tagName === "button"
     );
     expect(buttons.map((button: any) => button.textContent)).toEqual([
-      "Index vault",
-      "Reindex vault",
+      "Update index",
+      "Rebuild index",
     ]);
     buttons[0].click();
     expect(runIndex).toHaveBeenCalledWith("index");
@@ -341,10 +297,10 @@ describe("FiloView", () => {
   });
 
   it.each([
-    ["error", false, true, false, "Index vault", "index"],
-    ["error", true, false, true, "Reindex vault", "reindex"],
-    ["cancelled", false, true, false, "Index vault", "index"],
-    ["cancelled", true, false, true, "Reindex vault", "reindex"],
+    ["error", false, true, false, "Build index", "index"],
+    ["error", true, false, true, "Rebuild index", "reindex"],
+    ["cancelled", false, true, false, "Build index", "index"],
+    ["cancelled", true, false, true, "Rebuild index", "reindex"],
   ])(
     "renders the correct recovery action for %s with last-good=%s",
     async (kind, hasLastGood, canIndex, canReindex, label, action) => {

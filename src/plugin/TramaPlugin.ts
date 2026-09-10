@@ -47,7 +47,6 @@ export class TramaPlugin extends Plugin {
   private lifecycleAbort?: AbortController;
   private automaticAbort?: AbortController;
   private automaticReschedulePending = false;
-  private suppressNextAutomaticLenteRefresh = false;
   private indexLoad?: Promise<boolean>;
   private indexLoaded = false;
   private indexReady = false;
@@ -225,32 +224,20 @@ export class TramaPlugin extends Plugin {
     const lenteChanged =
       before.lente.searchMethod !== saved.lente.searchMethod ||
       before.lente.maxResults !== saved.lente.maxResults;
-    const addedExclusions = saved.filo.excludedPaths.filter(
-      (path) => !before.filo.excludedPaths.includes(path)
-    );
-    const removedExclusions = before.filo.excludedPaths.filter(
-      (path) => !saved.filo.excludedPaths.includes(path)
-    );
+    const exclusionsChanged =
+      before.filo.excludedPaths.length !== saved.filo.excludedPaths.length ||
+      before.filo.excludedPaths.some((path, index) => path !== saved.filo.excludedPaths[index]);
+    const indexDefinitionChanged = embeddingChanged || exclusionsChanged;
     const app = (this as unknown as { app?: any }).app;
 
     if (!saved.filo.automaticUpdates)
       this.stopAutomaticWork(true, before.filo.automaticUpdates && !saved.filo.automaticUpdates);
     else if (!before.filo.automaticUpdates) this.armAutomaticWork();
 
-    if (addedExclusions.length) {
-      // A live eligibility change must stop an in-flight background operation
-      // before the deletion-only prune examines the committed snapshot.
-      this.stopAutomaticWork();
-      this.cancelExplicitIndexForEligibilityChange();
-      this.relatedNotes?.invalidateExcludedPaths(addedExclusions);
-      this.invalidateOpenExcludedResults(app, addedExclusions);
-    }
-    if (embeddingChanged) {
+    if (indexDefinitionChanged) {
       this.stopAutomaticWork(false);
       this.session?.cancel();
       this.relatedNotes?.cancel();
-    }
-    if (embeddingChanged) {
       this.indexStatus?.cancel();
       const oldIndex = this.index;
       oldIndex?.invalidate();
@@ -264,27 +251,11 @@ export class TramaPlugin extends Plugin {
       this.indexStatus?.markStale(false);
     }
     if (app?.vault && app.workspace && app.metadataCache && this.session) {
-      if (chatChanged && !embeddingChanged) this.replaceChatModel(saved);
-      else if (embeddingChanged) this.composeRuntime(app, saved);
+      if (chatChanged && !indexDefinitionChanged) this.replaceChatModel(saved);
+      else if (indexDefinitionChanged) this.composeRuntime(app, saved);
     }
 
-    if (lenteChanged && !embeddingChanged && this.index) {
-      this.replaceLenteSearch(app, addedExclusions.length === 0);
-    }
-    const exclusionsPruned = addedExclusions.length ? await this.pruneAddedExclusions() : true;
-    if (removedExclusions.length) this.queueRemovedExclusions(before.filo.excludedPaths);
-
-    if (
-      exclusionsPruned &&
-      this.getSettings().filo.automaticUpdates &&
-      this.queuedWork &&
-      this.indexReady
-    ) {
-      if (addedExclusions.length) this.suppressNextAutomaticLenteRefresh = true;
-      this.scheduleReconcile();
-    } else if (addedExclusions.length) {
-      this.suppressNextAutomaticLenteRefresh = false;
-    }
+    if (lenteChanged && !indexDefinitionChanged && this.index) this.replaceLenteSearch(app);
   }
   updateChatEndpoint(value: string): Promise<void> {
     return this.enqueueSettingsUpdate((current) => ({
@@ -316,9 +287,12 @@ export class TramaPlugin extends Plugin {
       policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
     });
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.workspace, app.metadataCache);
+    const excludedPaths = [...settings.filo.excludedPaths];
+    const isIndexEligible = (path: string) =>
+      this.isVisibleMarkdown(path) && !isExcludedPath(path, excludedPaths);
     const indexVault: IndexVaultPort = new ObsidianIndexVault(app.vault, {
       isBaseVisible: (path) => this.isVisibleMarkdown(path),
-      isIndexEligible: (path) => this.isIndexEligible(path),
+      isIndexEligible,
     });
     const embedding = new LmStudioEmbeddingModel({ ...settings.embedding, transport });
     this.embeddingModel = embedding;
@@ -329,7 +303,8 @@ export class TramaPlugin extends Plugin {
       settings.embedding.endpoint,
       settings.embedding.modelId,
       {
-        isIndexEligible: (path) => this.isIndexEligible(path),
+        excludedPaths,
+        isIndexEligible,
         onProgress: (progress) => this.indexStatus?.reportProgress(progress),
       },
       this.diagnostics
@@ -417,30 +392,6 @@ export class TramaPlugin extends Plugin {
     for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
       const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
       view?.refreshRelatedSuggestions?.();
-    }
-  }
-
-  private refreshOpenFilo(app: any): void {
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
-      const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
-      view?.refreshRelatedSuggestions?.();
-    }
-  }
-
-  private invalidateOpenExcludedResults(app: any, paths: readonly string[]): void {
-    if (!app?.workspace) return;
-    this.refreshOpenRelatedSuggestions(app);
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
-      const view = (
-        leaf as { view?: { invalidateExcludedPaths?: (paths: readonly string[]) => void } }
-      ).view;
-      view?.invalidateExcludedPaths?.(paths);
-    }
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
-      const view = (
-        leaf as { view?: { invalidateExcludedPaths?: (paths: readonly string[]) => void } }
-      ).view;
-      view?.invalidateExcludedPaths?.(paths);
     }
   }
 
@@ -564,75 +515,11 @@ export class TramaPlugin extends Plugin {
     if (markStale && this.queuedWork) this.markQueuedWorkStale();
   }
 
-  private cancelExplicitIndexForEligibilityChange(): void {
-    const status = (
-      this.indexStatus as { getStatus?: () => { kind?: string } } | undefined
-    )?.getStatus?.();
-    if (status?.kind === "building" || status?.kind === "cancelling") this.indexStatus?.cancel();
-  }
-
   private markQueuedWorkStale(): void {
     if (!this.indexStatus) return;
     const manager = this.index as (IndexManager & { hasUsableIndex?: () => boolean }) | undefined;
     const hasLastGood = manager?.hasUsableIndex?.() ?? this.indexReady;
     this.indexStatus.markStale(hasLastGood);
-  }
-
-  private async pruneAddedExclusions(): Promise<boolean> {
-    const manager = this.index;
-    if (!manager) return true;
-    const signal = this.lifecycleAbort?.signal ?? new AbortController().signal;
-    let published = false;
-    let failed = false;
-    const wasBuilding = manager.isBuilding();
-    try {
-      published = await manager.pruneExcludedPaths(signal);
-    } catch {
-      // An automatic operation may have been cancelled immediately before the
-      // prune call. Let that operation settle once, then retry this one local
-      // deletion-only pass exactly once.
-      if (wasBuilding) {
-        try {
-          await manager.waitForBuild().catch(() => undefined);
-          published = await manager.pruneExcludedPaths(signal);
-        } catch {
-          published = false;
-        }
-      }
-      failed = !published;
-      if (failed && this.index === manager) {
-        this.queuedWork = true;
-        this.markQueuedWorkStale();
-      }
-    }
-    if (this.index !== manager) return false;
-    this.relatedNotes?.cancel();
-    const app = (this as unknown as { app?: any }).app;
-    if (!app?.workspace) return !failed;
-    this.refreshOpenRelatedSuggestions(app);
-    this.refreshOpenFilo(app);
-    return !failed;
-  }
-
-  private queueRemovedExclusions(previousExcludedPaths: readonly string[]): void {
-    const manager = this.index;
-    const app = (this as unknown as { app?: any }).app;
-    if (!manager || !app?.vault?.getMarkdownFiles) return;
-    for (const file of app.vault.getMarkdownFiles()) {
-      const path = file.path;
-      if (
-        !this.isVisibleMarkdown(path) ||
-        !this.isIndexEligible(path) ||
-        !isExcludedPath(path, previousExcludedPaths)
-      )
-        continue;
-      manager.queueOperation({ kind: "create", path });
-      if (!this.indexLoaded || !this.indexReady) this.pendingVaultChanges.add(path);
-      this.queuedWork = true;
-    }
-    if (!this.queuedWork) return;
-    if (this.getSettings().filo.automaticUpdates && this.indexReady) this.scheduleReconcile();
-    else this.markQueuedWorkStale();
   }
 
   private async runFullIndex(signal: AbortSignal): Promise<void> {
@@ -703,13 +590,10 @@ export class TramaPlugin extends Plugin {
       .then(() => {
         completed = true;
         const published = manager.getLastReconciliationPublished();
-        const suppressLenteRefresh =
-          source === "automatic" && this.suppressNextAutomaticLenteRefresh;
-        if (suppressLenteRefresh) this.suppressNextAutomaticLenteRefresh = false;
         this.indexStatus?.setReady();
         const app = (this as unknown as { app?: any }).app;
         if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-        if (published && !suppressLenteRefresh && app?.workspace) this.refreshOpenLente(app);
+        if (published && app?.workspace) this.refreshOpenLente(app);
       })
       .catch((error) => {
         this.queuedWork = true;

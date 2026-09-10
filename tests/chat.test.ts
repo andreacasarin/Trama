@@ -402,7 +402,14 @@ describe("ChatSession module", () => {
           "attachment_preflight_completed",
           "model_round_started",
           "model_round_completed",
+          "session_completed",
         ]);
+        expect(records.at(-1)).toMatchObject({
+          area: "chat",
+          event: "session_completed",
+          generation: 1,
+          durationMs: expect.any(Number),
+        });
       });
 
       it("emits exact tool and session-error payloads", async () => {

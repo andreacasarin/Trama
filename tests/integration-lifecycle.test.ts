@@ -4,6 +4,7 @@ import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { LenteSearch } from "@/index/LenteSearch";
+import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -207,7 +208,7 @@ describe("TramaPlugin lifecycle integration", () => {
     ).toEqual([
       ["open-voce", "message-circle"],
       ["open-filo", "route"],
-      ["open-lente", "search"],
+      ["open-lente", "binoculars"],
     ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
@@ -1084,6 +1085,40 @@ describe("TramaPlugin lifecycle integration", () => {
     status.cancel();
     await run;
     expect(command.checkCallback(true)).toBe(true);
+  });
+
+  it("logs elapsed time for a completed user index action", async () => {
+    let now = 1_000;
+    const records: TramaDiagnosticRecord[] = [];
+    const status = new IndexStatusController(
+      {} as any,
+      {
+        index: async () => undefined,
+        reindex: async () => {
+          now = 3_500;
+        },
+        cancel: () => undefined,
+      },
+      { emit: (record) => records.push(record) },
+      {
+        now: () => now,
+        setTimeout: (callback) => setTimeout(callback, 0),
+        clearTimeout: (timer) => clearTimeout(timer),
+      }
+    );
+    status.setReady();
+
+    await status.run("reindex");
+
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        area: "index",
+        event: "index_operation",
+        operation: "full",
+        stage: "user-completed",
+        durationMs: 2_500,
+      })
+    );
   });
 
   it("estimates remaining embedding time from observed throughput", () => {

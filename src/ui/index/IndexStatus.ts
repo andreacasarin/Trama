@@ -2,6 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
+  startDiagnosticTimer,
   TramaDiagnostics,
   TramaDiagnosticRecord,
 } from "@/diagnostics/TramaDiagnostics";
@@ -96,7 +97,7 @@ export class IndexStatusController {
   register(): void {
     this.plugin.addCommand({
       id: "index-filo-vault",
-      name: "Index vault",
+      name: "Update index",
       callback: () => void this.start("index"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canIndex) return false;
@@ -106,7 +107,7 @@ export class IndexStatusController {
     });
     this.plugin.addCommand({
       id: "reindex-filo-vault",
-      name: "Reindex vault",
+      name: "Rebuild index",
       callback: () => void this.start("reindex"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canReindex) return false;
@@ -310,6 +311,7 @@ export class IndexStatusController {
   }
   private async start(kind: "index" | "reindex"): Promise<void> {
     if (this.controller) return;
+    const elapsedMs = startDiagnosticTimer(() => this.timing.now());
     this.controller = new AbortController();
     this.set("building", this.status.hasLastGood, "Building index…");
     try {
@@ -317,6 +319,13 @@ export class IndexStatusController {
         ? this.actions.index(this.controller.signal)
         : this.actions.reindex(this.controller.signal));
       if (this.status.kind === "building") this.set("ready", true);
+      this.emitDiagnostic({
+        area: "index",
+        event: "index_operation",
+        operation: kind === "index" ? "incremental" : "full",
+        stage: "user-completed",
+        durationMs: elapsedMs(),
+      });
     } catch (error) {
       const cancelled = this.controller.signal.aborted;
       this.set(

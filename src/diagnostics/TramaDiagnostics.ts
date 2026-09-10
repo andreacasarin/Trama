@@ -16,6 +16,12 @@ export type TramaDiagnosticRecord =
   | { readonly area: "chat"; readonly event: "session_started"; readonly generation: number }
   | {
       readonly area: "chat";
+      readonly event: "session_completed";
+      readonly generation: number;
+      readonly durationMs: number;
+    }
+  | {
+      readonly area: "chat";
       readonly event: "attachment_preflight_started";
       readonly generation: number;
       readonly count: number;
@@ -148,6 +154,12 @@ export interface TramaDiagnostics {
 }
 
 export const NOOP_TRAMA_DIAGNOSTICS: TramaDiagnostics = Object.freeze({ emit: () => undefined });
+
+/** Starts one wall-clock timer for diagnostic duration records. */
+export function startDiagnosticTimer(now: () => number = () => Date.now()): () => number {
+  const startedAt = now();
+  return () => Math.max(0, now() - startedAt);
+}
 
 /** Emits observational diagnostics without allowing a hostile sink to affect control flow. */
 export function emitTramaDiagnostic(

@@ -4,6 +4,7 @@ import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
   projectDiagnosticError,
+  startDiagnosticTimer,
 } from "@/diagnostics/TramaDiagnostics";
 import type { LenteNoteStatPort } from "@/vault/readOnly/ObsidianLenteNoteStats";
 import { isQueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
@@ -102,7 +103,7 @@ export class LenteSearch {
     const normalized = query.trim();
     if (!normalized)
       throw new StructuredError("invalid_request", "Search query must not be empty.", false);
-    const started = Date.now();
+    const elapsedMs = startDiagnosticTimer();
     const signal = options.signal;
     if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
     const lease = this.retrieval.acquireLenteLease();
@@ -137,7 +138,7 @@ export class LenteSearch {
         displayLimit,
         results,
         canonicalResults,
-        durationMs: Date.now() - started,
+        durationMs: elapsedMs(),
       } as const;
       emitTramaDiagnostic(this.diagnostics, {
         area: "index",
@@ -155,7 +156,7 @@ export class LenteSearch {
         generation: lease.generationId,
         mode,
         resultCount: 0,
-        durationMs: Date.now() - started,
+        durationMs: elapsedMs(),
         cancelled: isCancelled(error),
         error: projectDiagnosticError(error),
       } as never);

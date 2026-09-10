@@ -6,7 +6,7 @@ Trama is a desktop-only Obsidian plugin for local AI conversation and semantic c
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer**, load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
 2. Configure the chat model and embedding model independently in the plugin settings.
-3. Use **Index vault** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
+3. Use **Update index** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
 
 The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
 
@@ -34,9 +34,9 @@ and does not alter the authoritative schema-3 corpus.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and
-processed as per-note incremental updates. **Index vault** is the normal synchronization
+processed as per-note incremental updates. **Update index** is the normal synchronization
 mode: it scans the current vault, compares committed content identities, and embeds only
-new or changed notes while removing deleted paths. **Reindex vault** remains the explicit
+new or changed notes while removing deleted paths. **Rebuild index** remains the explicit
 forced rebuild for recovery or configuration refresh. If a note is moved or deleted while
 either pass is running, that stale path is logged and skipped, then the queued vault event
 is reconciled without failing the whole operation. Builds use an atomic last-good

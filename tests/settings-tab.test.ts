@@ -118,6 +118,15 @@ describe("Settings tab module", () => {
   });
 
   describe("TramaSettingsTab", () => {
+    it("explains that exclusion changes require reindexing", () => {
+      const tab = new TramaSettingsTab({} as never, controller() as never);
+      tab.display();
+
+      expect(latestSetting("Excluded files and directories")?.description).toContain(
+        "reindex the vault"
+      );
+    });
+
     it("renders the four headings in order with Lente controls and an unboxed Save button", () => {
       const tab = new TramaSettingsTab({} as never, controller() as never);
       tab.display();

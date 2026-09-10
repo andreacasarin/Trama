@@ -702,6 +702,8 @@ describe("VoceView module", () => {
         expect(input.value).toBe("[[Daily/Today.md]]");
         const selected = byAttribute(root, "aria-label", "Remove Daily/Today.md")[0];
         expect(selected.getAttribute("aria-pressed")).toBe("true");
+        expect(selected.classes.has("clickable-icon")).toBe(true);
+        expect(selected.classes.has("is-active")).toBe(true);
         selected.click();
         expect(input.value).toBe("");
 

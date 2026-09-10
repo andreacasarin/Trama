@@ -19,6 +19,7 @@ import {
   type CorpusTransaction,
   type IncrementalChange,
 } from "@/index/corpus/CorpusStore";
+import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
 import { deriveNoteContentId, sha256Hex } from "@/index/corpus/Hash";
 import { ExactVectorIndex } from "@/index/vector/ExactVectorIndex";
 import { OramaLexicalIndex } from "@/index/lexical/OramaLexicalIndex";
@@ -54,6 +55,7 @@ export interface IndexFingerprint {
   readonly embeddingBaseUrl: string;
   readonly modelId: string;
   readonly dimensions: number;
+  readonly excludedPaths: readonly string[];
   readonly chunking: {
     readonly algorithmVersion: number;
     readonly size: number;
@@ -102,7 +104,7 @@ interface Bundle {
 
 export interface LenteBundleLease {
   readonly generationId: string;
-  readonly retriever: Pick<Retriever, "search">;
+  readonly retriever: Retriever;
   search(
     query: string,
     mode: "hybrid" | "lexical",
@@ -119,12 +121,19 @@ export function createIndexFingerprint(
   embeddingBaseUrl: string,
   modelId: string,
   dimensions: number,
-  options: { readonly size?: number; readonly overlap?: number } = {}
+  options: {
+    readonly size?: number;
+    readonly overlap?: number;
+    readonly excludedPaths?: readonly string[];
+  } = {}
 ): IndexFingerprint {
   return {
     embeddingBaseUrl: embeddingBaseUrl.trim().replace(/\/$/, "").toLowerCase(),
     modelId,
     dimensions,
+    excludedPaths: Object.freeze(
+      [...new Set((options.excludedPaths ?? []).map(normalizePath))].sort(compareCodeUnits)
+    ),
     chunking: {
       algorithmVersion: CHUNK_ALGORITHM_VERSION,
       size: options.size ?? CHUNK_SIZE,
@@ -150,7 +159,7 @@ export class IndexManager implements VaultSearchPort {
   private loaded = false;
   private unavailable = false;
   private loadPromise?: Promise<boolean>;
-  private buildPromise?: Promise<void | boolean>;
+  private buildPromise?: Promise<void>;
   private generation = 0;
   private epoch = 0;
   private revision = 0;
@@ -167,7 +176,8 @@ export class IndexManager implements VaultSearchPort {
     private readonly options: {
       readonly size?: number;
       readonly overlap?: number;
-      /** Optional live override for plugin-owned index eligibility. */
+      readonly excludedPaths?: readonly string[];
+      /** Fixed eligibility predicate for this index fingerprint. */
       readonly isIndexEligible?: (path: string) => boolean;
       readonly onProgress?: (progress: IndexProgress) => void;
     } = {},
@@ -410,88 +420,6 @@ export class IndexManager implements VaultSearchPort {
     for (const note of this.active.snapshot.notes)
       if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
     return this.reconcileQueuedChangesWithPublication(signal);
-  }
-
-  /**
-   * Removes committed notes which are no longer index-eligible without reading,
-   * chunking, or embedding them. Queued revisions are deliberately untouched.
-   */
-  async pruneExcludedPaths(signal: AbortSignal): Promise<boolean> {
-    check(signal);
-    if (this.building) {
-      await this.buildPromise;
-      return this.pruneExcludedPaths(signal);
-    }
-    if (!this.loaded) await this.load();
-    const base = this.active;
-    if (!base || this.unavailable) return false;
-    const deleted = base.snapshot.notes
-      .filter((note) => !this.isIndexEligible(note.path))
-      .map((note) => ({ type: "delete" as const, path: note.path }));
-    if (!deleted.length) return false;
-
-    const run = this.pruneExcludedPathsInternal(base, deleted, signal);
-    this.buildPromise = run;
-    try {
-      return await run;
-    } finally {
-      if (this.buildPromise === run) this.buildPromise = undefined;
-    }
-  }
-
-  /** Alias for callers that use the eligibility terminology. */
-  async pruneIneligiblePaths(signal: AbortSignal): Promise<boolean> {
-    return this.pruneExcludedPaths(signal);
-  }
-
-  private async pruneExcludedPathsInternal(
-    base: Bundle,
-    deleted: readonly IncrementalChange[],
-    signal: AbortSignal
-  ): Promise<boolean> {
-    this.building = true;
-    this.corpus.enableDiagnostics();
-    const epoch = ++this.epoch;
-    let tx: CorpusTransaction | undefined;
-    let bundle: Bundle | undefined;
-    try {
-      tx = await this.corpus.stageIncremental(base.snapshot, deleted, await this.fingerprintId(), {
-        signal,
-      });
-      check(signal);
-      if (epoch !== this.epoch)
-        throw new StructuredError("cancelled", "Index pruning cancelled.", true);
-      bundle = await this.derive(tx.snapshot, ++this.generation, signal, "incremental");
-      check(signal);
-      await tx.commit();
-      const published = bundle;
-      bundle = undefined;
-      await this.swap(published);
-      this.unavailable = false;
-      await this.collectGarbage("incremental", tx.snapshot.generationId);
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: "published",
-        generation: tx.snapshot.generationId,
-        counts: { changes: deleted.length, pruned: deleted.length },
-      });
-      return true;
-    } catch (error) {
-      if (bundle) await bundle.retriever.close().catch(() => undefined);
-      if (tx) await tx.abort().catch(() => undefined);
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: signal.aborted ? "cancelled" : "failed",
-        error: projectDiagnosticError(error),
-      });
-      throw error;
-    } finally {
-      this.building = false;
-    }
   }
 
   async waitForBuild(): Promise<void> {
@@ -742,23 +670,11 @@ export class IndexManager implements VaultSearchPort {
     if (!bundle || this.unavailable) return null;
     bundle.leases++;
     let released = false;
-    const retriever: Pick<Retriever, "search"> = {
-      search: async (request) => {
-        const results = await bundle.retriever.search({
-          ...request,
-          visiblePaths: this.intersectVisiblePaths(
-            request.visiblePaths,
-            this.eligiblePaths(bundle.snapshot)
-          ),
-        });
-        return results.filter((result) => this.isIndexEligible(result.path));
-      },
-    };
     return {
       generationId: bundle.snapshot.generationId,
-      retriever,
+      retriever: bundle.retriever,
       search: (query, mode, signal) =>
-        retriever.search({
+        bundle.retriever.search({
           query,
           mode,
           resultShape: "notes",
@@ -1164,18 +1080,14 @@ export class IndexManager implements VaultSearchPort {
       limit: Math.min(20, Math.max(0, limit)),
       semanticCandidateLimit: 80,
       lexicalCandidateLimit: 80,
-      visiblePaths: this.eligiblePaths(bundle.snapshot),
       signal,
     });
-    return results
-      .filter((result) => this.isIndexEligible(result.path))
-      .map((r) => this.provenance(r));
+    return results.map((r) => this.provenance(r));
   }
   relatedSnapshot(path: string): RelatedIndexSnapshot | null {
     const bundle = this.active;
     if (!bundle || this.unavailable) return null;
     const currentPath = normalizePath(path);
-    if (!this.isIndexEligible(currentPath)) return null;
     const note = bundle.snapshot.getNote(currentPath);
     if (!note) return null;
     return {
@@ -1184,7 +1096,6 @@ export class IndexManager implements VaultSearchPort {
       contentHash: note.contentId,
       prepareQuery: async (signal) => {
         check(signal);
-        if (!this.isIndexEligible(currentPath)) return null;
         const textParts: string[] = [];
         let textLength = 0;
         let vectorSum: Float64Array | undefined;
@@ -1225,35 +1136,30 @@ export class IndexManager implements VaultSearchPort {
         return { text: textParts.join(""), vector };
       },
       search: async (query, vector, signal, limit) =>
-        !this.isIndexEligible(currentPath)
-          ? []
-          : (
-              await bundle.retriever.search({
-                query,
-                queryVector: vector,
-                // Related-note lookup runs automatically when the active note
-                // changes. Use its committed aggregate vector so this path
-                // never invokes Orama's synchronous whole-index text search
-                // on Obsidian's renderer thread.
-                mode: "related",
-                resultShape: "chunks",
-                currentPath,
-                limit: Math.min(128, limit),
-                semanticCandidateLimit: 128,
-                lexicalCandidateLimit: 0,
-                visiblePaths: this.eligiblePaths(bundle.snapshot),
-                signal,
-              })
-            )
-              .filter((result) => this.isIndexEligible(result.path))
-              .map((r) => ({
-                path: r.path,
-                score: r.fusedScore,
-                ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
-                excerpt: r.excerpt,
-                startLine: r.startLine,
-                endLine: r.endLine,
-              })),
+        (
+          await bundle.retriever.search({
+            query,
+            queryVector: vector,
+            // Related-note lookup runs automatically when the active note
+            // changes. Use its committed aggregate vector so this path
+            // never invokes Orama's synchronous whole-index text search
+            // on Obsidian's renderer thread.
+            mode: "related",
+            resultShape: "chunks",
+            currentPath,
+            limit: Math.min(128, limit),
+            semanticCandidateLimit: 128,
+            lexicalCandidateLimit: 0,
+            signal,
+          })
+        ).map((r) => ({
+          path: r.path,
+          score: r.fusedScore,
+          ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
+          excerpt: r.excerpt,
+          startLine: r.startLine,
+          endLine: r.endLine,
+        })),
     };
   }
   async upsert(path: string, signal: AbortSignal): Promise<void> {
@@ -1287,7 +1193,7 @@ export class IndexManager implements VaultSearchPort {
     };
   }
 
-  /** Eligibility is live and fail-closed if a plugin predicate misbehaves. */
+  /** Eligibility is fixed for this manager and applied only while constructing the corpus. */
   private isIndexEligible(path: string): boolean {
     try {
       const normalized = normalizePath(path);
@@ -1299,25 +1205,6 @@ export class IndexManager implements VaultSearchPort {
     } catch {
       return false;
     }
-  }
-
-  private eligiblePaths(snapshot: CorpusSnapshot): ReadonlySet<string> {
-    return new Set(
-      snapshot.notes.map((note) => note.path).filter((path) => this.isIndexEligible(path))
-    );
-  }
-
-  private intersectVisiblePaths(
-    requested: ReadonlySet<string> | readonly string[] | undefined,
-    eligible: ReadonlySet<string>
-  ): ReadonlySet<string> {
-    if (!requested) return eligible;
-    const visible = requested instanceof Set ? requested : new Set(requested);
-    return new Set(
-      [...visible]
-        .map(normalizePath)
-        .filter((path) => eligible.has(path) && this.isIndexEligible(path))
-    );
   }
 
   private emit(record: TramaDiagnosticRecord): void {

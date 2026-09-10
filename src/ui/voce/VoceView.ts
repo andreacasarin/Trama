@@ -154,7 +154,7 @@ export class VoceView extends ItemView {
     this.isViewOpen = true;
     this.contentEl.empty();
     this.root = this.contentEl.createDiv({ cls: "trama-voce" });
-    this.root.createEl("h2", { text: "Voce", cls: "trama-voce__title" });
+    this.root.createEl("h1", { text: "Voce", cls: "trama-voce__title" });
     this.transcript = this.root.createDiv({ cls: "trama-voce__transcript" });
     this.transcript.addEventListener("click", (event) => this.openInternalLink(event));
     this.feedback = this.root.createDiv({ cls: "trama-voce__feedback" });
@@ -183,7 +183,7 @@ export class VoceView extends ItemView {
       }
     });
     this.actionButton = composeRow.createEl("button", {
-      cls: "trama-icon-button trama-voce__action",
+      cls: "clickable-icon trama-voce__action",
       attr: { type: "button" },
     });
     this.actionButton.addEventListener("click", () => {
@@ -396,7 +396,10 @@ export class VoceView extends ItemView {
 
   private renderSources(parent: HTMLDivElement, turn: AssistantConversationTurn): void {
     const sources = parent.createDiv({ cls: "trama-voce__sources" });
-    sources.createDiv({ cls: "trama-voce__sources-label", text: "Sources" });
+    sources.createDiv({
+      cls: "setting-item-description trama-voce__sources-label",
+      text: "Sources",
+    });
     for (const note of turn.provenance)
       this.renderInternalLink(sources, note.path, provenanceLabel(note), "trama-voce__chip");
   }
@@ -435,11 +438,7 @@ export class VoceView extends ItemView {
     for (const path of paths) {
       const isSelected = selected.has(path);
       const button = this.attachments.createEl("button", {
-        cls: [
-          "trama-button",
-          "trama-voce__context-tag",
-          isSelected ? "trama-voce__context-tag--selected" : "",
-        ],
+        cls: ["clickable-icon", "trama-voce__context-tag", isSelected ? "is-active" : ""],
         text: this.noteLabel(path),
         attr: {
           type: "button",
@@ -465,7 +464,7 @@ export class VoceView extends ItemView {
       });
     }
     const addButton = this.attachments.createEl("button", {
-      cls: "trama-icon-button trama-voce__context-add",
+      cls: "clickable-icon trama-voce__context-add",
       attr: { type: "button", "aria-label": "Choose note" },
     });
     setIcon(addButton, "plus");
@@ -529,7 +528,7 @@ export class VoceView extends ItemView {
     const actions = parent.createDiv({ cls: "trama-voce__message-actions" });
     for (const action of this.assistantActions(turn)) {
       const button = actions.createEl("button", {
-        cls: "trama-icon-button trama-voce__message-action",
+        cls: "clickable-icon trama-voce__message-action",
         attr: { type: "button", "aria-label": action.label },
       });
       setIcon(button, action.icon);
@@ -546,7 +545,7 @@ export class VoceView extends ItemView {
 
   private renderExpandAction(parent: HTMLDivElement, turnId: string, isExpanded: boolean): void {
     const button = parent.createEl("button", {
-      cls: "trama-button trama-voce__expand",
+      cls: "clickable-icon trama-voce__expand",
       text: isExpanded ? "Show less" : "Show more",
       attr: {
         type: "button",
@@ -564,7 +563,7 @@ export class VoceView extends ItemView {
     this.feedback.empty();
     const message = this.localError ?? (state.error ? errorMessage(state.error) : undefined);
     if (!message) return;
-    this.feedback.createDiv({ cls: "trama-voce__error", text: message });
+    this.feedback.createDiv({ cls: "mod-warning trama-voce__error", text: message });
   }
 
   private updateActionButton(running: boolean): void {

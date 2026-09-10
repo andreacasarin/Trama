@@ -1,6 +1,5 @@
 import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
-import { isExcludedPath } from "@/settings/Settings";
 import { formatIndexProgress, IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
@@ -78,7 +77,7 @@ export class FiloView extends ItemView {
     this.isViewOpen = true;
     this.contentEl.empty();
     this.root = this.contentEl.createDiv({ cls: "trama-filo" });
-    this.root.createEl("h2", { text: "Filo", cls: "trama-filo__title" });
+    this.root.createEl("h1", { text: "Filo", cls: "trama-filo__title" });
     this.statusUnsubscribe = this.statusSource.subscribe((status) => {
       this.status = status;
       this.render();
@@ -175,53 +174,38 @@ export class FiloView extends ItemView {
     return !key || key === `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
   }
 
-  /** Immediately removes excluded cached rows before prune/refresh completes. */
-  invalidateExcludedPaths(paths: readonly string[]): void {
-    if (!paths.length) return;
-    this.requestGeneration++;
-    this.requestAbort?.abort();
-    this.requestAbort = undefined;
-    this.requestKey = undefined;
-    this.relatedError = false;
-    if (this.related)
-      this.related = {
-        ...this.related,
-        results: isExcludedPath(this.related.currentPath, paths)
-          ? []
-          : this.related.results.filter((result) => !isExcludedPath(result.path, paths)),
-      };
-    this.render();
-  }
-
   private render(): void {
     if (!this.root) return;
     this.root.empty();
-    this.root.createEl("h2", { text: "Filo", cls: "trama-filo__title" });
+    this.root.createEl("h1", { text: "Filo", cls: "trama-filo__title" });
     const path = this.activePath;
     if (!path) {
       this.root.createDiv({
-        cls: "trama-filo__message",
+        cls: "setting-item-description trama-filo__message",
         text: "Open a Markdown note to see related notes.",
       });
       return;
     }
     const status = this.status;
     if (status.kind === "loading") {
-      this.root.createDiv({ cls: "trama-filo__message", text: "Loading index…" });
+      this.root.createDiv({
+        cls: "setting-item-description trama-filo__message",
+        text: "Loading index…",
+      });
       return;
     }
     if (status.kind === "index-required") {
       this.root.createDiv({
-        cls: "trama-filo__message",
+        cls: "setting-item-description trama-filo__message",
         text: "Index your vault to discover related notes.",
       });
-      if (status.canIndex) this.actionButton("Index vault", "index");
+      if (status.canIndex) this.actionButton("Build index", "index");
       return;
     }
     if (status.kind === "building" || status.kind === "cancelling") {
       if (status.kind === "cancelling" || !this.renderProgress(status))
         this.root.createDiv({
-          cls: "trama-filo__message",
+          cls: "setting-item-description trama-filo__message",
           text: status.message ?? "Building index…",
         });
       if (status.canCancel) this.actionButton("Cancel", "cancel");
@@ -230,50 +214,56 @@ export class FiloView extends ItemView {
     if (status.kind === "stale") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
-        cls: "trama-filo__message trama-filo__message--warning",
+        cls: "setting-item-description mod-warning trama-filo__message",
         text: status.message ?? "Index has changes; update required.",
       });
-      if (status.canIndex) this.actionButton("Index vault", "index");
-      if (status.canReindex) this.actionButton("Reindex vault", "reindex");
+      if (status.canIndex) this.actionButton("Update index", "index");
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
       return;
     }
     if (status.kind === "error") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
-        cls: "trama-filo__message trama-filo__message--warning",
+        cls: "setting-item-description mod-warning trama-filo__message",
         text: status.message ?? "Indexing failed.",
       });
-      if (status.canReindex) this.actionButton("Reindex vault", "reindex");
-      else if (status.canIndex) this.actionButton("Index vault", "index");
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Build index", "index");
       return;
     }
     if (status.kind === "cancelled") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
-        cls: "trama-filo__message trama-filo__message--warning",
+        cls: "setting-item-description mod-warning trama-filo__message",
         text: status.message ?? "Indexing cancelled.",
       });
-      if (status.canReindex) this.actionButton("Reindex vault", "reindex");
-      else if (status.canIndex) this.actionButton("Index vault", "index");
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Build index", "index");
       return;
     }
     if (status.kind === "updating") {
       if (this.related) this.renderRows();
       if (!this.renderProgress(status))
-        this.root.createDiv({ cls: "trama-filo__message", text: "Updating index…" });
+        this.root.createDiv({
+          cls: "setting-item-description trama-filo__message",
+          text: "Updating index…",
+        });
       return;
     }
     if (status.kind === "empty") {
-      this.root.createDiv({ cls: "trama-filo__message", text: "No related notes found." });
-      if (status.canReindex) this.actionButton("Reindex vault", "reindex");
-      else if (status.canIndex) this.actionButton("Index vault", "index");
+      this.root.createDiv({
+        cls: "setting-item-description trama-filo__message",
+        text: "No related notes found.",
+      });
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Build index", "index");
       return;
     }
     if (!this.related) {
       this.root.createDiv({
         cls: this.relatedError
-          ? "trama-filo__message trama-filo__message--warning"
-          : "trama-filo__message",
+          ? "setting-item-description mod-warning trama-filo__message"
+          : "setting-item-description trama-filo__message",
         text: this.relatedError ? "Related notes could not be loaded." : "Finding related notes…",
       });
       return;
@@ -286,7 +276,7 @@ export class FiloView extends ItemView {
     if (!progress) return false;
     const label = formatIndexProgress(progress, status.etaSeconds);
     this.root.createEl("p", {
-      cls: "trama-filo__progress-label",
+      cls: "setting-item-description trama-filo__progress-label",
       text: label,
       attr: { "aria-live": "polite" },
     });
@@ -336,7 +326,7 @@ export class FiloView extends ItemView {
         this.render();
       });
       const link = header.createEl("a", {
-        cls: "trama-filo__link",
+        cls: "internal-link trama-filo__link",
         text: this.basename(result.path),
         attr: { href: result.path },
       });
@@ -352,27 +342,30 @@ export class FiloView extends ItemView {
       });
       const relevance = this.relevance(result.similarity ?? result.score);
       header.createSpan({
-        cls: `trama-filo__relevance trama-filo__relevance--${relevance.toLowerCase()}`,
+        cls: "setting-item-description trama-filo__relevance",
         text: relevance,
       });
       if (expanded) {
         const detail = item.createDiv({ cls: "trama-filo__detail" });
         if (result.excerpt) detail.createDiv({ cls: "trama-filo__excerpt", text: result.excerpt });
         detail.createDiv({
-          cls: "trama-filo__path",
+          cls: "setting-item-description trama-filo__path",
           text: `${result.path}${this.lineLabel(result.startLine, result.endLine)}`,
         });
       }
     }
     if (!paths.size)
-      rows.createDiv({ cls: "trama-filo__message", text: "No related notes found." });
+      rows.createDiv({
+        cls: "setting-item-description trama-filo__message",
+        text: "No related notes found.",
+      });
   }
 
   private actionButton(label: string, action: "index" | "reindex" | "cancel"): void {
     const button = this.root.createEl("button", {
-      cls: "trama-button trama-filo__action",
+      cls: `${action === "cancel" ? "clickable-icon " : ""}trama-filo__action`,
       text: label,
-      attr: { type: "button" },
+      attr: { type: "button", "aria-label": label },
     });
     if (action === "cancel") setIcon(button, "square");
     button.addEventListener("click", () => {

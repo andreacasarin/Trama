@@ -11,6 +11,7 @@ import {
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
+  startDiagnosticTimer,
   TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
 import { ToolRegistry, ToolResult } from "@/tools/ToolRegistry";
@@ -151,6 +152,7 @@ export class ChatSession {
 
     const controller = new AbortController();
     const identity = ++this.generation;
+    const elapsedMs = startDiagnosticTimer();
     this.active = controller;
     this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
     this.publish(identity, { ...this.state, running: true, error: undefined });
@@ -194,7 +196,7 @@ export class ChatSession {
         ]),
         running: true,
       });
-      return await this.runTurn(
+      const state = await this.runTurn(
         identity,
         controller,
         assistantTurnId,
@@ -202,6 +204,14 @@ export class ChatSession {
         userMessageIndex,
         requestUserMessage
       );
+      if (this.isCurrent(identity) && !state.running && !state.error)
+        this.diagnostics.emit({
+          area: "chat",
+          event: "session_completed",
+          generation: identity,
+          durationMs: elapsedMs(),
+        });
+      return state;
     } catch (error) {
       if (
         controller.signal.aborted ||

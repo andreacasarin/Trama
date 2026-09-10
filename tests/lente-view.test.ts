@@ -81,6 +81,12 @@ function subject(search = vi.fn(async () => batch([]))) {
 }
 
 describe("LenteView", () => {
+  it("uses a native icon distinct from Obsidian's core Search", () => {
+    const { view } = subject();
+
+    expect(view.getIcon()).toBe("binoculars");
+  });
+
   it("does not search on open, empty input, or typing", async () => {
     const { view, search } = subject();
     await view.onOpen();
@@ -128,6 +134,7 @@ describe("LenteView", () => {
 
     const button = byClass(view.contentEl, "trama-lente__submit");
     expect(button.getAttribute("aria-label")).toBe("Search");
+    expect(button.classes.has("clickable-icon")).toBe(true);
     button.click();
     await vi.waitFor(() => expect(search).toHaveBeenCalledTimes(2));
   });
@@ -216,24 +223,6 @@ describe("LenteView", () => {
     await vi.waitFor(() => expect(textOf(view.contentEl)).toContain("A-refreshed"));
   });
 
-  it("hides an already-rendered excluded row synchronously", async () => {
-    const search = vi.fn(async () =>
-      batch([result("Private/Secret.md", 1), result("Public.md", 2)])
-    );
-    const { view } = subject(search);
-    await view.onOpen();
-    const input = byTag(view.contentEl, "input");
-    input.value = "needle";
-    input.dispatch("input", { target: input });
-    input.dispatch("keydown", { key: "Enter", isComposing: false });
-    await vi.waitFor(() => expect(textOf(view.contentEl)).toContain("Secret"));
-
-    (view as any).invalidateExcludedPaths(["Private"]);
-
-    expect(textOf(view.contentEl)).not.toContain("Secret");
-    expect(textOf(view.contentEl)).toContain("Public");
-  });
-
   it("reorders cached results for Updated without searching again", async () => {
     const search = vi.fn(async () => batch([result("Old.md", 1), result("New.md", 2)]));
     const { view } = subject(search);
@@ -315,6 +304,7 @@ describe("LenteView", () => {
     );
     expect(byClass(view.contentEl, "trama-lente__announcement").textContent).toBe("1 results");
     const link = byClass(view.contentEl, "trama-lente__link");
+    expect(link.classes.has("internal-link")).toBe(true);
     link.dispatch("click", { ctrlKey: true });
     expect(openLinkText).toHaveBeenCalledWith("Folder/Note.md", "", true);
   });

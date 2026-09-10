@@ -7,7 +7,6 @@ import {
   type LenteSearch,
   type LenteSort,
 } from "@/index/LenteSearch";
-import { isExcludedPath } from "@/settings/Settings";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 
@@ -71,31 +70,11 @@ export class LenteView extends ItemView {
     if (this.submitted && this.opened) void this.runQuery(this.submitted);
   }
 
-  /** Immediately hides excluded rows while the replacement search is pending. */
-  invalidateExcludedPaths(paths: readonly string[]): void {
-    if (!paths.length) return;
-    this.cancel();
-    this.canonicalResults = this.canonicalResults.filter(
-      (result) => !isExcludedPath(result.path, paths)
-    );
-    if (this.batch) {
-      this.batch = {
-        ...this.batch,
-        results: sortLenteResults(this.canonicalResults, this.sort, this.batch.displayLimit),
-      };
-      if (this.announcementEl)
-        this.announcementEl.textContent = this.batch.results.length
-          ? `${this.batch.results.length} results`
-          : "No matching notes found.";
-    }
-    this.render();
-  }
-
   override onOpen(): Promise<void> {
     this.opened = true;
     this.contentEl.empty();
     this.root = this.contentEl.createDiv({ cls: "trama-lente" });
-    this.root.createEl("h2", { text: "Lente", cls: "trama-lente__title" });
+    this.root.createEl("h1", { text: "Lente", cls: "trama-lente__title" });
     const form = this.root.createDiv({ cls: "trama-lente__form" });
     this.input = form.createEl("input", {
       cls: "trama-lente__input",
@@ -118,7 +97,7 @@ export class LenteView extends ItemView {
       }
     });
     this.submitButton = form.createEl("button", {
-      cls: "trama-button trama-lente__submit",
+      cls: "clickable-icon trama-lente__submit",
       text: "Search",
       attr: { type: "button", "aria-label": "Search" },
     });
@@ -128,14 +107,16 @@ export class LenteView extends ItemView {
       cls: "trama-lente__toolbar",
       attr: { hidden: "true", "aria-hidden": "true" },
     });
-    this.resultCountEl = this.toolbar.createSpan({ cls: "trama-lente__count" });
+    this.resultCountEl = this.toolbar.createSpan({
+      cls: "setting-item-description trama-lente__count",
+    });
     this.sortGroup = this.toolbar.createDiv({
       cls: "trama-lente__sort",
       attr: { role: "group", "aria-label": "Sort results" },
     });
     for (const value of ["relevant", "updated"] as const) {
       const button = this.sortGroup.createEl("button", {
-        cls: "trama-lente__sort-button",
+        cls: "clickable-icon trama-lente__sort-button",
         text: value === "relevant" ? "Relevant" : "Updated",
         attr: {
           type: "button",
@@ -163,7 +144,7 @@ export class LenteView extends ItemView {
     }
     this.renderSort(this.sortGroup);
     this.statusEl = this.root.createDiv({
-      cls: "trama-lente__status",
+      cls: "setting-item-description trama-lente__status",
     });
     this.announcementEl = this.root.createDiv({
       cls: "trama-lente__announcement",
@@ -275,7 +256,10 @@ export class LenteView extends ItemView {
     this.rowsEl.empty();
     if (!this.batch) return;
     if (!this.batch.results.length) {
-      this.rowsEl.createDiv({ cls: "trama-lente__message", text: "No matching notes found." });
+      this.rowsEl.createDiv({
+        cls: "setting-item-description trama-lente__message",
+        text: "No matching notes found.",
+      });
       return;
     }
     for (const result of this.batch.results) this.renderRow(result);
@@ -283,7 +267,7 @@ export class LenteView extends ItemView {
   private renderRow(result: LenteResult): void {
     const item = this.rowsEl.createDiv({ cls: "trama-lente__item" });
     const link = item.createEl("a", {
-      cls: "trama-lente__link",
+      cls: "internal-link trama-lente__link",
       text: this.basename(result.path),
       attr: { href: result.path, tabindex: "0" },
     });
@@ -294,12 +278,15 @@ export class LenteView extends ItemView {
       void (this.app as any)?.workspace?.openLinkText?.(result.path, "", Keymap.isModEvent(event));
     });
     item.createDiv({
-      cls: "trama-lente__path",
+      cls: "setting-item-description trama-lente__path",
       text: `${result.path}${this.lineLabel(result.startLine, result.endLine)}`,
     });
     item.createDiv({ cls: "trama-lente__excerpt", text: result.excerpt });
     if (result.mtime !== null)
-      item.createDiv({ cls: "trama-lente__mtime", text: new Date(result.mtime).toLocaleString() });
+      item.createDiv({
+        cls: "setting-item-description trama-lente__mtime",
+        text: new Date(result.mtime).toLocaleString(),
+      });
   }
   private renderSort(group: HTMLDivElement): void {
     for (const child of Array.from(group.children)) {
