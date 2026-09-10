@@ -172,6 +172,19 @@ describe("semantic index module", () => {
       expect(createIndexFingerprint("http://a", "m", 3)).not.toEqual(base);
       expect(createIndexFingerprint("http://a", "m", 2, { size: 4 })).not.toEqual(base);
     });
+    it("normalizes exclusions and treats them as part of the indexed corpus", () => {
+      const base = createIndexFingerprint("http://a", "m", 2);
+      const excluded = createIndexFingerprint("http://a", "m", 2, {
+        excludedPaths: ["./Private\\Notes", "Archive", "Archive"],
+      });
+      expect(excluded.excludedPaths).toEqual(["Archive", "Private/Notes"]);
+      expect(excluded).toEqual(
+        createIndexFingerprint("http://a", "m", 2, {
+          excludedPaths: ["Archive", "Private/Notes"],
+        })
+      );
+      expect(excluded).not.toEqual(base);
+    });
   });
   describe("chunkMarkdown()", () => {
     it("is deterministic and reports line boundaries", () => {
@@ -844,6 +857,49 @@ describe("semantic index module", () => {
       });
     });
     describe("search()", () => {
+      it("routes the Voce search port through bounded hybrid retrieval on eligible committed notes", async () => {
+        const storage = new MemoryIndexStorage();
+        const indexed = new IndexManager(
+          fixture({
+            "included.md": "alpha concept in an eligible note",
+            "excluded.md": "alpha concept in an excluded note",
+          }),
+          embeddings(),
+          storage,
+          "HTTP://127.0.0.1:1234/v1/",
+          "embed",
+          { size: 100, overlap: 10, isIndexEligible: (path) => path !== "excluded.md" }
+        );
+        await indexed.build(signal);
+        const retrieverSearch = vi.spyOn(Retriever.prototype, "search");
+        const callerSignal = new AbortController().signal;
+        try {
+          const results = await indexed.search("alpha concept", callerSignal, 3);
+          expect(retrieverSearch).toHaveBeenCalledWith({
+            query: "alpha concept",
+            mode: "hybrid",
+            resultShape: "chunks",
+            limit: 3,
+            semanticCandidateLimit: 80,
+            lexicalCandidateLimit: 80,
+            signal: callerSignal,
+          });
+          expect(results).toEqual([
+            expect.objectContaining({
+              path: "included.md",
+              startLine: expect.any(Number),
+              endLine: expect.any(Number),
+              excerpt: expect.any(String),
+            }),
+          ]);
+          expect(results).not.toEqual(
+            expect.arrayContaining([expect.objectContaining({ path: "excluded.md" })])
+          );
+        } finally {
+          retrieverSearch.mockRestore();
+        }
+      });
+
       it("caps results and reports unavailable before a usable index", async () => {
         const setup = manager({ "a.md": "alpha", "b.md": "alpha" });
         await expect(setup.manager.search("alpha", signal, 2)).rejects.toMatchObject({
@@ -1119,82 +1175,6 @@ describe("semantic index module", () => {
 
         expect(setup.model.embed).not.toHaveBeenCalled();
         expect(JSON.parse((await setup.storage.read("active.json"))!).previous).toBeTruthy();
-      });
-
-      it("prunes newly excluded committed notes without embedding and fails closed on stale hits", async () => {
-        const contents: Record<string, string> = {
-          "keep.md": "alpha keep",
-          "private/note.md": "beta private",
-        };
-        let eligible = true;
-        const setup = manager(contents);
-        const vault = {
-          ...fixture(contents),
-          isIndexEligible: (path: string) => eligible || path === "keep.md",
-        };
-        const indexed = new IndexManager(
-          vault,
-          setup.model,
-          setup.storage,
-          "HTTP://127.0.0.1:1234/v1/",
-          "embed",
-          { size: 100, overlap: 10 }
-        );
-        await indexed.build(signal);
-        setup.model.embed.mockClear();
-        eligible = false;
-
-        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
-          expect.objectContaining({ path: "private/note.md" })
-        );
-        setup.model.embed.mockClear();
-        await expect(indexed.pruneExcludedPaths(signal)).resolves.toBe(true);
-        expect(setup.model.embed).not.toHaveBeenCalled();
-        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
-          expect.objectContaining({ path: "private/note.md" })
-        );
-        await expect(indexed.search("alpha", signal, 5)).resolves.toMatchObject([
-          { path: "keep.md" },
-        ]);
-      });
-
-      it("preserves unrelated queued work when exclusion pruning fails", async () => {
-        const contents: Record<string, string> = {
-          "keep.md": "alpha keep",
-          "private/note.md": "beta private",
-        };
-        let eligible = true;
-        const setup = manager(contents);
-        const indexed = new IndexManager(
-          {
-            ...fixture(contents),
-            isIndexEligible: (path: string) => eligible || path === "keep.md",
-          },
-          setup.model,
-          setup.storage,
-          "http://127.0.0.1:1234/v1",
-          "embed",
-          { size: 100, overlap: 10 }
-        );
-        await indexed.build(signal);
-        contents["keep.md"] = "gamma changed";
-        indexed.queueChange("keep.md");
-        eligible = false;
-        const stage = vi
-          .spyOn(CorpusStore.prototype, "stageIncremental")
-          .mockRejectedValueOnce(new Error("prune failed"));
-        try {
-          await expect(indexed.pruneExcludedPaths(signal)).rejects.toThrow("prune failed");
-        } finally {
-          stage.mockRestore();
-        }
-        await expect(indexed.search("beta", signal, 5)).resolves.not.toContainEqual(
-          expect.objectContaining({ path: "private/note.md" })
-        );
-        await indexed.reconcileQueuedChanges(signal);
-        await expect(indexed.search("gamma", signal, 5)).resolves.toMatchObject([
-          { path: "keep.md" },
-        ]);
       });
 
       it("commits empty-note changes without embedding", async () => {

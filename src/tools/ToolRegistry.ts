@@ -257,10 +257,16 @@ export interface VaultSearchPort {
 export class VaultSearchTool implements ReadonlyTool {
   readonly definition = {
     name: "vault_search",
-    description: "Search the vault through the bounded retrieval port.",
+    description:
+      "Search eligible notes in the committed index using an exact term, phrase, or natural-language concept. Returns matching passages with excerpts, note paths, and line ranges; use read_note on a returned path for fuller context.",
     inputSchema: {
       type: "object",
-      properties: { query: { type: "string" } },
+      properties: {
+        query: {
+          type: "string",
+          description: "An exact term, phrase, or natural-language concept to search for.",
+        },
+      },
       required: ["query"],
       additionalProperties: false,
     },

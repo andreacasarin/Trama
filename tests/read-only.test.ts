@@ -245,6 +245,28 @@ describe("read-only vault and tools module", () => {
     });
   });
   describe("VaultSearchTool", () => {
+    it("advertises exact-term and conceptual passage search through its closed contract", () => {
+      const definition = new VaultSearchTool({ search: vi.fn() }).definition;
+      expect(definition.name).toBe("vault_search");
+      expect(definition.description).toContain("exact term, phrase, or natural-language concept");
+      expect(definition.description).toContain("eligible notes in the committed index");
+      expect(definition.description).toContain(
+        "passages with excerpts, note paths, and line ranges"
+      );
+      expect(definition.description).toContain("read_note");
+      expect(definition.inputSchema).toMatchObject({
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          query: {
+            type: "string",
+            description: expect.stringContaining("exact term, phrase, or natural-language concept"),
+          },
+        },
+      });
+    });
+
     describe("execute()", () => {
       it("delegates with the hard result cap and returns provenance", async () => {
         const search = vi.fn(async (_query: string, _signal: AbortSignal, limit: number) => [
