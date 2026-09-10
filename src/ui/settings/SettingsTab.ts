@@ -33,6 +33,7 @@ export interface SettingsDraft {
   embeddingModelId: string;
   lenteSearchMethod: LenteSearchMethod;
   lenteMaxResults: number;
+  lenteAutomaticSearchDelayMs: number;
   filoExcludedPaths: readonly string[];
 }
 
@@ -82,6 +83,7 @@ export function projectSettingsWithDraft(
     lente: {
       searchMethod: draft.lenteSearchMethod,
       maxResults: draft.lenteMaxResults,
+      automaticSearchDelayMs: draft.lenteAutomaticSearchDelayMs,
     },
     filo: {
       automaticUpdates: false,
@@ -119,6 +121,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       embeddingModelId: settings.embedding.modelId,
       lenteSearchMethod: settings.lente.searchMethod,
       lenteMaxResults: settings.lente.maxResults,
+      lenteAutomaticSearchDelayMs: settings.lente.automaticSearchDelayMs,
       filoExcludedPaths: [...settings.filo.excludedPaths],
     });
 
@@ -132,6 +135,19 @@ export class TramaSettingsTab extends PluginSettingTab {
         dropdown.setValue(draft.lenteSearchMethod);
         dropdown.onChange((value) => {
           draft.lenteSearchMethod = value as LenteSearchMethod;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Automatic search delay")
+      .setDesc(
+        "Search with Lente modal only: 0 keeps explicit Enter/Search submission. Hybrid queries still use LM Studio."
+      )
+      .addSlider((slider) => {
+        slider.setLimits(0, 1000, 50);
+        slider.setValue(draft.lenteAutomaticSearchDelayMs);
+        slider.setDynamicTooltip();
+        slider.onChange((value) => {
+          draft.lenteAutomaticSearchDelayMs = value;
         });
       });
     new Setting(this.containerEl)

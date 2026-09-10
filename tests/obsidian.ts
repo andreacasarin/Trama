@@ -2,6 +2,85 @@ export const Platform = { isDesktopApp: true };
 
 type Listener = (event?: any) => void;
 
+type WindowListener = {
+  callback: Listener;
+  capture: boolean;
+};
+
+export class TestWindow {
+  readonly listeners = new Map<string, WindowListener[]>();
+
+  addEventListener(type: string, callback: Listener, options?: boolean | { capture?: boolean }) {
+    const capture = typeof options === "boolean" ? options : Boolean(options?.capture);
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push({ callback, capture });
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, callback: Listener, options?: boolean | { capture?: boolean }) {
+    const capture = typeof options === "boolean" ? options : Boolean(options?.capture);
+    const listeners = this.listeners.get(type) ?? [];
+    const index = listeners.findIndex(
+      (listener) => listener.callback === callback && listener.capture === capture
+    );
+    if (index >= 0) listeners.splice(index, 1);
+  }
+
+  dispatchFrom(target: TestElement, event: { type: string; [key: string]: unknown }) {
+    let stopped = false;
+    let immediateStopped = false;
+    const originalPreventDefault = event.preventDefault as (() => void) | undefined;
+    const originalStopPropagation = event.stopPropagation as (() => void) | undefined;
+    const originalStopImmediatePropagation = event.stopImmediatePropagation as
+      (() => void) | undefined;
+    const payload: any = {
+      ...event,
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+        originalPreventDefault?.();
+      },
+      stopPropagation() {
+        stopped = true;
+        originalStopPropagation?.();
+      },
+      stopImmediatePropagation() {
+        stopped = true;
+        immediateStopped = true;
+        originalStopImmediatePropagation?.();
+      },
+      target,
+      currentTarget: this,
+    };
+    const listeners = this.listeners.get(event.type) ?? [];
+    for (const listener of [...listeners]) {
+      if (!this.listeners.get(event.type)?.includes(listener)) continue;
+      const { callback, capture } = listener;
+      if (!capture) continue;
+      callback(payload);
+      if (immediateStopped) return !payload.defaultPrevented;
+    }
+    if (stopped) return !payload.defaultPrevented;
+    target.dispatchLocal(event.type, payload);
+    if (stopped) return !payload.defaultPrevented;
+    for (const listener of [...listeners]) {
+      if (!this.listeners.get(event.type)?.includes(listener)) continue;
+      const { callback, capture } = listener;
+      if (capture) continue;
+      callback(payload);
+      if (immediateStopped) break;
+    }
+    return !payload.defaultPrevented;
+  }
+}
+
+const testWindow = new TestWindow();
+const testDocument = { defaultView: testWindow };
+
+export function resetTestWindow(): void {
+  testWindow.listeners.clear();
+}
+
 export class TestElement {
   readonly children: TestElement[] = [];
   readonly classes = new Set<string>();
@@ -11,11 +90,14 @@ export class TestElement {
   textContent = "";
   value = "";
   disabled = false;
+  hidden = false;
+  focused = false;
   title = "";
   type = "";
   rows = 0;
   selectionStart = 0;
   selectionEnd = 0;
+  readonly ownerDocument = testDocument;
 
   constructor(readonly tagName: string) {}
 
@@ -46,6 +128,17 @@ export class TestElement {
     this.listeners.set(type, listeners);
   }
 
+  dispatchEvent(event: { type: string; [key: string]: unknown }) {
+    if (event.type === "keydown") return this.ownerDocument.defaultView.dispatchFrom(this, event);
+    this.dispatch(event.type, event);
+    return true;
+  }
+
+  dispatchLocal(type: string, event: Record<string, unknown>) {
+    const listeners = this.listeners.get(type) ?? [];
+    for (const listener of listeners) listener(event);
+  }
+
   dispatch(type: string, event: Record<string, unknown> = {}) {
     const listeners = this.listeners.get(type) ?? [];
     const payload = {
@@ -66,7 +159,19 @@ export class TestElement {
     this.dispatch("click");
   }
 
-  focus() {}
+  focus() {
+    this.focused = true;
+  }
+
+  toggleVisibility(visible: boolean) {
+    this.hidden = !visible;
+  }
+
+  addClass(...classes: string[]) {
+    for (const value of classes.flatMap((item) => item.split(/\s+/))) {
+      if (value) this.classes.add(value);
+    }
+  }
 
   setText(value: string) {
     this.textContent = value;
@@ -147,6 +252,42 @@ export class Component {
   register() {}
   registerEvent() {}
 }
+
+type ScopeListener = (event: KeyboardEvent, context: { vkey: string }) => false | any;
+
+export class Scope {
+  private readonly listeners: Array<{
+    key: string | null;
+    callback: ScopeListener;
+  }> = [];
+  active = false;
+
+  constructor(readonly parent?: Scope) {}
+
+  register(_modifiers: unknown[] | null, key: string | null, callback: ScopeListener) {
+    const handler = { key, callback };
+    this.listeners.push(handler);
+    return { scope: this, ...handler };
+  }
+
+  unregister(handler: { callback: ScopeListener }) {
+    const index = this.listeners.findIndex((listener) => listener.callback === handler.callback);
+    if (index >= 0) this.listeners.splice(index, 1);
+  }
+
+  dispatch(event: KeyboardEvent): boolean {
+    if (!this.active) return true;
+    for (const listener of [...this.listeners]) {
+      if (listener.key !== null && listener.key !== event.key) continue;
+      const result = listener.callback(event, { vkey: event.key });
+      if (result === false) {
+        event.preventDefault();
+        return false;
+      }
+    }
+    return true;
+  }
+}
 export class PluginSettingTab {
   constructor(
     public app: unknown,
@@ -164,6 +305,127 @@ export class ItemView extends Component {
 }
 export class WorkspaceLeaf {
   constructor(public app?: unknown) {}
+}
+
+export class SuggestModal<T> {
+  static lastOpened: SuggestModal<unknown> | undefined;
+  opened = false;
+  placeholder = "";
+  instructions: Array<{ command: string; purpose: string }> = [];
+  emptyStateText = "";
+  readonly containerEl = new TestElement("div");
+  readonly modalEl = new TestElement("div");
+  readonly contentEl = new TestElement("div");
+  readonly inputEl = new TestElement("input");
+  readonly resultContainerEl = new TestElement("div");
+  readonly scope: Scope;
+  private activeIndex = 0;
+  private renderedSuggestions: T[] = [];
+
+  constructor(public app: unknown) {
+    this.scope = new Scope((app as { scope?: Scope })?.scope);
+    this.inputEl.parent = this.containerEl;
+    this.containerEl.children.push(this.inputEl);
+    this.contentEl.parent = this.containerEl;
+    this.containerEl.children.push(this.contentEl);
+    this.resultContainerEl.parent = this.contentEl;
+    this.contentEl.children.push(this.resultContainerEl);
+    this.scope.register(null, "Enter", (event) => {
+      if (event.isComposing) return undefined;
+      const value = this.renderedSuggestions[this.activeIndex];
+      if (value !== undefined) this.onChooseSuggestion(value, event);
+      return false;
+    });
+    this.inputEl.addEventListener("input", () => {
+      this.activeIndex = 0;
+      this.renderSuggestions();
+    });
+    this.scope.register(null, "ArrowDown", () => {
+      this.activeIndex = Math.min(this.activeIndex + 1, this.renderedSuggestions.length - 1);
+      this.updateActiveSuggestion();
+      return false;
+    });
+    this.scope.register(null, "ArrowUp", () => {
+      this.activeIndex = Math.max(0, this.activeIndex - 1);
+      this.updateActiveSuggestion();
+      return false;
+    });
+    this.inputEl.ownerDocument.defaultView.addEventListener(
+      "keydown",
+      (event) => {
+        if (!this.scope.active || event.target !== this.inputEl) return;
+        const consumed = this.scope.dispatch(event as KeyboardEvent);
+        if (event.key === "Enter" && !event.isComposing) {
+          if (consumed === false) event.stopPropagation();
+          const trace = (event as KeyboardEvent & { trace?: string[] }).trace;
+          trace?.push(consumed === false ? "native-consume" : "native-pass");
+        }
+      },
+      true
+    );
+  }
+
+  open() {
+    this.opened = true;
+    SuggestModal.lastOpened = this;
+    this.onOpen();
+  }
+
+  close() {
+    if (!this.opened) return;
+    this.opened = false;
+    this.onClose();
+  }
+
+  onOpen() {
+    this.scope.active = true;
+  }
+  onClose() {
+    this.scope.active = false;
+  }
+
+  setPlaceholder(value: string) {
+    this.placeholder = value;
+  }
+
+  setInstructions(value: Array<{ command: string; purpose: string }>) {
+    this.instructions = value;
+  }
+
+  getSuggestions(_query: string): T[] {
+    return [];
+  }
+
+  renderSuggestion(_value: T, _el: TestElement): void {}
+
+  selectSuggestion(_value: T, _evt: MouseEvent | KeyboardEvent): void {}
+
+  onChooseSuggestion(value: T, evt: MouseEvent | KeyboardEvent): void {
+    this.selectSuggestion(value, evt);
+  }
+
+  selectActiveSuggestion(evt: MouseEvent | KeyboardEvent): void {
+    const value = this.renderedSuggestions[this.activeIndex];
+    if (value !== undefined) this.selectSuggestion(value, evt);
+  }
+
+  private renderSuggestions() {
+    const suggestions = this.getSuggestions(this.inputEl.value);
+    this.renderedSuggestions = suggestions instanceof Promise ? [] : [...suggestions];
+    this.resultContainerEl.empty();
+    this.renderedSuggestions.forEach((suggestion) => {
+      const row = this.resultContainerEl.createDiv({ cls: "suggestion-item" });
+      this.renderSuggestion(suggestion, row);
+    });
+    this.updateActiveSuggestion();
+  }
+
+  private updateActiveSuggestion() {
+    this.resultContainerEl.children.forEach((row, index) => {
+      if (index === this.activeIndex) row.classes.add("is-selected");
+      else row.classes.delete("is-selected");
+    });
+  }
 }
 
 export class Keymap {

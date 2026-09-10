@@ -24,7 +24,11 @@ describe("Settings module", () => {
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
-        expect(loaded.lente).toEqual({ searchMethod: "hybrid", maxResults: 20 });
+        expect(loaded.lente).toEqual({
+          searchMethod: "hybrid",
+          maxResults: 20,
+          automaticSearchDelayMs: 0,
+        });
         expect(loaded.filo).toEqual({ automaticUpdates: false, excludedPaths: [] });
         expect(loaded.detailedDebug).toBe(false);
       });
@@ -39,7 +43,11 @@ describe("Settings module", () => {
           },
         });
 
-        expect(loaded.lente).toEqual({ searchMethod: "keyword", maxResults: 35 });
+        expect(loaded.lente).toEqual({
+          searchMethod: "keyword",
+          maxResults: 35,
+          automaticSearchDelayMs: 0,
+        });
         expect(loaded.filo).toEqual({
           automaticUpdates: false,
           excludedPaths: ["Projects", "private/notes"],
@@ -274,6 +282,36 @@ describe("Settings module", () => {
             lente: { ...DEFAULT_SETTINGS.lente, searchMethod: "semantic" as never },
           })
         ).toThrow();
+      });
+
+      it("validates and round-trips the modal automatic search delay", () => {
+        const store = new SettingsStore();
+        for (const delay of [0, 50, 1000]) {
+          expect(
+            store.stage({
+              ...DEFAULT_SETTINGS,
+              lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: delay },
+            }).lente.automaticSearchDelayMs
+          ).toBe(delay);
+          expect(
+            store.load({
+              schemaVersion: 3,
+              lente: { automaticSearchDelayMs: delay },
+            }).lente.automaticSearchDelayMs
+          ).toBe(delay);
+        }
+        for (const delay of [-50, 25, 1001, 1.5, Number.NaN]) {
+          expect(
+            store.load({ schemaVersion: 3, lente: { automaticSearchDelayMs: delay } }).lente
+              .automaticSearchDelayMs
+          ).toBe(0);
+          expect(() =>
+            store.stage({
+              ...DEFAULT_SETTINGS,
+              lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: delay },
+            })
+          ).toThrow();
+        }
       });
 
       it("normalizes and matches excluded files and directories purely", () => {

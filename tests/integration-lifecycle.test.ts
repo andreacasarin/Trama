@@ -4,6 +4,7 @@ import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { LenteSearch } from "@/index/LenteSearch";
+import { SuggestModal } from "obsidian";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 function deferred<T>() {
@@ -183,7 +184,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(6);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(7);
     expect(plugin.registerView).toHaveBeenCalledTimes(3);
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
     expect(plugin.registerView).toHaveBeenCalledWith("trama-filo", expect.any(Function));
@@ -199,22 +200,97 @@ describe("TramaPlugin lifecycle integration", () => {
       "open-voce",
       "open-filo",
       "open-lente",
+      "search-with-lente",
     ]);
     expect(
       (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls
         .map(([command]) => command as { id: string; icon?: string })
-        .filter(({ id }) => id === "open-voce" || id === "open-filo" || id === "open-lente")
+        .filter(
+          ({ id }) =>
+            id === "open-voce" ||
+            id === "open-filo" ||
+            id === "open-lente" ||
+            id === "search-with-lente"
+        )
         .map(({ id, icon }) => [id, icon])
     ).toEqual([
       ["open-voce", "message-circle"],
       ["open-filo", "route"],
       ["open-lente", "binoculars"],
+      ["search-with-lente", "binoculars"],
     ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
     expect(app.listeners).toHaveLength(4);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(debugSpy).not.toHaveBeenCalled();
     expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("opens Search with Lente without changing the sidebar and searches only after Enter", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const command = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([value]) => (value as { id: string }).id === "search-with-lente"
+    )?.[0] as { callback: () => void };
+    const search = vi.spyOn((plugin as any).lenteSearch, "search").mockResolvedValue({
+      generationId: "g1",
+      mode: "lexical",
+      degraded: false,
+      displayLimit: 20,
+      results: [],
+      canonicalResults: [],
+      durationMs: 0,
+    });
+    const getLeaf = vi.spyOn(app.workspace, "getLeaf");
+
+    command.callback();
+    const modal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
+    expect(modal).toBeDefined();
+    expect(getLeaf).not.toHaveBeenCalled();
+    expect(search).not.toHaveBeenCalled();
+
+    modal.inputEl.value = "needle";
+    modal.inputEl.dispatch("input");
+    expect(search).not.toHaveBeenCalled();
+    modal.inputEl.dispatchEvent({ type: "keydown", key: "Enter" });
+    await Promise.resolve();
+    expect(search).toHaveBeenCalledWith(
+      "needle",
+      expect.objectContaining({ sort: "relevant", signal: expect.any(AbortSignal) })
+    );
+  });
+
+  it("snapshots modal delay and keeps delay-only saves out of runtime composition", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const command = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([value]) => (value as { id: string }).id === "search-with-lente"
+    )?.[0] as { callback: () => void };
+    const oldIndex = (plugin as any).index;
+    const oldSession = (plugin as any).session;
+    const oldLente = (plugin as any).lenteSearch;
+
+    command.callback();
+    const firstModal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
+    expect(firstModal).toBeDefined();
+    expect((firstModal as any).automaticSearchDelayMs).toBe(0);
+
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: 250 },
+    });
+
+    expect((plugin as any).index).toBe(oldIndex);
+    expect((plugin as any).session).toBe(oldSession);
+    expect((plugin as any).lenteSearch).toBe(oldLente);
+
+    command.callback();
+    const secondModal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
+    expect((secondModal as any).automaticSearchDelayMs).toBe(250);
   });
 
   it("keeps default-off vault events queued and stale without scheduling or contacting LM Studio", async () => {
@@ -266,7 +342,7 @@ describe("TramaPlugin lifecycle integration", () => {
 
     await plugin.saveSettings({
       ...DEFAULT_SETTINGS,
-      lente: { searchMethod: "keyword", maxResults: 35 },
+      lente: { ...DEFAULT_SETTINGS.lente, searchMethod: "keyword", maxResults: 35 },
     });
 
     expect((plugin as any).session).toBe(oldSession);

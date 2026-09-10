@@ -28,6 +28,7 @@ import { RelatedNotes } from "@/index/RelatedNotes";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { LenteBatch, LenteSearch, LenteSearchOptions } from "@/index/LenteSearch";
 import { ObsidianLenteNoteStats } from "@/vault/readOnly/ObsidianLenteNoteStats";
+import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
 
 interface LenteSearchPort {
   search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
@@ -174,6 +175,23 @@ export class TramaPlugin extends Plugin {
       icon: TRAMA_ICONS.lente,
       callback: () =>
         void app.workspace.getLeaf(true).setViewState({ type: LENTE_VIEW_TYPE, active: true }),
+    });
+    this.addCommand({
+      id: "search-with-lente",
+      name: "Search with Lente",
+      icon: TRAMA_ICONS.lente,
+      callback: () => {
+        const searchSource: LenteSearchPort = {
+          search: (query, options = {}) =>
+            this.lenteSearch?.search(query, options) ??
+            Promise.reject({ code: "unavailable", message: "Lente is unavailable." }),
+        };
+        new LenteSearchModal(
+          app,
+          searchSource,
+          this.getSettings().lente.automaticSearchDelayMs
+        ).open();
+      },
     });
     this.registerVaultEvents(app.vault);
   }

@@ -269,6 +269,50 @@
   margin-top: 5px;
   overflow-wrap: anywhere;
 }
+
+.trama-lente-search-modal__result {
+  margin-block: var(--size-4-1);
+}
+
+.trama-lente-search-modal__result + .trama-lente-search-modal__result {
+  border-block-start: 1px solid var(--background-modifier-border);
+  padding-block-start: var(--size-4-2);
+}
+
+.trama-lente-search-modal__result.suggestion-item:hover,
+.trama-lente-search-modal__result.suggestion-item.is-selected {
+  background-color: var(--background-modifier-hover);
+}
+
+.trama-lente-search-modal__content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-1);
+  min-width: 0;
+}
+
+.trama-lente-search-modal__title {
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-weight-semibold, 600);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.trama-lente-search-modal__path {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.trama-lente-search-modal__excerpt {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .trama-filo__message {
   margin: 8px 0;
 }

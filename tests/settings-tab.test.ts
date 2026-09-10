@@ -56,6 +56,7 @@ const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   embeddingModelId: "embed-v1",
   lenteSearchMethod: "hybrid",
   lenteMaxResults: 20,
+  lenteAutomaticSearchDelayMs: 0,
   filoExcludedPaths: [],
   ...overrides,
 });
@@ -146,6 +147,12 @@ describe("Settings tab module", () => {
         limits: { min: 5, max: 50, step: 5 },
         dynamicTooltip: true,
       });
+      expect(latestSetting("Automatic search delay")?.sliderControls[0]).toMatchObject({
+        value: 0,
+        limits: { min: 0, max: 1000, step: 50 },
+        dynamicTooltip: true,
+      });
+      expect(latestSetting("Automatic search delay")?.description).toContain("modal only");
       expect(latestSetting("Automatic updates")).toBeUndefined();
       expect(latestSetting("Approved LAN origins")?.description).toContain("leave this device");
       expect((tab.containerEl as any).children.some((child: any) => child.tagName === "p")).toBe(
@@ -215,6 +222,7 @@ describe("Settings tab module", () => {
 
       latestSetting("Search method")!.dropdownControls[0].emit("keyword");
       latestSetting("Maximum displayed results")!.sliderControls[0].emit(35);
+      latestSetting("Automatic search delay")!.sliderControls[0].emit(250);
       latestSetting("Excluded files and directories")!.textControls[0].emit("./Projects\\Private/");
       latestSetting("Excluded files and directories")!.buttonControls[0].click();
       await vi.waitFor(() => expect(latestSetting("Projects/Private")).toBeDefined());
@@ -223,7 +231,7 @@ describe("Settings tab module", () => {
       await vi.waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
       const updater = saveSettings.mock.calls[0][0];
       expect(updater(DEFAULT_SETTINGS)).toMatchObject({
-        lente: { searchMethod: "keyword", maxResults: 35 },
+        lente: { searchMethod: "keyword", maxResults: 35, automaticSearchDelayMs: 250 },
         filo: { automaticUpdates: false, excludedPaths: ["Projects/Private"] },
       });
     });

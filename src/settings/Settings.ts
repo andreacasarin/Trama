@@ -17,6 +17,7 @@ export type LenteSearchMethod = "hybrid" | "keyword";
 export interface LenteSettings {
   readonly searchMethod: LenteSearchMethod;
   readonly maxResults: number;
+  readonly automaticSearchDelayMs: number;
 }
 export interface FiloSettings {
   readonly automaticUpdates: boolean;
@@ -46,6 +47,16 @@ function isValidLenteMaxResults(value: unknown): value is number {
     value >= 5 &&
     value <= 50 &&
     value % 5 === 0
+  );
+}
+
+function isValidLenteAutomaticSearchDelay(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= 1000 &&
+    value % 50 === 0
   );
 }
 
@@ -123,6 +134,7 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   lente: Object.freeze({
     searchMethod: "hybrid",
     maxResults: 20,
+    automaticSearchDelayMs: 0,
   }),
   filo: Object.freeze({
     automaticUpdates: false,
@@ -190,6 +202,9 @@ export class SettingsStore {
       maxResults: isValidLenteMaxResults(rawLente.maxResults)
         ? rawLente.maxResults
         : DEFAULT_SETTINGS.lente.maxResults,
+      automaticSearchDelayMs: isValidLenteAutomaticSearchDelay(rawLente.automaticSearchDelayMs)
+        ? rawLente.automaticSearchDelayMs
+        : DEFAULT_SETTINGS.lente.automaticSearchDelayMs,
     };
     const filo = {
       // Automatic reconciliation currently rebuilds the full derived lexical
@@ -308,7 +323,16 @@ export class SettingsStore {
     if (!isValidLenteMaxResults(lente.maxResults)) {
       throw new Error("Lente maximum displayed results must be from 5 to 50 in increments of 5.");
     }
-    return { searchMethod: lente.searchMethod, maxResults: lente.maxResults };
+    if (!isValidLenteAutomaticSearchDelay(lente.automaticSearchDelayMs)) {
+      throw new Error(
+        "Lente automatic search delay must be from 0 to 1000 ms in increments of 50."
+      );
+    }
+    return {
+      searchMethod: lente.searchMethod,
+      maxResults: lente.maxResults,
+      automaticSearchDelayMs: lente.automaticSearchDelayMs,
+    };
   }
   private validateChatControls(
     chat: ChatSettings
