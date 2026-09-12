@@ -21,8 +21,7 @@ export async function sha256Bytes(value: ArrayBuffer | Uint8Array | string): Pro
       : value instanceof ArrayBuffer
         ? new Uint8Array(value)
         : value;
-  const safe = bytes.slice();
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", safe));
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice()));
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array | string): Promise<string> {

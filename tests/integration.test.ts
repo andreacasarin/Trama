@@ -10,9 +10,13 @@ import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
 
 class FakeEmbedding {
-  readonly dimensions = 2;
+  readonly dimensions = 768;
   async embed(texts: readonly string[]): Promise<readonly number[][]> {
-    return texts.map((text) => [text.length, text.includes("alpha") ? 1 : 0]);
+    return texts.map((text) => {
+      const vector = Array.from({ length: 768 }, () => 0);
+      vector[text.includes("alpha") ? 0 : 1] = 1;
+      return vector;
+    });
   }
 }
 

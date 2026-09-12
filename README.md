@@ -8,7 +8,7 @@ Trama is a desktop-only Obsidian plugin for local AI conversation and semantic c
 2. Configure the chat model and embedding model independently in the plugin settings.
 3. Use **Update index** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
 
-The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+The semantic index is stored at `<vault>/.trama/index.json`. It is one completed JSON snapshot of the live Orama projection, containing catalog metadata and the public Orama save payload. A temporary file is used only during the single-rename replacement boundary; cleanup is attempted after success or failure, and cleanup failures surface as sanitized metadata while stale temporary files are ignored on startup. The older `<vault>/.trama/index/` directory is never addressed by the plugin. Update and rebuild mutate the live projection in deterministic note batches, so an interrupted operation leaves the current in-memory projection available while the last completed snapshot remains durable. Cancellation before replacement leaves that live projection dirty; once replacement begins, the new snapshot wins and the operation completes successfully. Configure `.trama` in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
 
 ## Filo related notes
 
@@ -29,8 +29,8 @@ Lente searches indexed visible Markdown only after Enter or Search is pressed.
 Results are unique notes with their winning passage. Relevant uses deterministic
 hybrid vector/BM25 ranking; Updated uses live note modification times. If query
 embeddings are unavailable, Lente retries lexical filename, path, and body
-matching and labels the result degraded. Its derived lexical index is in memory
-and does not alter the authoritative schema-3 corpus.
+matching and labels the result degraded. Both retrieval channels use the same
+live Orama projection.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and
@@ -39,9 +39,9 @@ mode: it scans the current vault, compares committed content identities, and emb
 new or changed notes while removing deleted paths. **Rebuild index** remains the explicit
 forced rebuild for recovery or configuration refresh. If a note is moved or deleted while
 either pass is running, that stale path is logged and skipped, then the queued vault event
-is reconciled without failing the whole operation. Builds use an atomic last-good
-generation: a failed or cancelled operation does not expose a partial index, and the
-previous usable generation remains searchable.
+is reconciled without failing the whole operation. The live projection stays available
+through partial update or rebuild work; only a converged complete projection is saved to
+the single durable snapshot.
 
 During a full rebuild, Filo estimates the number of embedding texts from file-size
 metadata calibrated by a deterministic sample of at most 32 notes passed through the
@@ -140,25 +140,29 @@ npm run build
 ```
 
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
-limitations include the cost of exact `Float32` scans and rebuilding the derived,
-non-persisted Orama BM25 index on large corpora. Hybrid retrieval uses reciprocal-rank
-fusion (RRF) over exact semantic and lexical candidates; there is no ANN/HNSW backend.
+limitations include the cost of exact vector scans and serializing the complete
+Orama snapshot on large synthetic corpora. Hybrid retrieval uses reciprocal-rank
+fusion (RRF, `k=60`) over exact semantic and BM25 candidates; there is no ANN/HNSW
+backend.
 The conservative 384/64 chunking is fingerprinted, so changing it requires an explicit
 full reindex. Filo and Voce use native (rather than React) UI. Trama is an independent,
 clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
+Snapshot publication probes the configured storage for same-directory overwrite semantics
+using private sibling files before touching `index.json`. Publication then relies on one
+same-directory rename as a platform assumption; the public Obsidian `DataAdapter` typings
+do not promise power-loss atomicity, so real Obsidian replacement behavior remains a
+user-only smoke check.
 
 ### Optional scale benchmark
 
-The benchmark is intentionally opt-in and is not part of normal tests. Run it with
-`npx vitest bench tests/index.bench.ts`; set `TRAMA_BENCH_CHUNKS=25000`, `50000`, or
-`100000`, `TRAMA_BENCH_DIMENSIONS` (default `768`), and `TRAMA_BENCH_SAMPLES` (default
-`7`) for a bounded deterministic fixture. The explicit `TRAMA_INDEX_BENCHMARK` summary
-reports p50 and p95 scan time plus the contiguous vector-buffer size; Vitest also reports
-its own timing distribution for the same raw exact semantic scan primitive.
-
-This probe does not build or open the persisted corpus, Orama lexical index, or hybrid
-retriever. It therefore does not measure startup, corpus artifact size, RSS, lexical or
-hybrid latency, cancellation latency, or prove the absence of generation-wide
-serialization. Validate those properties separately with focused implementation tests,
-code review, and a real-vault Obsidian/LM Studio smoke test. Do not use this benchmark as
-ANN evidence until an exact-oracle recall comparison is added.
+The benchmark is intentionally opt-in and uses only repository-generated synthetic notes.
+Run the frozen candidate workload with
+`TRAMA_BENCH_SCALES=1000,25000 npx vitest run tests/index-candidate-benchmark.test.ts`.
+The harness records build, restart, search, event-loop, storage, and process-memory
+measurements without note text, vectors, IDs, or hashes. The characterization workload
+also exercises cancellation, corrupt-snapshot rejection, fingerprint mismatch, replacement
+failure, and temporary-file cleanup. Larger scales are optional resource
+measurements; they do not provide ANN or real-vault performance evidence.
+The sanitized pre-replacement baseline evidence is retained at
+`docs/benchmarks/unified-orama-baseline.json`; the normal test suite validates this
+immutable artifact and never rewrites it.

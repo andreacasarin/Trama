@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "harness": "unified-orama",
+  "backend": "baseline-current-source",
+  "source": "pre-replacement current indexing source",
+  "workload": {
+    "schemaVersion": 1,
+    "seed": "0x517a2911",
+    "dimensions": 768,
+    "chunkSize": 384,
+    "overlap": 64,
+    "scales": [1000, 25000, 50000, 100000],
+    "queryCount": 7,
+    "warmupQueries": 1
+  },
+  "scales": [
+    {
+      "scale": 1000,
+      "noteCount": 100,
+      "chunkCount": 1000,
+      "buildMs": 199.21,
+      "restartMs": 90.56,
+      "search": { "p50Ms": 2.49, "p95Ms": 24.65 },
+      "eventLoop": { "p95Ms": 10 },
+      "storageBytes": 3494903,
+      "memory": { "rssDeltaBytes": 61095936, "heapDeltaBytes": 14192584 },
+      "updates": { "unchangedPublished": false },
+      "unsupported": [
+        "embedding-call counts are unsupported in the baseline capture",
+        "maximum timing samples were not retained"
+      ]
+    },
+    {
+      "scale": 25000,
+      "noteCount": 2740,
+      "chunkCount": 25000,
+      "buildMs": 5280.75,
+      "restartMs": 3356.07,
+      "search": { "p50Ms": 60.66, "p95Ms": 77.66 },
+      "eventLoop": { "p95Ms": 344, "maxMs": 345 },
+      "storageBytes": 87462094,
+      "memory": { "rssDeltaBytes": 372506624, "heapDeltaBytes": 138463944 },
+      "updates": { "unchangedPublished": false },
+      "unsupported": [
+        "embedding-call counts are unsupported in the baseline capture",
+        "maximum search timing sample was not retained"
+      ]
+    }
+  ],
+  "unsupported": ["50000 chunks were not captured", "100000 chunks were not captured"]
+}

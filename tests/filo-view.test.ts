@@ -245,6 +245,62 @@ describe("FiloView", () => {
     expect(progress?.getAttribute("max")).toBe("4");
   });
 
+  it.each([4, 5])(
+    "keeps an estimated progress bar indeterminate while indexing continues at %s texts",
+    async (completed) => {
+      const { view } = subject({
+        ...ready,
+        kind: "updating",
+        progress: {
+          operation: "full",
+          phase: "embed",
+          completed,
+          total: 4,
+          unit: "texts",
+          determinate: true,
+          estimated: true,
+        },
+      });
+
+      await view.onOpen();
+
+      const text = textOf(view.contentEl as any);
+      expect(text).toContain(`Creating embeddings — ${completed} texts`);
+      expect(text).not.toContain(`of about 4 texts`);
+      const progress = (view.contentEl as any).children[0].children.find(
+        (child: any) => child.tagName === "progress"
+      );
+      expect(progress?.getAttribute("value")).toBeNull();
+      expect(progress?.getAttribute("max")).toBeNull();
+    }
+  );
+
+  it("keeps a genuinely completed progress event determinate", async () => {
+    const { view } = subject({
+      ...ready,
+      kind: "updating",
+      progress: {
+        operation: "full",
+        phase: "embed",
+        completed: 4,
+        total: 4,
+        unit: "texts",
+        determinate: true,
+        estimated: false,
+      },
+    });
+
+    await view.onOpen();
+
+    const text = textOf(view.contentEl as any);
+    expect(text).toContain("Creating embeddings — 4 of 4 texts");
+    const progress = (view.contentEl as any).children[0].children.find(
+      (child: any) => child.tagName === "progress"
+    );
+    expect(progress?.getAttribute("value")).toBe("4");
+    expect(progress?.getAttribute("max")).toBe("4");
+  });
+
   it("shows completed counts for indeterminate progress", async () => {
     const { view } = subject({
       ...ready,

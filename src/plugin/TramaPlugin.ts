@@ -2,7 +2,7 @@ import { Platform, Plugin, TAbstractFile } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, IndexVaultPort } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { compareCodeUnits } from "@/index/Ordering";
 import { ObsidianIndexStorage } from "@/index/storage";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";

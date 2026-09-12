@@ -1,5 +1,5 @@
-import { RelatedIndexSnapshot } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { RelatedIndexHit, RelatedIndexSnapshot } from "@/index/IndexManager";
+import { compareCodeUnits } from "@/index/Ordering";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
@@ -228,7 +228,7 @@ export class RelatedNotes {
       };
     }
     const retrieveStarted = Date.now();
-    const hits = await snapshot.search(prepared.text, prepared.vector, signal, 128);
+    const hits = await this.retrieveCandidates(snapshot, prepared.text, prepared.vector, signal);
     this.emitDiagnostic({
       area: "filo",
       event: "related_search",
@@ -270,6 +270,30 @@ export class RelatedNotes {
     };
   }
 
+  private async retrieveCandidates(
+    snapshot: RelatedIndexSnapshot,
+    query: string,
+    vector: readonly number[],
+    signal: AbortSignal
+  ): Promise<readonly RelatedIndexHit[]> {
+    const targetPaths = RelatedNotes.MAX_RESULTS;
+    const maxCandidates = 4096;
+    let requestLimit = 128;
+    let hits = await snapshot.search(query, vector, signal, requestLimit);
+    while (requestLimit < maxCandidates) {
+      if (
+        hits.length < requestLimit ||
+        distinctPathCount(hits, snapshot.currentPath) >= targetPaths
+      )
+        break;
+      const nextLimit = Math.min(maxCandidates, requestLimit * 2);
+      if (nextLimit === requestLimit) break;
+      requestLimit = nextLimit;
+      hits = await snapshot.search(query, vector, signal, requestLimit);
+    }
+    return hits;
+  }
+
   private key(snapshot: RelatedIndexSnapshot): string {
     return `${snapshot.generationId}\0${snapshot.currentPath}\0${snapshot.contentHash}`;
   }
@@ -287,4 +311,8 @@ export class RelatedNotes {
   private emitDiagnostic(record: TramaDiagnosticRecord): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
+}
+
+function distinctPathCount(hits: readonly RelatedIndexHit[], currentPath: string): number {
+  return new Set(hits.filter((hit) => hit.path !== currentPath).map((hit) => hit.path)).size;
 }

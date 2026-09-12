@@ -9,6 +9,7 @@ export interface SafeDiagnosticError {
   readonly code?: string;
   readonly retryable?: boolean;
   readonly cancelled?: boolean;
+  readonly cleanupFailed?: boolean;
 }
 
 /** Typed diagnostic events emitted by Trama's bounded conversation session. */
@@ -182,6 +183,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
       code?: unknown;
       retryable?: unknown;
       cancelled?: unknown;
+      cleanupFailed?: unknown;
     };
     const knownCodes = new Set([
       "cancelled",
@@ -196,6 +198,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
     const code = candidate.code;
     const retryable = candidate.retryable;
     const cancelled = candidate.cancelled;
+    const cleanupFailed = candidate.cleanupFailed;
     return {
       name: name === "StructuredError" || name === "Error" ? name : "Error",
       ...(typeof code === "string" && knownCodes.has(code) ? { code } : {}),
@@ -203,6 +206,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
         ? { retryable }
         : {}),
       ...(cancelled === true || code === "cancelled" ? { cancelled: true } : {}),
+      ...(cleanupFailed === true ? { cleanupFailed: true } : {}),
     };
   } catch {
     return { name: "Error" };

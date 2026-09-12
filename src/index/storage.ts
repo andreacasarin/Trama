@@ -9,13 +9,33 @@ export interface IndexStorage {
   writeBinary?(path: string, value: ArrayBuffer | Uint8Array): Promise<void>;
   list?(path: string): Promise<{ files: string[]; folders: string[] }>;
   stat?(path: string): Promise<{ type: "file" | "folder"; size: number; mtime: number } | null>;
-  /** Atomically publishes the pointer, retaining the prior pointer if publication fails. */
-  activate(pointer: string, value: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Replaces `to` with an already-written temporary file at one
+   * non-cancellable same-directory boundary. Atomicity remains a platform
+   * assumption; this method is not a power-loss guarantee.
+   */
+  replace?(from: string, to: string): Promise<void>;
+  /** Runtime verification that replacement overwrites an existing sibling. */
+  verifyReplaceCapability?(): Promise<IndexStorageReplaceCapability>;
   prepare?(): Promise<void>;
 }
 
-/** Restricts derived index files to the vault's index directory. */
+export interface IndexStorageReplaceCapability {
+  readonly operation: "same-directory-overwrite";
+  readonly atomicity: "single-rename-platform-assumption";
+}
+
+const REPLACE_CAPABILITY: IndexStorageReplaceCapability = Object.freeze({
+  operation: "same-directory-overwrite",
+  atomicity: "single-rename-platform-assumption",
+});
+
+let replaceProbeSequence = 0;
+
+/** Restricts derived index files to one repository-owned directory. */
 export class StrictIndexStorage implements IndexStorage {
+  private replaceCapabilityPromise?: Promise<IndexStorageReplaceCapability>;
+
   constructor(
     readonly root: string,
     private readonly adapter: IndexStorage
@@ -23,6 +43,7 @@ export class StrictIndexStorage implements IndexStorage {
     if (!root || root.startsWith("/") || root.split("/").includes(".."))
       throw new Error("Invalid index root");
   }
+
   private safe(path: string): string {
     if (
       !path ||
@@ -33,6 +54,7 @@ export class StrictIndexStorage implements IndexStorage {
       throw new Error("Index path escapes index root");
     return `${this.root}/${path}`;
   }
+
   read(path: string): Promise<string | null> {
     return this.adapter.read(this.safe(path));
   }
@@ -53,22 +75,30 @@ export class StrictIndexStorage implements IndexStorage {
   }
   list(path = ""): Promise<{ files: string[]; folders: string[] }> {
     if (!this.adapter.list)
-      return Promise.reject(new Error("Binary storage listing is unavailable"));
+      return Promise.reject(new Error("Index storage listing is unavailable"));
     return this.adapter.list(path ? this.safe(path) : this.root);
   }
   stat(path: string): Promise<{ type: "file" | "folder"; size: number; mtime: number } | null> {
-    if (!this.adapter.stat) return Promise.reject(new Error("Binary storage stat is unavailable"));
+    if (!this.adapter.stat) return Promise.reject(new Error("Index storage stat is unavailable"));
     return this.adapter.stat(this.safe(path));
   }
-  activate(pointer: string, value: string, signal?: AbortSignal): Promise<void> {
-    return this.adapter.activate(this.safe("active.json"), value, signal);
+  replace(from: string, to: string): Promise<void> {
+    if (!this.adapter.replace)
+      return Promise.reject(
+        new StructuredError("internal", "Same-directory index replacement is unavailable.", true)
+      );
+    return this.adapter.replace(this.safe(from), this.safe(to));
+  }
+  verifyReplaceCapability(): Promise<IndexStorageReplaceCapability> {
+    if (!this.replaceCapabilityPromise)
+      this.replaceCapabilityPromise = probeReplaceCapability(this, `${this.root}-replace-probe`);
+    return this.replaceCapabilityPromise;
   }
   prepare(): Promise<void> {
     return this.adapter.prepare?.() ?? Promise.resolve();
   }
 }
 
-/** Projects Obsidian's write-capable adapter into the strictly contained index store. */
 type ObsidianIndexAdapter = {
   read(path: string): Promise<string>;
   exists(path: string): Promise<boolean>;
@@ -82,10 +112,11 @@ type ObsidianIndexAdapter = {
   rename?(from: string, to: string): Promise<void>;
 };
 
+/** Projects Obsidian's adapter into `.trama/index.json` only. */
 export class ObsidianIndexStorage extends StrictIndexStorage {
-  constructor(adapter: ObsidianIndexAdapter, root = ".trama/index") {
+  constructor(adapter: ObsidianIndexAdapter, root = ".trama") {
     const ensure = async (path: string) => {
-      if (!adapter.mkdir) return;
+      if (!adapter.mkdir || !path) return;
       const parts = path.split("/");
       let current = "";
       for (const part of parts) {
@@ -100,6 +131,7 @@ export class ObsidianIndexStorage extends StrictIndexStorage {
         await ensure(path.slice(0, path.lastIndexOf("/")));
         await adapter.write(path, value);
       },
+      remove: (path) => adapter.remove(path),
       readBinary: adapter.readBinary ? (path) => adapter.readBinary!(path) : undefined,
       writeBinary: adapter.writeBinary
         ? async (path, value) => {
@@ -124,77 +156,30 @@ export class ObsidianIndexStorage extends StrictIndexStorage {
           }
         : undefined,
       stat: adapter.stat ? (path) => adapter.stat!(path) : undefined,
-      remove: (path) => adapter.remove(path),
-      activate: async (path, value, signal) => {
-        if (signal?.aborted) throw new Error("Index activation cancelled");
+      replace: async (from, to) => {
         if (!adapter.rename)
           throw new StructuredError(
             "internal",
-            "Atomic index activation is unavailable on this vault adapter.",
+            "Same-directory index replacement is unavailable on this vault adapter.",
             true
           );
-        const parent = path.slice(0, path.lastIndexOf("/"));
-        if (adapter.mkdir) {
-          if (!(await adapter.exists(parent))) await adapter.mkdir(parent);
-          if (!(await adapter.exists(`${parent}/generations`)))
-            await adapter.mkdir(`${parent}/generations`);
-        }
-        const temp = `${path}.tmp`;
-        const backup = `${path}.bak`;
-        await adapter.write(temp, value);
-        if (signal?.aborted) {
-          await adapter.remove(temp).catch(() => undefined);
-          throw new Error("Index activation cancelled");
-        }
-        const hadOld = await adapter.exists(path);
-        let oldMovedToBackup = false;
-        try {
-          if (hadOld) {
-            try {
-              await adapter.rename(path, backup);
-              oldMovedToBackup = true;
-            } catch (error) {
-              // The old pointer is still authoritative when this move fails.
-              await adapter.remove(temp).catch(() => undefined);
-              throw error;
-            }
-          }
-          if (signal?.aborted) throw new Error("Index activation cancelled");
-          await adapter.rename(temp, path);
-          await adapter.remove(backup).catch(() => undefined);
-        } catch (error) {
-          if (oldMovedToBackup) {
-            await adapter.remove(path).catch(() => undefined);
-            try {
-              await adapter.rename(backup, path);
-            } catch {
-              throw new StructuredError(
-                "internal",
-                "Index activation failed; the previous pointer remains in backup storage.",
-                true
-              );
-            }
-          }
-          await adapter.remove(temp).catch(() => undefined);
-          throw error;
-        }
+        await ensure(to.slice(0, to.lastIndexOf("/")));
+        // One same-directory rename is the replacement boundary. Obsidian's
+        // public DataAdapter contract does not promise power-loss atomicity.
+        await adapter.rename(from, to);
       },
-      prepare: async () => {
-        await ensure(root);
-        await ensure(`${root}/manifests`);
-        await ensure(`${root}/segments`);
-        // Legacy generation artifacts remain readable and reclaimable.
-        await ensure(`${root}/generations`);
-      },
+      prepare: async () => ensure(root),
     });
   }
 }
 
-/** In-memory storage useful for tests and non-Obsidian composition. */
+/** Repository-contained storage used by tests and synthetic benchmarks. */
 export class MemoryIndexStorage implements IndexStorage {
   readonly files = new Map<string, string>();
   readonly binaryFiles = new Map<string, Uint8Array>();
-  constructor(readonly root = ".trama/index") {}
+  private replaceCapabilityPromise?: Promise<IndexStorageReplaceCapability>;
+  constructor(readonly root = ".trama") {}
+
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
   }
@@ -222,8 +207,8 @@ export class MemoryIndexStorage implements IndexStorage {
   }
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
     const prefix = path ? `${path}/` : "";
-    const all = [...this.files.keys(), ...this.binaryFiles.keys()].filter((p) =>
-      p.startsWith(prefix)
+    const all = [...this.files.keys(), ...this.binaryFiles.keys()].filter((entry) =>
+      entry.startsWith(prefix)
     );
     const files = new Set<string>();
     const folders = new Set<string>();
@@ -245,16 +230,105 @@ export class MemoryIndexStorage implements IndexStorage {
     if (binary) return { type: "file", size: binary.byteLength, mtime: 0 };
     return null;
   }
-  async activate(pointer: string, value: string, signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) throw new Error("Index activation cancelled");
-    const previous = this.files.get(pointer);
-    this.files.set(`${pointer}.tmp`, value);
-    if (signal?.aborted) {
-      this.files.delete(`${pointer}.tmp`);
-      throw new Error("Index activation cancelled");
-    }
-    this.files.set(pointer, value);
-    this.files.delete(`${pointer}.tmp`);
-    if (previous === undefined) this.files.delete(`${pointer}.bak`);
+  async replace(from: string, to: string): Promise<void> {
+    const value = this.files.get(from);
+    if (value === undefined) throw new Error("Missing temporary index snapshot");
+    this.files.set(to, value);
+    this.files.delete(from);
   }
+
+  verifyReplaceCapability(): Promise<IndexStorageReplaceCapability> {
+    if (!this.replaceCapabilityPromise)
+      this.replaceCapabilityPromise = probeReplaceCapability(this, `${this.root}-replace-probe`);
+    return this.replaceCapabilityPromise;
+  }
+}
+
+async function probeReplaceCapability(
+  storage: IndexStorage,
+  prefix: string
+): Promise<IndexStorageReplaceCapability> {
+  if (!storage.replace)
+    throw new StructuredError(
+      "internal",
+      "Same-directory index replacement is unavailable on this storage.",
+      true
+    );
+  const sequence = replaceProbeSequence++;
+  const source = `${prefix}-${sequence}-source`;
+  const target = `${prefix}-${sequence}-target`;
+  if ((await probePathOccupied(storage, source)) || (await probePathOccupied(storage, target)))
+    throw new StructuredError("internal", "Index replacement probe path is occupied.", true);
+
+  let sourceOwned = false;
+  let targetOwned = false;
+  let failed = false;
+  let primaryError: unknown;
+  try {
+    sourceOwned = true;
+    await storage.write(source, "trama-replace-probe-source");
+    targetOwned = true;
+    await storage.write(target, "trama-replace-probe-target");
+    await storage.replace(source, target);
+    if ((await storage.read(source)) !== null)
+      throw new Error("Index replacement probe left its source sibling");
+    sourceOwned = false;
+    if ((await storage.read(target)) !== "trama-replace-probe-source")
+      throw new Error("Index replacement does not overwrite an existing sibling");
+  } catch (error) {
+    failed = true;
+    primaryError = error;
+  }
+
+  let cleanupFailed = false;
+  if (sourceOwned) cleanupFailed = (await cleanupProbePath(storage, source)) || cleanupFailed;
+  if (targetOwned) cleanupFailed = (await cleanupProbePath(storage, target)) || cleanupFailed;
+  if (cleanupFailed) {
+    if (failed) markCleanupFailure(primaryError);
+    else {
+      failed = true;
+      primaryError = new StructuredError(
+        "internal",
+        "Index replacement capability probe cleanup failed.",
+        true
+      );
+      markCleanupFailure(primaryError);
+    }
+  }
+  if (failed) throw primaryError;
+  return REPLACE_CAPABILITY;
+}
+
+async function cleanupProbePath(storage: IndexStorage, path: string): Promise<boolean> {
+  try {
+    await storage.remove(path);
+    return (await probePathOccupied(storage, path)) === true;
+  } catch {
+    return true;
+  }
+}
+
+function markCleanupFailure(error: unknown): void {
+  if (!error || typeof error !== "object") return;
+  try {
+    Object.defineProperty(error, "cleanupFailed", {
+      value: true,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    // Preserve the primary error even when it cannot carry metadata.
+  }
+}
+
+async function probePathOccupied(storage: IndexStorage, path: string): Promise<boolean> {
+  if (storage.stat) {
+    try {
+      return (await storage.stat(path)) !== null;
+    } catch (error) {
+      if (!(error instanceof Error && error.message === "Index storage stat is unavailable"))
+        throw error;
+    }
+  }
+  return (await storage.read(path)) !== null;
 }

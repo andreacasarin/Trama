@@ -274,7 +274,13 @@ export class FiloView extends ItemView {
   private renderProgress(status: IndexStatus): boolean {
     const progress = status.progress;
     if (!progress) return false;
-    const label = formatIndexProgress(progress, status.etaSeconds);
+    const displayProgress =
+      progress.estimated === true &&
+      progress.total !== undefined &&
+      progress.completed >= progress.total
+        ? { ...progress, total: undefined, determinate: false, estimated: false }
+        : progress;
+    const label = formatIndexProgress(displayProgress, status.etaSeconds);
     this.root.createEl("p", {
       cls: "setting-item-description trama-filo__progress-label",
       text: label,
@@ -284,10 +290,12 @@ export class FiloView extends ItemView {
       cls: "trama-filo__progress",
       attr: {
         "aria-label": label,
-        ...(progress.determinate && progress.total !== undefined
+        ...(displayProgress.determinate && displayProgress.total !== undefined
           ? {
-              max: String(Math.max(1, progress.total)),
-              value: String(Math.min(progress.completed, Math.max(1, progress.total))),
+              max: String(Math.max(1, displayProgress.total)),
+              value: String(
+                Math.min(displayProgress.completed, Math.max(1, displayProgress.total))
+              ),
             }
           : {}),
       },

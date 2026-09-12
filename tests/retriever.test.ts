@@ -1,292 +1,106 @@
 import { describe, expect, it, vi } from "vitest";
-import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
-import { Retriever } from "@/index/retrieval/Retriever";
+import { IndexManager } from "@/index/IndexManager";
+import { MemoryIndexStorage } from "@/index/storage";
 import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
-import { StructuredError } from "@/domain/contracts";
 
-function fixture() {
-  const record = { ordinal: 0, startLine: 4, endLine: 5, text: "x".repeat(600), vector: [1, 0] };
-  const notes = [{ path: "a.md", contentId: "a".repeat(64), chunkCount: 1, segments: [] }];
-  const hydrateChunk = vi.fn(async (_path: string, _ordinal: number) => record);
-  const snapshot = {
-    generationId: "g1",
-    fingerprint: "f1",
-    root: {} as never,
-    notes,
-    pin() {
-      return this;
-    },
-    release: vi.fn(async () => undefined),
-    getNote(path: string) {
-      return notes.find((note) => note.path === path);
-    },
-    hydrateChunk,
-    readSegment: vi.fn(),
-    hydrateNote: vi.fn(),
-  } as unknown as CorpusSnapshot;
-  const vector = {
-    snapshot,
-    search: vi.fn(async () => [{ id: "semantic", path: "a.md", ordinal: 0, score: 0.8 }]),
-    close: vi.fn(async () => undefined),
+const signal = new AbortController().signal;
+
+function model() {
+  return {
+    dimensions: 768,
+    embed: vi.fn(async (texts: readonly string[]) =>
+      texts.map((text) => {
+        const vector = Array.from({ length: 768 }, () => 0);
+        vector[text.includes("beta") ? 1 : 0] = 1;
+        return vector;
+      })
+    ),
   };
-  const lexical = {
-    generationId: "g1",
-    fingerprint: "f1",
-    search: vi.fn(async () => [{ id: "lexical", path: "a.md", ordinal: 0, score: 2 }]),
-    close: vi.fn(async () => undefined),
-  };
-  return { snapshot, vector, lexical, hydrateChunk };
 }
 
-describe("Retriever", () => {
-  it("fuses channels with RRF and hydrates bounded canonical provenance", async () => {
-    const f = fixture();
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    const [result] = await retriever.search({ query: "needle", limit: 1 });
-    expect(result).toMatchObject({ path: "a.md", startLine: 4, endLine: 5, generationId: "g1" });
-    expect(result.excerpt).toHaveLength(500);
-    expect(result.fusedScore).toBeCloseTo(2 / 61);
-    expect(f.vector.search).toHaveBeenCalledWith([1, 0], expect.objectContaining({ limit: 80 }));
-    await retriever.close();
-    await retriever.close();
-    expect(f.snapshot.release).toHaveBeenCalledTimes(1);
-  });
-
-  it("embeds once and semantic mode does not invoke lexical search", async () => {
-    const f = fixture();
-    const embed = vi.fn(async () => [[1, 0]]);
-    const retriever = new Retriever({ ...f, embedding: { embed } });
-    await retriever.search({ query: "needle", mode: "semantic" });
-    expect(embed).toHaveBeenCalledTimes(1);
-    expect(f.lexical.search).not.toHaveBeenCalled();
-  });
-
-  it("rejects empty queries and observes cancellation", async () => {
-    const f = fixture();
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    await expect(retriever.search({ query: " " })).rejects.toMatchObject({
-      code: "invalid_request",
-    });
-    const controller = new AbortController();
-    controller.abort();
-    await expect(retriever.search({ query: "x", signal: controller.signal })).rejects.toMatchObject(
-      { code: "cancelled" }
-    );
-  });
-
-  it("assigns RRF ranks after defensive filtering and applies Filo defaults", async () => {
-    const f = fixture();
-    f.vector.search.mockResolvedValue([
-      { id: "excluded", path: "current.md", ordinal: 0, score: 1 },
-      { id: "kept", path: "a.md", ordinal: 0, score: 0.1 },
-    ]);
-    f.lexical.search.mockResolvedValue([
-      { id: "excluded", path: "current.md", ordinal: 0, score: 9 },
-      { id: "kept", path: "a.md", ordinal: 0, score: 1 },
-    ]);
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    const [result] = await retriever.search({
-      query: "needle",
-      mode: "related",
-      currentPath: "current.md",
-    });
-    expect(result.fusedScore).toBeCloseTo(2 / 61);
-    expect(f.vector.search).toHaveBeenCalledWith(
-      [1, 0],
-      expect.objectContaining({ limit: 128, excludePath: "current.md" })
-    );
-    expect(f.lexical.search).toHaveBeenCalledWith(
-      "needle",
-      expect.objectContaining({ candidateLimit: 128, excludePath: "current.md" })
-    );
-  });
-
-  it("allows related chunk overfetch while keeping related note output capped", async () => {
-    const f = fixture();
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    await expect(
-      retriever.search({ query: "needle", mode: "related", resultShape: "chunks", limit: 128 })
-    ).resolves.toHaveLength(1);
-    await expect(
-      retriever.search({ query: "needle", mode: "related", resultShape: "notes", limit: 8 })
-    ).rejects.toMatchObject({ code: "invalid_request" });
-  });
-
-  it("keeps multiple RAG chunks but collapses note results to the max fused chunk", async () => {
-    const f = fixture();
-    const notes = [
-      { path: "a.md", contentId: "a".repeat(64), chunkCount: 2, segments: [] },
-      { path: "b.md", contentId: "b".repeat(64), chunkCount: 1, segments: [] },
-    ];
-    Object.assign(f.snapshot, { notes });
-    f.snapshot.getNote = (path: string) => notes.find((note) => note.path === path);
-    f.hydrateChunk.mockImplementation(
-      async (_path: string, ordinal: number) =>
-        ({
-          ordinal,
-          startLine: ordinal + 1,
-          endLine: ordinal + 1,
-          text: "chunk",
-          vector: [1, 0],
-        }) as never
-    );
-    f.vector.search.mockResolvedValue([
-      { id: "a0", path: "a.md", ordinal: 0, score: 1 },
-      { id: "a1", path: "a.md", ordinal: 1, score: 0.9 },
-      { id: "b0", path: "b.md", ordinal: 0, score: 0.8 },
-    ]);
-    f.lexical.search.mockResolvedValue([]);
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    expect((await retriever.search({ query: "x", limit: 3 })).map((r) => r.path)).toEqual([
-      "a.md",
-      "a.md",
-      "b.md",
-    ]);
-    expect(
-      (await retriever.search({ query: "x", mode: "related", limit: 7 })).map((r) => r.path)
-    ).toEqual(["a.md", "b.md"]);
-  });
-
-  it("fuses Lente channel ranks by path and keeps one deterministic winning passage", async () => {
-    const f = fixture();
-    const notes = [
-      { path: "a.md", contentId: "a".repeat(64), chunkCount: 2, segments: [] },
-      { path: "b.md", contentId: "b".repeat(64), chunkCount: 1, segments: [] },
-    ];
-    Object.assign(f.snapshot, { notes });
-    f.snapshot.getNote = (path: string) => notes.find((note) => note.path === path);
-    f.hydrateChunk.mockImplementation(async (_path: string, ordinal: number) => ({
-      ordinal,
-      startLine: ordinal + 1,
-      endLine: ordinal + 1,
-      text: `passage ${ordinal}`,
-      vector: [1, 0],
-    }));
-    f.vector.search.mockResolvedValue([
-      { id: "a-semantic", path: "a.md", ordinal: 0, score: 0.9 },
-      { id: "b-semantic", path: "b.md", ordinal: 0, score: 0.8 },
-    ]);
-    f.lexical.search.mockResolvedValue([
-      { id: "a-lexical", path: "a.md", ordinal: 1, score: 2 },
-      { id: "b-lexical", path: "b.md", ordinal: 0, score: 1 },
-    ]);
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    const results = await retriever.search({
-      query: "x",
-      feature: "lente",
-      resultShape: "notes",
-      limit: 2,
-      semanticCandidateLimit: 2,
-      lexicalCandidateLimit: 2,
-    });
-    expect(results.map((result) => result.path)).toEqual(["a.md", "b.md"]);
-    expect(results[0]).toMatchObject({
-      ordinal: 0,
-      semanticScore: 0.9,
-      lexicalScore: 2,
-      fusedScore: 2 / 61,
-    });
-    await retriever.close();
-  });
-
-  it("uses locale-independent code-unit ordering for equal retrieval hits", async () => {
-    const f = fixture();
-    f.vector.search.mockResolvedValue([
-      { id: "umlaut", path: "ä.md", ordinal: 0, score: 1 },
-      { id: "lower", path: "a.md", ordinal: 0, score: 1 },
-      { id: "upper", path: "Z.md", ordinal: 0, score: 1 },
-    ]);
-    f.lexical.search.mockResolvedValue([]);
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-
-    expect((await retriever.search({ query: "x", limit: 3 })).map((result) => result.path)).toEqual(
-      ["Z.md", "a.md", "ä.md"]
-    );
-  });
-
-  it("rejects invalid limits and mixed generation bundles", async () => {
-    const f = fixture();
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    for (const limit of [-1, 21, 1.5])
-      await expect(retriever.search({ query: "x", limit })).rejects.toMatchObject({
-        code: "invalid_request",
-      });
-    expect(() => new Retriever({ ...f, lexical: { ...f.lexical, generationId: "g2" } })).toThrow(
-      "different generations"
-    );
-  });
-
-  it("preserves backend and hydration failures and supports semantic zero candidates", async () => {
-    const f = fixture();
-    f.vector.search.mockRejectedValue(new Error("vector unavailable"));
-    const retriever = new Retriever({ ...f, embedding: { embed: vi.fn(async () => [[1, 0]]) } });
-    await expect(retriever.search({ query: "x" })).rejects.toThrow("vector unavailable");
-    f.vector.search.mockResolvedValue([]);
-    f.lexical.search.mockResolvedValue([]);
-    await expect(
-      retriever.search({ query: "x", semanticCandidateLimit: 0, lexicalCandidateLimit: 0 })
-    ).resolves.toEqual([]);
-    f.lexical.search.mockResolvedValue([{ id: "lexical", path: "a.md", ordinal: 0, score: 1 }]);
-    f.hydrateChunk.mockRejectedValue(new Error("hydrate failed"));
-    await expect(retriever.search({ query: "x", semanticCandidateLimit: 0 })).rejects.toThrow(
-      "hydrate failed"
-    );
-    await retriever.close();
-  });
-
-  it("classifies missing, nonfinite, wrong-dimension, and near-zero Lente query vectors", async () => {
-    for (const embedded of [[], undefined]) {
-      const f = fixture();
-      const retriever = new Retriever({
-        ...f,
-        embedding: { dimensions: 2, embed: vi.fn(async () => embedded as never) },
-      });
-      await expect(retriever.search({ query: "x" })).rejects.toBeInstanceOf(QueryEmbeddingError);
-      await retriever.close();
-    }
-    for (const vector of [
-      [Number.NaN, 0],
-      [1, 0, 0],
-      [0, 0],
-      [1e-13, 0],
-    ]) {
-      const f = fixture();
-      const retriever = new Retriever({
-        ...f,
-        embedding: { dimensions: 2, embed: vi.fn(async () => [vector]) },
-      });
-      await expect(
-        retriever.search({ query: "x", feature: "lente", resultShape: "notes" })
-      ).rejects.toBeInstanceOf(QueryEmbeddingError);
-      await retriever.close();
-    }
-  });
-
-  it("does not classify AbortError as a query-embedding fallback", async () => {
-    const f = fixture();
-    const retriever = new Retriever({
-      ...f,
-      embedding: {
-        dimensions: 2,
-        embed: vi.fn(async () => {
-          throw new DOMException("aborted", "AbortError");
-        }),
+function manager(contents: Record<string, string>, embedding = model()) {
+  return {
+    manager: new IndexManager(
+      {
+        listMarkdownPaths: async () => Object.keys(contents),
+        readMarkdown: async (path: string) => ({ path, content: contents[path] }),
       },
+      embedding,
+      new MemoryIndexStorage(),
+      "http://synthetic.invalid/v1",
+      "synthetic"
+    ),
+    embedding,
+  };
+}
+
+describe("live Orama retriever", () => {
+  it("runs independent vector/BM25 channels and deterministic RRF", async () => {
+    const setup = manager({ "a.md": "alpha body", "b.md": "beta body" });
+    await setup.manager.build(signal);
+    const lease = setup.manager.acquireLenteLease();
+    expect(lease).not.toBeNull();
+    const results = await lease!.retriever.search({
+      query: "alpha",
+      mode: "hybrid",
+      resultShape: "notes",
+      feature: "lente",
+      limit: 2,
+      semanticCandidateLimit: 10,
+      lexicalCandidateLimit: 10,
+      lexicalProfile: "lente",
+      signal,
     });
-    await expect(retriever.search({ query: "x" })).rejects.toMatchObject({ name: "AbortError" });
-    await retriever.close();
+    expect(results[0]).toMatchObject({ path: "a.md" });
+    expect(results[0]?.semanticScore).toEqual(expect.any(Number));
+    expect(results[0]?.lexicalScore).toEqual(expect.any(Number));
+    await lease!.release();
   });
 
-  it("preserves structured embedding cancellation without starting retrieval", async () => {
-    const f = fixture();
-    const cancelled = new StructuredError("cancelled", "Search cancelled.", true);
-    const retriever = new Retriever({
-      ...f,
-      embedding: { embed: vi.fn(async () => Promise.reject(cancelled)) },
+  it("keeps a lease on the stable projection across mutation", async () => {
+    const contents: Record<string, string> = { "a.md": "alpha" };
+    const setup = manager(contents);
+    await setup.manager.build(signal);
+    const lease = setup.manager.acquireLenteLease()!;
+    contents["a.md"] = "beta";
+    setup.manager.queueChange("a.md");
+    await setup.manager.reconcileQueuedChanges(signal);
+    const result = await lease.retriever.search({
+      query: "beta",
+      mode: "lexical",
+      resultShape: "notes",
+      feature: "lente",
+      limit: 1,
+      lexicalCandidateLimit: 10,
+      semanticCandidateLimit: 0,
+      lexicalProfile: "lente",
+      signal,
     });
-    await expect(retriever.search({ query: "x" })).rejects.toBe(cancelled);
-    expect(f.vector.search).not.toHaveBeenCalled();
-    expect(f.lexical.search).not.toHaveBeenCalled();
-    await retriever.close();
+    expect(result).toMatchObject([{ path: "a.md" }]);
+    await lease.release();
+  });
+
+  it("preserves query-embedding failure as an explicit error for Lente fallback", async () => {
+    const embedding = model();
+    const setup = manager({ "a.md": "alpha" }, embedding);
+    await setup.manager.build(signal);
+    embedding.embed = vi.fn(async () => {
+      throw new Error("synthetic query failure");
+    });
+    const lease = setup.manager.acquireLenteLease()!;
+    await expect(
+      lease.retriever.search({
+        query: "alpha",
+        mode: "hybrid",
+        resultShape: "notes",
+        feature: "lente",
+        limit: 1,
+        semanticCandidateLimit: 10,
+        lexicalCandidateLimit: 10,
+        lexicalProfile: "lente",
+        signal,
+      })
+    ).rejects.toBeInstanceOf(QueryEmbeddingError);
+    await lease.release();
   });
 });

@@ -3,4 +3,5 @@ node_modules/
 main.js
 coverage/
 .local-vault-assistant/
+.index-benchmark/
 .DS_Store

@@ -62,6 +62,38 @@ describe("RelatedNotes", () => {
     ]);
   });
 
+  it("continues past a dominant note so path deduplication can fill twenty results", async () => {
+    const truncated = [
+      ...Array.from({ length: 200 }, () => ({ path: "dominant.md", score: 1 })),
+      ...Array.from({ length: 25 }, (_, index) => ({
+        path: `related-${index.toString().padStart(2, "0")}.md`,
+        score: 0.8,
+      })),
+    ];
+    const prepareQuery = vi.fn(async () => ({ text: "query", vector: [1, 0] }));
+    const search = vi.fn(
+      async (_query: string, _vector: readonly number[], _signal: AbortSignal, limit: number) =>
+        truncated.slice(0, limit)
+    );
+    const current: RelatedIndexSnapshot = {
+      generationId: "1",
+      currentPath: "current.md",
+      contentHash: "current",
+      prepareQuery,
+      search,
+    };
+
+    const result = await new RelatedNotes({ relatedSnapshot: () => current }).find(
+      "current.md",
+      signal,
+      20
+    );
+
+    expect(result.results).toHaveLength(20);
+    expect(new Set(result.results.map((item) => item.path)).size).toBe(20);
+    expect(search.mock.calls.map((call) => call[3])).toEqual([128, 256]);
+  });
+
   it("keeps the winning chunk preview and strongest semantic similarity per note", async () => {
     const current = snapshot("current.md", "query", [
       {
