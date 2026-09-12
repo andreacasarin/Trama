@@ -273,13 +273,13 @@ export class IndexStatusController {
       hasLastGood,
       message,
       canIndex:
-        kind === "index-required" ||
         kind === "ready" ||
         kind === "stale" ||
         kind === "cancelled" ||
         kind === "error" ||
         kind === "empty",
       canReindex:
+        kind === "index-required" ||
         kind === "ready" ||
         kind === "stale" ||
         ((kind === "cancelled" || kind === "error" || kind === "empty") && hasLastGood),

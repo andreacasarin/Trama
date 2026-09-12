@@ -1,6 +1,11 @@
-import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
+import type { IndexRevision } from "@/index/contracts";
 
 export interface VectorSearchHit {
+  /** Backend row identity; unlike path/ordinal it remains stable during hydration. */
+  readonly rowId?: string;
+  /** Canonical content-addressed chunk identity, when the backend can expose it. */
+  readonly canonicalId?: string;
+  /** Legacy/backend identity retained during the transition. */
   readonly id: string;
   readonly path: string;
   readonly ordinal: number;
@@ -22,7 +27,10 @@ export interface VectorSearchOptions {
 }
 
 export interface VectorIndex {
-  readonly snapshot: CorpusSnapshot;
+  /** Identity of the retrieval view represented by this index. */
+  readonly generationId?: string;
+  readonly revision?: IndexRevision;
+  readonly fingerprint?: string;
   /** Dimension of committed vectors when the backend can expose it. */
   readonly dimensions?: number;
   search(

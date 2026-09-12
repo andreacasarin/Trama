@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ChatSession } from "@/chat/ChatSession";
 import { ChatModel, ChatResponse, ReadonlyVault } from "@/domain/contracts";
 import { IndexManager } from "@/index/IndexManager";
-import { MemoryIndexStorage } from "@/index/storage";
+import { MemoryIndexStorage } from "@/index/taladb/storage";
 import { ToolRegistry, ReadNoteTool, FollowLinkTool, VaultSearchTool } from "@/tools/ToolRegistry";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
@@ -48,7 +48,8 @@ describe("integration composition seams", () => {
       embedding,
       storage,
       "http://127.0.0.1:1234/v1",
-      "embed-v1"
+      "embed-v1",
+      { backend: "memory" }
     );
     await first.build(new AbortController().signal);
     expect(await first.search("alpha", new AbortController().signal, 10)).toHaveLength(2);
@@ -57,7 +58,8 @@ describe("integration composition seams", () => {
       embedding,
       storage,
       "http://127.0.0.1:1234/v1",
-      "embed-v1"
+      "embed-v1",
+      { backend: "memory" }
     );
     expect(await restarted.load()).toBe(true);
   });

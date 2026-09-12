@@ -2,8 +2,9 @@ import { Platform, Plugin, TAbstractFile } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, IndexVaultPort } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
-import { ObsidianIndexStorage } from "@/index/storage";
+import { compareCodeUnits } from "@/index/order";
+import { ObsidianIndexStorage } from "@/index/taladb/storage";
+import { resolveTalaPluginMainResource } from "@/index/taladb/resource";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
@@ -204,6 +205,8 @@ export class TramaPlugin extends Plugin {
     this.relatedNotes?.cancel();
     this.relatedNotes = undefined;
     this.session?.cancel();
+    // Lifecycle teardown is intentionally fire-and-forget in Obsidian's unload hook.
+    void this.index?.close();
     for (const ref of this.eventRefs) ref.unsubscribe?.();
     this.eventRefs.length = 0;
     this.desktopLoaded = false;
@@ -265,6 +268,7 @@ export class TramaPlugin extends Plugin {
       } catch {
         // The old build is intentionally cancelled before composing its replacement.
       }
+      await oldIndex?.close();
       this.lifecycleAbort = new AbortController();
       this.indexStatus?.markStale(false);
     }
@@ -301,6 +305,17 @@ export class TramaPlugin extends Plugin {
   }
 
   private composeRuntime(app: any, settings: TramaSettings): void {
+    // The bundled TalaDB browser client resolves its worker/WASM assets from
+    // import.meta.url.  CommonJS plugin loading has no file URL, so provide an
+    // Obsidian resource URL through its public adapter API before any database
+    // is opened.  The build banner keeps a mutable URL object for this hook.
+    const pluginResource = resolveTalaPluginMainResource(
+      app.vault.adapter,
+      (this.manifest as { dir?: string } | undefined)?.dir ?? ""
+    );
+    const pluginUrl = (globalThis as typeof globalThis & { __tramaPluginUrl?: URL })
+      .__tramaPluginUrl;
+    if (pluginResource && pluginUrl) pluginUrl.href = pluginResource;
     const transport = new LmStudioTransport({
       policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
     });
@@ -321,6 +336,10 @@ export class TramaPlugin extends Plugin {
       settings.embedding.endpoint,
       settings.embedding.modelId,
       {
+        // Repository-contained Vitest fixtures may explicitly inject the
+        // memory backend on their projected app. Real Obsidian apps never set
+        // this marker and therefore always use native TalaDB storage.
+        ...(app.__tramaTestBackend === "memory" ? { backend: "memory" as const } : {}),
         excludedPaths,
         isIndexEligible,
         onProgress: (progress) => this.indexStatus?.reportProgress(progress),
@@ -354,6 +373,10 @@ export class TramaPlugin extends Plugin {
         // The initial persisted-index decision is startup bookkeeping and must
         // stay silent even if debugging is enabled immediately after onload.
         this.indexStatus?.setIndexRequired(true);
+        return;
+      }
+      if (manager.isSyncNeeded()) {
+        this.indexStatus?.markStale(true);
         return;
       }
       if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);

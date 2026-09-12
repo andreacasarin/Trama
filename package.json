@@ -9,7 +9,12 @@
     "format": "prettier --write '**/*.{js,mjs,ts,json,md}'",
     "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "taladb:gate0": "TMPDIR=$PWD/candidate/taladb/.generated/tmp PLAYWRIGHT_BROWSERS_PATH=$PWD/candidate/taladb/.generated/playwright-browsers node scripts/taladb-gate0.mjs",
+    "taladb:browser": "npm run taladb:gate0",
+    "taladb:native": "TRAMA_TALADB_GENERATED=$PWD/benchmarks/taladb/.generated TMPDIR=$PWD/benchmarks/taladb/.generated/tmp node scripts/taladb-native-lifecycle.mjs",
+    "artifact:verify": "node scripts/verify-plugin-artifact.mjs",
+    "taladb:benchmark": "TRAMA_TALADB_GENERATED=$PWD/benchmarks/taladb/.generated TMPDIR=$PWD/benchmarks/taladb/.generated/tmp node scripts/taladb-benchmark.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
@@ -23,6 +28,7 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "@orama/orama": "^3.1.18"
+    "@taladb/web": "0.11.3",
+    "taladb": "0.11.3"
   }
 }

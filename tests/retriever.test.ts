@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
 import { Retriever } from "@/index/retrieval/Retriever";
 import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 import { StructuredError } from "@/domain/contracts";
+import type { VectorSearchHit } from "@/index/vector/VectorIndex";
 
 function fixture() {
   const record = { ordinal: 0, startLine: 4, endLine: 5, text: "x".repeat(600), vector: [1, 0] };
@@ -23,10 +23,12 @@ function fixture() {
     hydrateChunk,
     readSegment: vi.fn(),
     hydrateNote: vi.fn(),
-  } as unknown as CorpusSnapshot;
+  };
   const vector = {
     snapshot,
-    search: vi.fn(async () => [{ id: "semantic", path: "a.md", ordinal: 0, score: 0.8 }]),
+    search: vi.fn(async (): Promise<VectorSearchHit[]> => [
+      { id: "semantic", path: "a.md", ordinal: 0, score: 0.8 },
+    ]),
     close: vi.fn(async () => undefined),
   };
   const lexical = {
@@ -50,6 +52,59 @@ describe("Retriever", () => {
     await retriever.close();
     await retriever.close();
     expect(f.snapshot.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("hydrates mutable rows by row identity and skips rows deleted after ranking", async () => {
+    const f = fixture();
+    f.vector.search.mockResolvedValue([
+      {
+        id: "gone-canonical",
+        canonicalId: "gone-canonical",
+        rowId: "gone-row",
+        path: "gone.md",
+        ordinal: 0,
+        score: 1,
+      },
+      {
+        id: "kept-canonical",
+        canonicalId: "kept-canonical",
+        rowId: "kept-row",
+        path: "a.md",
+        ordinal: 0,
+        score: 0.9,
+      },
+    ]);
+    f.lexical.search.mockResolvedValue([]);
+    const hydrateRow = vi.fn(async (row: { rowId?: string }) =>
+      row.rowId === "gone-row"
+        ? undefined
+        : { ordinal: 0, startLine: 1, endLine: 1, text: "kept", vector: [1, 0] }
+    );
+    const repository = {
+      generationId: "g1",
+      revision: 2,
+      fingerprint: "f1",
+      notes: f.snapshot.notes,
+      pin() {
+        return this;
+      },
+      release: vi.fn(async () => undefined),
+      getNote: f.snapshot.getNote,
+      hydrateRow,
+    };
+    const retriever = new Retriever({
+      repository,
+      vector: f.vector,
+      lexical: f.lexical,
+      embedding: { embed: vi.fn(async () => [[1, 0]]) },
+    });
+    await expect(
+      retriever.search({ query: "needle", mode: "semantic", limit: 2 })
+    ).resolves.toMatchObject([{ path: "a.md", rowId: "kept-row", chunkId: "kept-canonical" }]);
+    expect(hydrateRow).toHaveBeenCalledWith(
+      expect.objectContaining({ rowId: "kept-row", canonicalId: "kept-canonical" })
+    );
+    await retriever.close();
   });
 
   it("embeds once and semantic mode does not invoke lexical search", async () => {

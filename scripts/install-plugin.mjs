@@ -5,7 +5,14 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const PLUGIN_ID = "trama";
-const REQUIRED_FILES = ["main.js", "manifest.json", "styles.css"];
+const REQUIRED_FILES = [
+  "main.js",
+  "manifest.json",
+  "styles.css",
+  "@taladb/web/worker/taladb.worker.js",
+  "@taladb/web/pkg/taladb_web.js",
+  "@taladb/web/pkg/taladb_web_bg.wasm",
+];
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const vaultArgument = process.argv[2] ?? process.env.OBSIDIAN_VAULT_PATH;
@@ -41,7 +48,9 @@ for (const fileName of REQUIRED_FILES) {
 await mkdir(pluginDirectory, { recursive: true });
 
 for (const fileName of REQUIRED_FILES) {
-  await installFile(path.join(projectRoot, fileName), path.join(pluginDirectory, fileName));
+  const destination = path.join(pluginDirectory, fileName);
+  await mkdir(path.dirname(destination), { recursive: true });
+  await installFile(path.join(projectRoot, fileName), destination);
 }
 
 process.stdout.write(`Installed ${PLUGIN_ID} in ${pluginDirectory}\n`);

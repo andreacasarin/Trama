@@ -1,7 +1,7 @@
 import { bench, describe } from "vitest";
 
 // Opt-in scale probe for the contiguous exact Float32 scan primitive. It does
-// not construct an Obsidian DataAdapter corpus, Orama index, or hybrid
+// not construct an Obsidian DataAdapter corpus, Tala index, or hybrid
 // retriever, so it deliberately makes no claims about those layers.
 const chunks = Number(process.env.TRAMA_BENCH_CHUNKS ?? 25_000);
 const dimensions = Number(process.env.TRAMA_BENCH_DIMENSIONS ?? 768);

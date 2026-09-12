@@ -1,7 +1,12 @@
 import { StructuredError, type EmbeddingModel } from "@/domain/contracts";
-import type { BinarySegmentRecord } from "@/index/corpus/BinarySegment";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
-import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
+import type {
+  IndexRevision,
+  RetrievalChunk,
+  RetrievalNote,
+  RetrievalRepository,
+  RetrievalRow,
+} from "@/index/contracts";
+import { compareCodeUnits } from "@/index/order";
 import { chunkId } from "@/index/corpus/Hash";
 import type { LexicalHit, LexicalIndex, LexicalProfile } from "@/index/lexical/LexicalIndex";
 import type { VectorIndex, VectorSearchHit } from "@/index/vector/VectorIndex";
@@ -13,16 +18,33 @@ export type RetrievalShape = "chunks" | "notes";
 export { QueryEmbeddingError, isQueryEmbeddingError } from "./QueryEmbeddingError";
 
 export interface RetrievalSnapshot {
-  readonly corpus: CorpusSnapshot;
+  readonly corpus: RetrievalSource;
   readonly vector: VectorIndex;
   readonly lexical: LexicalIndex;
   readonly generationId: string;
+  readonly revision?: IndexRevision;
   readonly fingerprint: string;
   close(): Promise<void>;
 }
 
+/** Legacy immutable corpus shape retained while the concrete backend migrates. */
+export interface LegacyRetrievalSource {
+  readonly generationId: string;
+  readonly revision?: IndexRevision;
+  readonly fingerprint: string;
+  readonly notes: readonly RetrievalNote[];
+  pin(): LegacyRetrievalSource;
+  release(): Promise<void>;
+  getNote(path: string): RetrievalNote | undefined;
+  hydrateChunk(path: string, ordinal: number): Promise<RetrievalChunk | undefined>;
+}
+export type RetrievalSource = LegacyRetrievalSource | RetrievalRepository;
+
 export interface RetrieverOptions {
-  readonly snapshot: CorpusSnapshot;
+  /** Transitional CorpusSnapshot-compatible source. */
+  readonly snapshot?: LegacyRetrievalSource;
+  /** Mutable Tala-neutral source; preferred by new backends. */
+  readonly repository?: RetrievalRepository;
   readonly vector: VectorIndex;
   readonly lexical: LexicalIndex;
   readonly embedding?: Pick<EmbeddingModel, "embed"> & Partial<Pick<EmbeddingModel, "dimensions">>;
@@ -52,6 +74,7 @@ export interface RetrievalResult {
   readonly excerpt: string;
   readonly generationId: string;
   readonly chunkId: string;
+  readonly rowId?: string;
   readonly semanticScore?: number;
   readonly lexicalScore?: number;
   readonly fusedScore: number;
@@ -66,38 +89,42 @@ export class Retriever {
     Partial<Pick<EmbeddingModel, "dimensions">>;
 
   constructor(options: RetrieverOptions) {
-    const { snapshot, vector, lexical } = options;
-    if (vector.snapshot !== snapshot)
+    const source = options.repository ?? options.snapshot;
+    if (!source) throw new StructuredError("internal", "Retrieval source is missing.", false);
+    const generationId = source.generationId;
+    const fingerprint = source.fingerprint;
+    const revision = source.revision;
+    const { vector, lexical } = options;
+    const legacyVectorSnapshot = (vector as { readonly snapshot?: unknown }).snapshot;
+    if (options.snapshot && legacyVectorSnapshot && legacyVectorSnapshot !== options.snapshot)
       throw new StructuredError(
         "internal",
         "Vector index is not bound to the corpus snapshot.",
         false
       );
     if (
-      vector.snapshot.generationId !== snapshot.generationId ||
-      lexical.generationId !== snapshot.generationId
+      !sameGeneration(vector, generationId, revision) ||
+      !sameGeneration(lexical, generationId, revision)
     )
       throw new StructuredError(
         "internal",
         "Retrieval backends belong to different generations.",
         false
       );
-    if (
-      vector.snapshot.fingerprint !== snapshot.fingerprint ||
-      lexical.fingerprint !== snapshot.fingerprint
-    )
+    if (!sameFingerprint(vector, fingerprint) || !sameFingerprint(lexical, fingerprint))
       throw new StructuredError(
         "internal",
         "Retrieval backends belong to a different corpus.",
         false
       );
-    const pinned = snapshot.pin();
+    const pinned = source.pin?.() ?? source;
     this.snapshot = Object.freeze({
       corpus: pinned,
       vector,
       lexical,
-      generationId: snapshot.generationId,
-      fingerprint: snapshot.fingerprint,
+      generationId,
+      revision,
+      fingerprint,
       close: () => this.close(),
     });
     this.embedding = options.embedding;
@@ -200,10 +227,12 @@ export class Retriever {
     try {
       for (const hit of selected) {
         check(signal);
-        const record = await this.snapshot.corpus.hydrateChunk(hit.path, hit.ordinal);
+        const record = await hydrateChunk(this.snapshot.corpus, hit);
         check(signal);
         this.validateGeneration();
-        if (!record) throw new Error(`Chunk is unavailable: ${hit.path}:${hit.ordinal}`);
+        // A mutable repository may delete a ranked row before hydration. It is
+        // a normal race: omit that result and continue with the next candidate.
+        if (!record) continue;
         hydrated.push(toResult(this.snapshot, hit, record));
       }
     } catch (error) {
@@ -216,10 +245,10 @@ export class Retriever {
     if (
       this.snapshot.corpus.generationId !== this.snapshot.generationId ||
       this.snapshot.corpus.fingerprint !== this.snapshot.fingerprint ||
-      this.snapshot.vector.snapshot.generationId !== this.snapshot.generationId ||
-      this.snapshot.vector.snapshot.fingerprint !== this.snapshot.fingerprint ||
-      this.snapshot.lexical.generationId !== this.snapshot.generationId ||
-      this.snapshot.lexical.fingerprint !== this.snapshot.fingerprint
+      !sameGeneration(this.snapshot.vector, this.snapshot.generationId) ||
+      !sameFingerprint(this.snapshot.vector, this.snapshot.fingerprint) ||
+      !sameGeneration(this.snapshot.lexical, this.snapshot.generationId) ||
+      !sameFingerprint(this.snapshot.lexical, this.snapshot.fingerprint)
     )
       throw new StructuredError("internal", "Retrieval generation changed.", false);
   }
@@ -230,7 +259,7 @@ export class Retriever {
     await Promise.all([
       this.snapshot.vector.close(),
       this.snapshot.lexical.close(),
-      this.snapshot.corpus.release(),
+      this.snapshot.corpus.release?.() ?? Promise.resolve(),
     ]);
   }
 }
@@ -289,6 +318,8 @@ function isCancellationError(error: unknown): boolean {
 
 interface Fused {
   id: string;
+  rowId?: string;
+  canonicalId?: string;
   path: string;
   ordinal: number;
   semanticScore?: number;
@@ -318,6 +349,8 @@ function fuseLenteByPath(
     const next: Fused = {
       ...old,
       id: evidenceIsBetter ? hit.id : (old?.id ?? hit.id),
+      rowId: evidenceIsBetter ? hit.rowId : (old?.rowId ?? hit.rowId),
+      canonicalId: evidenceIsBetter ? hit.canonicalId : (old?.canonicalId ?? hit.canonicalId),
       path: hit.path,
       ordinal: evidenceIsBetter ? hit.ordinal : (old?.ordinal ?? hit.ordinal),
       fusedScore: (old?.fusedScore ?? 0) + 1 / (60 + rank + 1),
@@ -342,6 +375,8 @@ function fuse(semantic: readonly VectorSearchHit[], lexical: readonly LexicalHit
     map.set(key, {
       ...map.get(key),
       id: hit.id,
+      rowId: hit.rowId,
+      canonicalId: hit.canonicalId,
       path: hit.path,
       ordinal: hit.ordinal,
       semanticScore: hit.score,
@@ -354,6 +389,8 @@ function fuse(semantic: readonly VectorSearchHit[], lexical: readonly LexicalHit
     map.set(key, {
       ...old,
       id: old?.id ?? hit.id,
+      rowId: old?.rowId ?? hit.rowId,
+      canonicalId: old?.canonicalId ?? hit.canonicalId,
       path: hit.path,
       ordinal: hit.ordinal,
       lexicalScore: hit.score,
@@ -387,11 +424,11 @@ function uniqueNotes(hits: readonly Fused[], limit: number): Fused[] {
 function toResult(
   snapshot: RetrievalSnapshot,
   hit: Fused,
-  record: BinarySegmentRecord
+  record: RetrievalChunk
 ): RetrievalResult {
-  const note = snapshot.corpus.getNote(hit.path);
-  let canonicalId = hit.id;
-  if (note) {
+  const note = snapshot.corpus.getNote?.(hit.path);
+  let canonicalId = hit.canonicalId ?? record.canonicalId ?? hit.id;
+  if (note && hit.canonicalId === undefined && record.canonicalId === undefined) {
     try {
       canonicalId = chunkId(note.contentId, hit.ordinal);
     } catch {
@@ -405,9 +442,67 @@ function toResult(
     excerpt: record.text.slice(0, 500),
     generationId: snapshot.generationId,
     chunkId: canonicalId,
+    rowId: hit.rowId ?? record.rowId,
     ordinal: hit.ordinal,
     semanticScore: hit.semanticScore,
     lexicalScore: hit.lexicalScore,
     fusedScore: hit.fusedScore,
   };
+}
+
+function sameGeneration(
+  backend: {
+    readonly generationId?: string;
+    readonly revision?: IndexRevision;
+    readonly fingerprint?: string;
+  },
+  generationId: string,
+  revision?: IndexRevision
+): boolean {
+  const legacySnapshot = (
+    backend as {
+      readonly snapshot?: {
+        readonly generationId?: string;
+        readonly fingerprint?: string;
+        readonly revision?: IndexRevision;
+      };
+    }
+  ).snapshot;
+  const actualGeneration = backend.generationId ?? legacySnapshot?.generationId;
+  const actualRevision = backend.revision ?? legacySnapshot?.revision;
+  return (
+    (actualGeneration === undefined || actualGeneration === generationId) &&
+    (revision === undefined || actualRevision === undefined || actualRevision === revision)
+  );
+}
+
+function sameFingerprint(backend: { readonly fingerprint?: string }, fingerprint: string): boolean {
+  const legacySnapshot = (backend as { readonly snapshot?: { readonly fingerprint?: string } })
+    .snapshot;
+  const actualFingerprint = backend.fingerprint ?? legacySnapshot?.fingerprint;
+  return actualFingerprint === undefined || actualFingerprint === fingerprint;
+}
+
+async function hydrateChunk(
+  source: RetrievalSource,
+  hit: Fused
+): Promise<RetrievalChunk | undefined> {
+  if (isMutableRepository(source)) {
+    const row: RetrievalRow = {
+      ...(hit.rowId === undefined ? {} : { rowId: hit.rowId }),
+      ...(hit.canonicalId === undefined ? {} : { canonicalId: hit.canonicalId }),
+      ...(hit.id === undefined ? {} : { id: hit.id }),
+      path: hit.path,
+      ordinal: hit.ordinal,
+    };
+    if (source.hydrateRow) return source.hydrateRow(row);
+    return source.hydrateChunk?.(hit.rowId ?? hit.canonicalId ?? hit.id);
+  }
+  return source.hydrateChunk(hit.path, hit.ordinal);
+}
+
+function isMutableRepository(source: RetrievalSource): source is RetrievalRepository & {
+  hydrateRow?: (row: RetrievalRow) => Promise<RetrievalChunk | undefined>;
+} {
+  return "revision" in source;
 }

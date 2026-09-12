@@ -90,6 +90,7 @@ function projectedApp() {
     getLeaf: () => ({ setViewState: vi.fn() }),
   };
   return {
+    __tramaTestBackend: "memory" as const,
     vault,
     workspace,
     metadataCache: { getFirstLinkpathDest: () => null, getFileCache: () => ({ links: [] }) },
@@ -726,7 +727,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
@@ -749,7 +750,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     vi.spyOn((plugin as any).index, "build").mockRejectedValue(new Error("cancelled"));
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
     await rebuild();
     expect((plugin as any).indexReady).toBe(false);
@@ -1028,7 +1029,7 @@ describe("TramaPlugin lifecycle integration", () => {
       statuses.push(`${value.kind}:${value.revision}`)
     );
     const indexCommand = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0];
     expect(indexCommand.checkCallback(true)).toBe(true);
     indexCommand.callback();
@@ -1061,7 +1062,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const command = (plugin as any).addCommand.mock.calls.find(
-      ([item]: [{ id: string }]) => item.id === "index-filo-vault"
+      ([item]: [{ id: string }]) => item.id === "reindex-filo-vault"
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
@@ -1081,7 +1082,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const command = (plugin as any).addCommand.mock.calls.find(
-      ([item]: [{ id: string }]) => item.id === "index-filo-vault"
+      ([item]: [{ id: string }]) => item.id === "reindex-filo-vault"
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));

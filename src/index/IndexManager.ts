@@ -13,18 +13,25 @@ import {
   INDEX_SCHEMA_VERSION,
   chunkMarkdown,
 } from "@/index/chunking";
-import {
-  CorpusStore,
-  type CorpusSnapshot,
-  type CorpusTransaction,
-  type IncrementalChange,
-} from "@/index/corpus/CorpusStore";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import type { IndexFingerprint, IndexVaultDocument, IndexVaultPort } from "@/index/contracts";
+export type { IndexFingerprint, IndexVaultDocument, IndexVaultPort } from "@/index/contracts";
+import { compareCodeUnits } from "@/index/order";
 import { deriveNoteContentId, sha256Hex } from "@/index/corpus/Hash";
-import { ExactVectorIndex } from "@/index/vector/ExactVectorIndex";
-import { OramaLexicalIndex } from "@/index/lexical/OramaLexicalIndex";
 import { Retriever, type RetrievalResult } from "@/index/retrieval/Retriever";
-import type { IndexStorage } from "@/index/storage";
+import {
+  TalaDbEngine,
+  TalaDbRepository,
+  TalaLexicalIndex,
+  TalaVectorIndex,
+  createTalaNamespace,
+  TALA_NAMESPACE_VERSION,
+  TalaCheckpointStore,
+  type TalaCheckpoint,
+  type TalaNamespace,
+  type TalaNoteInput,
+  type TalaState,
+} from "@/index/taladb";
+import type { IndexStorage } from "@/index/taladb/storage";
 import {
   NOOP_TRAMA_DIAGNOSTICS,
   emitTramaDiagnostic,
@@ -33,37 +40,6 @@ import {
   type TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
 
-export interface IndexVaultDocument {
-  readonly path: string;
-  readonly content: string;
-  readonly revision?: string;
-}
-export interface IndexVaultPort {
-  listMarkdownPaths(signal: AbortSignal): Promise<readonly string[]>;
-  readMarkdown(path: string, signal: AbortSignal): Promise<IndexVaultDocument>;
-  /** Live plugin-owned index eligibility; omitted by non-Obsidian test ports. */
-  isIndexEligible?(path: string): boolean;
-  isMarkdownAvailable?(path: string, signal: AbortSignal): Promise<boolean>;
-  estimateMarkdownTextCount?(
-    paths: readonly string[],
-    chunkSize: number,
-    overlap: number,
-    signal: AbortSignal
-  ): Promise<number | undefined>;
-}
-export interface IndexFingerprint {
-  readonly embeddingBaseUrl: string;
-  readonly modelId: string;
-  readonly dimensions: number;
-  readonly excludedPaths: readonly string[];
-  readonly chunking: {
-    readonly algorithmVersion: number;
-    readonly size: number;
-    readonly overlap: number;
-  };
-  readonly extractionVersion: number;
-  readonly schemaVersion: number;
-}
 export interface RelatedIndexHit {
   readonly path: string;
   readonly score: number;
@@ -94,38 +70,28 @@ interface Queued {
   revision: number;
 }
 interface Bundle {
-  readonly snapshot: CorpusSnapshot;
+  readonly repository: TalaDbRepository;
   readonly retriever: Retriever;
-  readonly number: number;
-  leases: number;
-  retired: boolean;
-  closePromise?: Promise<void>;
-}
-
-export interface LenteBundleLease {
   readonly generationId: string;
-  readonly retriever: Retriever;
-  search(
-    query: string,
-    mode: "hybrid" | "lexical",
-    signal?: AbortSignal
-  ): Promise<readonly RetrievalResult[]>;
-  release(): Promise<void>;
+  leases: number;
 }
-interface FullIndexPlan {
-  readonly paths: readonly string[];
-  readonly estimatedTexts?: number;
+interface ManagerOptions {
+  readonly size?: number;
+  readonly overlap?: number;
+  readonly excludedPaths?: readonly string[];
+  readonly isIndexEligible?: (path: string) => boolean;
+  readonly onProgress?: (progress: IndexProgress) => void;
+  /** Test-only injection. Production composition leaves this unset and uses native TalaDB. */
+  readonly engine?: TalaDbEngine;
+  readonly backend?: "native" | "memory";
+  readonly namespace?: TalaNamespace;
 }
 
 export function createIndexFingerprint(
   embeddingBaseUrl: string,
   modelId: string,
   dimensions: number,
-  options: {
-    readonly size?: number;
-    readonly overlap?: number;
-    readonly excludedPaths?: readonly string[];
-  } = {}
+  options: Pick<ManagerOptions, "size" | "overlap" | "excludedPaths"> = {}
 ): IndexFingerprint {
   return {
     embeddingBaseUrl: embeddingBaseUrl.trim().replace(/\/$/, "").toLowerCase(),
@@ -153,38 +119,41 @@ function check(signal: AbortSignal): void {
   if (signal.aborted) throw new StructuredError("cancelled", "Index operation cancelled.", true);
 }
 
+/** Direct TalaDB production lifecycle. The legacy corpus backends are intentionally absent. */
 export class IndexManager implements VaultSearchPort {
   private active: Bundle | null = null;
-  private building = false;
+  private engine?: TalaDbEngine;
   private loaded = false;
   private unavailable = false;
   private loadPromise?: Promise<boolean>;
   private buildPromise?: Promise<void>;
+  private building = false;
+  private closed = false;
+  private closePromise?: Promise<void>;
   private generation = 0;
-  private epoch = 0;
   private revision = 0;
+  private writer: Promise<void> = Promise.resolve();
   private readonly queued = new Map<string, Queued>();
   private lastReconciliationPublished = false;
-  private readonly corpus: CorpusStore;
+  private namespace: TalaNamespace;
+  private readonly namespaceExplicit: boolean;
   private readonly onProgress?: (progress: IndexProgress) => void;
+  private fingerprintCache = "";
+
   constructor(
     private readonly vault: IndexVaultPort,
     private readonly embedding: EmbeddingModel,
-    storage: IndexStorage,
+    private readonly storage: IndexStorage,
     private readonly embeddingBaseUrl: string,
     private readonly modelId: string,
-    private readonly options: {
-      readonly size?: number;
-      readonly overlap?: number;
-      readonly excludedPaths?: readonly string[];
-      /** Fixed eligibility predicate for this index fingerprint. */
-      readonly isIndexEligible?: (path: string) => boolean;
-      readonly onProgress?: (progress: IndexProgress) => void;
-    } = {},
+    private readonly options: ManagerOptions = {},
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {
-    this.corpus = new CorpusStore(storage, diagnostics);
+    this.namespace =
+      options.namespace ?? options.engine?.namespace ?? createTalaNamespace("pending");
+    this.namespaceExplicit = Boolean(options.namespace ?? options.engine?.namespace);
     this.onProgress = options.onProgress;
+    if (options.engine) this.engine = options.engine;
   }
   fingerprint(): IndexFingerprint {
     return createIndexFingerprint(
@@ -203,274 +172,212 @@ export class IndexManager implements VaultSearchPort {
   hasUsableIndex(): boolean {
     return this.active !== null && !this.unavailable;
   }
+  isSyncNeeded(): boolean {
+    return this.engine?.state().syncNeeded ?? false;
+  }
+  state(): TalaState | undefined {
+    return this.engine?.state();
+  }
+
   async load(options: { readonly emitDiagnostics?: boolean } = {}): Promise<boolean> {
     if (!this.loadPromise) this.loadPromise = this.loadPersisted(options.emitDiagnostics === true);
     return this.loadPromise;
   }
   private async loadPersisted(emit: boolean): Promise<boolean> {
+    if (this.closed) return false;
+    let loadPhase = "namespace";
+    await this.loadNamespaceIdentity();
+    loadPhase = "marker";
+    const marker = await this.storage.read(this.statePath());
+    // No pointer means no database open, schema creation, embedding, or network work.
+    if (!marker) {
+      this.loaded = true;
+      return false;
+    }
     const started = Date.now();
-    const observable = emit || this.diagnostics !== NOOP_TRAMA_DIAGNOSTICS;
-    if (observable)
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "load",
-        stage: "started",
-        phase: "validate-corpus",
-      });
     try {
-      const snapshot = await this.corpus.load();
-      if (observable)
-        this.emit({
-          area: "index",
-          event: "index_operation",
-          operation: "load",
-          stage: "completed",
-          phase: "validate-corpus",
-          durationMs: Date.now() - started,
-          generation: snapshot.generationId,
-          counts: {
-            notes: snapshot.notes.length,
-            chunks: snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0),
-          },
-        });
-      if (snapshot.fingerprint !== (await this.fingerprintId()))
+      const state = JSON.parse(marker) as TalaState;
+      loadPhase = "fingerprint";
+      const fingerprint = await this.fingerprintId();
+      if (state.fingerprint !== fingerprint || state.dimensions !== this.embedding.dimensions)
         throw new Error("Index fingerprint mismatch");
-      this.active = await this.derive(snapshot, 0, undefined, "startup");
-      this.generation = 1;
+      loadPhase = "open-engine";
+      await this.openEngine(state);
+      loadPhase = "publish";
+      await this.publishBundle();
       this.unavailable = false;
-      if (observable)
+      if (emit)
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "completed",
           durationMs: Date.now() - started,
-          generation: snapshot.generationId,
+          generation: this.active?.generationId,
         });
       return true;
     } catch (error) {
       this.active = null;
       this.unavailable = false;
-      if (observable)
+      if (emit)
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "failed",
           durationMs: Date.now() - started,
-          error: projectDiagnosticError(error),
+          error: { ...projectDiagnosticError(error), code: `load-${loadPhase}` },
         });
       return false;
     } finally {
       this.loaded = true;
     }
   }
-  private async derive(
-    snapshot: CorpusSnapshot,
-    number: number,
-    signal?: AbortSignal,
-    operation: "full" | "incremental" | "startup" = "full"
-  ): Promise<Bundle> {
-    check(signal ?? new AbortController().signal);
-    const chunkCount = snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0);
-    const vectorStarted = Date.now();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation,
-      stage: "started",
-      phase: "build-vector",
-      counts: { notes: snapshot.notes.length, chunks: chunkCount },
-      generation: snapshot.generationId,
-    });
-    this.reportProgress(
-      {
-        operation,
-        phase: "build-vector",
-        completed: 0,
-        total: chunkCount,
-        unit: "chunks",
-        determinate: true,
-        generationId: snapshot.generationId,
-      },
-      operation !== "startup"
-    );
-    const vector = await ExactVectorIndex.open(snapshot);
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation,
-      stage: "completed",
-      phase: "build-vector",
-      durationMs: Date.now() - vectorStarted,
-      counts: { chunks: chunkCount },
-      generation: snapshot.generationId,
-    });
-    this.reportProgress(
-      {
-        operation,
-        phase: "build-vector",
-        completed: chunkCount,
-        total: chunkCount,
-        unit: "chunks",
-        determinate: true,
-        generationId: snapshot.generationId,
-      },
-      operation !== "startup"
-    );
+  private namespaceMetadataPath(): string {
+    const root = this.storage.root.replace(/\/$/, "");
+    const prefix = `${root}/`;
+    return this.namespace.root.startsWith(prefix)
+      ? `${TALA_NAMESPACE_VERSION}/namespace.json`
+      : `${root}/${TALA_NAMESPACE_VERSION}/namespace.json`;
+  }
+  private async loadNamespaceIdentity(): Promise<void> {
+    if (this.namespaceExplicit) return;
+    const marker = await this.storage.read(this.namespaceMetadataPath());
+    if (!marker) return;
     try {
-      const lexicalStarted = Date.now();
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "started",
-        phase: "build-lexical",
-        counts: { chunks: chunkCount },
-        generation: snapshot.generationId,
-      });
-      this.reportProgress(
-        {
-          operation,
-          phase: "build-lexical",
-          completed: 0,
-          total: chunkCount,
-          unit: "chunks",
-          determinate: true,
-          generationId: snapshot.generationId,
-        },
-        operation !== "startup"
-      );
-      const lexical = await OramaLexicalIndex.build(snapshot, {
-        signal,
-        profile: "lente",
-        onProgress: (progress) =>
-          this.reportProgress(
-            {
-              operation,
-              phase: "build-lexical",
-              completed: progress.completed,
-              total: progress.total,
-              unit: "chunks",
-              determinate: progress.total !== undefined,
-              generationId: snapshot.generationId,
-            },
-            operation !== "startup"
-          ),
-      });
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "completed",
-        phase: "build-lexical",
-        durationMs: Date.now() - lexicalStarted,
-        counts: { chunks: chunkCount },
-        generation: snapshot.generationId,
-      });
-      try {
-        return {
-          snapshot,
-          retriever: new Retriever({ snapshot, vector, lexical, embedding: this.embedding }),
-          number,
-          leases: 0,
-          retired: false,
-        };
-      } catch (e) {
-        await lexical.close();
-        throw e;
-      }
-    } catch (e) {
-      await vector.close();
-      throw e;
+      const value = JSON.parse(marker) as { version?: number; id?: string };
+      if (value.version !== 1 || typeof value.id !== "string") throw new Error("invalid");
+      this.namespace = createTalaNamespace(value.id);
+    } catch {
+      // An invalid identity makes the persisted index unavailable; it must not
+      // cause startup to select another vault's database.
+      this.namespace = createTalaNamespace("pending");
     }
   }
+  private async persistNamespaceIdentity(): Promise<void> {
+    if (this.namespaceExplicit) return;
+    await this.storage.prepare?.();
+    await this.storage.write(
+      this.namespaceMetadataPath(),
+      JSON.stringify({ version: 1, id: this.namespace.root.split("/").at(-1) })
+    );
+  }
+  private newNamespace(): TalaNamespace {
+    const id =
+      typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+    return createTalaNamespace(id);
+  }
+  private statePath(): string {
+    const root = this.storage.root.replace(/\/$/, "");
+    if (root === this.namespace.root) return "state.json";
+    const prefix = `${root}/`;
+    const relativeRoot = this.namespace.root.startsWith(prefix)
+      ? this.namespace.root.slice(prefix.length)
+      : this.namespace.root;
+    return `${relativeRoot}/state.json`;
+  }
+  private createEngine(initialState?: TalaState): TalaDbEngine {
+    // The native backend is the only production default. Tests must opt in to
+    // the in-memory backend explicitly through ManagerOptions.backend or an
+    // injected engine; never infer it from a storage class name.
+    const backend = this.options.backend ?? "native";
+    return new TalaDbEngine({
+      namespace: this.namespace,
+      dimensions: this.embedding.dimensions,
+      fingerprint: this.fingerprintCache,
+      backend,
+      initialState,
+      durability: {
+        writeState: async (state) => this.storage.write(this.statePath(), JSON.stringify(state)),
+      },
+    });
+  }
+  private async openEngine(initialState?: TalaState): Promise<void> {
+    if (!this.engine) {
+      this.fingerprintCache = await this.fingerprintId();
+      this.engine = this.createEngine(initialState);
+    }
+    await this.engine.open();
+  }
+  private async ensureEngineForMutation(): Promise<TalaDbEngine> {
+    if (!this.engine) {
+      this.fingerprintCache = await this.fingerprintId();
+      this.engine = this.createEngine();
+      await this.engine.open();
+    }
+    return this.engine;
+  }
+  private async publishBundle(): Promise<void> {
+    const engine = this.engine;
+    if (!engine) throw new Error("Tala database is unavailable");
+    const generationId = `taladb-v1:${++this.generation}`;
+    const repository = new TalaDbRepository(engine, generationId, false);
+    const retriever = new Retriever({
+      repository,
+      vector: new TalaVectorIndex(engine, generationId),
+      lexical: new TalaLexicalIndex(engine, generationId),
+      embedding: this.embedding,
+    });
+    this.active = { repository, retriever, generationId: repository.generationId, leases: 0 };
+  }
+  private withWriter<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.writer.then(operation, operation);
+    this.writer = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }
+
   async build(signal: AbortSignal): Promise<void> {
-    if (this.building) throw new StructuredError("busy", "Index rebuild is already running.", true);
-    const run = this.buildInternal(signal);
-    this.buildPromise = run;
+    if (this.building || this.buildPromise)
+      throw new StructuredError("busy", "Index rebuild is already running.", true);
+    const run = this.withWriter(() => this.buildInternal(signal));
+    this.buildPromise = run.then(() => undefined);
     try {
       await run;
     } finally {
-      if (this.buildPromise === run) this.buildPromise = undefined;
+      this.buildPromise = undefined;
     }
-  }
-  /** Synchronizes the committed corpus, embedding only notes whose content changed. */
-  async synchronize(signal: AbortSignal): Promise<void> {
-    await this.synchronizeWithPublication(signal);
-  }
-
-  async synchronizeWithPublication(signal: AbortSignal): Promise<boolean> {
-    if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
-    check(signal);
-    if (!this.loaded) await this.load();
-    if (!this.active || this.unavailable) {
-      await this.build(signal);
-      return true;
-    }
-
-    const paths = [...(await this.vault.listMarkdownPaths(signal))]
-      .map(normalizePath)
-      .filter((path) => this.isIndexEligible(path))
-      .sort();
-    const present = new Set(paths);
-    for (const path of paths)
-      this.queueOperation({ kind: this.active.snapshot.getNote(path) ? "modify" : "create", path });
-    for (const note of this.active.snapshot.notes)
-      if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
-    return this.reconcileQueuedChangesWithPublication(signal);
-  }
-
-  async waitForBuild(): Promise<void> {
-    await this.buildPromise;
   }
   private async buildInternal(signal: AbortSignal): Promise<void> {
-    if (this.building) throw new StructuredError("busy", "Index rebuild is already running.", true);
-    check(signal);
     this.building = true;
-    this.corpus.enableDiagnostics();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "full",
-      stage: "started",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
-    });
-    this.reportProgress({
-      operation: "full",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
-    });
-    const epoch = ++this.epoch;
     const started = Date.now();
-    let tx: CorpusTransaction | undefined;
-    let bundle: Bundle | undefined;
-    let encodedArtifacts = 0;
     try {
-      if (!this.loaded) await this.load();
-      const plan = await this.planFullIndex(signal);
-      tx = await this.corpus.stage(this.noteInputs(plan, signal), await this.fingerprintId(), {
-        signal,
-        onProgress: (event) => {
-          if (event.phase === "encode-write") {
-            encodedArtifacts = Math.max(encodedArtifacts, event.completed);
-          }
-        },
+      check(signal);
+      const paths = [...(await this.vault.listMarkdownPaths(signal))]
+        .map(normalizePath)
+        .filter((path) => this.isIndexEligible(path))
+        .sort(compareCodeUnits);
+      this.reportProgress({
+        operation: "full",
+        phase: "discover",
+        completed: paths.length,
+        total: paths.length,
+        unit: "paths",
+        determinate: true,
       });
+      // Enter the dirty state before any embedding work. The same mutable
+      // engine remains queryable while rows are replaced, including a first
+      // build where the initial bundle is empty.
+      if (!this.namespaceExplicit && this.namespace.root.endsWith("/pending")) {
+        this.namespace = this.newNamespace();
+        await this.persistNamespaceIdentity();
+      }
+      const engine = await this.ensureEngineForMutation();
+      await engine.markDirty("rebuilding");
+      await this.publishBundle();
+      const notes = await this.readAndEmbed(paths, signal, "full");
+      await engine.rebuild(notes, signal);
       this.reportProgress({
         operation: "full",
         phase: "encode-write",
-        completed: encodedArtifacts,
-        total: encodedArtifacts,
+        completed: notes.length,
+        total: notes.length,
         unit: "artifacts",
         determinate: true,
-        generationId: tx.snapshot.generationId,
       });
       this.reportProgress({
         operation: "full",
@@ -479,23 +386,23 @@ export class IndexManager implements VaultSearchPort {
         total: 1,
         unit: "artifacts",
         determinate: true,
-        generationId: tx.snapshot.generationId,
       });
-      check(signal);
-      if (epoch !== this.epoch)
-        throw new StructuredError("cancelled", "Index rebuild cancelled.", true);
-      bundle = await this.derive(tx.snapshot, ++this.generation, signal);
       this.reportProgress({
         operation: "full",
-        phase: "activate",
-        completed: 0,
+        phase: "build-vector",
+        completed: 1,
         total: 1,
-        unit: "artifacts",
+        unit: "chunks",
         determinate: true,
-        generationId: tx.snapshot.generationId,
       });
-      check(signal);
-      await tx.commit();
+      this.reportProgress({
+        operation: "full",
+        phase: "build-lexical",
+        completed: 1,
+        total: 1,
+        unit: "chunks",
+        determinate: true,
+      });
       this.reportProgress({
         operation: "full",
         phase: "activate",
@@ -503,24 +410,19 @@ export class IndexManager implements VaultSearchPort {
         total: 1,
         unit: "artifacts",
         determinate: true,
-        generationId: tx.snapshot.generationId,
       });
-      const published = bundle;
-      bundle = undefined;
-      await this.swap(published);
+      await this.publishBundle();
       this.unavailable = false;
-      await this.collectGarbage("full", tx.snapshot.generationId);
       this.emit({
         area: "index",
         event: "index_operation",
         operation: "build",
         stage: "published",
-        generation: tx.snapshot.generationId,
+        generation: this.active?.generationId,
         durationMs: Date.now() - started,
       });
     } catch (error) {
-      if (bundle) await bundle.retriever.close().catch(() => undefined);
-      if (tx) await tx.abort().catch(() => undefined);
+      if (this.engine) await this.publishBundle().catch(() => undefined);
       this.emit({
         area: "index",
         event: "index_operation",
@@ -534,144 +436,344 @@ export class IndexManager implements VaultSearchPort {
       this.building = false;
     }
   }
-  private async planFullIndex(signal: AbortSignal): Promise<FullIndexPlan> {
-    const paths = [...(await this.vault.listMarkdownPaths(signal))]
-      .map(normalizePath)
-      .filter((path) => this.isIndexEligible(path))
-      .sort();
+  private async readAndEmbed(
+    paths: readonly string[],
+    signal: AbortSignal,
+    operation: "full" | "incremental"
+  ): Promise<TalaNoteInput[]> {
+    const fingerprint = await this.fingerprintId();
+    const result: TalaNoteInput[] = [];
+    let embedded = 0;
+    let chunked = 0;
     this.reportProgress({
-      operation: "full",
-      phase: "discover",
-      completed: paths.length,
-      total: paths.length,
-      unit: "paths",
-      determinate: true,
-    });
-    const estimatedTexts = await this.vault.estimateMarkdownTextCount?.(
-      paths,
-      this.options.size ?? CHUNK_SIZE,
-      this.options.overlap ?? CHUNK_OVERLAP,
-      signal
-    );
-    this.reportProgress({
-      operation: "full",
+      operation,
       phase: "read",
-      completed: paths.length,
+      completed: 0,
       total: paths.length,
       unit: "notes",
       determinate: true,
-      estimated: true,
     });
-    this.reportProgress({
-      operation: "full",
-      phase: "chunk",
-      completed: 0,
-      ...(estimatedTexts === undefined ? {} : { total: estimatedTexts }),
-      unit: "texts",
-      determinate: estimatedTexts !== undefined,
-      estimated: estimatedTexts !== undefined,
-    });
-    return { paths, ...(estimatedTexts === undefined ? {} : { estimatedTexts }) };
-  }
-
-  private async *noteInputs(
-    plan: FullIndexPlan,
-    signal: AbortSignal
-  ): AsyncIterable<{
-    path: string;
-    contentId: string;
-    records: Array<{
-      ordinal: number;
-      startLine: number;
-      endLine: number;
-      text: string;
-      vector: readonly number[];
-    }>;
-  }> {
-    const fingerprint = await this.fingerprintId();
-    let embedded = 0;
-    const estimateFields = (completed: number) =>
-      plan.estimatedTexts !== undefined && completed <= plan.estimatedTexts
-        ? { total: plan.estimatedTexts, determinate: true as const, estimated: true }
-        : { determinate: false as const };
-    this.reportProgress({
-      operation: "full",
-      phase: "embed",
-      completed: 0,
-      ...estimateFields(0),
-      unit: "texts",
-    });
-    for (const path of plan.paths) {
+    for (const path of paths) {
       check(signal);
-      if (!this.isIndexEligible(path)) continue;
-      const doc = await this.readMarkdownIfAvailable(path, signal, "full");
+      const doc = await this.readMarkdownIfAvailable(path, signal, operation);
       if (!doc) continue;
+      this.reportProgress({
+        operation,
+        phase: "read",
+        completed: result.length + 1,
+        total: paths.length,
+        unit: "notes",
+        determinate: true,
+      });
       const chunks = chunkMarkdown(
         doc.content,
         this.options.size ?? CHUNK_SIZE,
         this.options.overlap ?? CHUNK_OVERLAP,
         signal
       );
+      chunked += chunks.length;
+      this.reportProgress({
+        operation,
+        phase: "chunk",
+        completed: chunked,
+        unit: "chunks",
+        determinate: false,
+      });
       const vectors = chunks.length
         ? await this.embedding.embed(
             chunks.map((c) => c.text),
             signal,
             (progress) =>
               this.reportProgress({
-                operation: "full",
+                operation,
                 phase: "embed",
                 completed: embedded + progress.completed,
-                ...estimateFields(embedded + progress.completed),
                 unit: "texts",
+                determinate: false,
               })
           )
         : [];
-      embedded += chunks.length;
-      this.reportProgress({
-        operation: "full",
-        phase: "embed",
-        completed: embedded,
-        ...estimateFields(embedded),
-        unit: "texts",
-      });
       if (
         vectors.length !== chunks.length ||
-        vectors.some((v) => v.length !== this.embedding.dimensions)
+        vectors.some((vector) => vector.length !== this.embedding.dimensions)
       )
         throw new StructuredError(
           "internal",
           "Embedding dimensions changed during indexing.",
           false
         );
-      yield {
+      embedded += chunks.length;
+      this.reportProgress({
+        operation,
+        phase: "embed",
+        completed: embedded,
+        total: operation === "full" ? embedded : undefined,
+        unit: "texts",
+        determinate: operation === "full",
+      });
+      result.push({
         path,
+        content: doc.content,
         contentId: await deriveNoteContentId(fingerprint, doc.content),
-        records: chunks.map((c, i) => ({ ...c, ordinal: i, vector: vectors[i] })),
-      };
+        chunks: chunks.map((chunk, ordinal) => ({ ...chunk, ordinal, vector: vectors[ordinal] })),
+      });
     }
     this.reportProgress({
-      operation: "full",
-      phase: "embed",
-      completed: embedded,
-      total: embedded,
-      unit: "texts",
+      operation,
+      phase: "read",
+      completed: paths.length,
+      total: paths.length,
+      unit: "notes",
       determinate: true,
     });
-  }
-  private async swap(bundle: Bundle): Promise<void> {
-    const old = this.active;
-    this.active = bundle;
-    if (old) await this.retireBundle(old);
+    this.reportProgress({
+      operation,
+      phase: "chunk",
+      completed: chunked,
+      total: chunked,
+      unit: "chunks",
+      determinate: true,
+    });
+    return result;
   }
 
-  /** Acquires a generation-stable reader for Lente. Retired bundles remain alive until release. */
-  acquireLenteLease(): LenteBundleLease | null {
+  async synchronize(signal: AbortSignal): Promise<void> {
+    await this.synchronizeWithPublication(signal);
+  }
+  async synchronizeWithPublication(signal: AbortSignal): Promise<boolean> {
+    check(signal);
+    if (!this.loaded) await this.load();
+    if (!this.active || this.unavailable)
+      throw new StructuredError("unavailable", "Rebuild index is required.", true);
+    const paths = [...(await this.vault.listMarkdownPaths(signal))]
+      .map(normalizePath)
+      .filter((path) => this.isIndexEligible(path))
+      .sort(compareCodeUnits);
+    const present = new Set(paths);
+    for (const path of paths) this.queueOperation({ kind: "modify", path });
+    for (const note of this.active.repository.notes)
+      if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
+    return this.reconcileQueuedChangesWithPublication(signal);
+  }
+  async waitForBuild(): Promise<void> {
+    await this.buildPromise;
+  }
+  queueChange(path: string): void {
+    this.queueOperation({ kind: "modify", path });
+  }
+  queueOperation(operation: RevisionOperation): void {
+    const key =
+      operation.kind === "rename" ? `${operation.oldPath}\0${operation.path}` : operation.path;
+    this.queued.set(key, { operation, revision: ++this.revision });
+  }
+  queueRename(oldPath: string, path: string): void {
+    this.queueOperation({ kind: "rename", oldPath, path });
+  }
+  async reconcileQueuedChanges(signal: AbortSignal): Promise<void> {
+    this.lastReconciliationPublished = await this.reconcileQueuedChangesWithPublication(signal);
+  }
+  getLastReconciliationPublished(): boolean {
+    return this.lastReconciliationPublished;
+  }
+  async reconcileQueuedChangesWithPublication(signal: AbortSignal): Promise<boolean> {
+    if (!this.queued.size) return false;
+    return this.withWriter(async () => {
+      if (!this.active || this.unavailable)
+        throw new StructuredError("unavailable", "Rebuild index is required.", true);
+      this.building = true;
+      try {
+        const captured = new Map(this.queued);
+        const base = new Map(this.active.repository.notes.map((note) => [note.path, note]));
+        const paths = [...(await this.vault.listMarkdownPaths(signal))]
+          .map(normalizePath)
+          .filter((path) => this.isIndexEligible(path))
+          .sort(compareCodeUnits);
+        const docs = new Map<string, IndexVaultDocument>();
+        const skipped = new Set<string>();
+        for (const path of paths) {
+          const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
+          if (doc) docs.set(path, doc);
+          else skipped.add(path);
+        }
+        const fingerprint = await this.fingerprintId();
+        const desired = new Map<string, { doc: IndexVaultDocument; contentId: string }>();
+        for (const [path, doc] of docs)
+          desired.set(path, {
+            doc,
+            contentId: await deriveNoteContentId(fingerprint, doc.content),
+          });
+        // Explicit delete requests are authoritative even when a test/tool vault
+        // still exposes the file; ordinary update scans use modify operations.
+        for (const { operation } of captured.values())
+          if (operation.kind === "delete") desired.delete(normalizePath(operation.path));
+          else if (operation.kind === "rename") desired.delete(normalizePath(operation.oldPath));
+        const changed =
+          [...desired].some(([path, value]) => base.get(path)?.contentId !== value.contentId) ||
+          [...base].some(([path]) => !desired.has(path) && !skipped.has(path));
+        if (!changed) {
+          this.clearCaptured(captured);
+          return false;
+        }
+        const engine = await this.ensureEngineForMutation();
+        await engine.markDirty("syncing");
+        await this.publishBundle();
+        for (const [path] of base)
+          if (!desired.has(path) && !skipped.has(path)) await engine.delete(path);
+        for (const [path, value] of desired) {
+          const old = [...base].find(
+            ([oldPath, note]) =>
+              oldPath !== path && note.contentId === value.contentId && !desired.has(oldPath)
+          );
+          if (old) {
+            const oldCheckpoint = await engine.noteChunks(old[0]);
+            await engine.delete(old[0]);
+            if (oldCheckpoint.length) {
+              await engine.reconcile({
+                path,
+                content: value.doc.content,
+                contentId: value.contentId,
+                chunks: oldCheckpoint,
+              });
+              continue;
+            }
+          }
+          if (base.get(path)?.contentId === value.contentId) continue;
+          const note = (await this.readAndEmbed([path], signal, "incremental"))[0];
+          if (note) await engine.reconcile(note);
+        }
+        await engine.commitReady();
+        this.reportProgress({
+          operation: "incremental",
+          phase: "encode-write",
+          completed: 1,
+          total: 1,
+          unit: "artifacts",
+          determinate: true,
+        });
+        this.reportProgress({
+          operation: "incremental",
+          phase: "validate",
+          completed: 1,
+          total: 1,
+          unit: "artifacts",
+          determinate: true,
+        });
+        this.reportProgress({
+          operation: "incremental",
+          phase: "build-vector",
+          completed: 1,
+          total: 1,
+          unit: "chunks",
+          determinate: true,
+        });
+        this.reportProgress({
+          operation: "incremental",
+          phase: "build-lexical",
+          completed: 1,
+          total: 1,
+          unit: "chunks",
+          determinate: true,
+        });
+        this.reportProgress({
+          operation: "incremental",
+          phase: "activate",
+          completed: 1,
+          total: 1,
+          unit: "artifacts",
+          determinate: true,
+        });
+        this.clearCaptured(captured);
+        await this.publishBundle();
+        return true;
+      } catch (error) {
+        if (this.engine) await this.publishBundle().catch(() => undefined);
+        throw error;
+      } finally {
+        this.building = false;
+      }
+    });
+  }
+
+  /** Export is deliberately explicit; startup never restores checkpoints. */
+  async exportCheckpoint(): Promise<TalaCheckpoint> {
+    if (this.building) throw new StructuredError("busy", "Index operation is running.", true);
+    if (!this.engine || !this.active || this.engine.state().status !== "ready")
+      throw new StructuredError("unavailable", "A ready index is required.", true);
+    const checkpoint = await this.engine.exportCheckpoint();
+    await this.storage.prepare?.();
+    await this.checkpointStore().export(checkpoint);
+    return checkpoint;
+  }
+  async importCheckpoint(signal: AbortSignal): Promise<TalaState> {
+    return this.withWriter(() => this.importCheckpointExclusive(signal));
+  }
+  private async importCheckpointExclusive(signal: AbortSignal): Promise<TalaState> {
+    if (this.building) throw new StructuredError("busy", "Index operation is running.", true);
+    if (!this.loaded) await this.load();
+    let checkpoint: TalaCheckpoint | null;
+    try {
+      checkpoint = await this.checkpointStore().import();
+    } catch {
+      throw new StructuredError("internal", "Checkpoint is corrupt.", false);
+    }
+    if (!checkpoint) throw new StructuredError("unavailable", "No checkpoint is available.", true);
+    const engine = await this.ensureEngineForMutation();
+    if (checkpoint.version !== 1 || checkpoint.namespace !== this.namespace.root)
+      throw new StructuredError("internal", "Checkpoint is incompatible with this index.", false);
+    await engine.markDirty("syncing");
+    try {
+      await engine.importCheckpoint(checkpoint, signal);
+      await engine.commitReady();
+      await this.publishBundle();
+      this.unavailable = false;
+      return engine.state();
+    } catch (error) {
+      this.unavailable = false;
+      await this.publishBundle().catch(() => undefined);
+      throw error;
+    }
+  }
+  private relativeNamespacePath(path: string): string {
+    const root = this.storage.root.replace(/\/$/, "");
+    const prefix = `${root}/`;
+    if (!path.startsWith(prefix)) throw new Error("Checkpoint path is outside index storage");
+    return path.slice(prefix.length);
+  }
+  private checkpointStore(): TalaCheckpointStore {
+    const id = this.namespace.root.split("/").at(-1)!;
+    const checkpointNamespace: TalaNamespace = {
+      ...this.namespace,
+      checkpoint: `.trama/index/${TALA_NAMESPACE_VERSION}/checkpoints/${id}.bin`,
+    };
+    const adapter = {
+      read: (path: string) => this.storage.read(this.relativeNamespacePath(path)),
+      write: (path: string, value: string) =>
+        this.storage.write(this.relativeNamespacePath(path), value),
+      remove: (path: string) => this.storage.remove(this.relativeNamespacePath(path)),
+    };
+    return new TalaCheckpointStore(adapter, checkpointNamespace);
+  }
+  private clearCaptured(captured: Map<string, Queued>): void {
+    for (const [key, value] of captured)
+      if (this.queued.get(key)?.revision === value.revision) this.queued.delete(key);
+  }
+
+  acquireLenteLease(): {
+    readonly generationId: string;
+    readonly retriever: Retriever;
+    search(
+      query: string,
+      mode: "hybrid" | "lexical",
+      signal?: AbortSignal
+    ): Promise<readonly RetrievalResult[]>;
+    release(): Promise<void>;
+  } | null {
     const bundle = this.active;
     if (!bundle || this.unavailable) return null;
     bundle.leases++;
     let released = false;
     return {
-      generationId: bundle.snapshot.generationId,
+      generationId: bundle.generationId,
       retriever: bundle.retriever,
       search: (query, mode, signal) =>
         bundle.retriever.search({
@@ -689,12 +791,9 @@ export class IndexManager implements VaultSearchPort {
         if (released) return;
         released = true;
         bundle.leases = Math.max(0, bundle.leases - 1);
-        if (bundle.retired && bundle.leases === 0) await this.closeBundle(bundle);
       },
     };
   }
-
-  /** Feature-specific Lente retrieval entry point; RAG search remains unchanged. */
   async searchLente(
     query: string,
     mode: "hybrid" | "lexical" = "hybrid",
@@ -706,362 +805,6 @@ export class IndexManager implements VaultSearchPort {
       return await lease.search(query, mode, signal);
     } finally {
       await lease.release();
-    }
-  }
-
-  private async closeBundle(bundle: Bundle): Promise<void> {
-    if (!bundle.closePromise) bundle.closePromise = bundle.retriever.close();
-    await bundle.closePromise;
-  }
-
-  private async retireBundle(bundle: Bundle): Promise<void> {
-    bundle.retired = true;
-    if (bundle.leases === 0) await this.closeBundle(bundle);
-  }
-  queueChange(path: string): void {
-    this.queueOperation({ kind: "modify", path });
-  }
-  queueOperation(operation: RevisionOperation): void {
-    const key =
-      operation.kind === "rename" ? `${operation.oldPath}\0${operation.path}` : operation.path;
-    this.queued.set(key, { operation, revision: ++this.revision });
-  }
-  queueRename(oldPath: string, path: string): void {
-    this.queueOperation({ kind: "rename", oldPath, path });
-  }
-  async reconcileQueuedChanges(signal: AbortSignal): Promise<void> {
-    this.lastReconciliationPublished = await this.reconcileQueuedChangesWithPublication(signal);
-  }
-
-  getLastReconciliationPublished(): boolean {
-    return this.lastReconciliationPublished;
-  }
-
-  async reconcileQueuedChangesWithPublication(signal: AbortSignal): Promise<boolean> {
-    if (!this.queued.size) return false;
-    if (this.building) {
-      await this.buildPromise;
-      return this.reconcileQueuedChangesWithPublication(signal);
-    }
-    if (!this.active || this.unavailable) {
-      await this.build(signal);
-      return true;
-    }
-    const run = this.reconcileIncremental(signal);
-    const pending = run.then(() => undefined);
-    this.buildPromise = pending;
-    void pending.catch(() => undefined);
-    try {
-      return await run;
-    } finally {
-      if (this.buildPromise === pending) this.buildPromise = undefined;
-    }
-  }
-  private async reconcileIncremental(signal: AbortSignal): Promise<boolean> {
-    if (this.building)
-      throw new StructuredError("busy", "Index reconciliation is already running.", true);
-    const captured = new Map(this.queued);
-    this.building = true;
-    this.corpus.enableDiagnostics();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "incremental",
-      stage: "started",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
-    });
-    const epoch = ++this.epoch;
-    let tx: CorpusTransaction | undefined;
-    let bundle: Bundle | undefined;
-    let encodedArtifacts = 0;
-    try {
-      const base = this.active?.snapshot;
-      if (!base) throw new Error("Index base is unavailable");
-      const fingerprint = await this.fingerprintId();
-      const present = new Set(
-        (await this.vault.listMarkdownPaths(signal))
-          .map(normalizePath)
-          .filter((path) => this.isIndexEligible(path))
-      );
-      const virtualNotes = new Map(base.notes.map((note) => [note.path, note.contentId]));
-      const changes: IncrementalChange[] = [];
-      const operations = [...captured.values()].sort((a, b) => a.revision - b.revision);
-      const readableState = new Set(base.notes.map((note) => note.path));
-      let readable = 0;
-      for (const { operation } of operations) {
-        const path = normalizePath(operation.path);
-        if (operation.kind === "rename") {
-          const oldPath = normalizePath(operation.oldPath);
-          if (!present.has(path)) readableState.delete(oldPath);
-          else if (readableState.delete(oldPath)) readableState.add(path);
-          else {
-            readable++;
-            readableState.add(path);
-          }
-        } else if (operation.kind === "delete" || !present.has(path)) {
-          readableState.delete(path);
-        } else if (operation.kind !== "unchanged") {
-          readable++;
-          readableState.add(path);
-        }
-      }
-      this.reportProgress({
-        operation: "incremental",
-        phase: "discover",
-        completed: captured.size,
-        total: captured.size,
-        unit: "paths",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "read",
-        completed: 0,
-        total: readable,
-        unit: "notes",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "chunk",
-        completed: 0,
-        unit: "chunks",
-        determinate: false,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "embed",
-        completed: 0,
-        unit: "texts",
-        determinate: false,
-      });
-      let read = 0;
-      let chunked = 0;
-      let embedded = 0;
-      for (const { operation } of operations) {
-        check(signal);
-        let readableOperation = operation;
-        if (operation.kind === "rename") {
-          const oldPath = normalizePath(operation.oldPath);
-          const newPath = normalizePath(operation.path);
-          if (!present.has(newPath)) {
-            changes.push({ type: "delete", path: oldPath });
-            virtualNotes.delete(oldPath);
-            continue;
-          }
-          const oldContentId = virtualNotes.get(oldPath);
-          if (oldContentId) {
-            changes.push({ type: "rename", path: newPath, previousPath: oldPath });
-            virtualNotes.delete(oldPath);
-            virtualNotes.set(newPath, oldContentId);
-            continue;
-          }
-          // A rename can be observed while a full build is still reading its old
-          // discovery snapshot. If the old path was skipped, index the new path.
-          readableOperation = { kind: "create", path: newPath };
-        }
-        const path = normalizePath(readableOperation.path);
-        if (readableOperation.kind === "unchanged") continue;
-        if (
-          readableOperation.kind === "delete" ||
-          !present.has(path) ||
-          !this.isIndexEligible(path)
-        ) {
-          changes.push({ type: "delete", path });
-          virtualNotes.delete(path);
-          continue;
-        }
-        const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
-        if (!doc) {
-          changes.push({ type: "delete", path });
-          virtualNotes.delete(path);
-          continue;
-        }
-        read++;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "read",
-          completed: read,
-          total: readable,
-          unit: "notes",
-          determinate: true,
-        });
-        const contentId = await deriveNoteContentId(fingerprint, doc.content);
-        if (virtualNotes.get(path) === contentId) continue;
-        const chunks = chunkMarkdown(
-          doc.content,
-          this.options.size ?? CHUNK_SIZE,
-          this.options.overlap ?? CHUNK_OVERLAP,
-          signal
-        );
-        chunked += chunks.length;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "chunk",
-          completed: chunked,
-          unit: "chunks",
-          determinate: false,
-        });
-        const vectors =
-          readableOperation.kind === "empty" || chunks.length === 0
-            ? []
-            : await this.embedding.embed(
-                chunks.map((c) => c.text),
-                signal,
-                (progress) =>
-                  this.reportProgress({
-                    operation: "incremental",
-                    phase: "embed",
-                    completed: embedded + progress.completed,
-                    unit: "texts",
-                    determinate: false,
-                  })
-              );
-        embedded += chunks.length;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "embed",
-          completed: embedded,
-          unit: "texts",
-          determinate: false,
-        });
-        if (vectors.length !== chunks.length) throw new Error("Embedding count mismatch");
-        changes.push({
-          type: readableOperation.kind === "empty" ? "empty" : readableOperation.kind,
-          path,
-          note: {
-            path,
-            contentId,
-            records: chunks.map((c, i) => ({ ...c, ordinal: i, vector: vectors[i] })),
-          },
-        });
-        virtualNotes.set(path, contentId);
-      }
-      this.reportProgress({
-        operation: "incremental",
-        phase: "chunk",
-        completed: chunked,
-        total: chunked,
-        unit: "chunks",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "embed",
-        completed: embedded,
-        total: embedded,
-        unit: "texts",
-        determinate: true,
-      });
-      if (changes.length === 0) {
-        for (const [key, value] of captured)
-          if (this.queued.get(key)?.revision === value.revision) this.queued.delete(key);
-        this.emit({
-          area: "index",
-          event: "index_operation",
-          operation: "incremental",
-          stage: "completed",
-          counts: { changes: 0 },
-        });
-        return false;
-      }
-      tx = await this.corpus.stageIncremental(base, changes, fingerprint, {
-        signal,
-        onProgress: (event) => {
-          if (event.phase === "encode-write") {
-            encodedArtifacts = Math.max(encodedArtifacts, event.completed);
-            this.reportProgress({
-              operation: "incremental",
-              phase: "encode-write",
-              completed: encodedArtifacts,
-              unit: "artifacts",
-              determinate: false,
-            });
-          } else {
-            this.reportProgress({
-              operation: "incremental",
-              phase: "validate",
-              completed: event.completed,
-              ...(event.total === undefined ? {} : { total: event.total }),
-              unit: "artifacts",
-              determinate: event.total !== undefined,
-            });
-          }
-        },
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "encode-write",
-        completed: encodedArtifacts,
-        total: encodedArtifacts,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "validate",
-        completed: 1,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      check(signal);
-      if (epoch !== this.epoch)
-        throw new StructuredError("cancelled", "Index reconciliation cancelled.", true);
-      bundle = await this.derive(tx.snapshot, ++this.generation, signal, "incremental");
-      check(signal);
-      this.reportProgress({
-        operation: "incremental",
-        phase: "activate",
-        completed: 0,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      await tx.commit();
-      this.reportProgress({
-        operation: "incremental",
-        phase: "activate",
-        completed: 1,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      const published = bundle;
-      bundle = undefined;
-      await this.swap(published);
-      await this.collectGarbage("incremental", tx.snapshot.generationId);
-      for (const [key, value] of captured)
-        if (this.queued.get(key)?.revision === value.revision) this.queued.delete(key);
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: "published",
-        generation: tx.snapshot.generationId,
-        counts: { changes: captured.size },
-      });
-      return true;
-    } catch (error) {
-      if (bundle) await bundle.retriever.close().catch(() => undefined);
-      if (tx) await tx.abort().catch(() => undefined);
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: signal.aborted ? "cancelled" : "failed",
-        error: projectDiagnosticError(error),
-      });
-      throw error;
-    } finally {
-      this.building = false;
     }
   }
   async search(
@@ -1082,68 +825,49 @@ export class IndexManager implements VaultSearchPort {
       lexicalCandidateLimit: 80,
       signal,
     });
-    return results.map((r) => this.provenance(r));
+    return results.map((result) => ({
+      path: result.path,
+      startLine: result.startLine,
+      endLine: result.endLine,
+      excerpt: result.excerpt,
+      score: result.fusedScore,
+    }));
   }
   relatedSnapshot(path: string): RelatedIndexSnapshot | null {
     const bundle = this.active;
     if (!bundle || this.unavailable) return null;
     const currentPath = normalizePath(path);
-    const note = bundle.snapshot.getNote(currentPath);
+    const note = bundle.repository.getNote(currentPath);
     if (!note) return null;
     return {
-      generationId: bundle.snapshot.generationId,
+      generationId: bundle.generationId,
       currentPath,
       contentHash: note.contentId,
       prepareQuery: async (signal) => {
         check(signal);
-        const textParts: string[] = [];
-        let textLength = 0;
-        let vectorSum: Float64Array | undefined;
-        let firstVector: readonly number[] | Float32Array | undefined;
-        let vectorCount = 0;
-        for (const view of await bundle.snapshot.hydrateNote(currentPath)) {
-          for (const record of view.segment.records) {
-            check(signal);
-            if (!vectorSum) vectorSum = new Float64Array(record.vector.length);
-            if (record.vector.length !== vectorSum.length)
-              throw new StructuredError(
-                "internal",
-                "Related-note vector dimensions changed within the committed note.",
-                false
-              );
-            firstVector ??= record.vector;
-            for (let i = 0; i < vectorSum.length; i++) vectorSum[i] += record.vector[i];
-            vectorCount++;
-            if (textLength < CHUNK_SIZE) {
-              const separator = textParts.length ? "\n\n" : "";
-              const remaining = CHUNK_SIZE - textLength - separator.length;
-              if (remaining > 0) {
-                const piece = record.text.slice(0, remaining);
-                if (piece) {
-                  textParts.push(`${separator}${piece}`);
-                  textLength += separator.length + piece.length;
-                }
-              }
-            }
-          }
-        }
-        if (!vectorSum || !firstVector || vectorCount === 0) return null;
-        let normSquared = 0;
-        for (const value of vectorSum) normSquared += value * value;
-        const norm = Math.sqrt(normSquared);
-        const vector =
-          norm > 1e-12 ? Array.from(vectorSum, (value) => value / norm) : Array.from(firstVector);
-        return { text: textParts.join(""), vector };
+        const chunks = (await this.engine?.noteChunks(currentPath)) ?? [];
+        if (!chunks.length) return null;
+        const text = chunks
+          .map((chunk) => chunk.text)
+          .join("\n\n")
+          .slice(0, CHUNK_SIZE);
+        const sum = new Float64Array(this.embedding.dimensions);
+        for (const chunk of chunks)
+          for (let i = 0; i < sum.length; i++) sum[i] += chunk.vector[i] ?? 0;
+        let norm = 0;
+        for (const value of sum) norm += value * value;
+        const divisor = Math.sqrt(norm);
+        return {
+          text,
+          vector:
+            divisor > 1e-12 ? Array.from(sum, (value) => value / divisor) : [...chunks[0].vector],
+        };
       },
       search: async (query, vector, signal, limit) =>
         (
           await bundle.retriever.search({
             query,
             queryVector: vector,
-            // Related-note lookup runs automatically when the active note
-            // changes. Use its committed aggregate vector so this path
-            // never invokes Orama's synchronous whole-index text search
-            // on Obsidian's renderer thread.
             mode: "related",
             resultShape: "chunks",
             currentPath,
@@ -1152,13 +876,13 @@ export class IndexManager implements VaultSearchPort {
             lexicalCandidateLimit: 0,
             signal,
           })
-        ).map((r) => ({
-          path: r.path,
-          score: r.fusedScore,
-          ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
-          excerpt: r.excerpt,
-          startLine: r.startLine,
-          endLine: r.endLine,
+        ).map((result) => ({
+          path: result.path,
+          score: result.fusedScore,
+          similarity: result.semanticScore,
+          excerpt: result.excerpt,
+          startLine: result.startLine,
+          endLine: result.endLine,
         })),
     };
   }
@@ -1171,29 +895,21 @@ export class IndexManager implements VaultSearchPort {
     await this.reconcileQueuedChanges(signal);
   }
   invalidate(): void {
-    this.epoch++;
     this.unavailable = true;
-    const old = this.active;
-    this.active = null;
-    if (old) void this.retireBundle(old);
   }
   markUnavailable(): void {
     this.unavailable = true;
-    const old = this.active;
-    this.active = null;
-    if (old) void this.retireBundle(old);
   }
-  private provenance(r: RetrievalResult): ProvenanceRecord {
-    return {
-      path: r.path,
-      startLine: r.startLine,
-      endLine: r.endLine,
-      excerpt: r.excerpt,
-      score: r.fusedScore,
-    };
+  async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = (async () => {
+      this.closed = true;
+      await this.buildPromise?.catch(() => undefined);
+      await this.engine?.close().catch(() => undefined);
+      this.active = null;
+    })();
+    return this.closePromise;
   }
-
-  /** Eligibility is fixed for this manager and applied only while constructing the corpus. */
   private isIndexEligible(path: string): boolean {
     try {
       const normalized = normalizePath(path);
@@ -1206,11 +922,9 @@ export class IndexManager implements VaultSearchPort {
       return false;
     }
   }
-
   private emit(record: TramaDiagnosticRecord): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
-
   private async readMarkdownIfAvailable(
     path: string,
     signal: AbortSignal,
@@ -1225,7 +939,7 @@ export class IndexManager implements VaultSearchPort {
       try {
         available = (await this.vault.isMarkdownAvailable?.(path, signal)) ?? true;
       } catch {
-        // Preserve the original read error when availability cannot be checked.
+        /* preserve read error */
       }
       if (available) throw error;
       this.emit({
@@ -1239,68 +953,23 @@ export class IndexManager implements VaultSearchPort {
       return undefined;
     }
   }
-  private reportProgress(progress: IndexProgress, emitDiagnostic = true): void {
-    if (emitDiagnostic)
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: progress.operation === "startup" ? "startup" : progress.operation,
-        stage: "started",
-        phase: progress.phase,
-        completed: progress.completed,
-        ...(progress.total === undefined ? {} : { total: progress.total }),
-        unit: progress.unit,
-        determinate: progress.determinate,
-        ...(progress.generationId ? { generation: progress.generationId } : {}),
-      });
+  private reportProgress(progress: IndexProgress): void {
     try {
       this.onProgress?.(progress);
     } catch {
-      // Progress is observational and must not affect indexing.
+      /* observational */
     }
-  }
-
-  private async collectGarbage(
-    operation: "full" | "incremental",
-    generationId: string
-  ): Promise<void> {
-    this.reportProgress({
-      operation,
-      phase: "GC",
-      completed: 0,
-      unit: "artifacts",
-      determinate: false,
-      generationId,
+    this.emit({
+      area: "index",
+      event: "index_operation",
+      operation: progress.operation,
+      stage: "started",
+      phase: progress.phase,
+      completed: progress.completed,
+      ...(progress.total === undefined ? {} : { total: progress.total }),
+      unit: progress.unit,
+      determinate: progress.determinate,
+      ...(progress.generationId ? { generation: progress.generationId } : {}),
     });
-    try {
-      const result = await this.corpus.collectGarbage((event) =>
-        this.reportProgress({
-          operation,
-          phase: "GC",
-          completed: event.completed,
-          ...(event.total === undefined ? {} : { total: event.total }),
-          unit: "artifacts",
-          determinate: event.total !== undefined,
-          generationId,
-        })
-      );
-      this.reportProgress({
-        operation,
-        phase: "GC",
-        completed: result.removed,
-        total: result.removed,
-        unit: "artifacts",
-        determinate: true,
-        generationId,
-      });
-    } catch (error) {
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "GC",
-        stage: "failed",
-        error: projectDiagnosticError(error),
-      });
-    }
   }
 }

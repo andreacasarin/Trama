@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { LenteSearch, selectLenteResults, type LenteHit } from "@/index/LenteSearch";
-import { OramaLexicalIndex } from "@/index/lexical/OramaLexicalIndex";
-import type { CorpusSnapshot } from "@/index/corpus/CorpusStore";
 import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 
 const hit = (path: string, fusedScore: number, ordinal = 0): LenteHit => ({
@@ -16,96 +14,6 @@ const hit = (path: string, fusedScore: number, ordinal = 0): LenteHit => ({
 });
 
 describe("LenteSearch", () => {
-  it("weights filename, path, and body 3/2/1 in the derived lexical profile", async () => {
-    const notes = [
-      { path: "needle.md", contentId: "a", chunkCount: 1, segments: [] },
-      { path: "folder/needle/path.md", contentId: "b", chunkCount: 1, segments: [] },
-      { path: "body.md", contentId: "c", chunkCount: 1, segments: [] },
-    ];
-    const source = {
-      generationId: "g1",
-      fingerprint: "f1",
-      notes,
-      root: {} as never,
-      pin() {
-        return this;
-      },
-      release: vi.fn(async () => undefined),
-      getNote(path: string) {
-        return notes.find((note) => note.path === path);
-      },
-      async hydrateNote(path: string) {
-        return [
-          {
-            id: path,
-            checksum: path,
-            chunkCount: 1,
-            segment: {
-              records: [
-                {
-                  ordinal: 0,
-                  startLine: 1,
-                  endLine: 1,
-                  text: path === "body.md" ? `needle ${"quiet ".repeat(1_000)}` : "quiet",
-                  vector: [1],
-                },
-              ],
-            },
-          },
-        ] as never;
-      },
-      readSegment: vi.fn(),
-      hydrateChunk: vi.fn(),
-    } as unknown as CorpusSnapshot;
-    const index = await OramaLexicalIndex.build(source, { profile: "lente" });
-    const results = await index.search("needle", {
-      profile: "lente",
-      limit: 3,
-      candidateLimit: 10,
-    });
-    expect(results).toHaveLength(3);
-    expect(results[0].path).toBe("needle.md");
-    expect(new Set(results.map((result) => result.path)).size).toBe(3);
-    expect((index as unknown as { db: { schema: unknown } }).db.schema).toEqual({
-      id: "string",
-      text: "string",
-      path: "string",
-      ordinal: "number",
-      filename: "string",
-      pathText: "string",
-      body: "string",
-    });
-    await index.close();
-  });
-
-  it("checks cancellation before progressive Lente overfetch", async () => {
-    const records = Array.from({ length: 100 }, (_, ordinal) => ({ ordinal, text: "needle" }));
-    const source = {
-      generationId: "g1",
-      fingerprint: "f1",
-      notes: [{ path: "a.md", contentId: "a", chunkCount: records.length, segments: [] }],
-      root: {} as never,
-      pin() {
-        return this;
-      },
-      release: vi.fn(async () => undefined),
-      async hydrateNote() {
-        return [{ id: "a", checksum: "a", chunkCount: records.length, segment: { records } }];
-      },
-    } as unknown as CorpusSnapshot;
-    const index = await OramaLexicalIndex.build(source, { profile: "lente" });
-    let reads = 0;
-    const signal = {
-      get aborted() {
-        return ++reads >= 3;
-      },
-    } as AbortSignal;
-    await expect(
-      index.search("needle", { profile: "lente", limit: 1, candidateLimit: 50, signal })
-    ).rejects.toThrow("cancelled");
-    await index.close();
-  });
-
   it("collapses notes, drops missing live files, and sorts by live mtime", () => {
     const results = selectLenteResults(
       [hit("old.md", 0.9), hit("new.md", 0.4), hit("old.md", 0.8)],

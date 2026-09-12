@@ -1,5 +1,5 @@
 import { RelatedIndexSnapshot } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { compareCodeUnits } from "@/index/order";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,

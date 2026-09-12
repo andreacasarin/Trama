@@ -1,5 +1,5 @@
 import { TFile } from "obsidian";
-import type { IndexVaultDocument, IndexVaultPort } from "@/index/IndexManager";
+import type { IndexVaultDocument, IndexVaultPort } from "@/index/contracts";
 import { chunkMarkdown } from "@/index/chunking";
 
 const ESTIMATE_SAMPLE_LIMIT = 32;

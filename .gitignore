@@ -1,6 +1,10 @@
 node_modules/
 .ai/
 main.js
+@taladb/
 coverage/
 .local-vault-assistant/
 .DS_Store
+candidate/taladb/.generated/**
+benchmarks/taladb/.generated/**
+tests/taladb/gate0/.generated/**

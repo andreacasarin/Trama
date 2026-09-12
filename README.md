@@ -6,9 +6,9 @@ Trama is a desktop-only Obsidian plugin for local AI conversation and semantic c
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer**, load a chat model and an embedding model, and enable its local OpenAI-compatible server (normally `http://127.0.0.1:1234/v1`).
 2. Configure the chat model and embedding model independently in the plugin settings.
-3. Use **Update index** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
+3. Install the standard plugin artifact (including the TalaDB worker/WASM assets), reload Obsidian, and use **Rebuild index** once on first use. Then open **Voce**, **Filo**, or **Lente**.
 
-The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+The semantic index is stored at `<vault>/.trama/index/taladb-v1/`. The first explicit rebuild creates and persists a per-vault opaque Tala database identity; tests provide an identity explicitly. Legacy `.trama/index` files are inert and are never migrated or deleted. TalaDB is the sole production backend, using a mutable `ready`/`dirty` state and normalized exact `Float32` vectors. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
 
 ## Filo related notes
 
@@ -29,8 +29,8 @@ Lente searches indexed visible Markdown only after Enter or Search is pressed.
 Results are unique notes with their winning passage. Relevant uses deterministic
 hybrid vector/BM25 ranking; Updated uses live note modification times. If query
 embeddings are unavailable, Lente retries lexical filename, path, and body
-matching and labels the result degraded. Its derived lexical index is in memory
-and does not alter the authoritative schema-3 corpus.
+matching and labels the result degraded. Lexical fields and vectors are persisted
+in TalaDB; searches use its native FTS and flat cosine indexes.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and
@@ -39,9 +39,16 @@ mode: it scans the current vault, compares committed content identities, and emb
 new or changed notes while removing deleted paths. **Rebuild index** remains the explicit
 forced rebuild for recovery or configuration refresh. If a note is moved or deleted while
 either pass is running, that stale path is logged and skipped, then the queued vault event
-is reconciled without failing the whole operation. Builds use an atomic last-good
-generation: a failed or cancelled operation does not expose a partial index, and the
-previous usable generation remains searchable.
+is reconciled without failing the whole operation. Searches continue while writes are in
+progress and may observe dirty or partial rows; an interrupted operation remains marked
+dirty and converges on the next explicit Update/Rebuild. Exact-row hydration skips rows
+that disappeared after ranking.
+
+Checkpoint export/import is an explicit lifecycle operation on `IndexManager`; it is
+never performed during startup or automatically after an update. Checkpoint bytes are
+stored by the DataAdapter below `.trama/index/taladb-v1/checkpoints/`, and import validates
+the complete payload, replaces the mutable store under an exclusive writer, then validates
+and publishes `ready` once.
 
 During a full rebuild, Filo estimates the number of embedding texts from file-size
 metadata calibrated by a deterministic sample of at most 32 notes passed through the
@@ -125,9 +132,15 @@ OBSIDIAN_VAULT_PATH="/path/to/your/vault" npm run install:plugin
 ```
 
 The installer verifies that the target is an Obsidian vault, then copies
-`main.js`, `manifest.json`, and `styles.css` into
-`<vault>/.obsidian/plugins/trama/`. Restart or reload Obsidian
-after installation.
+`main.js`, `manifest.json`, `styles.css`, and the local `@taladb/web/worker/` and
+`@taladb/web/pkg/` assets into `<vault>/.obsidian/plugins/trama/`. Restart or reload
+Obsidian after installation. Agents did not run this installer or launch Obsidian;
+the manual checklist below is user-run.
+
+The build anchors TalaDB's public `openDB` worker URL to the installed plugin resource
+URI via Obsidian's public `VaultAdapter.getResourcePath`, so the worker, glue, and WASM
+files remain local to the ordinary plugin artifact. TalaDB's public `openDB` owns the
+dedicated Worker and Web-Lock writer isolation; Trama does not add a second dispatcher.
 
 Run the development checks separately with:
 
@@ -137,28 +150,33 @@ npm run format
 npm run lint
 npm test
 npm run build
+npm run artifact:verify
+npm run taladb:gate0
 ```
 
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
-limitations include the cost of exact `Float32` scans and rebuilding the derived,
-non-persisted Orama BM25 index on large corpora. Hybrid retrieval uses reciprocal-rank
-fusion (RRF) over exact semantic and lexical candidates; there is no ANN/HNSW backend.
+limitations include the cost of flat cosine scans and native FTS candidate retrieval
+on large corpora. Hybrid retrieval uses reciprocal-rank fusion (RRF) over semantic
+and lexical candidates; there is no ANN backend.
 The conservative 384/64 chunking is fingerprinted, so changing it requires an explicit
 full reindex. Filo and Voce use native (rather than React) UI. Trama is an independent,
 clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
 
 ### Optional scale benchmark
 
-The benchmark is intentionally opt-in and is not part of normal tests. Run it with
-`npx vitest bench tests/index.bench.ts`; set `TRAMA_BENCH_CHUNKS=25000`, `50000`, or
-`100000`, `TRAMA_BENCH_DIMENSIONS` (default `768`), and `TRAMA_BENCH_SAMPLES` (default
-`7`) for a bounded deterministic fixture. The explicit `TRAMA_INDEX_BENCHMARK` summary
-reports p50 and p95 scan time plus the contiguous vector-buffer size; Vitest also reports
-its own timing distribution for the same raw exact semantic scan primitive.
+The raw exact-only scan probe from earlier revisions is retired. The maintained,
+opt-in benchmark is `npm run taladb:benchmark`; it exercises the repository's TalaDB
+profiles without implying ANN or production-scale guarantees. The committed evaluation
+candidate is supported through the representative 25,000-chunk native profile; 50,000
+chunks is unsupported after an actual Worker/WASM `Error: unreachable` (and an earlier
+approximately 1.93 GiB restart), while 100,000 chunks was not run and is unsupported.
+Validate startup, restart, RSS, cancellation, and real-vault behavior separately with
+focused tests and the manual Obsidian/LM Studio smoke test below.
 
-This probe does not build or open the persisted corpus, Orama lexical index, or hybrid
-retriever. It therefore does not measure startup, corpus artifact size, RSS, lexical or
-hybrid latency, cancellation latency, or prove the absence of generation-wide
-serialization. Validate those properties separately with focused implementation tests,
-code review, and a real-vault Obsidian/LM Studio smoke test. Do not use this benchmark as
-ANN evidence until an exact-oracle recall comparison is added.
+### Manual Obsidian checklist (user-run)
+
+1. Install the standard artifact with all local Tala worker/WASM assets and reload the plugin.
+2. Run **Rebuild index** once. Confirm startup is silent, then confirm partial search remains available while an index is dirty and that a later **Update index** reaches convergence.
+3. Create, edit, rename, and delete visible Markdown notes; verify live results and Filo/Voce refresh after the write completes.
+4. Cancel and restart an index operation; verify the dirty state recovers on the next explicit update.
+5. Verify legacy `.trama/index` files remain inert and untouched.

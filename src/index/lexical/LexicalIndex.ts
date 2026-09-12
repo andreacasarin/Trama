@@ -1,4 +1,4 @@
-import type { CorpusSnapshot } from "../corpus/CorpusStore";
+import type { IndexRevision } from "@/index/contracts";
 
 export interface LexicalSearchOptions {
   readonly limit?: number;
@@ -12,6 +12,11 @@ export interface LexicalSearchOptions {
 export type LexicalProfile = "default" | "lente";
 
 export interface LexicalHit {
+  /** Backend row identity used for race-safe hydration when available. */
+  readonly rowId?: string;
+  /** Canonical content-addressed chunk identity, when available. */
+  readonly canonicalId?: string;
+  /** Legacy/backend identity retained during the transition. */
   readonly id: string;
   readonly path: string;
   readonly ordinal: number;
@@ -32,14 +37,16 @@ export interface LexicalBuildOptions {
 }
 
 export interface LexicalIndex {
-  readonly generationId: string;
-  readonly fingerprint: string;
+  readonly generationId?: string;
+  readonly revision?: IndexRevision;
+  readonly fingerprint?: string;
   readonly profile?: LexicalProfile;
   search(query: string, options?: LexicalSearchOptions): Promise<readonly LexicalHit[]>;
   close(): Promise<void>;
 }
 
-export type LexicalIndexBuilder = (
-  snapshot: CorpusSnapshot,
+/** Builder source is intentionally generic: concrete backends own their source shape. */
+export type LexicalIndexBuilder<Source = unknown> = (
+  source: Source,
   options?: LexicalBuildOptions
 ) => Promise<LexicalIndex>;
