@@ -29,7 +29,12 @@ type SqliteModule = {
   }>;
 };
 
-type SqliteInitModule = (options: { readonly wasmBinary: ArrayBuffer }) => Promise<SqliteModule>;
+type SqliteInitModule = (options: {
+  readonly instantiateWasm: (
+    imports: WebAssembly.Imports,
+    onSuccess: (instance: WebAssembly.Instance, module: WebAssembly.Module) => void
+  ) => object;
+}) => Promise<SqliteModule>;
 
 type OpfsPool = Awaited<ReturnType<SqliteModule["installOpfsSAHPoolVfs"]>>;
 const storage: WorkerStorageState<MutableSqliteDatabase, SqliteConnection, OpfsPool> = {};
@@ -87,12 +92,26 @@ async function initializeSqlite(): Promise<SqliteModule> {
   }
   let module: SqliteInitModule;
   try {
+    (
+      globalThis as typeof globalThis & {
+        sqlite3ApiConfig?: { disable: { vfs: Record<string, boolean> } };
+      }
+    ).sqlite3ApiConfig = {
+      disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
+    };
     module = (await import(moduleUrl)).default as SqliteInitModule;
   } catch {
     throw sqliteError("storage_unavailable", "SQLite module asset could not be loaded.", true);
   }
   try {
-    return await module({ wasmBinary });
+    return await module({
+      instantiateWasm(imports, onSuccess) {
+        WebAssembly.instantiate(wasmBinary, imports).then(({ instance, module }) =>
+          onSuccess(instance, module)
+        );
+        return {};
+      },
+    });
   } catch {
     throw sqliteError("storage_unavailable", "SQLite WASM failed to initialize.", true);
   }
@@ -192,6 +211,8 @@ async function handle(request: SqliteRequest): Promise<unknown> {
       return db.getState();
     case "listNotes":
       return db.listNotes();
+    case "planReconciliation":
+      return db.planReconciliation(payload.summaries);
     case "markIncomplete":
       return db.markIncomplete();
     case "beginRebuild":

@@ -1,5 +1,5 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 3;
+export const SQLITE_SCHEMA_VERSION = 4;
 
 export function schemaSql(dimensions: number): string {
   if (!Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096)

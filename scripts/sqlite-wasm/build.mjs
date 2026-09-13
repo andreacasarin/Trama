@@ -13,8 +13,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const CACHE_SCHEMA = 4;
-export const BUILDER_VERSION = "dockerfile-v1";
+export const CACHE_SCHEMA = 5;
+export const BUILDER_VERSION = "canonical-sqlite-vector-v1";
 export const DOCKER_BUILD_TIMEOUT_MS = 20 * 60 * 1000;
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -37,7 +37,6 @@ export function getBuildContext({ rootDir = root, platform = dockerPlatform() } 
   const supplyChainPath = join(rootDir, "vendor/sqlite-wasm/supply-chain.json");
   const licensesPath = join(rootDir, "vendor/sqlite-wasm/LICENSES.md");
   const dockerfilePath = join(rootDir, "scripts/sqlite-wasm/Dockerfile");
-  const patchPath = join(rootDir, "scripts/sqlite-wasm/patch-module.mjs");
   const extraInitPath = join(rootDir, "scripts/sqlite-wasm/sqlite3_wasm_extra_init.c");
   const lockBytes = readFileSync(supplyChainPath);
   const lock = JSON.parse(lockBytes);
@@ -50,7 +49,6 @@ export function getBuildContext({ rootDir = root, platform = dockerPlatform() } 
     supplyChainSha256: digestBytes(lockBytes),
     licensesSha256: digest(licensesPath),
     dockerfileSha256: digest(dockerfilePath),
-    patchSha256: digest(patchPath),
     extraInitSha256: digest(extraInitPath),
     platform,
     dockerImage,
@@ -97,8 +95,7 @@ export function validateArtifactCache(context, directory = context.artifactDir) 
     if (manifest.toolchain !== context.dockerImage)
       return { ok: false, reason: "toolchain mismatch" };
     if (
-      manifest.postProcessing?.localWasmBootstrap !== true ||
-      manifest.postProcessing?.asyncOpfsInitializerDisabled !== true ||
+      manifest.postProcessing?.canonicalModule !== true ||
       manifest.postProcessing?.persistenceVfs !== "opfs-sah-pool"
     )
       return { ok: false, reason: "post-processing metadata mismatch" };
@@ -106,7 +103,7 @@ export function validateArtifactCache(context, directory = context.artifactDir) 
       manifest.source?.sqliteArchiveSha256 !== context.lock.sqlite.archiveSha256 ||
       manifest.source?.sqliteAmalgamationArchiveSha256 !==
         context.lock.sqlite.amalgamationArchiveSha256 ||
-      manifest.source?.sqliteVecArchiveSha256 !== context.lock.sqliteVec.archiveSha256
+      manifest.source?.sqliteVectorArchiveSha256 !== context.lock.sqliteVector.archiveSha256
     )
       return { ok: false, reason: "source checksum metadata mismatch" };
     if (
@@ -151,8 +148,8 @@ function dockerArgs(context, destination, noCache) {
     SQLITE_SHA256: lock.sqlite.archiveSha256,
     SQLITE_AMALGAMATION_URL: lock.sqlite.amalgamationUrl,
     SQLITE_AMALGAMATION_SHA256: lock.sqlite.amalgamationArchiveSha256,
-    SQLITE_VEC_URL: lock.sqliteVec.url,
-    SQLITE_VEC_SHA256: lock.sqliteVec.archiveSha256,
+    SQLITE_VECTOR_URL: lock.sqliteVector.url,
+    SQLITE_VECTOR_SHA256: lock.sqliteVector.archiveSha256,
     SQLITE_OPT: [...lock.build.flags, "-DSQLITE_C=../../sqlite3.c"]
       .map((flag) => (flag.startsWith("-DSQLITE_DEFAULT_UNIX_VFS=") ? `'${flag}'` : flag))
       .join(" "),
@@ -184,12 +181,11 @@ function buildArtifact(context, noCache) {
       source: {
         sqliteArchiveSha256: context.lock.sqlite.archiveSha256,
         sqliteAmalgamationArchiveSha256: context.lock.sqlite.amalgamationArchiveSha256,
-        sqliteVecArchiveSha256: context.lock.sqliteVec.archiveSha256,
+        sqliteVectorArchiveSha256: context.lock.sqliteVector.archiveSha256,
       },
       outputs: outputEntries(temporary),
       postProcessing: {
-        localWasmBootstrap: true,
-        asyncOpfsInitializerDisabled: true,
+        canonicalModule: true,
         persistenceVfs: "opfs-sah-pool",
       },
     };

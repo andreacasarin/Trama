@@ -1,16 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { MutableSqliteDatabase, type SqliteConnection } from "@/index/sqlite/database";
+import { loadTestSqlite } from "./sqlite-test-client";
 
 async function database(
   dimensions = 2,
   observeSql?: (sql: string) => void
 ): Promise<MutableSqliteDatabase> {
-  // @ts-expect-error generated production asset has no application declarations.
-  const init = (await import("../sqlite3.mjs")).default;
-  const wasmPath = fileURLToPath(new URL("../sqlite3.wasm", import.meta.url));
-  const sqlite = await init({ wasmBinary: readFileSync(wasmPath) });
+  const sqlite = await loadTestSqlite();
   const raw = new sqlite.oo1.DB(":memory:", "c");
   const db: SqliteConnection = {
     exec: (options) => {
@@ -161,7 +157,7 @@ describe("SQLite hydrated retrieval", () => {
     index.close();
   });
 
-  it("uses one deterministic scalar query for tied semantic candidates", async () => {
+  it("uses one deterministic exact vector scan for tied semantic candidates", async () => {
     const statements: string[] = [];
     const index = await database(2, (sql) => statements.push(sql));
     for (let note = 0; note < 20; note++) {
@@ -186,12 +182,12 @@ describe("SQLite hydrated retrieval", () => {
     const hits = index.retrieve(undefined, new Float32Array([1, 0]), 5, undefined, {
       semanticCandidateLimit: 5,
     });
-    const semanticSql = statements.filter((sql) => sql.includes("vec_distance_L2"));
+    const semanticSql = statements.filter((sql) => sql.includes("vector_full_scan"));
     expect(semanticSql).toHaveLength(1);
     expect(semanticSql[0]).toContain(
       "ORDER BY distance,path COLLATE BINARY,ordinal,id COLLATE BINARY"
     );
-    expect(statements.some((sql) => sql.includes("embedding MATCH"))).toBe(false);
+    expect(semanticSql[0]).toContain("JOIN chunks c ON c.chunk_pk=v.rowid");
     expect(hits.map((hit) => hit.path)).toEqual([
       "tie-00.md",
       "tie-01.md",

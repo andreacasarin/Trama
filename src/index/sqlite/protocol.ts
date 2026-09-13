@@ -1,5 +1,5 @@
 /** Closed, versioned protocol for the mutable SQLite index. */
-export const SQLITE_PROTOCOL_VERSION = 2 as const;
+export const SQLITE_PROTOCOL_VERSION = 3 as const;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
 export const SQLITE_MAX_NOTES = 100_000;
@@ -13,6 +13,7 @@ export type SqliteMethod =
   | "boot"
   | "getState"
   | "listNotes"
+  | "planReconciliation"
   | "markIncomplete"
   | "beginRebuild"
   | "upsertNote"
@@ -57,6 +58,17 @@ export interface SqliteNoteSummary {
   readonly chunkCount?: number;
 }
 
+export interface SqliteReconciliationPlan {
+  readonly renames: readonly {
+    readonly from: string;
+    readonly to: string;
+    readonly contentId: string;
+  }[];
+  readonly upserts: readonly SqliteNoteSummary[];
+  readonly deletes: readonly SqliteNoteSummary[];
+  readonly state: SqliteState;
+}
+
 export type SqliteMutationStatus =
   "changed" | "unchanged" | "absent" | "alreadyApplied" | "state_changed";
 
@@ -85,6 +97,7 @@ export interface SqliteRequestPayloads {
   boot: { readonly fingerprint: string; readonly dimensions: number; readonly identity: string };
   getState: Record<string, never>;
   listNotes: Record<string, never>;
+  planReconciliation: { readonly summaries: readonly SqliteNoteSummary[] };
   markIncomplete: Record<string, never>;
   beginRebuild: Record<string, never>;
   upsertNote: { readonly note: SqliteNoteInput };
@@ -92,7 +105,7 @@ export interface SqliteRequestPayloads {
   deleteNote: { readonly path: string; readonly contentId?: string };
   finishReconciliation: {
     readonly observedChangeCounter: number;
-    readonly summaries: readonly Required<SqliteNoteSummary>[];
+    readonly summaries: readonly SqliteNoteSummary[];
   };
   retrieve: {
     readonly query?: string;
@@ -169,6 +182,7 @@ export function isSqliteMethod(value: unknown): value is SqliteMethod {
       "boot",
       "getState",
       "listNotes",
+      "planReconciliation",
       "markIncomplete",
       "beginRebuild",
       "upsertNote",
@@ -267,10 +281,11 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
   } else if (method === "deleteNote") {
     if (!validPath(value.path) || (value.contentId !== undefined && !validHex(value.contentId, 32)))
       throw sqliteError("invalid_request", "Invalid delete payload");
-  } else if (method === "finishReconciliation") {
+  } else if (method === "planReconciliation" || method === "finishReconciliation") {
     if (
-      !Number.isSafeInteger(value.observedChangeCounter) ||
-      Number(value.observedChangeCounter) < 0 ||
+      (method === "finishReconciliation" &&
+        (!Number.isSafeInteger(value.observedChangeCounter) ||
+          Number(value.observedChangeCounter) < 0)) ||
       !Array.isArray(value.summaries) ||
       value.summaries.length > SQLITE_MAX_NOTES ||
       !value.summaries.every(
@@ -279,8 +294,9 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
           typeof summary === "object" &&
           validPath((summary as SqliteNoteSummary).path) &&
           validHex((summary as SqliteNoteSummary).contentId, 32) &&
-          Number.isSafeInteger((summary as SqliteNoteSummary).chunkCount) &&
-          Number((summary as SqliteNoteSummary).chunkCount) >= 0
+          ((summary as SqliteNoteSummary).chunkCount === undefined ||
+            (Number.isSafeInteger((summary as SqliteNoteSummary).chunkCount) &&
+              Number((summary as SqliteNoteSummary).chunkCount) >= 0))
       )
     )
       throw sqliteError("invalid_request", "Invalid reconciliation payload");

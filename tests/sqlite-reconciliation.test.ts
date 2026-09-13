@@ -1,16 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-// @ts-expect-error generated production asset has no application typings.
-import initSqlite from "../sqlite3.mjs";
+import { loadTestSqlite } from "./sqlite-test-client";
 
 const id = (letter: string) => letter.repeat(64);
 
 async function openIndex() {
-  const wasmPath = fileURLToPath(new URL("../sqlite3.wasm", import.meta.url));
-  const sqlite = await initSqlite({ wasmBinary: readFileSync(wasmPath) });
+  const sqlite = await loadTestSqlite();
   const database = new sqlite.oo1.DB(":memory:", "c");
   const index = new MutableSqliteDatabase(database);
   index.boot(id("f"), 2);
@@ -69,6 +64,39 @@ describe("mutable SQLite reconciliation", () => {
       ).incomplete
     ).toBe(false);
     expect(index.getState().incomplete).toBe(false);
+    index.close();
+    database.close();
+  });
+
+  it("plans deterministic renames, upserts, and deletes inside SQLite", async () => {
+    const { index, database } = await openIndex();
+    index.upsertNote({ path: "old.md", contentId: id("a"), chunks: [] });
+    index.upsertNote({ path: "changed.md", contentId: id("b"), chunks: [] });
+    index.upsertNote({ path: "gone.md", contentId: id("c"), chunks: [] });
+    index.finishReconciliation(
+      [
+        { path: "changed.md", contentId: id("b") },
+        { path: "gone.md", contentId: id("c") },
+        { path: "old.md", contentId: id("a") },
+      ],
+      index.getState().changeCounter
+    );
+
+    const plan = index.planReconciliation([
+      { path: "added.md", contentId: id("d") },
+      { path: "changed.md", contentId: id("e") },
+      { path: "new.md", contentId: id("a") },
+    ]);
+
+    expect(plan).toMatchObject({
+      renames: [{ from: "old.md", to: "new.md", contentId: id("a") }],
+      upserts: [
+        { path: "added.md", contentId: id("d") },
+        { path: "changed.md", contentId: id("e") },
+      ],
+      deletes: [{ path: "gone.md", contentId: id("c") }],
+      state: { incomplete: true },
+    });
     index.close();
     database.close();
   });

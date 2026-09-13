@@ -2,8 +2,7 @@ import { describe, expect, it } from "vitest";
 import { literalTerms, safeFtsQuery } from "@/index/sqlite/database";
 import { schemaSql } from "@/index/sqlite/schema";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { loadTestSqlite } from "./sqlite-test-client";
 
 describe("SQLite schema/query foundation", () => {
   it("bounds literal FTS terms without evaluating query grammar", () => {
@@ -33,10 +32,7 @@ describe("SQLite schema/query foundation", () => {
   });
 
   it("opens the audited local SQLite build and atomically maintains FTS and vectors", async () => {
-    // @ts-expect-error generated production asset has no application type declarations.
-    const init = (await import("../sqlite3.mjs")).default;
-    const wasmPath = fileURLToPath(new URL("../sqlite3.wasm", import.meta.url));
-    const sqlite = await init({ wasmBinary: readFileSync(wasmPath) });
+    const sqlite = await loadTestSqlite();
     const db = new sqlite.oo1.DB(":memory:", "c");
     const index = new MutableSqliteDatabase(db);
     const hash = "b".repeat(64);

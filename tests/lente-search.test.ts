@@ -46,13 +46,12 @@ describe("LenteSearch", () => {
   });
 
   it("falls back to lexical retrieval only for an unavailable embedding", async () => {
-    const release = vi.fn(async () => undefined);
     const search = vi
       .fn()
       .mockRejectedValueOnce(new QueryEmbeddingError())
       .mockResolvedValueOnce([hit("note.md", 1)]);
     const service = new LenteSearch(
-      { acquireLenteLease: () => ({ generationId: "g1", search, release }) },
+      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle")).resolves.toMatchObject({
@@ -60,13 +59,12 @@ describe("LenteSearch", () => {
       degraded: true,
     });
     expect(search).toHaveBeenNthCalledWith(2, "needle", "lexical", undefined);
-    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("uses keyword retrieval without marking the result degraded", async () => {
     const search = vi.fn(async () => [hit("note.md", 1)]);
     const service = new LenteSearch(
-      { acquireLenteLease: () => ({ generationId: "g1", search, release: async () => undefined }) },
+      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle", { searchMethod: "keyword" })).resolves.toMatchObject({
@@ -83,7 +81,7 @@ describe("LenteSearch", () => {
     );
     const search = vi.fn(async () => candidates);
     const service = new LenteSearch(
-      { acquireLenteLease: () => ({ generationId: "g1", search, release: async () => undefined }) },
+      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
       { getMtime: () => 1 }
     );
     const result = await service.search("needle", { maxResults: 5 });
@@ -107,7 +105,8 @@ describe("LenteSearch", () => {
       else search.mockRejectedValue(error);
       const service = new LenteSearch(
         {
-          acquireLenteLease: () => ({ generationId: "g1", search, release: async () => undefined }),
+          lenteState: () => ({ generationId: "g1", changeCounter: 1 }),
+          searchLente: search,
         },
         { getMtime: () => 1 }
       );

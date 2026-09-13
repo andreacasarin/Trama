@@ -1,4 +1,4 @@
-import { RelatedIndexSnapshot } from "@/index/IndexManager";
+import { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
 import { compareCodeUnits } from "@/index/Identity";
 import {
   emitTramaDiagnostic,
@@ -9,7 +9,12 @@ import {
 } from "@/diagnostics/TramaDiagnostics";
 
 export interface RelatedNotesSource {
-  relatedSnapshot(path: string): RelatedIndexSnapshot | null;
+  relatedState(path: string): RelatedIndexState | null;
+  findRelated(
+    path: string,
+    signal: AbortSignal,
+    limit: number
+  ): Promise<readonly RelatedIndexHit[]>;
 }
 export interface RelatedNoteResult {
   readonly path: string;
@@ -60,8 +65,8 @@ export class RelatedNotes {
   }
 
   snapshotKey(path: string): string | undefined {
-    const snapshot = this.index.relatedSnapshot(path);
-    return snapshot ? this.key(snapshot) : undefined;
+    const state = this.index.relatedState(path);
+    return state ? this.key(state) : undefined;
   }
 
   async find(
@@ -73,19 +78,19 @@ export class RelatedNotes {
     const started = Date.now();
     if (signal.aborted) throw new Error("Operation cancelled");
     const cap = Math.max(0, Math.min(RelatedNotes.MAX_RESULTS, Math.floor(limit)));
-    const snapshot = this.index.relatedSnapshot(currentPath);
-    if (!snapshot || cap === 0) {
+    const state = this.index.relatedState(currentPath);
+    if (!state || cap === 0) {
       const result = {
-        changeCounter: snapshot?.changeCounter ?? 0,
-        generationId: snapshot?.generationId ?? `counter:${snapshot?.changeCounter ?? 0}`,
-        currentPath: snapshot?.currentPath ?? currentPath,
-        contentHash: snapshot?.contentHash ?? "",
+        changeCounter: state?.changeCounter ?? 0,
+        generationId: state?.generationId ?? `counter:${state?.changeCounter ?? 0}`,
+        currentPath: state?.currentPath ?? currentPath,
+        contentHash: state?.contentHash ?? "",
         results: [],
       };
-      this.publish(result, snapshot ? this.key(snapshot) : "");
+      this.publish(result, state ? this.key(state) : "");
       return result;
     }
-    const key = this.key(snapshot);
+    const key = this.key(state);
     if (refresh) this.cancelAll();
     const cached = this.cache.get(key);
     if (cached && !refresh) {
@@ -102,10 +107,10 @@ export class RelatedNotes {
       event: "related_search",
       stage: "started",
       path: currentPath,
-      generation: snapshot.generationId,
+      generation: state.generationId,
       resultCount: 0,
     });
-    const run = this.compute(snapshot, controller.signal, RelatedNotes.MAX_RESULTS)
+    const run = this.compute(state, controller.signal, RelatedNotes.MAX_RESULTS)
       .then((result) => {
         if (controller.signal.aborted) throw new Error("Operation cancelled");
         if (this.snapshotKey(result.currentPath) === key) {
@@ -195,45 +200,25 @@ export class RelatedNotes {
   }
 
   private async compute(
-    snapshot: RelatedIndexSnapshot,
+    state: RelatedIndexState,
     signal: AbortSignal,
     limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) throw new Error("Operation cancelled");
-    const prepareStarted = Date.now();
-    const prepared = await snapshot.prepareQuery(signal);
-    this.emitDiagnostic({
-      area: "filo",
-      event: "related_search",
-      stage: "prepare-completed",
-      path: snapshot.currentPath,
-      generation: snapshot.generationId,
-      resultCount: 0,
-      durationMs: Date.now() - prepareStarted,
-    });
-    if (!prepared || !prepared.text) {
-      return {
-        changeCounter: snapshot.changeCounter,
-        generationId: snapshot.generationId,
-        currentPath: snapshot.currentPath,
-        contentHash: snapshot.contentHash,
-        results: [],
-      };
-    }
     const retrieveStarted = Date.now();
-    const hits = await snapshot.search(prepared.text, prepared.vector, signal, 128);
+    const hits = await this.index.findRelated(state.currentPath, signal, 128);
     this.emitDiagnostic({
       area: "filo",
       event: "related_search",
       stage: "retrieve-completed",
-      path: snapshot.currentPath,
-      generation: snapshot.generationId,
+      path: state.currentPath,
+      generation: state.generationId,
       resultCount: hits.length,
       durationMs: Date.now() - retrieveStarted,
     });
     const best = new Map<string, RelatedNoteResult>();
     for (const hit of hits) {
-      if (hit.path === snapshot.currentPath) continue;
+      if (hit.path === state.currentPath) continue;
       const previous = best.get(hit.path);
       const similarity =
         hit.similarity === undefined
@@ -256,16 +241,16 @@ export class RelatedNotes {
       .sort((a, b) => b.score - a.score || compareCodeUnits(a.path, b.path))
       .slice(0, limit);
     return {
-      changeCounter: snapshot.changeCounter,
-      generationId: snapshot.generationId,
-      currentPath: snapshot.currentPath,
-      contentHash: snapshot.contentHash,
+      changeCounter: state.changeCounter,
+      generationId: state.generationId,
+      currentPath: state.currentPath,
+      contentHash: state.contentHash,
       results,
     };
   }
 
-  private key(snapshot: RelatedIndexSnapshot): string {
-    return `${snapshot.changeCounter ?? snapshot.generationId ?? 0}\0${snapshot.currentPath}\0${snapshot.contentHash}`;
+  private key(state: RelatedIndexState): string {
+    return `${state.changeCounter ?? state.generationId ?? 0}\0${state.currentPath}\0${state.contentHash}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {

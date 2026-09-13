@@ -21,18 +21,12 @@ export interface LenteSearchOptions {
 }
 
 export interface LenteRetrievalPort {
-  acquireLenteLease(): LenteRetrievalLease | null;
-}
-
-export interface LenteRetrievalLease {
-  readonly changeCounter?: number;
-  readonly generationId?: string;
-  search?(
+  lenteState(): { readonly changeCounter: number; readonly generationId: string } | null;
+  searchLente(
     query: string,
     mode: LenteRetrievalMode,
     signal?: AbortSignal
   ): Promise<readonly LenteHit[]>;
-  release(): Promise<void>;
 }
 
 export interface LenteHit {
@@ -97,8 +91,8 @@ export class LenteSearch {
     const elapsedMs = startDiagnosticTimer();
     const signal = options.signal;
     if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
-    const lease = this.retrieval.acquireLenteLease();
-    if (!lease) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
+    const state = this.retrieval.lenteState();
+    if (!state) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
     const method = options.searchMethod ?? "hybrid";
     const displayLimit = appliedDisplayLimit(options.maxResults);
     let mode: LenteRetrievalMode = method === "keyword" ? "lexical" : "hybrid";
@@ -106,25 +100,27 @@ export class LenteSearch {
     try {
       let raw: readonly LenteHit[];
       try {
-        raw = await this.retrieve(lease, normalized, mode, signal);
+        raw = await this.retrieval.searchLente(normalized, mode, signal);
       } catch (error) {
         if (mode !== "hybrid" || !this.canFallback(error, signal)) throw error;
         mode = "lexical";
         degraded = true;
-        raw = await this.retrieve(lease, normalized, "lexical", signal);
+        raw = await this.retrieval.searchLente(normalized, "lexical", signal);
       }
       if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
+      const generationId = raw[0]?.generationId ?? state.generationId;
+      const changeCounter = raw[0]?.changeCounter ?? state.changeCounter;
       const canonicalResults = selectLenteResults(
         raw,
-        lease.generationId ?? `counter:${lease.changeCounter ?? 0}`,
+        generationId,
         (path) => this.stats.getMtime(path),
         "relevant",
         MAX_CANDIDATES
       );
       const results = sortLenteResults(canonicalResults, options.sort ?? "relevant", displayLimit);
       const batch = {
-        generationId: lease.generationId ?? `counter:${lease.changeCounter ?? 0}`,
-        changeCounter: lease.changeCounter,
+        generationId,
+        changeCounter,
         mode,
         degraded,
         displayLimit,
@@ -135,7 +131,7 @@ export class LenteSearch {
       emitTramaDiagnostic(this.diagnostics, {
         area: "index",
         event: "lente_search",
-        generation: lease.generationId,
+        generation: generationId,
         mode,
         resultCount: results.length,
         durationMs: batch.durationMs,
@@ -145,7 +141,7 @@ export class LenteSearch {
       emitTramaDiagnostic(this.diagnostics, {
         area: "index",
         event: "lente_search",
-        generation: lease.generationId,
+        generation: state.generationId,
         mode,
         resultCount: 0,
         durationMs: elapsedMs(),
@@ -153,8 +149,6 @@ export class LenteSearch {
         error: projectDiagnosticError(error),
       } as never);
       throw error;
-    } finally {
-      await lease.release();
     }
   }
 
@@ -162,16 +156,6 @@ export class LenteSearch {
     if (signal?.aborted) return false;
     if (!error || typeof error !== "object") return false;
     return isQueryEmbeddingError(error);
-  }
-
-  private retrieve(
-    lease: LenteRetrievalLease,
-    query: string,
-    mode: LenteRetrievalMode,
-    signal?: AbortSignal
-  ): Promise<readonly LenteHit[]> {
-    if (lease.search) return lease.search(query, mode, signal);
-    return Promise.reject(new Error("Lente retrieval lease is invalid."));
   }
 }
 

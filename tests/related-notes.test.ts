@@ -1,38 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
 import { RelatedNotes } from "@/index/RelatedNotes";
-import type { RelatedIndexHit, RelatedIndexSnapshot } from "@/index/IndexManager";
+import type { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 const signal = new AbortController().signal;
-function snapshot(path: string, text: string, hits: RelatedIndexHit[], generationId = "1") {
-  const prepareQuery = vi.fn(async () => (text ? { text, vector: [1, 0] } : null));
+function snapshot(path: string, _text: string, hits: RelatedIndexHit[], generationId = "1") {
   const search = vi.fn(async () => hits);
-  const value: RelatedIndexSnapshot = {
+  const value: RelatedIndexState = {
     generationId,
     currentPath: path,
     contentHash: `${generationId}:${path}`,
-    prepareQuery,
-    search,
   };
-  return { value, prepareQuery, search };
+  return { value, search };
 }
 
 describe("RelatedNotes", () => {
-  it("does not prepare absent or zero-limit notes and handles an empty prepared query", async () => {
-    const absent = { relatedSnapshot: vi.fn(() => null) };
+  it("does not retrieve absent or zero-limit notes", async () => {
+    const absent = { relatedState: vi.fn(() => null), findRelated: vi.fn(async () => []) };
     await expect(new RelatedNotes(absent).find("missing.md", signal)).resolves.toMatchObject({
       results: [],
     });
-    const empty = snapshot("empty.md", "", []);
-    await expect(
-      new RelatedNotes({ relatedSnapshot: () => empty.value }).find("empty.md", signal)
-    ).resolves.toMatchObject({ results: [] });
-    expect(empty.prepareQuery).toHaveBeenCalledOnce();
     const zeroLimit = snapshot("zero.md", "query", []);
     await expect(
-      new RelatedNotes({ relatedSnapshot: () => zeroLimit.value }).find("zero.md", signal, 0)
+      new RelatedNotes({ relatedState: () => zeroLimit.value, findRelated: zeroLimit.search }).find(
+        "zero.md",
+        signal,
+        0
+      )
     ).resolves.toMatchObject({ results: [] });
-    expect(zeroLimit.prepareQuery).not.toHaveBeenCalled();
+    expect(zeroLimit.search).not.toHaveBeenCalled();
   });
 
   it("prepares once, excludes current, aggregates max score, caps, and sorts ties", async () => {
@@ -44,13 +40,11 @@ describe("RelatedNotes", () => {
       ...Array.from({ length: 8 }, (_, i) => ({ path: `extra-${i}.md`, score: 0.2 })),
     ];
     const current = snapshot("current.md", "query", hits);
-    const result = await new RelatedNotes({ relatedSnapshot: () => current.value }).find(
-      "current.md",
-      signal,
-      7
-    );
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
-    expect(current.search).toHaveBeenCalledWith("query", [1, 0], expect.any(AbortSignal), 128);
+    const result = await new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    }).find("current.md", signal, 7);
+    expect(current.search).toHaveBeenCalledWith("current.md", expect.any(AbortSignal), 128);
     expect(result.results).toEqual([
       { path: "b.md", score: 0.9 },
       { path: "a.md", score: 0.4 },
@@ -82,10 +76,10 @@ describe("RelatedNotes", () => {
       },
     ]);
 
-    const result = await new RelatedNotes({ relatedSnapshot: () => current.value }).find(
-      "current.md",
-      signal
-    );
+    const result = await new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    }).find("current.md", signal);
 
     expect(result.results).toEqual([
       {
@@ -101,23 +95,23 @@ describe("RelatedNotes", () => {
 
   it("shares same-key work and caches successful results", async () => {
     const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
-    const source = { relatedSnapshot: vi.fn(() => current.value) };
+    const source = { relatedState: vi.fn(() => current.value), findRelated: current.search };
     const service = new RelatedNotes(source);
     const [first, second] = await Promise.all([
       service.find("current.md", signal),
       service.find("current.md", signal),
     ]);
     expect(first.results).toEqual(second.results);
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
+    expect(current.search).toHaveBeenCalledOnce();
     await service.find("current.md", signal);
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
+    expect(current.search).toHaveBeenCalledOnce();
   });
 
   it("reports preparation and retrieval timings for the single shared computation", async () => {
     const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
     const records: TramaDiagnosticRecord[] = [];
     const service = new RelatedNotes(
-      { relatedSnapshot: () => current.value },
+      { relatedState: () => current.value, findRelated: current.search },
       { emit: (record) => records.push(record) }
     );
 
@@ -127,7 +121,7 @@ describe("RelatedNotes", () => {
       records
         .filter((record) => record.area === "filo" && record.event === "related_search")
         .map((record) => record.stage)
-    ).toEqual(["started", "prepare-completed", "retrieve-completed", "completed"]);
+    ).toEqual(["started", "retrieve-completed", "completed"]);
   });
 
   it("caches twenty candidates while preserving the default seven-result consumer cap", async () => {
@@ -137,14 +131,16 @@ describe("RelatedNotes", () => {
       similarity: 0.8 - index / 100,
     }));
     const current = snapshot("current.md", "query", hits);
-    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const service = new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    });
 
     const defaultResult = await service.find("current.md", signal);
     const extendedResult = await service.find("current.md", signal, 20);
 
     expect(defaultResult.results).toHaveLength(7);
     expect(extendedResult.results).toHaveLength(20);
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
     expect(current.search).toHaveBeenCalledOnce();
   });
 
@@ -153,7 +149,10 @@ describe("RelatedNotes", () => {
       { path: "b.md", score: 0.8 },
       { path: "a.md", score: 0.8 },
     ]);
-    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const service = new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    });
     const updates: string[][] = [];
     const unsubscribe = service.subscribe((result) =>
       updates.push(result.results.map((item) => item.path))
@@ -172,10 +171,10 @@ describe("RelatedNotes", () => {
       { path: "Z.md", score: 0.8 },
     ]);
 
-    const result = await new RelatedNotes({ relatedSnapshot: () => current.value }).find(
-      "current.md",
-      signal
-    );
+    const result = await new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    }).find("current.md", signal);
 
     expect(result.results.map((item) => item.path)).toEqual(["Z.md", "a.md", "ä.md"]);
   });
@@ -184,7 +183,10 @@ describe("RelatedNotes", () => {
     const first = snapshot("current.md", "query", [{ path: "old.md", score: 1 }], "1");
     const second = snapshot("current.md", "query", [{ path: "new.md", score: 1 }], "2");
     let current = first.value;
-    const service = new RelatedNotes({ relatedSnapshot: () => current });
+    const service = new RelatedNotes({
+      relatedState: () => current,
+      findRelated: () => (current === first.value ? first.search() : second.search()),
+    });
     await service.find("current.md", signal);
     expect(service.latest("current.md")).toEqual(["old.md"]);
 
@@ -196,19 +198,21 @@ describe("RelatedNotes", () => {
   });
 
   it("allows a late result but suppresses its cache after the live snapshot changes", async () => {
-    let release!: (value: readonly number[][]) => void;
+    let release!: () => void;
     const old = snapshot("old.md", "old", [{ path: "stale.md", score: 1 }]);
-    old.prepareQuery.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => (release = (value) => resolve({ text: "old", vector: value[0] })))
+    old.search.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve([{ path: "stale.md", score: 1 }])))
     );
     const next = snapshot("new.md", "new", [{ path: "fresh.md", score: 1 }], "2");
     let current = old.value;
-    const service = new RelatedNotes({ relatedSnapshot: () => current });
+    const service = new RelatedNotes({
+      relatedState: () => current,
+      findRelated: (path) => (path === "old.md" ? old.search() : next.search()),
+    });
     const stale = service.find("old.md", signal);
     current = next.value;
     const fresh = await service.find("new.md", signal);
-    release([[1, 0]]);
+    release();
     await expect(stale).resolves.toMatchObject({ results: [{ path: "stale.md" }] });
     expect(fresh.results[0].path).toBe("fresh.md");
     expect(service.latest("new.md")).toEqual(["fresh.md"]);
@@ -219,52 +223,52 @@ describe("RelatedNotes", () => {
     const controller = new AbortController();
     controller.abort();
     await expect(
-      new RelatedNotes({ relatedSnapshot: () => current.value }).find(
+      new RelatedNotes({ relatedState: () => current.value, findRelated: current.search }).find(
         "current.md",
         controller.signal
       )
     ).rejects.toThrow("cancelled");
-    expect(current.prepareQuery).not.toHaveBeenCalled();
+    expect(current.search).not.toHaveBeenCalled();
   });
 
   it("does not return aborted shared work to a later same-key consumer", async () => {
-    let release!: (value: readonly number[][]) => void;
+    let release!: () => void;
     const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
-    current.prepareQuery.mockImplementationOnce(
-      () =>
-        new Promise(
-          (resolve) => (release = (value) => resolve({ text: "query", vector: value[0] }))
-        )
+    current.search.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve([{ path: "a.md", score: 1 }])))
     );
-    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const service = new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    });
     const cancelled = new AbortController();
     const first = service.find("current.md", cancelled.signal);
     cancelled.abort();
     await expect(first).rejects.toThrow("cancelled");
-    release([[1, 0]]);
+    release();
     const second = await service.find("current.md", signal);
     expect(second.results).toEqual([{ path: "a.md", score: 1 }]);
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
+    expect(current.search).toHaveBeenCalledOnce();
   });
 
   it("shares work while one consumer cancels", async () => {
-    let release!: (value: readonly number[][]) => void;
+    let release!: () => void;
     const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
-    current.prepareQuery.mockImplementationOnce(
-      () =>
-        new Promise(
-          (resolve) => (release = (value) => resolve({ text: "query", vector: value[0] }))
-        )
+    current.search.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve([{ path: "a.md", score: 1 }])))
     );
-    const service = new RelatedNotes({ relatedSnapshot: () => current.value });
+    const service = new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: current.search,
+    });
     const cancelled = new AbortController();
     const first = service.find("current.md", cancelled.signal);
     const second = service.find("current.md", signal);
-    await vi.waitFor(() => expect(current.prepareQuery).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(current.search).toHaveBeenCalledOnce());
     cancelled.abort();
-    release([[1, 0]]);
+    release();
     await expect(first).rejects.toThrow("cancelled");
     await expect(second).resolves.toMatchObject({ results: [{ path: "a.md" }] });
-    expect(current.prepareQuery).toHaveBeenCalledOnce();
+    expect(current.search).toHaveBeenCalledOnce();
   });
 });

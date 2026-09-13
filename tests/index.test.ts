@@ -268,9 +268,8 @@ describe("semantic index module", () => {
     const setup = manager({ "a.md": "alpha", "b.md": "beta" });
     await setup.manager.build(signal);
     const embeddingCalls = setup.model.embed.mock.calls.length;
-    const snapshot = setup.manager.relatedSnapshot("a.md");
-    expect(snapshot).not.toBeNull();
-    await snapshot!.search("ignored", [], signal, 128);
+    expect(setup.manager.relatedState("a.md")).not.toBeNull();
+    await setup.manager.findRelated("a.md", signal, 128);
     expect(setup.model.embed.mock.calls.length).toBe(embeddingCalls);
   });
 

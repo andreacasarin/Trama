@@ -16,18 +16,32 @@ interface OpenDatabase {
 const storage = new WeakMap<object, TestStorage>();
 let runtimePromise: Promise<any> | undefined;
 
-async function runtime(): Promise<any> {
+export async function loadTestSqlite(): Promise<any> {
   runtimePromise ??= (async () => {
+    (globalThis as any).sqlite3ApiConfig = {
+      disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
+    };
     // @ts-expect-error generated production asset has no application declarations.
     const init = (await import("../sqlite3.mjs")).default;
     const wasmPath = fileURLToPath(new URL("../sqlite3.wasm", import.meta.url));
-    return init({ wasmBinary: readFileSync(wasmPath) });
+    const wasmBinary = readFileSync(wasmPath);
+    return init({
+      instantiateWasm(
+        imports: WebAssembly.Imports,
+        onSuccess: (instance: WebAssembly.Instance, module: WebAssembly.Module) => void
+      ) {
+        WebAssembly.instantiate(wasmBinary, imports).then(({ instance, module }) =>
+          onSuccess(instance, module)
+        );
+        return {};
+      },
+    });
   })();
   return runtimePromise;
 }
 
 async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {
-  const sqlite = await runtime();
+  const sqlite = await loadTestSqlite();
   const raw = new sqlite.oo1.DB(":memory:", "c");
   if (snapshot?.byteLength) {
     const pointer = sqlite.wasm.allocFromTypedArray(snapshot);
@@ -50,7 +64,7 @@ async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {
 }
 
 async function serialized(opened: OpenDatabase): Promise<Uint8Array> {
-  const sqlite = await runtime();
+  const sqlite = await loadTestSqlite();
   return new Uint8Array(sqlite.capi.sqlite3_js_db_export(opened.raw.pointer));
 }
 
@@ -79,6 +93,8 @@ export function createTestSqliteClient(
         return opened.database.getState();
       case "listNotes":
         return opened.database.listNotes();
+      case "planReconciliation":
+        return opened.database.planReconciliation(value.summaries);
       case "markIncomplete":
         result = opened.database.markIncomplete();
         break;

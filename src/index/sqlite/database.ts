@@ -5,6 +5,7 @@ import {
   type SqliteState,
   type SqliteMutationResult,
   type SqliteNoteSummary,
+  type SqliteReconciliationPlan,
   sqliteError,
 } from "./protocol";
 import { SQLITE_APPLICATION_ID, SQLITE_SCHEMA_VERSION, schemaSql } from "./schema";
@@ -67,7 +68,10 @@ function vectorBytes(vector: Float32Array, dimensions?: number): Uint8Array {
   for (const value of vector) norm += value * value;
   if (!Number.isFinite(norm) || norm <= 0)
     throw sqliteError("invalid_request", "Vector must have non-zero magnitude");
-  return new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+  const scale = 1 / Math.sqrt(norm);
+  const normalized = new Float32Array(vector.length);
+  for (let index = 0; index < vector.length; index++) normalized[index] = vector[index] * scale;
+  return new Uint8Array(normalized.buffer);
 }
 
 function bytesOf(value: unknown): Uint8Array {
@@ -150,6 +154,7 @@ export class MutableSqliteDatabase {
           });
         });
     }
+    this.initializeVector();
     // Every open fences uncertainty from events that may have arrived while
     // the previous Worker was stopped. Update/Rebuild re-establishes complete.
     return this.markIncomplete();
@@ -184,6 +189,66 @@ export class MutableSqliteDatabase {
       contentId: String(row.contentId),
       chunkCount: Number(row.chunkCount),
     }));
+  }
+
+  planReconciliation(summaries: readonly SqliteNoteSummary[]): SqliteReconciliationPlan {
+    this.ensureOpen();
+    const manifest = JSON.stringify(summaries);
+    const planned = rows(
+      this.db,
+      `WITH expected(path,content_id) AS MATERIALIZED (
+         SELECT json_extract(value,'$.path'),json_extract(value,'$.contentId') FROM json_each(?)
+       ), actual(path,content_id) AS MATERIALIZED (
+         SELECT path,content_id FROM notes
+       ), missing AS MATERIALIZED (
+         SELECT a.* FROM actual a WHERE NOT EXISTS(SELECT 1 FROM expected e WHERE e.path=a.path)
+       ), added AS MATERIALIZED (
+         SELECT e.* FROM expected e WHERE NOT EXISTS(SELECT 1 FROM actual a WHERE a.path=e.path)
+       ), old_ranked AS MATERIALIZED (
+         SELECT *,ROW_NUMBER() OVER(PARTITION BY content_id ORDER BY path COLLATE BINARY) AS rank
+           FROM missing
+       ), new_ranked AS MATERIALIZED (
+         SELECT *,ROW_NUMBER() OVER(PARTITION BY content_id ORDER BY path COLLATE BINARY) AS rank
+           FROM added
+       ), renames AS MATERIALIZED (
+         SELECT o.path,n.path AS target,o.content_id
+           FROM old_ranked o JOIN new_ranked n
+             ON n.content_id=o.content_id AND n.rank=o.rank
+       ), upserts AS MATERIALIZED (
+         SELECT e.path,NULL AS target,e.content_id
+           FROM expected e LEFT JOIN actual a ON a.path=e.path
+          WHERE (a.path IS NULL OR a.content_id<>e.content_id)
+            AND NOT EXISTS(SELECT 1 FROM renames r WHERE r.target=e.path)
+       ), deletes AS MATERIALIZED (
+         SELECT m.path,NULL AS target,m.content_id
+           FROM missing m
+          WHERE NOT EXISTS(SELECT 1 FROM renames r WHERE r.path=m.path)
+       )
+       SELECT 'rename' AS kind,path,target,content_id AS contentId FROM renames
+       UNION ALL SELECT 'upsert',path,target,content_id FROM upserts
+       UNION ALL SELECT 'delete',path,target,content_id FROM deletes
+       ORDER BY kind COLLATE BINARY,path COLLATE BINARY`,
+      [manifest]
+    );
+    const renames = planned
+      .filter((row) => row.kind === "rename")
+      .map((row) => ({
+        from: String(row.path),
+        to: String(row.target),
+        contentId: String(row.contentId),
+      }));
+    const upserts = planned
+      .filter((row) => row.kind === "upsert")
+      .map((row) => ({ path: String(row.path), contentId: String(row.contentId) }));
+    const deletes = planned
+      .filter((row) => row.kind === "delete")
+      .map((row) => ({ path: String(row.path), contentId: String(row.contentId) }));
+    return {
+      renames,
+      upserts,
+      deletes,
+      state: planned.length ? this.markIncomplete() : this.getState(),
+    };
   }
 
   /** Durably fences a vault event observed after a reconciliation snapshot. */
@@ -228,7 +293,7 @@ export class MutableSqliteDatabase {
       });
       const pk = rows(this.db, "SELECT note_pk FROM notes WHERE path=?", [note.path])[0].note_pk;
       const sql =
-        "INSERT INTO chunks(note_pk,chunk_id,ordinal,start_line,end_line,path_text,filename,body,embedding) VALUES(?,?,?,?,?,?,?,?,vec_normalize(?))";
+        "INSERT INTO chunks(note_pk,chunk_id,ordinal,start_line,end_line,path_text,filename,body,embedding) VALUES(?,?,?,?,?,?,?,?,vector_as_f32(?))";
       const statement = this.db.prepare?.(sql);
       const filename = note.path.slice(note.path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
       try {
@@ -307,7 +372,7 @@ export class MutableSqliteDatabase {
   }
 
   finishReconciliation(
-    summaries: readonly Required<SqliteNoteSummary>[],
+    summaries: readonly SqliteNoteSummary[],
     observedChangeCounter: number
   ): SqliteState {
     this.ensureOpen();
@@ -324,9 +389,11 @@ export class MutableSqliteDatabase {
                   FROM notes n LEFT JOIN chunks c ON c.note_pk=n.note_pk
                  GROUP BY n.note_pk
               ), differences AS (
-                SELECT * FROM expected EXCEPT SELECT * FROM actual
+                SELECT e.path FROM expected e LEFT JOIN actual a ON a.path=e.path
+                 WHERE a.path IS NULL OR a.content_id<>e.content_id
+                    OR (e.chunk_count IS NOT NULL AND e.chunk_count<>a.chunk_count)
                 UNION ALL
-                SELECT * FROM actual EXCEPT SELECT * FROM expected
+                SELECT a.path FROM actual a WHERE NOT EXISTS(SELECT 1 FROM expected e WHERE e.path=a.path)
               )
               UPDATE index_state
                  SET incomplete=0,reconciliation_summary=?
@@ -369,11 +436,11 @@ export class MutableSqliteDatabase {
     if (vector && semanticLimit > 0) {
       const bytes = vectorBytes(vector, this.dimensions);
       const pathClause = currentPath ? "WHERE n.path<>?" : "";
-      ctes.push(`query_vector AS MATERIALIZED (SELECT vec_normalize(?) AS embedding),
-      semantic_scored AS MATERIALIZED (
-        SELECT c.chunk_pk AS chunkPk,c.chunk_id AS id,n.path,c.ordinal,
-               vec_distance_L2(c.embedding,q.embedding) AS distance
-          FROM chunks c JOIN notes n ON n.note_pk=c.note_pk CROSS JOIN query_vector q ${pathClause}
+      ctes.push(`semantic_scored AS MATERIALIZED (
+        SELECT c.chunk_pk AS chunkPk,c.chunk_id AS id,n.path,c.ordinal,v.distance
+          FROM vector_full_scan('chunks','embedding',?) v
+          JOIN chunks c ON c.chunk_pk=v.rowid
+          JOIN notes n ON n.note_pk=c.note_pk ${pathClause}
       )`);
       bind.push(bytes);
       if (currentPath) bind.push(currentPath);
@@ -384,7 +451,7 @@ export class MutableSqliteDatabase {
           ) AS shapeRank
             FROM semantic_scored
         ), semantic_ordered AS MATERIALIZED (
-          SELECT *,max(-1.0,min(1.0,1.0-(distance*distance/2.0))) AS score,
+          SELECT *,max(-1.0,min(1.0,1.0-distance)) AS score,
                  ROW_NUMBER() OVER (ORDER BY distance,path COLLATE BINARY,ordinal,id COLLATE BINARY) AS channelRank
             FROM semantic_shaped WHERE shapeRank=1
         ), semantic_boundary AS (
@@ -397,7 +464,7 @@ export class MutableSqliteDatabase {
         bind.push(semanticLimit, semanticLimit);
       } else {
         ctes.push(`semantic_limited AS MATERIALIZED (
-          SELECT *,max(-1.0,min(1.0,1.0-(distance*distance/2.0))) AS score
+          SELECT *,max(-1.0,min(1.0,1.0-distance)) AS score
             FROM semantic_scored
            ORDER BY distance,path COLLATE BINARY,ordinal,id COLLATE BINARY LIMIT ?
         ), semantic AS (
@@ -558,6 +625,7 @@ export class MutableSqliteDatabase {
       throw sqliteError("integrity_failed", "Snapshot integrity check failed");
     if (rows(this.db, "PRAGMA foreign_key_check").length)
       throw sqliteError("integrity_failed", "Snapshot integrity check failed");
+    this.initializeVector();
     try {
       this.db.exec("INSERT INTO chunks_fts(chunks_fts) VALUES ('integrity-check')");
     } catch {
@@ -619,6 +687,13 @@ export class MutableSqliteDatabase {
     this.db.exec({
       sql: "UPDATE index_state SET incomplete=CASE WHEN ? THEN 1 ELSE incomplete END, change_counter=change_counter+1 WHERE id=1",
       bind: [incomplete ? 1 : 0],
+    });
+  }
+
+  private initializeVector(): void {
+    this.db.exec({
+      sql: "SELECT vector_init('chunks','embedding',?)",
+      bind: [`dimension=${this.dimensions},type=FLOAT32,distance=COSINE,normalized=1`],
     });
   }
 

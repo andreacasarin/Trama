@@ -23,6 +23,7 @@ import {
   type SqliteNoteInput,
   type SqliteState,
   type SqliteNoteSummary,
+  type SqliteReconciliationPlan,
   type SqliteMutationResult,
 } from "@/index/sqlite/protocol";
 import {
@@ -73,34 +74,15 @@ export interface RelatedIndexHit {
   readonly startLine?: number;
   readonly endLine?: number;
 }
-export interface RelatedIndexSnapshot {
+export interface RelatedIndexState {
   readonly changeCounter?: number;
   readonly generationId?: string;
   readonly currentPath: string;
   readonly contentHash: string;
-  prepareQuery(
-    signal: AbortSignal
-  ): Promise<{ readonly text: string; readonly vector: readonly number[] } | null>;
-  search(
-    query: string,
-    vector: readonly number[],
-    signal: AbortSignal,
-    limit: number
-  ): Promise<readonly RelatedIndexHit[]>;
 }
 interface FullIndexPlan {
   readonly paths: readonly string[];
   readonly estimatedTexts?: number;
-}
-export interface LenteBundleLease {
-  readonly changeCounter?: number;
-  readonly generationId?: string;
-  search(
-    query: string,
-    mode: "hybrid" | "lexical",
-    signal?: AbortSignal
-  ): Promise<readonly RetrievalResult[]>;
-  release(): Promise<void>;
 }
 export interface SnapshotDataAdapter {
   exists?(path: string): Promise<boolean>;
@@ -168,14 +150,6 @@ function sameSummaries(a: readonly SqliteNoteSummary[], b: readonly SqliteNoteSu
     if (a[index].path !== b[index].path || a[index].contentId !== b[index].contentId) return false;
   return true;
 }
-function sameKnownSummaries(
-  summaries: readonly SqliteNoteSummary[],
-  known: ReadonlyMap<string, { contentId: string }>
-): boolean {
-  if (summaries.length !== known.size) return false;
-  return summaries.every((summary) => known.get(summary.path)?.contentId === summary.contentId);
-}
-
 export class IndexManager implements VaultSearchPort {
   private client?: SqliteWorkerClient;
   private state?: SqliteState;
@@ -191,7 +165,6 @@ export class IndexManager implements VaultSearchPort {
   private readonly workerFactory?: () => SqliteWorkerLike;
   private readonly worker?: SqliteWorkerLike;
   private readonly snapshotAdapter?: SnapshotDataAdapter;
-  private readonly knownNotes = new Map<string, { contentId: string; chunkCount: number }>();
 
   constructor(
     private readonly vault: IndexVaultPort,
@@ -262,13 +235,6 @@ export class IndexManager implements VaultSearchPort {
   private generationId(): string {
     return indexIdentity(this.changeCounter());
   }
-  private syncKnown(
-    notes: readonly { path: string; contentId: string; chunkCount: number }[]
-  ): void {
-    this.knownNotes.clear();
-    for (const note of notes)
-      this.knownNotes.set(note.path, { contentId: note.contentId, chunkCount: note.chunkCount });
-  }
   private setState(state: SqliteState): void {
     this.state = state;
   }
@@ -314,7 +280,6 @@ export class IndexManager implements VaultSearchPort {
         identity: await sha256Hex(sqliteIdentity),
       });
       this.setState(state as SqliteState);
-      this.syncKnown(await this.ensureClient().call("listNotes", {}));
       this.unavailable = false;
       if (observable)
         this.emit({
@@ -394,7 +359,6 @@ export class IndexManager implements VaultSearchPort {
         determinate: plan.estimatedTexts !== undefined,
         estimated: plan.estimatedTexts !== undefined,
       });
-      this.syncKnown(await this.ensureClient().call("listNotes", {}, signal));
       let encoded = 0;
       for await (const note of this.noteInputs(plan, signal)) {
         check(signal);
@@ -402,10 +366,6 @@ export class IndexManager implements VaultSearchPort {
           state: SqliteState;
         };
         this.setState(result.state);
-        this.knownNotes.set(note.path, {
-          contentId: note.contentId,
-          chunkCount: note.chunks.length,
-        });
         encoded++;
         this.reportProgress({
           operation: "full",
@@ -558,16 +518,26 @@ export class IndexManager implements VaultSearchPort {
   }
 
   async synchronize(signal: AbortSignal): Promise<IndexSyncResult> {
+    return this.runSynchronization(signal);
+  }
+
+  private async runSynchronization(
+    signal: AbortSignal,
+    phase?: "queued"
+  ): Promise<IndexSyncResult> {
     if (this.maintenance)
       throw new StructuredError("busy", "Index maintenance is in progress.", true);
     if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
     check(signal);
+    const tracksBuilding = phase === "queued";
+    if (tracksBuilding) this.building = true;
     const started = Date.now();
     this.emit({
       area: "index",
       event: "index_operation",
       operation: "incremental",
       stage: "started",
+      ...(phase ? { phase } : {}),
     });
     const complete = (changed: boolean): IndexSyncResult => {
       this.emit({
@@ -575,6 +545,7 @@ export class IndexManager implements VaultSearchPort {
         event: "index_operation",
         operation: "incremental",
         stage: "completed",
+        ...(phase ? { phase } : {}),
         durationMs: Date.now() - started,
         generation: this.generationId(),
         counts: {
@@ -588,22 +559,6 @@ export class IndexManager implements VaultSearchPort {
     };
     try {
       if (!this.loaded) await this.load();
-      const initialWatermark = this.revision;
-      const initial = await this.discoverEligible(signal);
-      if (
-        this.revision === this.reconciledRevision &&
-        this.state?.incomplete === false &&
-        initialWatermark === this.revision &&
-        sameKnownSummaries(initial, this.knownNotes)
-      ) {
-        const verify = await this.discoverEligible(signal);
-        if (
-          initialWatermark === this.revision &&
-          sameSummaries(initial, verify) &&
-          sameKnownSummaries(verify, this.knownNotes)
-        )
-          return complete(false);
-      }
       let changed = false;
       const embeddingProgress = { completed: 0 };
       // A vault can change while this pass is hashing or embedding. Repeat after
@@ -629,10 +584,13 @@ export class IndexManager implements VaultSearchPort {
         event: "index_operation",
         operation: "incremental",
         stage: signal.aborted ? "cancelled" : "failed",
+        ...(phase ? { phase } : {}),
         durationMs: Date.now() - started,
         error: projectDiagnosticError(error),
       });
       throw error;
+    } finally {
+      if (tracksBuilding) this.building = false;
     }
   }
 
@@ -656,58 +614,25 @@ export class IndexManager implements VaultSearchPort {
     signal: AbortSignal,
     embeddingProgress: { completed: number }
   ): Promise<boolean> {
-    const current = new Map(discovered.map((summary) => [summary.path, summary]));
-    const missing = [...this.knownNotes.entries()]
-      .filter(([path]) => !current.has(path))
-      .sort(([a], [b]) => compareCodeUnits(a, b));
-    const additions = [...current.values()]
-      .filter((summary) => !this.knownNotes.has(summary.path))
-      .sort((a, b) => compareCodeUnits(a.path, b.path));
+    const plan = (await this.ensureClient().call(
+      "planReconciliation",
+      { summaries: discovered },
+      signal
+    )) as SqliteReconciliationPlan;
+    this.setState(plan.state);
     let changed = false;
-
-    // Pair offline renames before considering any deletion. Content IDs are
-    // path-independent, so duplicate notes are paired deterministically by
-    // code-unit path order and retain their existing vectors.
-    const byId = new Map<string, string[]>();
-    for (const [path, note] of missing)
-      (byId.get(note.contentId) ?? (byId.set(note.contentId, []), byId.get(note.contentId)!)).push(
-        path
-      );
-    const newById = new Map<string, string[]>();
-    for (const summary of additions)
-      (
-        newById.get(summary.contentId) ??
-        (newById.set(summary.contentId, []), newById.get(summary.contentId)!)
-      ).push(summary.path);
-    for (const [contentId, oldPaths] of byId) {
-      const newPaths = newById.get(contentId) ?? [];
-      oldPaths.sort(compareCodeUnits);
-      newPaths.sort(compareCodeUnits);
-      for (let index = 0; index < Math.min(oldPaths.length, newPaths.length); index++) {
-        const from = oldPaths[index],
-          to = newPaths[index];
-        const previous = this.knownNotes.get(from)!;
-        const result = (await this.ensureClient().call(
-          "renameNote",
-          { from, to, contentId },
-          signal
-        )) as SqliteMutationResult;
-        this.setState(result.state);
-        if (result.status === "state_changed") continue;
-        changed ||= result.changed;
-        this.knownNotes.delete(from);
-        this.knownNotes.set(to, previous);
-        newById.get(contentId)!.splice(newById.get(contentId)!.indexOf(to), 1);
-        byId.get(contentId)!.splice(byId.get(contentId)!.indexOf(from), 1);
-      }
+    for (const rename of plan.renames) {
+      const result = (await this.ensureClient().call(
+        "renameNote",
+        rename,
+        signal
+      )) as SqliteMutationResult;
+      this.setState(result.state);
+      changed ||= result.changed;
     }
 
-    // Hash-only additions and changed notes are embedded only after the
-    // content identity proves that an update is actually necessary.
-    for (const summary of [...current.values()].sort((a, b) => compareCodeUnits(a.path, b.path))) {
+    for (const summary of plan.upserts) {
       check(signal);
-      const known = this.knownNotes.get(summary.path);
-      if (known?.contentId === summary.contentId) continue;
       const doc = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
       if (!doc) continue;
       const note = await this.prepareNote(summary.path, doc, signal, embeddingProgress);
@@ -727,26 +652,16 @@ export class IndexManager implements VaultSearchPort {
       )) as SqliteMutationResult;
       this.setState(result.state);
       changed ||= result.changed;
-      if (result.status !== "state_changed")
-        this.knownNotes.set(summary.path, {
-          contentId: note.contentId,
-          chunkCount: note.chunks.length,
-        });
     }
 
-    // Remaining missing rows are genuine deletes. Idempotent deletes make
-    // replay after a lost acknowledgement safe.
-    for (const [path, note] of [...this.knownNotes.entries()]
-      .filter(([path]) => !current.has(path))
-      .sort(([a], [b]) => compareCodeUnits(a, b))) {
+    for (const note of plan.deletes) {
       const result = (await this.ensureClient().call(
         "deleteNote",
-        { path, contentId: note.contentId },
+        note,
         signal
       )) as SqliteMutationResult;
       this.setState(result.state);
       changed ||= result.changed;
-      if (result.status !== "state_changed") this.knownNotes.delete(path);
     }
     return changed;
   }
@@ -829,14 +744,10 @@ export class IndexManager implements VaultSearchPort {
       await this.markIncomplete(signal);
       return false;
     }
-    const expectedWithChunks = expected.map((note) => ({
-      ...note,
-      chunkCount: this.knownNotes.get(note.path)?.chunkCount ?? 0,
-    }));
     const before = this.state?.changeCounter ?? 0;
     const state = (await this.ensureClient().call(
       "finishReconciliation",
-      { summaries: expectedWithChunks, observedChangeCounter: before },
+      { summaries: expected, observedChangeCounter: before },
       signal
     )) as SqliteState;
     if (expectedRevision !== this.revision) {
@@ -844,7 +755,6 @@ export class IndexManager implements VaultSearchPort {
       return false;
     }
     this.setState(state);
-    if (!state.incomplete) this.syncKnown(expectedWithChunks);
     return !state.incomplete;
   }
 
@@ -859,76 +769,15 @@ export class IndexManager implements VaultSearchPort {
   }
   async reconcileQueuedChanges(signal: AbortSignal): Promise<IndexSyncResult> {
     if (this.revision === this.reconciledRevision) {
-      if (this.loaded && this.state?.incomplete) return this.synchronize(signal);
+      if (this.loaded && this.state?.incomplete) return this.runSynchronization(signal, "queued");
       return { changed: false, converged: this.state?.incomplete === false };
     }
     if (this.building) {
       await this.buildPromise;
-      return this.reconcileQueuedChanges(signal);
+      if (this.building)
+        throw new StructuredError("busy", "Index update is already running.", true);
     }
-    if (!this.loaded) await this.load();
-    this.building = true;
-    const started = Date.now();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "incremental",
-      stage: "started",
-      phase: "queued",
-    });
-    try {
-      let changed = false;
-      let converged = false;
-      const embeddingProgress = { completed: 0 };
-      for (let pass = 0; pass < 8; pass++) {
-        const watermark = this.revision;
-        // Events only establish the watermark. The vault scan is authoritative:
-        // a stale/reordered delete event must not hide a note that still exists.
-        const discovered = await this.discoverEligible(signal);
-        changed ||= await this.reconcileDiscovered(discovered, signal, embeddingProgress);
-        const stable = await this.discoverEligible(signal);
-        converged =
-          sameSummaries(discovered, stable) &&
-          watermark === this.revision &&
-          (await this.finishIfStable(stable, signal, watermark));
-        if (converged) {
-          // A later event is never discarded by an acknowledgement for the
-          // earlier watermark. It is left queued for the next pass.
-          this.reconciledRevision = Math.max(this.reconciledRevision, watermark);
-          break;
-        }
-      }
-      if (converged) this.unavailable = false;
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: "completed",
-        phase: "queued",
-        durationMs: Date.now() - started,
-        generation: this.generationId(),
-        counts: {
-          changed: changed ? 1 : 0,
-          notes: this.state?.noteCount ?? 0,
-          chunks: this.state?.chunkCount ?? 0,
-          incomplete: this.state?.incomplete ? 1 : 0,
-        },
-      });
-      return { changed, converged };
-    } catch (error) {
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: signal.aborted ? "cancelled" : "failed",
-        phase: "queued",
-        durationMs: Date.now() - started,
-        error: projectDiagnosticError(error),
-      });
-      throw error;
-    } finally {
-      this.building = false;
-    }
+    return this.runSynchronization(signal, "queued");
   }
 
   async search(
@@ -946,17 +795,17 @@ export class IndexManager implements VaultSearchPort {
       })
     );
   }
-  acquireLenteLease(): LenteBundleLease | null {
+  lenteState(): { readonly changeCounter: number; readonly generationId: string } | null {
     if (!this.hasUsableIndex()) return null;
     const changeCounter = this.changeCounter();
-    const generationId = indexIdentity(changeCounter);
-    return {
-      changeCounter,
-      generationId,
-      search: (query, mode, signal) =>
-        this.retrieve(query, mode, signal, 160, undefined, undefined, "lente"),
-      release: async () => undefined,
-    };
+    return { changeCounter, generationId: indexIdentity(changeCounter) };
+  }
+  searchLente(
+    query: string,
+    mode: "hybrid" | "lexical",
+    signal?: AbortSignal
+  ): Promise<readonly RetrievalResult[]> {
+    return this.retrieve(query, mode, signal, 160, undefined, undefined, "lente");
   }
   private async retrieve(
     query: string,
@@ -1044,37 +893,37 @@ export class IndexManager implements VaultSearchPort {
       throw error;
     }
   }
-  relatedSnapshot(path: string): RelatedIndexSnapshot | null {
-    const currentPath = normalizePath(path),
-      note = this.knownNotes.get(currentPath);
-    if (!note || !this.hasUsableIndex()) return null;
+  relatedState(path: string): RelatedIndexState | null {
+    const currentPath = normalizePath(path);
+    if (!this.hasUsableIndex() || !this.isIndexEligible(currentPath)) return null;
     const counter = this.changeCounter();
     const identity = indexIdentity(counter);
     return {
       changeCounter: counter,
       generationId: identity,
       currentPath,
-      contentHash: note.contentId,
-      prepareQuery: async (signal) => {
-        check(signal);
-        return note.chunkCount > 0 ? { text: currentPath, vector: [] } : null;
-      },
-      search: async (_query, _vector, signal, limit) => {
-        const hits = (await this.ensureClient().call(
-          "findRelated",
-          { path: currentPath, limit: Math.min(128, limit) },
-          signal
-        )) as readonly SqliteHit[];
-        return hits.map((hit) => ({
-          path: hit.path,
-          score: hit.score,
-          similarity: hit.score,
-          excerpt: hit.text,
-          startLine: hit.startLine,
-          endLine: hit.endLine,
-        }));
-      },
+      contentHash: identity,
     };
+  }
+  async findRelated(
+    path: string,
+    signal: AbortSignal,
+    limit: number
+  ): Promise<readonly RelatedIndexHit[]> {
+    check(signal);
+    const hits = (await this.ensureClient().call(
+      "findRelated",
+      { path: normalizePath(path), limit: Math.min(128, limit) },
+      signal
+    )) as readonly SqliteHit[];
+    return hits.map((hit) => ({
+      path: hit.path,
+      score: hit.score,
+      similarity: hit.score,
+      excerpt: hit.text,
+      startLine: hit.startLine,
+      endLine: hit.endLine,
+    }));
   }
   async exportSnapshot(): Promise<IndexSnapshotExport> {
     if (this.maintenance || this.building)
@@ -1158,7 +1007,6 @@ export class IndexManager implements VaultSearchPort {
       if (!state.incomplete || state.changeCounter <= previous)
         throw new StructuredError("internal", "Imported snapshot state is invalid.", false);
       this.setState(state);
-      this.syncKnown(await this.ensureClient().call("listNotes", {}));
       return state;
     } finally {
       this.maintenance = false;

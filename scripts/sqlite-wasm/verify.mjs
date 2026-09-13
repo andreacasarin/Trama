@@ -32,16 +32,24 @@ const wasmBytes = readFileSync(materialized.wasmPath);
 const wasmExports = WebAssembly.Module.exports(new WebAssembly.Module(wasmBytes)).map(
   ({ name }) => name
 );
+globalThis.sqlite3ApiConfig = { disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } } };
 const initModule = (await import(`${pathToFileURL(materialized.modulePath).href}?verify`)).default;
-const sqlite = await initModule({ wasmBinary: wasmBytes });
+const sqlite = await initModule({
+  instantiateWasm(imports, onSuccess) {
+    WebAssembly.instantiate(wasmBytes, imports).then(({ instance, module }) =>
+      onSuccess(instance, module)
+    );
+    return {};
+  },
+});
 const db = new sqlite.oo1.DB(":memory:", "c");
 const compiledCapabilities = {
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,
-  sqliteVec: db.selectValue("SELECT vec_version()") === context.lock.sqliteVec.version,
-  sqliteVecModule:
-    db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='vec0'") === 1,
+  sqliteVector: db.selectValue("SELECT vector_version()") === context.lock.sqliteVector.version,
+  sqliteVectorModule:
+    db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='vector_full_scan'") === 1,
   fts5Module: db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='fts5'") === 1,
 };
 db.close();
@@ -50,12 +58,12 @@ const checks = {
     manifest.source.sqliteArchiveSha256 === context.lock.sqlite.archiveSha256 &&
     manifest.source.sqliteAmalgamationArchiveSha256 ===
       context.lock.sqlite.amalgamationArchiveSha256 &&
-    manifest.source.sqliteVecArchiveSha256 === context.lock.sqliteVec.archiveSha256,
+    manifest.source.sqliteVectorArchiveSha256 === context.lock.sqliteVector.archiveSha256,
   toolchainPinned: manifest.toolchain === context.dockerImage,
-  sqliteVersionPinned: moduleText.includes("3.45.3"),
+  sqliteVersionPinned: moduleText.includes(context.lock.sqlite.version),
   sourceIdPinned: moduleText.includes(context.lock.sqlite.sourceId),
   fts5Requested: context.lock.build.flags.includes("-DSQLITE_ENABLE_FTS5"),
-  staticRegistrationSource: context.lock.build.flags.includes("-DSQLITE_VEC_STATIC"),
+  staticRegistrationSource: context.lock.build.extraInit.includes("sqlite3_vector_init"),
   runtimeExtensionLoadingDisabled:
     context.lock.build.flags.includes("-DSQLITE_OMIT_LOAD_EXTENSION") &&
     !wasmExports.includes("sqlite3_load_extension") &&
@@ -66,10 +74,7 @@ const checks = {
     context.lock.build.threaded === false && !moduleText.includes("PTHREAD_POOL_SIZE"),
   wasmValid: WebAssembly.validate(wasmBytes),
   noRemoteModuleImport: !/\b(?:import|fetch)\s*\(\s*["']https?:/.test(moduleText),
-  asyncOpfsInitializerDisabled:
-    manifest.postProcessing?.asyncOpfsInitializerDisabled === true &&
-    !moduleText.includes('installOpfsVfs.defaultProxyUri =\n  "sqlite3-opfs-async-proxy.js"') &&
-    !moduleText.includes("initializersAsync.push(async (sqlite3)=>"),
+  canonicalModule: manifest.postProcessing?.canonicalModule === true,
   persistenceUsesSahPool: manifest.postProcessing?.persistenceVfs === "opfs-sah-pool",
 };
 for (const [name, ok] of Object.entries(checks)) console.log(`${ok ? "ok" : "FAIL"} ${name}`);

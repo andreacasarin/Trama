@@ -146,8 +146,8 @@ files into `<vault>/.obsidian/plugins/trama/`. Restart or reload Obsidian after
 installation. Production startup is network-silent: it loads the packaged
 SQLite WASM assets and never downloads them at runtime.
 
-The pinned SQLite source, sqlite-vec source, Emscripten image, flags, patches,
-and build inputs are recorded in the repository's supply-chain metadata. A
+The pinned SQLite source, SQLite-Vector source, Emscripten image, flags, and
+build inputs are recorded in the repository's supply-chain metadata. A
 cache entry is reusable only when its fingerprint and output verification
 match those inputs. Release verification checks the pinned inputs, manifests,
 version agreement, and the exact six-file package inventory. The generated
