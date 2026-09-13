@@ -106,6 +106,7 @@ export class ChatSession {
   private state: ChatState = EMPTY_STATE;
   private readonly history: ChatMessage[] = [];
   private active: AbortController | undefined;
+  private activeElapsedMs?: () => number;
   private generation = 0;
   private nextTurnId = 0;
   private readonly listeners = new Set<(state: ChatState) => void>();
@@ -154,6 +155,7 @@ export class ChatSession {
     const identity = ++this.generation;
     const elapsedMs = startDiagnosticTimer();
     this.active = controller;
+    this.activeElapsedMs = elapsedMs;
     this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
@@ -227,10 +229,14 @@ export class ChatSession {
         code,
         message,
         error,
+        durationMs: elapsedMs(),
       });
       return this.failure(identity, code, message);
     } finally {
-      if (this.active === controller) this.active = undefined;
+      if (this.active === controller) {
+        this.active = undefined;
+        this.activeElapsedMs = undefined;
+      }
     }
   }
 
@@ -245,7 +251,13 @@ export class ChatSession {
       running: false,
       error: { code: "cancelled", message: "Chat turn cancelled." },
     });
-    this.diagnostics.emit({ area: "chat", event: "cancelled", generation: identity });
+    this.diagnostics.emit({
+      area: "chat",
+      event: "cancelled",
+      generation: identity,
+      durationMs: this.activeElapsedMs?.() ?? 0,
+    });
+    this.activeElapsedMs = undefined;
     for (const listener of this.listeners) listener(this.state);
   }
 
@@ -270,6 +282,7 @@ export class ChatSession {
     let contentSize = 0;
     for (let round = 0; round < CHAT_LIMITS.maxRounds; round++) {
       let streamedText = "";
+      const roundElapsedMs = startDiagnosticTimer();
       this.diagnostics.emit({
         area: "chat",
         event: "model_round_started",
@@ -299,6 +312,7 @@ export class ChatSession {
         generation: identity,
         round: round + 1,
         finishReason: response.finishReason,
+        durationMs: roundElapsedMs(),
       });
       this.history.push(Object.freeze(response.message));
       if (response.finishReason !== "tool_calls" || !response.message.toolCalls?.length)
@@ -374,6 +388,7 @@ export class ChatSession {
     signal: AbortSignal,
     identity: number
   ): Promise<readonly ReadonlyNote[]> {
+    const elapsedMs = startDiagnosticTimer();
     this.diagnostics.emit({
       area: "chat",
       event: "attachment_preflight_started",
@@ -394,6 +409,7 @@ export class ChatSession {
       event: "attachment_preflight_completed",
       generation: identity,
       count: notes.length,
+      durationMs: elapsedMs(),
     });
     return notes;
   }
@@ -406,6 +422,7 @@ export class ChatSession {
     const cache = new Map<string, Promise<ToolResult>>();
     return Promise.all(
       calls.map(async (call) => {
+        const elapsedMs = startDiagnosticTimer();
         const key = `${call.name}\n${JSON.stringify(call.arguments)}`;
         let result = cache.get(key);
         if (!result) {
@@ -421,6 +438,7 @@ export class ChatSession {
           ok: resolved.ok,
           call,
           result: resolved,
+          durationMs: elapsedMs(),
         });
         return resolved;
       })

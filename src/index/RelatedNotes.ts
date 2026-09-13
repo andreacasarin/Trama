@@ -1,5 +1,5 @@
 import { RelatedIndexSnapshot } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { compareCodeUnits } from "@/index/Identity";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
@@ -20,7 +20,8 @@ export interface RelatedNoteResult {
   readonly endLine?: number;
 }
 export interface RelatedNotesResult {
-  readonly generationId: string;
+  readonly changeCounter?: number;
+  readonly generationId?: string;
   readonly currentPath: string;
   readonly contentHash: string;
   readonly results: readonly RelatedNoteResult[];
@@ -75,7 +76,8 @@ export class RelatedNotes {
     const snapshot = this.index.relatedSnapshot(currentPath);
     if (!snapshot || cap === 0) {
       const result = {
-        generationId: snapshot?.generationId ?? "",
+        changeCounter: snapshot?.changeCounter ?? 0,
+        generationId: snapshot?.generationId ?? `counter:${snapshot?.changeCounter ?? 0}`,
         currentPath: snapshot?.currentPath ?? currentPath,
         contentHash: snapshot?.contentHash ?? "",
         results: [],
@@ -85,7 +87,6 @@ export class RelatedNotes {
     }
     const key = this.key(snapshot);
     if (refresh) this.cancelAll();
-    else if ([...this.inFlight.keys()].some((activeKey) => activeKey !== key)) this.cancelAll();
     const cached = this.cache.get(key);
     if (cached && !refresh) {
       if (this.snapshotKey(currentPath) !== key) throw new Error("Operation cancelled");
@@ -125,11 +126,9 @@ export class RelatedNotes {
             event: "related_search",
             path: result.currentPath,
             generation: result.generationId,
-            resultCount: 0,
+            resultCount: result.results.length,
             durationMs: Date.now() - started,
-            error: { name: "Error", code: "cancelled", retryable: true, cancelled: true },
           });
-          throw new Error("Operation cancelled");
         }
         return result;
       })
@@ -174,14 +173,7 @@ export class RelatedNotes {
       shared.then(
         (result) => {
           signal.removeEventListener("abort", onAbort);
-          if (
-            !signal.aborted &&
-            (!expectedKey ||
-              this.snapshotKey(expectedPath ?? result.currentPath) === expectedKey) &&
-            (!expectedKey || this.keyOf(result) === expectedKey)
-          )
-            resolve({ ...result, results: result.results.slice(0, limit) });
-          else if (!signal.aborted) reject(new Error("Operation cancelled"));
+          if (!signal.aborted) resolve({ ...result, results: result.results.slice(0, limit) });
         },
         (error) => {
           signal.removeEventListener("abort", onAbort);
@@ -221,6 +213,7 @@ export class RelatedNotes {
     });
     if (!prepared || !prepared.text) {
       return {
+        changeCounter: snapshot.changeCounter,
         generationId: snapshot.generationId,
         currentPath: snapshot.currentPath,
         contentHash: snapshot.contentHash,
@@ -263,6 +256,7 @@ export class RelatedNotes {
       .sort((a, b) => b.score - a.score || compareCodeUnits(a.path, b.path))
       .slice(0, limit);
     return {
+      changeCounter: snapshot.changeCounter,
       generationId: snapshot.generationId,
       currentPath: snapshot.currentPath,
       contentHash: snapshot.contentHash,
@@ -271,11 +265,11 @@ export class RelatedNotes {
   }
 
   private key(snapshot: RelatedIndexSnapshot): string {
-    return `${snapshot.generationId}\0${snapshot.currentPath}\0${snapshot.contentHash}`;
+    return `${snapshot.changeCounter ?? snapshot.generationId ?? 0}\0${snapshot.currentPath}\0${snapshot.contentHash}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
+    return `${result.changeCounter ?? result.generationId ?? 0}\0${result.currentPath}\0${result.contentHash}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

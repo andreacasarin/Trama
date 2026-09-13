@@ -410,6 +410,12 @@ describe("ChatSession module", () => {
           generation: 1,
           durationMs: expect.any(Number),
         });
+        expect(records.find((record) => record.event === "attachment_preflight_completed")).toEqual(
+          expect.objectContaining({ durationMs: expect.any(Number) })
+        );
+        expect(records.find((record) => record.event === "model_round_completed")).toEqual(
+          expect.objectContaining({ durationMs: expect.any(Number) })
+        );
       });
 
       it("emits exact tool and session-error payloads", async () => {
@@ -439,6 +445,7 @@ describe("ChatSession module", () => {
         expect(records.find((record) => record.event === "tool_completed")).toMatchObject({
           call,
           result,
+          durationMs: expect.any(Number),
         });
 
         const error = new Error("full session error");

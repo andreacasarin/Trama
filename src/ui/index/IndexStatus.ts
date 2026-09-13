@@ -25,6 +25,7 @@ export interface IndexStatus {
   readonly revision: number;
   readonly hasLastGood: boolean;
   readonly progress?: IndexProgress;
+  readonly changeCounter?: number;
   readonly etaSeconds?: number;
   readonly message?: string;
   readonly canIndex: boolean;
@@ -171,15 +172,18 @@ export class IndexStatusController {
       return;
     const previous = this.status.progress;
     if (
-      previous?.generationId &&
-      progress.generationId &&
-      previous.generationId !== progress.generationId
+      previous?.changeCounter !== undefined && progress.changeCounter !== undefined
+        ? previous.changeCounter !== progress.changeCounter
+        : previous?.generationId &&
+          progress.generationId &&
+          previous.generationId !== progress.generationId
     )
       return;
     if (
       previous &&
       previous.operation === progress.operation &&
       previous.phase === progress.phase &&
+      previous.changeCounter === progress.changeCounter &&
       previous.generationId === progress.generationId &&
       progress.completed < previous.completed
     )
@@ -213,7 +217,7 @@ export class IndexStatusController {
   private applyProgress(progress: IndexProgress): void {
     const now = this.timing.now();
     this.progressAt = now;
-    const rateKey = `${progress.operation}:${progress.phase}:${progress.generationId ?? ""}`;
+    const rateKey = `${progress.operation}:${progress.phase}:${progress.changeCounter ?? progress.generationId ?? ""}`;
     if (this.rateKey !== rateKey || progress.completed === 0) {
       this.rateKey = rateKey;
       this.rateStartedAt = now;
@@ -232,22 +236,11 @@ export class IndexStatusController {
     this.status = {
       ...this.status,
       progress,
+      changeCounter: progress.changeCounter,
       message,
       etaSeconds,
       revision: ++this.revision,
     };
-    this.emitDiagnostic({
-      area: "index",
-      event: "index_operation",
-      operation: progress.operation === "startup" ? "startup" : progress.operation,
-      stage: "started",
-      phase: progress.phase,
-      completed: progress.completed,
-      ...(progress.total === undefined ? {} : { total: progress.total }),
-      unit: progress.unit,
-      determinate: progress.determinate,
-      ...(progress.generationId ? { generation: progress.generationId } : {}),
-    });
     for (const listener of [...this.listeners]) listener(this.status);
   }
 
@@ -271,6 +264,7 @@ export class IndexStatusController {
       kind,
       revision: ++this.revision,
       hasLastGood,
+      changeCounter: this.status.changeCounter,
       message,
       canIndex:
         kind === "index-required" ||

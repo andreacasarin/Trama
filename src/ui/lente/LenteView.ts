@@ -65,7 +65,7 @@ export class LenteView extends ItemView {
     if (this.opened) this.render();
   }
 
-  /** Reruns the last submitted query after a newly published generation. */
+  /** Reruns the last submitted query after the mutable index changes. */
   refreshSubmitted(): void {
     if (this.submitted && this.opened) void this.runQuery(this.submitted);
   }

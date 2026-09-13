@@ -25,20 +25,8 @@ export interface LenteRetrievalPort {
 }
 
 export interface LenteRetrievalLease {
-  readonly generationId: string;
-  readonly retriever?: {
-    search(request: {
-      query: string;
-      mode: LenteRetrievalMode;
-      resultShape: "notes";
-      limit: number;
-      semanticCandidateLimit: number;
-      lexicalCandidateLimit: number;
-      lexicalProfile: "lente";
-      feature: "lente";
-      signal?: AbortSignal;
-    }): Promise<readonly LenteHit[]>;
-  };
+  readonly changeCounter?: number;
+  readonly generationId?: string;
   search?(
     query: string,
     mode: LenteRetrievalMode,
@@ -52,7 +40,8 @@ export interface LenteHit {
   readonly startLine: number;
   readonly endLine: number;
   readonly excerpt: string;
-  readonly generationId: string;
+  readonly generationId?: string;
+  readonly changeCounter?: number;
   readonly chunkId: string;
   readonly ordinal: number;
   readonly semanticScore?: number;
@@ -65,7 +54,8 @@ export interface LenteResult {
   readonly startLine: number;
   readonly endLine: number;
   readonly excerpt: string;
-  readonly generationId: string;
+  readonly generationId?: string;
+  readonly changeCounter?: number;
   readonly chunkId: string;
   readonly ordinal: number;
   readonly mtime: number | null;
@@ -75,7 +65,8 @@ export interface LenteResult {
 }
 
 export interface LenteBatch {
-  readonly generationId: string;
+  readonly generationId?: string;
+  readonly changeCounter?: number;
   readonly mode: LenteRetrievalMode;
   readonly degraded: boolean;
   readonly displayLimit: number;
@@ -125,14 +116,15 @@ export class LenteSearch {
       if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
       const canonicalResults = selectLenteResults(
         raw,
-        lease.generationId,
+        lease.generationId ?? `counter:${lease.changeCounter ?? 0}`,
         (path) => this.stats.getMtime(path),
         "relevant",
         MAX_CANDIDATES
       );
       const results = sortLenteResults(canonicalResults, options.sort ?? "relevant", displayLimit);
       const batch = {
-        generationId: lease.generationId,
+        generationId: lease.generationId ?? `counter:${lease.changeCounter ?? 0}`,
+        changeCounter: lease.changeCounter,
         mode,
         degraded,
         displayLimit,
@@ -179,18 +171,6 @@ export class LenteSearch {
     signal?: AbortSignal
   ): Promise<readonly LenteHit[]> {
     if (lease.search) return lease.search(query, mode, signal);
-    if (lease.retriever)
-      return lease.retriever.search({
-        query,
-        mode,
-        resultShape: "notes",
-        limit: MAX_CANDIDATES,
-        semanticCandidateLimit: MAX_CANDIDATES,
-        lexicalCandidateLimit: MAX_CANDIDATES,
-        lexicalProfile: "lente",
-        feature: "lente",
-        signal,
-      });
     return Promise.reject(new Error("Lente retrieval lease is invalid."));
   }
 }
@@ -220,7 +200,7 @@ export function selectLenteResults(
 ): LenteResult[] {
   const byPath = new Map<string, LenteResult>();
   for (const result of raw) {
-    if (result.generationId !== generationId) continue;
+    if (result.generationId !== undefined && result.generationId !== generationId) continue;
     const mtime = getMtime(result.path);
     if (mtime === null) continue;
     const enriched: LenteResult = { ...result, excerpt: plainExcerpt(result.excerpt), mtime };

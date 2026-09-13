@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ChatSession } from "@/chat/ChatSession";
 import { ChatModel, ChatResponse, ReadonlyVault } from "@/domain/contracts";
 import { IndexManager } from "@/index/IndexManager";
-import { MemoryIndexStorage } from "@/index/storage";
+import { createTestSqliteClient } from "./sqlite-test-client";
 import { ToolRegistry, ReadNoteTool, FollowLinkTool, VaultSearchTool } from "@/tools/ToolRegistry";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
@@ -34,7 +34,7 @@ const vault: ReadonlyVault = {
 describe("integration composition seams", () => {
   it("builds, persists, reloads, and searches a semantic index without network", async () => {
     const embedding = new FakeEmbedding();
-    const storage = new MemoryIndexStorage();
+    const storage = {};
     const port = {
       async listMarkdownPaths() {
         return ["A.md", "B.md"];
@@ -43,12 +43,14 @@ describe("integration composition seams", () => {
         return { path, content: `alpha ${path}` };
       },
     };
+    const sqliteClient = createTestSqliteClient(storage);
     const first = new IndexManager(
       port,
       embedding,
       storage,
       "http://127.0.0.1:1234/v1",
-      "embed-v1"
+      "embed-v1",
+      { sqliteClient }
     );
     await first.build(new AbortController().signal);
     expect(await first.search("alpha", new AbortController().signal, 10)).toHaveLength(2);
@@ -57,7 +59,8 @@ describe("integration composition seams", () => {
       embedding,
       storage,
       "http://127.0.0.1:1234/v1",
-      "embed-v1"
+      "embed-v1",
+      { sqliteClient: createTestSqliteClient(storage) }
     );
     expect(await restarted.load()).toBe(true);
   });

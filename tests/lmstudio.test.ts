@@ -104,7 +104,12 @@ describe("LM Studio adapters module", () => {
               },
             },
           },
-          { area: "chat", event: "model_response", response: result },
+          {
+            area: "chat",
+            event: "model_response",
+            response: result,
+            durationMs: expect.any(Number),
+          },
         ]);
       });
 

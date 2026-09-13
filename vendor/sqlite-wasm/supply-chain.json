@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "sqlite": {
+    "version": "3.45.3",
+    "sourceArchive": "sqlite-src-3450300.zip",
+    "url": "https://sqlite.org/2024/sqlite-src-3450300.zip",
+    "archiveSha256": "ec0c959e42cb5f1804135d0555f8ea32be6ff2048eb181bccd367c8f53f185d1",
+    "amalgamationArchive": "sqlite-amalgamation-3450300.zip",
+    "amalgamationUrl": "https://sqlite.org/2024/sqlite-amalgamation-3450300.zip",
+    "amalgamationArchiveSha256": "ea170e73e447703e8359308ca2e4366a3ae0c4304a8665896f068c736781c651",
+    "sourceId": "2024-04-15 13:34:05 8653b758870e6ef0c98d46b3ace27849054af85da891eb121e9aaa537f1e8355",
+    "amalgamationSha3_256": "21dbe688a71b449d28e2a8ec6a43e7520e54df456e02b6d4f6a1d1c7a998c826",
+    "license": "public-domain",
+    "evidence": "https://www.sqlite.org/releaselog/3_45_3.html"
+  },
+  "sqliteVec": {
+    "version": "v0.1.9",
+    "sourceArchive": "sqlite-vec-0.1.9-amalgamation.tar.gz",
+    "url": "https://github.com/asg017/sqlite-vec/releases/download/v0.1.9/sqlite-vec-0.1.9-amalgamation.tar.gz",
+    "archiveSha256": "3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61",
+    "sourceCommit": "e9f598a0fa0c06b328d8fe5da9c3760cce74be10",
+    "license": "MIT",
+    "evidence": "https://github.com/asg017/sqlite-vec/releases/tag/v0.1.9"
+  },
+  "emscripten": {
+    "version": "4.0.11",
+    "image": "emscripten/emsdk",
+    "images": {
+      "linux/amd64": "sha256:f8a157011b8fa61bdaab875bb1f0f08695229dffe086448d14b53538cae16bd3",
+      "linux/arm64": "sha256:40f650d8dd0ec1d54e77692a4c84d636449eb15d397a0e93d3cdb59c434105d5"
+    },
+    "evidence": "https://hub.docker.com/layers/emscripten/emsdk/4.0.11/images/sha256-f8a157011b8fa61bdaab875bb1f0f08695229dffe086448d14b53538cae16bd3"
+  },
+  "build": {
+    "optimization": "-O2 -g3",
+    "threaded": false,
+    "exports": ["sqlite3_wasm_db_reset", "sqlite3_wasm_vfs_unlink", "sqlite3_wasm_init_wasmfs"],
+    "flags": [
+      "-DSQLITE_ENABLE_FTS5",
+      "-DSQLITE_ENABLE_RTREE",
+      "-DSQLITE_ENABLE_EXPLAIN_COMMENTS",
+      "-DSQLITE_ENABLE_UNKNOWN_SQL_FUNCTION",
+      "-DSQLITE_ENABLE_STMTVTAB",
+      "-DSQLITE_ENABLE_DBPAGE_VTAB",
+      "-DSQLITE_ENABLE_DBSTAT_VTAB",
+      "-DSQLITE_ENABLE_BYTECODE_VTAB",
+      "-DSQLITE_ENABLE_OFFSET_SQL_FUNC",
+      "-DSQLITE_OMIT_LOAD_EXTENSION",
+      "-DSQLITE_OMIT_DEPRECATED",
+      "-DSQLITE_OMIT_UTF16",
+      "-DSQLITE_OMIT_SHARED_CACHE",
+      "-DSQLITE_THREADSAFE=0",
+      "-DSQLITE_TEMP_STORE=2",
+      "-DSQLITE_OS_KV_OPTIONAL=1",
+      "-DSQLITE_DEFAULT_UNIX_VFS=\"unix-none\"",
+      "-DSQLITE_USE_URI=1",
+      "-DSQLITE_WASM_ENABLE_C_TESTS",
+      "-DSQLITE_CORE",
+      "-DSQLITE_VEC_STATIC",
+      "-DSQLITE_VEC_OMIT_FS"
+    ],
+    "emccFlags": ["-O2", "-g3", "--minify 0", "--no-entry", "-sWASM_BIGINT=1", "-sMODULARIZE", "-sDYNAMIC_EXECUTION=0", "-sNO_POLYFILL", "-sIMPORTED_MEMORY", "-sALLOW_MEMORY_GROWTH", "-sALLOW_TABLE_GROWTH", "-sENVIRONMENT=web,worker"],
+    "extraInit": "sqlite3_wasm_extra_init.c calls sqlite3_auto_extension(sqlite3_vec_init)",
+    "architecture": "single-threaded Emscripten wasm32; no pthreads, no shared memory, no runtime extension loading"
+  }
+}

@@ -169,9 +169,9 @@ export class FiloView extends ItemView {
   }
 
   private acceptsResult(result: RelatedNotesResult): boolean {
-    if (result.currentPath !== this.activePath) return false;
-    const key = this.relatedSource?.snapshotKey?.(result.currentPath);
-    return !key || key === `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
+    // A completed read remains usable after a mutable-index counter bump. The
+    // next request observes the new snapshot key and refreshes the cache.
+    return result.currentPath === this.activePath;
   }
 
   private render(): void {

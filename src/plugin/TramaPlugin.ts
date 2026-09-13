@@ -1,9 +1,13 @@
 import { Platform, Plugin, TAbstractFile } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
-import { IndexManager, IndexVaultPort } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
-import { ObsidianIndexStorage } from "@/index/storage";
+import {
+  IndexManager,
+  IndexVaultPort,
+  type IndexSnapshotExport,
+  type SnapshotDataAdapter,
+} from "@/index/IndexManager";
+import { bytesToHex, compareCodeUnits } from "@/index/Identity";
 import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
@@ -29,6 +33,7 @@ import { TRAMA_ICONS } from "@/ui/icons";
 import { LenteBatch, LenteSearch, LenteSearchOptions } from "@/index/LenteSearch";
 import { ObsidianLenteNoteStats } from "@/vault/readOnly/ObsidianLenteNoteStats";
 import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
+import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
 
 interface LenteSearchPort {
   search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
@@ -58,6 +63,10 @@ export class TramaPlugin extends Plugin {
   private queuedWork = false;
   private readonly eventRefs: Array<{ unsubscribe?: () => void }> = [];
   private saveQueue: Promise<void> = Promise.resolve();
+  private sqliteIdentity?: string;
+  private sqliteIdentityAdapter?: SnapshotDataAdapter;
+  /** Test-only explicit backend injection; production composition leaves this unset. */
+  sqliteClientFactory?: (storage: object) => SqliteWorkerClient;
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
@@ -66,8 +75,20 @@ export class TramaPlugin extends Plugin {
       if (this.settingsStore.get().detailedDebug) {
         // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
         try {
+          const operation =
+            record.event === "index_operation"
+              ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
+              : "";
+          const stage = "stage" in record ? ` ${record.stage}` : "";
+          const duration =
+            "durationMs" in record && typeof record.durationMs === "number"
+              ? ` ${Math.round(record.durationMs)} ms`
+              : "";
           // eslint-disable-next-line no-console
-          console.info("[Trama]", record);
+          console.info(
+            `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
+            record
+          );
         } catch {
           // Console instrumentation is observational and must not break chat or indexing.
         }
@@ -198,6 +219,7 @@ export class TramaPlugin extends Plugin {
 
   override onunload(): void {
     this.indexReady = false;
+    this.index?.disposeImmediately();
     this.indexStatus?.cancel();
     this.lifecycleAbort?.abort();
     this.stopAutomaticWork(false);
@@ -265,6 +287,7 @@ export class TramaPlugin extends Plugin {
       } catch {
         // The old build is intentionally cancelled before composing its replacement.
       }
+      await oldIndex?.dispose();
       this.lifecycleAbort = new AbortController();
       this.indexStatus?.markStale(false);
     }
@@ -317,12 +340,16 @@ export class TramaPlugin extends Plugin {
     const manager = new IndexManager(
       indexVault,
       embedding,
-      new ObsidianIndexStorage(app.vault.adapter),
+      app.vault,
       settings.embedding.endpoint,
       settings.embedding.modelId,
       {
         excludedPaths,
         isIndexEligible,
+        workerFactory: () => this.createSqliteWorker(app),
+        sqliteIdentity: this.resolveSqliteIdentity(app.vault.adapter),
+        sqliteClient: this.sqliteClientFactory?.(app.vault),
+        snapshotAdapter: app.vault.adapter,
         onProgress: (progress) => this.indexStatus?.reportProgress(progress),
       },
       this.diagnostics
@@ -348,12 +375,13 @@ export class TramaPlugin extends Plugin {
       this.indexLoaded = true;
       this.indexReady = loaded;
       const hadPendingChanges = this.pendingVaultChanges.size > 0;
-      for (const path of this.pendingVaultChanges) manager.queueChange(path);
+      if (this.pendingVaultChanges.size) manager.queueChange();
       this.pendingVaultChanges.clear();
-      if (!loaded) {
+      if (!loaded || !manager.isComplete()) {
         // The initial persisted-index decision is startup bookkeeping and must
         // stay silent even if debugging is enabled immediately after onload.
-        this.indexStatus?.setIndexRequired(true);
+        if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
+        else this.indexStatus?.setIndexRequired(true);
         return;
       }
       if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
@@ -364,6 +392,80 @@ export class TramaPlugin extends Plugin {
         else this.markQueuedWorkStale();
       }
     });
+  }
+
+  private async resolveSqliteIdentity(adapter: SnapshotDataAdapter): Promise<string> {
+    const path = ".trama/sqlite/v1/identity.json";
+    if (this.sqliteIdentity && this.sqliteIdentityAdapter === adapter) return this.sqliteIdentity;
+    if (typeof adapter.read !== "function" || typeof adapter.write !== "function")
+      throw new Error("SQLite identity storage is unavailable.");
+    let identity: string | undefined;
+    try {
+      const raw = await adapter.read.call(adapter, path);
+      const parsed = JSON.parse(raw) as { readonly version?: unknown; readonly identity?: unknown };
+      if (
+        parsed.version === 1 &&
+        typeof parsed.identity === "string" &&
+        /^[0-9a-f]{64}$/i.test(parsed.identity)
+      )
+        identity = parsed.identity.toLowerCase();
+    } catch {
+      // A missing or malformed identity is replaced with a new opaque token.
+    }
+    if (!identity) {
+      const bytes = new Uint8Array(32);
+      globalThis.crypto.getRandomValues(bytes);
+      identity = bytesToHex(bytes);
+      if (typeof adapter.mkdir !== "function")
+        throw new Error("SQLite identity storage is unavailable.");
+      await adapter.mkdir.call(adapter, ".trama");
+      await adapter.mkdir.call(adapter, ".trama/sqlite");
+      await adapter.mkdir.call(adapter, ".trama/sqlite/v1");
+      await adapter.write.call(adapter, path, JSON.stringify({ version: 1, identity }));
+    }
+    this.sqliteIdentity = identity;
+    this.sqliteIdentityAdapter = adapter;
+    return identity;
+  }
+
+  private sqliteAssetUrl(app: any, fileName: string): string {
+    const adapter = app?.vault?.adapter;
+    if (!adapter || typeof adapter.getResourcePath !== "function")
+      throw new Error("SQLite Worker resource path is unavailable.");
+    const configDir =
+      typeof app?.vault?.configDir === "string" && app.vault.configDir
+        ? app.vault.configDir
+        : ".obsidian";
+    const pluginId = this.manifest?.id || "trama";
+    const pluginDir = this.manifest?.dir || `${configDir}/plugins/${pluginId}`;
+    return adapter.getResourcePath.call(adapter, `${pluginDir}/${fileName}`);
+  }
+
+  private sqliteWorkerUrl(app: any): string {
+    return this.sqliteAssetUrl(app, "sqlite-worker.mjs");
+  }
+
+  private createSqliteWorker(app: any): SqliteWorkerLike {
+    if (
+      typeof Worker !== "function" ||
+      typeof Blob !== "function" ||
+      typeof URL?.createObjectURL !== "function" ||
+      typeof URL?.revokeObjectURL !== "function"
+    )
+      throw new Error("SQLite Worker APIs are unavailable.");
+    const assets = {
+      moduleUrl: this.sqliteAssetUrl(app, "sqlite3.mjs"),
+      wasmUrl: this.sqliteAssetUrl(app, "sqlite3.wasm"),
+    };
+    const workerUrl = this.sqliteWorkerUrl(app);
+    const bootstrap = `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify(assets)};const __tramaWorkerUrl=${JSON.stringify(workerUrl)};let __tramaStartupError;try{await import(__tramaWorkerUrl)}catch{__tramaStartupError={code:"storage_unavailable",message:"SQLite Worker could not be started. Ensure the bundled SQLite assets are installed.",retryable:true}}URL.revokeObjectURL(globalThis.location.href);if(__tramaStartupError)self.onmessage=({data})=>self.postMessage({v:1,id:Number.isSafeInteger(data?.id)?data.id:0,ok:false,error:__tramaStartupError});`;
+    const bootstrapUrl = URL.createObjectURL(new Blob([bootstrap], { type: "text/javascript" }));
+    try {
+      return new Worker(bootstrapUrl, { type: "module" }) as unknown as SqliteWorkerLike;
+    } catch (error) {
+      URL.revokeObjectURL(bootstrapUrl);
+      throw error;
+    }
   }
 
   private createLenteSearch(
@@ -516,6 +618,23 @@ export class TramaPlugin extends Plugin {
     return this.relatedNotes;
   }
 
+  async exportSnapshot(): Promise<IndexSnapshotExport> {
+    if (!this.index) throw new Error("Index is not initialized.");
+    this.stopAutomaticWork(false);
+    await this.reconcilePromise?.catch(() => undefined);
+    return this.index.exportSnapshot();
+  }
+
+  async importSnapshot(bytes: ArrayBuffer, sha256?: string): Promise<void> {
+    if (!this.index) throw new Error("Index is not initialized.");
+    if (!sha256) throw new Error("Select a content-addressed SQLite snapshot file.");
+    this.stopAutomaticWork(false);
+    await this.reconcilePromise?.catch(() => undefined);
+    await this.index.importSnapshot({ bytes, sha256 });
+    this.indexReady = true;
+    this.indexStatus?.markStale(this.index.hasUsableIndex());
+  }
+
   private armAutomaticWork(): void {
     if (this.getSettings().filo.automaticUpdates && this.queuedWork && this.indexReady)
       this.scheduleReconcile();
@@ -552,15 +671,16 @@ export class TramaPlugin extends Plugin {
     if (!manager) throw new Error("Index is not initialized.");
     await this.indexLoad;
     if (this.index !== manager) throw new Error("Index was replaced during indexing.");
-    const published = force
-      ? (await manager.build(signal), true)
-      : await manager.synchronizeWithPublication(signal);
+    const result = force
+      ? (await manager.build(signal), { changed: true, converged: manager.isComplete() })
+      : await manager.synchronize(signal);
     this.indexReady = true;
     const app = (this as unknown as { app?: any }).app;
     if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-    if (published && app?.workspace) this.refreshOpenLente(app);
+    if (result.changed && app?.workspace) this.refreshOpenLente(app);
     this.pendingVaultChanges.clear();
     if (this.queuedWork) await this.reconcileNow("explicit", signal).catch(() => undefined);
+    else if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
     else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
     else this.indexStatus?.setReady();
   }
@@ -605,13 +725,13 @@ export class TramaPlugin extends Plugin {
     let completed = false;
     this.reconcilePromise = manager
       .reconcileQueuedChanges(operationSignal)
-      .then(() => {
+      .then((result) => {
         completed = true;
-        const published = manager.getLastReconciliationPublished();
-        this.indexStatus?.setReady();
+        if (result.converged && manager.isComplete()) this.indexStatus?.setReady();
+        else this.indexStatus?.markStale(manager.hasUsableIndex?.() ?? this.indexReady);
         const app = (this as unknown as { app?: any }).app;
         if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-        if (published && app?.workspace) this.refreshOpenLente(app);
+        if (result.changed && app?.workspace) this.refreshOpenLente(app);
       })
       .catch((error) => {
         this.queuedWork = true;
@@ -679,15 +799,13 @@ export class TramaPlugin extends Plugin {
       counts: { automatic: this.getSettings().filo.automaticUpdates ? 1 : 0 },
     });
     if (!this.indexLoaded || !this.indexReady) {
-      if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
-      else this.index.queueOperation(operation as any);
+      this.index.queueChange();
       for (const path of paths) this.pendingVaultChanges.add(path);
       this.queuedWork = true;
       return;
     }
     this.queuedWork = true;
-    if (operation.kind === "rename") this.index.queueRename(operation.oldPath, operation.path);
-    else this.index.queueOperation(operation as any);
+    this.index.queueChange();
     if (this.getSettings().filo.automaticUpdates) {
       if (!this.index.isBuilding()) this.indexStatus?.setUpdating();
       this.scheduleReconcile();

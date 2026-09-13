@@ -195,7 +195,7 @@ describe("RelatedNotes", () => {
     expect(service.latest("current.md")).toEqual(["new.md"]);
   });
 
-  it("supersedes a prior path/generation and suppresses its late cache", async () => {
+  it("allows a late result but suppresses its cache after the live snapshot changes", async () => {
     let release!: (value: readonly number[][]) => void;
     const old = snapshot("old.md", "old", [{ path: "stale.md", score: 1 }]);
     old.prepareQuery.mockImplementationOnce(
@@ -209,8 +209,9 @@ describe("RelatedNotes", () => {
     current = next.value;
     const fresh = await service.find("new.md", signal);
     release([[1, 0]]);
-    await expect(stale).rejects.toThrow("cancelled");
+    await expect(stale).resolves.toMatchObject({ results: [{ path: "stale.md" }] });
     expect(fresh.results[0].path).toBe("fresh.md");
+    expect(service.latest("new.md")).toEqual(["fresh.md"]);
   });
 
   it("honors caller cancellation", async () => {

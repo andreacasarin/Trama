@@ -93,7 +93,6 @@ export class VoceView extends ItemView {
   private relatedUnsubscribe?: () => void;
   private relatedAbort?: AbortController;
   private relatedRequestGeneration = 0;
-  private relatedRequestKey?: string;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -122,7 +121,6 @@ export class VoceView extends ItemView {
     this.relatedAbort?.abort();
     this.relatedAbort = undefined;
     this.relatedRequestGeneration++;
-    this.relatedRequestKey = undefined;
     this.relatedNotes = relatedNotes;
     if (!this.isViewOpen) return;
     this.relatedUnsubscribe = relatedNotes?.subscribe((result: RelatedNotesResult) => {
@@ -220,7 +218,6 @@ export class VoceView extends ItemView {
     this.relatedUnsubscribe?.();
     this.relatedUnsubscribe = undefined;
     this.relatedRequestGeneration++;
-    this.relatedRequestKey = undefined;
     this.relatedAbort?.abort();
     this.relatedAbort = undefined;
     return Promise.resolve();
@@ -476,10 +473,6 @@ export class VoceView extends ItemView {
     const path = this.activePath();
     this.relatedAbort?.abort();
     const generation = ++this.relatedRequestGeneration;
-    this.relatedRequestKey =
-      path && typeof (this.relatedNotes as any)?.snapshotKey === "function"
-        ? this.relatedNotes?.snapshotKey(path)
-        : undefined;
     this.renderAttachments();
     if (!path || !this.relatedNotes) return;
     const controller = new AbortController();
@@ -494,15 +487,9 @@ export class VoceView extends ItemView {
   }
 
   private acceptsRelatedResult(result: RelatedNotesResult): boolean {
-    if (result.currentPath !== this.activePath()) return false;
-    const expected = `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
-    const current =
-      typeof (this.relatedNotes as any)?.snapshotKey === "function"
-        ? this.relatedNotes?.snapshotKey(result.currentPath)
-        : undefined;
-    return current
-      ? current === expected
-      : !this.relatedRequestKey || this.relatedRequestKey === expected;
+    // Counter changes invalidate the next cache lookup, but do not make an
+    // already hydrated result unusable to the current conversation.
+    return result.currentPath === this.activePath();
   }
 
   private activePath(): string {
