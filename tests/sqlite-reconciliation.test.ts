@@ -59,6 +59,13 @@ describe("mutable SQLite reconciliation", () => {
     ).toBe(true);
     expect(
       index.finishReconciliation(
+        [{ path: "empty.md", contentId: id("e") }],
+        index.getState().changeCounter
+      ).incomplete
+    ).toBe(false);
+    index.markIncomplete();
+    expect(
+      index.finishReconciliation(
         [{ path: "empty.md", contentId: id("e"), chunkCount: 0 }],
         index.getState().changeCounter
       ).incomplete

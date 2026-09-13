@@ -381,19 +381,30 @@ export class MutableSqliteDatabase {
     const manifest = JSON.stringify(summaries);
     transaction(this.db, () => {
       this.db.exec({
-        sql: `WITH expected(path,content_id,chunk_count) AS (
+        sql: `WITH expected(path,content_id,chunk_count) AS MATERIALIZED (
                 SELECT json_extract(value,'$.path'),json_extract(value,'$.contentId'),json_extract(value,'$.chunkCount')
                   FROM json_each(?)
-              ), actual(path,content_id,chunk_count) AS (
+              ), actual(path,content_id,chunk_count) AS MATERIALIZED (
                 SELECT n.path,n.content_id,count(c.chunk_pk)
                   FROM notes n LEFT JOIN chunks c ON c.note_pk=n.note_pk
                  GROUP BY n.note_pk
+              ), missing_expected(path,content_id) AS (
+                SELECT path,content_id FROM expected
+                EXCEPT
+                SELECT path,content_id FROM actual
+              ), missing_actual(path,content_id) AS (
+                SELECT path,content_id FROM actual
+                EXCEPT
+                SELECT path,content_id FROM expected
               ), differences AS (
-                SELECT e.path FROM expected e LEFT JOIN actual a ON a.path=e.path
-                 WHERE a.path IS NULL OR a.content_id<>e.content_id
-                    OR (e.chunk_count IS NOT NULL AND e.chunk_count<>a.chunk_count)
+                SELECT path FROM missing_expected
                 UNION ALL
-                SELECT a.path FROM actual a WHERE NOT EXISTS(SELECT 1 FROM expected e WHERE e.path=a.path)
+                SELECT path FROM missing_actual
+                UNION ALL
+                SELECT e.path
+                  FROM expected e JOIN actual a
+                    ON a.path=e.path AND a.content_id=e.content_id
+                 WHERE e.chunk_count IS NOT NULL AND e.chunk_count<>a.chunk_count
               )
               UPDATE index_state
                  SET incomplete=0,reconciliation_summary=?
