@@ -1,6 +1,16 @@
 node_modules/
 .ai/
 main.js
+sqlite-worker.mjs
+sqlite3.mjs
+sqlite3.wasm
 coverage/
 .local-vault-assistant/
 .DS_Store
+.artifacts/
+.cache/
+
+# Audited SQLite inputs and licensing are source-controlled. Production
+# outputs are materialized at the ignored repository root by the cache builder.
+!vendor/sqlite-wasm/LICENSES.md
+!vendor/sqlite-wasm/supply-chain.json

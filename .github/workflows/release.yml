@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js 24.13.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.13.0
+          cache: npm
+
+      - name: Validate tag and package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            release_title="Trama $GITHUB_REF_NAME"
+            release_prerelease=false
+          elif git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/develop; then
+            release_title="Trama nightly $GITHUB_REF_NAME"
+            release_prerelease=true
+          else
+            echo "Tag $GITHUB_REF_NAME is not reachable from main or develop" >&2
+            exit 1
+          fi
+          node <<'NODE'
+          const fs = require("node:fs");
+          const tag = process.env.GITHUB_REF_NAME;
+          const match = /^v(.+)$/.exec(tag ?? "");
+          const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+          if (!match || !versionPattern.test(match[1])) throw new Error(`Invalid release tag: ${tag}`);
+          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const manifestVersion = JSON.parse(fs.readFileSync("manifest.json", "utf8")).version;
+          if (packageVersion !== match[1] || manifestVersion !== match[1]) {
+            throw new Error(`Tag ${tag}, package.json ${packageVersion}, and manifest.json ${manifestVersion} must match`);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_VERSION=${match[1]}\nRELEASE_TAG=${tag}\n`);
+          NODE
+          {
+            echo "RELEASE_TITLE=$release_title"
+            echo "RELEASE_PRERELEASE=$release_prerelease"
+          } >> "$GITHUB_ENV"
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check formatting and lint
+        run: |
+          npm run format:check
+          npm run lint
+
+      - name: Build the clean pinned SQLite assets
+        run: node scripts/sqlite-wasm/build.mjs --clean
+
+      - name: Run the full test suite
+        run: npm test
+
+      - name: Run the benchmark
+        run: npm run benchmark
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trama-benchmark-${{ github.run_id }}
+          path: .artifacts/trama-benchmark/*.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create and validate the release archive
+        run: node scripts/package-release.mjs --version "$RELEASE_VERSION" --archive "dist/trama-$RELEASE_VERSION.zip"
+
+      - name: Create or reconcile the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/trama-${RELEASE_VERSION}.zip"
+          release_json=""
+          create_status=0
+          create_args=("$RELEASE_TAG" "$archive" --draft --title "$RELEASE_TITLE" --generate-notes)
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then create_args+=(--prerelease); fi
+          gh release create "${create_args[@]}" || create_status=$?
+          if (( create_status != 0 )); then
+            release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets 2>/dev/null || true)"
+            if [[ -z "$release_json" ]]; then
+              exit "$create_status"
+            fi
+          else
+            release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets)"
+          fi
+
+          node - "$release_json" "$RELEASE_TAG" "$RELEASE_PRERELEASE" <<'NODE'
+          const release = JSON.parse(process.argv[2]);
+          const expectedTag = process.argv[3];
+          const expectedPrerelease = process.argv[4] === "true";
+          if (release.tagName !== expectedTag) throw new Error(`Release tag mismatch: ${release.tagName}`);
+          if (release.isPrerelease !== expectedPrerelease)
+            throw new Error(`Release prerelease state mismatch for ${expectedTag}`);
+          NODE
+
+          asset="trama-${RELEASE_VERSION}.zip"
+          draft="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).isDraft))' "$release_json")"
+          has_asset="$(node -e 'const x=JSON.parse(process.argv[1]); process.stdout.write(String(x.assets.some((asset) => asset.name === process.argv[2])))' "$release_json" "$asset")"
+          if [[ "$has_asset" == "true" ]]; then
+            existing_dir="$(mktemp -d)"
+            trap 'rm -rf "$existing_dir"' EXIT
+            gh release download "$RELEASE_TAG" --pattern "$asset" --dir "$existing_dir"
+            node scripts/package-release.mjs --verify --version "$RELEASE_VERSION" --archive "$existing_dir/$asset"
+          elif [[ "$draft" == "true" ]]; then
+            gh release upload "$RELEASE_TAG" "$archive"
+          else
+            echo "Published release $RELEASE_TAG is missing $asset; refusing to overwrite it" >&2
+            exit 1
+          fi
+
+          edit_args=("$RELEASE_TAG" --title "$RELEASE_TITLE")
+          if [[ "$draft" == "true" ]]; then edit_args+=(--draft=false); fi
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then edit_args+=(--prerelease); else edit_args+=(--prerelease=false); fi
+          gh release edit "${edit_args[@]}"

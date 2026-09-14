@@ -1,5 +1,5 @@
-import { RelatedIndexSnapshot } from "@/index/IndexManager";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
+import { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
+import { compareCodeUnits } from "@/index/Identity";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
@@ -9,7 +9,12 @@ import {
 } from "@/diagnostics/TramaDiagnostics";
 
 export interface RelatedNotesSource {
-  relatedSnapshot(path: string): RelatedIndexSnapshot | null;
+  relatedState(path: string): RelatedIndexState | null;
+  findRelated(
+    path: string,
+    signal: AbortSignal,
+    limit: number
+  ): Promise<readonly RelatedIndexHit[]>;
 }
 export interface RelatedNoteResult {
   readonly path: string;
@@ -20,7 +25,8 @@ export interface RelatedNoteResult {
   readonly endLine?: number;
 }
 export interface RelatedNotesResult {
-  readonly generationId: string;
+  readonly changeCounter?: number;
+  readonly generationId?: string;
   readonly currentPath: string;
   readonly contentHash: string;
   readonly results: readonly RelatedNoteResult[];
@@ -59,8 +65,8 @@ export class RelatedNotes {
   }
 
   snapshotKey(path: string): string | undefined {
-    const snapshot = this.index.relatedSnapshot(path);
-    return snapshot ? this.key(snapshot) : undefined;
+    const state = this.index.relatedState(path);
+    return state ? this.key(state) : undefined;
   }
 
   async find(
@@ -72,20 +78,20 @@ export class RelatedNotes {
     const started = Date.now();
     if (signal.aborted) throw new Error("Operation cancelled");
     const cap = Math.max(0, Math.min(RelatedNotes.MAX_RESULTS, Math.floor(limit)));
-    const snapshot = this.index.relatedSnapshot(currentPath);
-    if (!snapshot || cap === 0) {
+    const state = this.index.relatedState(currentPath);
+    if (!state || cap === 0) {
       const result = {
-        generationId: snapshot?.generationId ?? "",
-        currentPath: snapshot?.currentPath ?? currentPath,
-        contentHash: snapshot?.contentHash ?? "",
+        changeCounter: state?.changeCounter ?? 0,
+        generationId: state?.generationId ?? `counter:${state?.changeCounter ?? 0}`,
+        currentPath: state?.currentPath ?? currentPath,
+        contentHash: state?.contentHash ?? "",
         results: [],
       };
-      this.publish(result, snapshot ? this.key(snapshot) : "");
+      this.publish(result, state ? this.key(state) : "");
       return result;
     }
-    const key = this.key(snapshot);
+    const key = this.key(state);
     if (refresh) this.cancelAll();
-    else if ([...this.inFlight.keys()].some((activeKey) => activeKey !== key)) this.cancelAll();
     const cached = this.cache.get(key);
     if (cached && !refresh) {
       if (this.snapshotKey(currentPath) !== key) throw new Error("Operation cancelled");
@@ -101,10 +107,10 @@ export class RelatedNotes {
       event: "related_search",
       stage: "started",
       path: currentPath,
-      generation: snapshot.generationId,
+      generation: state.generationId,
       resultCount: 0,
     });
-    const run = this.compute(snapshot, controller.signal, RelatedNotes.MAX_RESULTS)
+    const run = this.compute(state, controller.signal, RelatedNotes.MAX_RESULTS)
       .then((result) => {
         if (controller.signal.aborted) throw new Error("Operation cancelled");
         if (this.snapshotKey(result.currentPath) === key) {
@@ -125,11 +131,9 @@ export class RelatedNotes {
             event: "related_search",
             path: result.currentPath,
             generation: result.generationId,
-            resultCount: 0,
+            resultCount: result.results.length,
             durationMs: Date.now() - started,
-            error: { name: "Error", code: "cancelled", retryable: true, cancelled: true },
           });
-          throw new Error("Operation cancelled");
         }
         return result;
       })
@@ -174,14 +178,7 @@ export class RelatedNotes {
       shared.then(
         (result) => {
           signal.removeEventListener("abort", onAbort);
-          if (
-            !signal.aborted &&
-            (!expectedKey ||
-              this.snapshotKey(expectedPath ?? result.currentPath) === expectedKey) &&
-            (!expectedKey || this.keyOf(result) === expectedKey)
-          )
-            resolve({ ...result, results: result.results.slice(0, limit) });
-          else if (!signal.aborted) reject(new Error("Operation cancelled"));
+          if (!signal.aborted) resolve({ ...result, results: result.results.slice(0, limit) });
         },
         (error) => {
           signal.removeEventListener("abort", onAbort);
@@ -203,44 +200,25 @@ export class RelatedNotes {
   }
 
   private async compute(
-    snapshot: RelatedIndexSnapshot,
+    state: RelatedIndexState,
     signal: AbortSignal,
     limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) throw new Error("Operation cancelled");
-    const prepareStarted = Date.now();
-    const prepared = await snapshot.prepareQuery(signal);
-    this.emitDiagnostic({
-      area: "filo",
-      event: "related_search",
-      stage: "prepare-completed",
-      path: snapshot.currentPath,
-      generation: snapshot.generationId,
-      resultCount: 0,
-      durationMs: Date.now() - prepareStarted,
-    });
-    if (!prepared || !prepared.text) {
-      return {
-        generationId: snapshot.generationId,
-        currentPath: snapshot.currentPath,
-        contentHash: snapshot.contentHash,
-        results: [],
-      };
-    }
     const retrieveStarted = Date.now();
-    const hits = await snapshot.search(prepared.text, prepared.vector, signal, 128);
+    const hits = await this.index.findRelated(state.currentPath, signal, 128);
     this.emitDiagnostic({
       area: "filo",
       event: "related_search",
       stage: "retrieve-completed",
-      path: snapshot.currentPath,
-      generation: snapshot.generationId,
+      path: state.currentPath,
+      generation: state.generationId,
       resultCount: hits.length,
       durationMs: Date.now() - retrieveStarted,
     });
     const best = new Map<string, RelatedNoteResult>();
     for (const hit of hits) {
-      if (hit.path === snapshot.currentPath) continue;
+      if (hit.path === state.currentPath) continue;
       const previous = best.get(hit.path);
       const similarity =
         hit.similarity === undefined
@@ -263,19 +241,20 @@ export class RelatedNotes {
       .sort((a, b) => b.score - a.score || compareCodeUnits(a.path, b.path))
       .slice(0, limit);
     return {
-      generationId: snapshot.generationId,
-      currentPath: snapshot.currentPath,
-      contentHash: snapshot.contentHash,
+      changeCounter: state.changeCounter,
+      generationId: state.generationId,
+      currentPath: state.currentPath,
+      contentHash: state.contentHash,
       results,
     };
   }
 
-  private key(snapshot: RelatedIndexSnapshot): string {
-    return `${snapshot.generationId}\0${snapshot.currentPath}\0${snapshot.contentHash}`;
+  private key(state: RelatedIndexState): string {
+    return `${state.changeCounter ?? state.generationId ?? 0}\0${state.currentPath}\0${state.contentHash}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.generationId}\0${result.currentPath}\0${result.contentHash}`;
+    return `${result.changeCounter ?? result.generationId ?? 0}\0${result.currentPath}\0${result.contentHash}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

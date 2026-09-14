@@ -8,7 +8,16 @@ Trama is a desktop-only Obsidian plugin for local AI conversation and semantic c
 2. Configure the chat model and embedding model independently in the plugin settings.
 3. Use **Update index** from the command palette for the initial explicit index, then open **Voce** with **Open Voce**, **Filo** with **Open Filo**, or **Lente** with **Open Lente**.
 
-The semantic index is stored at `<vault>/.trama/index/`. It is a definitive binary corpus: bounded immutable segments contain committed text/provenance and normalized exact `Float32` vectors, while a small atomic manifest maps notes to segments. The active and previous manifests are retained; unreachable artifacts are collected only after publication and validation. Configure this generated directory in your sync tool's exclusions. Trama reads Markdown notes only and has no note-write, edit, or save-as-note capability. Voce messages remain in memory and are not persisted.
+The live semantic index is one mutable SQLite WASM database persisted through the
+OPFS SAH pool. `.trama/sqlite/v1/` stores only the opaque vault identity and
+explicit manual snapshot files; configure this generated directory in your sync
+tool's exclusions. Each note mutation is transactional, while a longer Update
+or Rebuild may temporarily expose an incomplete mixed state. Every Worker open
+also fences the state incomplete; Update or Rebuild re-establishes completion
+from fresh vault truth. The monotonic change counter invalidates UI caches; it
+is not a publication generation. Trama reads Markdown notes only and has no
+note-write, edit, or save-as-note capability. Voce messages remain in memory
+and are not persisted.
 
 ## Filo related notes
 
@@ -29,8 +38,8 @@ Lente searches indexed visible Markdown only after Enter or Search is pressed.
 Results are unique notes with their winning passage. Relevant uses deterministic
 hybrid vector/BM25 ranking; Updated uses live note modification times. If query
 embeddings are unavailable, Lente retries lexical filename, path, and body
-matching and labels the result degraded. Its derived lexical index is in memory
-and does not alter the authoritative schema-3 corpus.
+matching and labels the result degraded. Its derived FTS5 lexical index is maintained
+inside the mutable SQLite backend.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and
@@ -39,9 +48,9 @@ mode: it scans the current vault, compares committed content identities, and emb
 new or changed notes while removing deleted paths. **Rebuild index** remains the explicit
 forced rebuild for recovery or configuration refresh. If a note is moved or deleted while
 either pass is running, that stale path is logged and skipped, then the queued vault event
-is reconciled without failing the whole operation. Builds use an atomic last-good
-generation: a failed or cancelled operation does not expose a partial index, and the
-previous usable generation remains searchable.
+is reconciled without failing the whole operation. An interrupted or failed pass may leave
+the searchable index incomplete; a later Update or Rebuild reconciles it deterministically
+while search remains available.
 
 During a full rebuild, Filo estimates the number of embedding texts from file-size
 metadata calibrated by a deterministic sample of at most 32 notes passed through the
@@ -105,12 +114,18 @@ When enabled, Trama writes one `[Trama]` console stream using the current
 committed setting; no diagnostic file is created. Rich chat diagnostics can
 contain full sensitive prompts, selected-note contents, requests, SSE events,
 tool arguments/results, and errors. Index and Filo diagnostics are metadata-only:
-they may include paths, counts, timings, generation/status information, and safe
+they may include paths, counts, timings, change-counter/status information, and safe
 errors, but never note or chunk text, vectors, hashes, exact embedding inputs, or
 serialized index data. Enable the setting only when you are comfortable with the
 console-visible chat data.
 
 ## Development
+
+The normal build produces the plugin's six runtime files from the pinned SQLite
+inputs and the fingerprinted local build cache. The generated root assets
+(`main.js`, `sqlite-worker.mjs`, `sqlite3.mjs`, and `sqlite3.wasm`) are ignored;
+they are build products, not source-controlled runtime copies. The cache is
+repository-local and ignored as well.
 
 Build and install the plugin into a vault with one command:
 
@@ -124,10 +139,20 @@ Alternatively, set the vault path through the environment:
 OBSIDIAN_VAULT_PATH="/path/to/your/vault" npm run install:plugin
 ```
 
-The installer verifies that the target is an Obsidian vault, then copies
-`main.js`, `manifest.json`, and `styles.css` into
-`<vault>/.obsidian/plugins/trama/`. Restart or reload Obsidian
-after installation.
+The production package has six runtime files: `main.js`, `sqlite-worker.mjs`,
+`sqlite3.mjs`, `sqlite3.wasm`, `manifest.json`, and `styles.css`. The installer
+verifies that the target is an Obsidian vault, then copies exactly those six
+files into `<vault>/.obsidian/plugins/trama/`. Restart or reload Obsidian after
+installation. Production startup is network-silent: it loads the packaged
+SQLite WASM assets and never downloads them at runtime.
+
+The pinned SQLite source, SQLite-Vector source, Emscripten image, flags, and
+build inputs are recorded in the repository's supply-chain metadata. Generated
+assets are reused only while their input fingerprint and checksums match.
+Release verification checks the pinned inputs, compiled capabilities,
+version agreement, and the exact six-file package inventory. The generated
+bytes are not promised to be identical across build environments; reproducible
+verification is based on the pinned inputs and recorded digests.
 
 Run the development checks separately with:
 
@@ -139,26 +164,27 @@ npm test
 npm run build
 ```
 
+### Optional performance workloads
+
+Performance measurements are opt-in and use deterministic synthetic Markdown passed
+through the production chunker. Results are written to the ignored
+`.artifacts/trama-benchmark/` directory; no vault is read or modified.
+
+```sh
+npm run benchmark
+```
+
+The single 10,000-chunk Trama workload reports rebuild and unchanged-update time,
+mutation timings, search latency, process RSS delta, package bytes, deterministic
+feature-path results, and snapshot size. Metrics unavailable to the in-memory Node
+harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
+CI renders the metrics as a GitHub Actions job summary and retains the complete JSON
+report as a downloadable workflow artifact.
+
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
-limitations include the cost of exact `Float32` scans and rebuilding the derived,
-non-persisted Orama BM25 index on large corpora. Hybrid retrieval uses reciprocal-rank
-fusion (RRF) over exact semantic and lexical candidates; there is no ANN/HNSW backend.
+limitations include the cost of exact SQLite vector scans and maintaining FTS5 on large
+corpora. Hybrid retrieval uses reciprocal-rank fusion (RRF) over exact semantic and
+lexical candidates; there is no ANN/HNSW backend.
 The conservative 384/64 chunking is fingerprinted, so changing it requires an explicit
 full reindex. Filo and Voce use native (rather than React) UI. Trama is an independent,
 clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
-
-### Optional scale benchmark
-
-The benchmark is intentionally opt-in and is not part of normal tests. Run it with
-`npx vitest bench tests/index.bench.ts`; set `TRAMA_BENCH_CHUNKS=25000`, `50000`, or
-`100000`, `TRAMA_BENCH_DIMENSIONS` (default `768`), and `TRAMA_BENCH_SAMPLES` (default
-`7`) for a bounded deterministic fixture. The explicit `TRAMA_INDEX_BENCHMARK` summary
-reports p50 and p95 scan time plus the contiguous vector-buffer size; Vitest also reports
-its own timing distribution for the same raw exact semantic scan primitive.
-
-This probe does not build or open the persisted corpus, Orama lexical index, or hybrid
-retriever. It therefore does not measure startup, corpus artifact size, RSS, lexical or
-hybrid latency, cancellation latency, or prove the absence of generation-wide
-serialization. Validate those properties separately with focused implementation tests,
-code review, and a real-vault Obsidian/LM Studio smoke test. Do not use this benchmark as
-ANN evidence until an exact-oracle recall comparison is added.

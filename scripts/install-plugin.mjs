@@ -3,9 +3,9 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { PLUGIN_FILES } from "./plugin-files.mjs";
 
 const PLUGIN_ID = "trama";
-const REQUIRED_FILES = ["main.js", "manifest.json", "styles.css"];
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const vaultArgument = process.argv[2] ?? process.env.OBSIDIAN_VAULT_PATH;
@@ -32,7 +32,7 @@ await access(obsidianDirectory).catch(() => {
   throw new Error(`Not an Obsidian vault: ${vaultPath} (missing .obsidian directory)`);
 });
 
-for (const fileName of REQUIRED_FILES) {
+for (const fileName of PLUGIN_FILES) {
   await access(path.join(projectRoot, fileName)).catch(() => {
     throw new Error(`Missing build artifact: ${fileName}`);
   });
@@ -40,7 +40,7 @@ for (const fileName of REQUIRED_FILES) {
 
 await mkdir(pluginDirectory, { recursive: true });
 
-for (const fileName of REQUIRED_FILES) {
+for (const fileName of PLUGIN_FILES) {
   await installFile(path.join(projectRoot, fileName), path.join(pluginDirectory, fileName));
 }
 

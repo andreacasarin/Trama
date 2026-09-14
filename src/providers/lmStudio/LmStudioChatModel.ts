@@ -11,6 +11,7 @@ import {
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
+  startDiagnosticTimer,
   TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
@@ -167,6 +168,7 @@ export class LmStudioChatModel implements ChatModel {
     requestTools?: readonly ChatToolDefinition[],
     onText?: (text: string) => void
   ): Promise<ChatResponse> {
+    const elapsedMs = startDiagnosticTimer();
     try {
       if (!this.options.modelId.trim())
         throw new StructuredError("invalid_request", "Chat model ID is required.", false);
@@ -205,10 +207,15 @@ export class LmStudioChatModel implements ChatModel {
       if (signal.aborted)
         throw new StructuredError("cancelled", "The request was cancelled.", false);
       const response = accumulator.finish();
-      this.diagnostics.emit({ area: "chat", event: "model_response", response });
+      this.diagnostics.emit({
+        area: "chat",
+        event: "model_response",
+        response,
+        durationMs: elapsedMs(),
+      });
       return response;
     } catch (error) {
-      this.diagnostics.emit({ area: "chat", event: "model_error", error });
+      this.diagnostics.emit({ area: "chat", event: "model_error", error, durationMs: elapsedMs() });
       throw error;
     }
   }

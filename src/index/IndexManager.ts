@@ -13,18 +13,19 @@ import {
   INDEX_SCHEMA_VERSION,
   chunkMarkdown,
 } from "@/index/chunking";
+import { compareCodeUnits, deriveNoteContentId, indexIdentity, sha256Hex } from "@/index/Identity";
+import { SqliteWorkerClient, type SqliteWorkerLike } from "@/index/sqlite/client";
 import {
-  CorpusStore,
-  type CorpusSnapshot,
-  type CorpusTransaction,
-  type IncrementalChange,
-} from "@/index/corpus/CorpusStore";
-import { compareCodeUnits } from "@/index/corpus/CorpusManifest";
-import { deriveNoteContentId, sha256Hex } from "@/index/corpus/Hash";
-import { ExactVectorIndex } from "@/index/vector/ExactVectorIndex";
-import { OramaLexicalIndex } from "@/index/lexical/OramaLexicalIndex";
-import { Retriever, type RetrievalResult } from "@/index/retrieval/Retriever";
-import type { IndexStorage } from "@/index/storage";
+  SQLITE_SNAPSHOT_MAX_BYTES,
+  SQLITE_SNAPSHOT_NAMESPACE,
+  sqliteError,
+  type SqliteHit,
+  type SqliteNoteInput,
+  type SqliteState,
+  type SqliteNoteSummary,
+  type SqliteReconciliationPlan,
+  type SqliteMutationResult,
+} from "@/index/sqlite/protocol";
 import {
   NOOP_TRAMA_DIAGNOSTICS,
   emitTramaDiagnostic,
@@ -32,6 +33,8 @@ import {
   type TramaDiagnosticRecord,
   type TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
+import type { RetrievalResult } from "@/index/retrieval/contracts";
+import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 
 export interface IndexVaultDocument {
   readonly path: string;
@@ -41,7 +44,6 @@ export interface IndexVaultDocument {
 export interface IndexVaultPort {
   listMarkdownPaths(signal: AbortSignal): Promise<readonly string[]>;
   readMarkdown(path: string, signal: AbortSignal): Promise<IndexVaultDocument>;
-  /** Live plugin-owned index eligibility; omitted by non-Obsidian test ports. */
   isIndexEligible?(path: string): boolean;
   isMarkdownAvailable?(path: string, signal: AbortSignal): Promise<boolean>;
   estimateMarkdownTextCount?(
@@ -72,49 +74,39 @@ export interface RelatedIndexHit {
   readonly startLine?: number;
   readonly endLine?: number;
 }
-export interface RelatedIndexSnapshot {
-  readonly generationId: string;
+export interface RelatedIndexState {
+  readonly changeCounter?: number;
+  readonly generationId?: string;
   readonly currentPath: string;
   readonly contentHash: string;
-  prepareQuery(
-    signal: AbortSignal
-  ): Promise<{ readonly text: string; readonly vector: readonly number[] } | null>;
-  search(
-    query: string,
-    vector: readonly number[],
-    signal: AbortSignal,
-    limit: number
-  ): Promise<readonly RelatedIndexHit[]>;
-}
-type RevisionOperation =
-  | { readonly kind: "create" | "modify" | "delete" | "empty" | "unchanged"; readonly path: string }
-  | { readonly kind: "rename"; readonly oldPath: string; readonly path: string };
-interface Queued {
-  operation: RevisionOperation;
-  revision: number;
-}
-interface Bundle {
-  readonly snapshot: CorpusSnapshot;
-  readonly retriever: Retriever;
-  readonly number: number;
-  leases: number;
-  retired: boolean;
-  closePromise?: Promise<void>;
-}
-
-export interface LenteBundleLease {
-  readonly generationId: string;
-  readonly retriever: Retriever;
-  search(
-    query: string,
-    mode: "hybrid" | "lexical",
-    signal?: AbortSignal
-  ): Promise<readonly RetrievalResult[]>;
-  release(): Promise<void>;
 }
 interface FullIndexPlan {
   readonly paths: readonly string[];
   readonly estimatedTexts?: number;
+}
+export interface SnapshotDataAdapter {
+  exists?(path: string): Promise<boolean>;
+  read?(path: string): Promise<string>;
+  mkdir?(path: string): Promise<void>;
+  readBinary?(path: string): Promise<ArrayBuffer>;
+  writeBinary(path: string, value: ArrayBuffer): Promise<void>;
+  write?(path: string, value: string): Promise<void>;
+}
+export interface IndexSnapshotExport {
+  readonly bytes: ArrayBuffer;
+  readonly sha256: string;
+  readonly size: number;
+  readonly path: string;
+  readonly incomplete: boolean;
+}
+export interface IndexSnapshotImport {
+  readonly bytes: ArrayBuffer;
+  readonly sha256: string;
+}
+
+export interface IndexSyncResult {
+  readonly changed: boolean;
+  readonly converged: boolean;
 }
 
 export function createIndexFingerprint(
@@ -152,40 +144,58 @@ function canonical(value: unknown): string {
 function check(signal: AbortSignal): void {
   if (signal.aborted) throw new StructuredError("cancelled", "Index operation cancelled.", true);
 }
-
+function sameSummaries(a: readonly SqliteNoteSummary[], b: readonly SqliteNoteSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index++)
+    if (a[index].path !== b[index].path || a[index].contentId !== b[index].contentId) return false;
+  return true;
+}
 export class IndexManager implements VaultSearchPort {
-  private active: Bundle | null = null;
-  private building = false;
+  private client?: SqliteWorkerClient;
+  private state?: SqliteState;
   private loaded = false;
   private unavailable = false;
+  private building = false;
+  private maintenance = false;
   private loadPromise?: Promise<boolean>;
   private buildPromise?: Promise<void>;
-  private generation = 0;
-  private epoch = 0;
   private revision = 0;
-  private readonly queued = new Map<string, Queued>();
-  private lastReconciliationPublished = false;
-  private readonly corpus: CorpusStore;
+  private reconciledRevision = 0;
   private readonly onProgress?: (progress: IndexProgress) => void;
+  private readonly workerFactory?: () => SqliteWorkerLike;
+  private readonly worker?: SqliteWorkerLike;
+  private readonly snapshotAdapter?: SnapshotDataAdapter;
+
   constructor(
     private readonly vault: IndexVaultPort,
     private readonly embedding: EmbeddingModel,
-    storage: IndexStorage,
+    storage: object,
     private readonly embeddingBaseUrl: string,
     private readonly modelId: string,
     private readonly options: {
       readonly size?: number;
       readonly overlap?: number;
       readonly excludedPaths?: readonly string[];
-      /** Fixed eligibility predicate for this index fingerprint. */
       readonly isIndexEligible?: (path: string) => boolean;
       readonly onProgress?: (progress: IndexProgress) => void;
+      readonly worker?: SqliteWorkerLike;
+      readonly workerFactory?: () => SqliteWorkerLike;
+      readonly sqliteIdentity?: string | Promise<string>;
+      readonly sqliteClient?: SqliteWorkerClient;
+      readonly snapshotAdapter?: SnapshotDataAdapter;
     } = {},
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {
-    this.corpus = new CorpusStore(storage, diagnostics);
+    this.snapshotAdapter =
+      options.snapshotAdapter ??
+      (typeof (storage as SnapshotDataAdapter).writeBinary === "function"
+        ? (storage as SnapshotDataAdapter)
+        : undefined);
+    this.worker = options.worker;
+    this.workerFactory = options.workerFactory;
     this.onProgress = options.onProgress;
   }
+
   fingerprint(): IndexFingerprint {
     return createIndexFingerprint(
       this.embeddingBaseUrl,
@@ -197,12 +207,56 @@ export class IndexManager implements VaultSearchPort {
   private async fingerprintId(): Promise<string> {
     return sha256Hex(canonical(this.fingerprint()));
   }
+  private ensureClient(): SqliteWorkerClient {
+    if (!this.client) {
+      if (this.options.sqliteClient) {
+        this.client = this.options.sqliteClient;
+        return this.client;
+      }
+      let worker = this.worker;
+      if (!worker && this.workerFactory) {
+        try {
+          worker = this.workerFactory();
+        } catch {
+          throw sqliteError(
+            "storage_unavailable",
+            "SQLite Worker could not be started. Ensure the bundled SQLite assets are installed.",
+            true
+          );
+        }
+      }
+      this.client = new SqliteWorkerClient(worker);
+    }
+    return this.client;
+  }
+  private changeCounter(): number {
+    return this.state?.changeCounter ?? 0;
+  }
+  private generationId(): string {
+    return indexIdentity(this.changeCounter());
+  }
+  private setState(state: SqliteState): void {
+    this.state = state;
+  }
   isBuilding(): boolean {
     return this.building;
   }
-  hasUsableIndex(): boolean {
-    return this.active !== null && !this.unavailable;
+  isInMaintenance(): boolean {
+    return this.maintenance;
   }
+  isComplete(): boolean {
+    return this.state?.incomplete === false;
+  }
+  hasUsableIndex(): boolean {
+    return (
+      !this.unavailable && !this.maintenance && this.loaded && (this.state?.noteCount ?? 0) > 0
+    );
+  }
+  async getState(): Promise<SqliteState | undefined> {
+    if (!this.loaded) await this.load();
+    return this.state;
+  }
+
   async load(options: { readonly emitDiagnostics?: boolean } = {}): Promise<boolean> {
     if (!this.loadPromise) this.loadPromise = this.loadPersisted(options.emitDiagnostics === true);
     return this.loadPromise;
@@ -216,28 +270,16 @@ export class IndexManager implements VaultSearchPort {
         event: "index_operation",
         operation: "load",
         stage: "started",
-        phase: "validate-corpus",
+        phase: "boot",
       });
     try {
-      const snapshot = await this.corpus.load();
-      if (observable)
-        this.emit({
-          area: "index",
-          event: "index_operation",
-          operation: "load",
-          stage: "completed",
-          phase: "validate-corpus",
-          durationMs: Date.now() - started,
-          generation: snapshot.generationId,
-          counts: {
-            notes: snapshot.notes.length,
-            chunks: snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0),
-          },
-        });
-      if (snapshot.fingerprint !== (await this.fingerprintId()))
-        throw new Error("Index fingerprint mismatch");
-      this.active = await this.derive(snapshot, 0, undefined, "startup");
-      this.generation = 1;
+      const sqliteIdentity = await (this.options.sqliteIdentity ?? "default-vault");
+      const state = await this.ensureClient().call("boot", {
+        fingerprint: await this.fingerprintId(),
+        dimensions: this.embedding.dimensions,
+        identity: await sha256Hex(sqliteIdentity),
+      });
+      this.setState(state as SqliteState);
       this.unavailable = false;
       if (observable)
         this.emit({
@@ -245,13 +287,14 @@ export class IndexManager implements VaultSearchPort {
           event: "index_operation",
           operation: "load",
           stage: "completed",
+          phase: "boot",
           durationMs: Date.now() - started,
-          generation: snapshot.generationId,
+          generation: this.generationId(),
+          counts: { notes: this.state!.noteCount, chunks: this.state!.chunkCount },
         });
       return true;
     } catch (error) {
-      this.active = null;
-      this.unavailable = false;
+      this.unavailable = true;
       if (observable)
         this.emit({
           area: "index",
@@ -266,127 +309,10 @@ export class IndexManager implements VaultSearchPort {
       this.loaded = true;
     }
   }
-  private async derive(
-    snapshot: CorpusSnapshot,
-    number: number,
-    signal?: AbortSignal,
-    operation: "full" | "incremental" | "startup" = "full"
-  ): Promise<Bundle> {
-    check(signal ?? new AbortController().signal);
-    const chunkCount = snapshot.notes.reduce((sum, note) => sum + note.chunkCount, 0);
-    const vectorStarted = Date.now();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation,
-      stage: "started",
-      phase: "build-vector",
-      counts: { notes: snapshot.notes.length, chunks: chunkCount },
-      generation: snapshot.generationId,
-    });
-    this.reportProgress(
-      {
-        operation,
-        phase: "build-vector",
-        completed: 0,
-        total: chunkCount,
-        unit: "chunks",
-        determinate: true,
-        generationId: snapshot.generationId,
-      },
-      operation !== "startup"
-    );
-    const vector = await ExactVectorIndex.open(snapshot);
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation,
-      stage: "completed",
-      phase: "build-vector",
-      durationMs: Date.now() - vectorStarted,
-      counts: { chunks: chunkCount },
-      generation: snapshot.generationId,
-    });
-    this.reportProgress(
-      {
-        operation,
-        phase: "build-vector",
-        completed: chunkCount,
-        total: chunkCount,
-        unit: "chunks",
-        determinate: true,
-        generationId: snapshot.generationId,
-      },
-      operation !== "startup"
-    );
-    try {
-      const lexicalStarted = Date.now();
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "started",
-        phase: "build-lexical",
-        counts: { chunks: chunkCount },
-        generation: snapshot.generationId,
-      });
-      this.reportProgress(
-        {
-          operation,
-          phase: "build-lexical",
-          completed: 0,
-          total: chunkCount,
-          unit: "chunks",
-          determinate: true,
-          generationId: snapshot.generationId,
-        },
-        operation !== "startup"
-      );
-      const lexical = await OramaLexicalIndex.build(snapshot, {
-        signal,
-        profile: "lente",
-        onProgress: (progress) =>
-          this.reportProgress(
-            {
-              operation,
-              phase: "build-lexical",
-              completed: progress.completed,
-              total: progress.total,
-              unit: "chunks",
-              determinate: progress.total !== undefined,
-              generationId: snapshot.generationId,
-            },
-            operation !== "startup"
-          ),
-      });
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "completed",
-        phase: "build-lexical",
-        durationMs: Date.now() - lexicalStarted,
-        counts: { chunks: chunkCount },
-        generation: snapshot.generationId,
-      });
-      try {
-        return {
-          snapshot,
-          retriever: new Retriever({ snapshot, vector, lexical, embedding: this.embedding }),
-          number,
-          leases: 0,
-          retired: false,
-        };
-      } catch (e) {
-        await lexical.close();
-        throw e;
-      }
-    } catch (e) {
-      await vector.close();
-      throw e;
-    }
-  }
+
   async build(signal: AbortSignal): Promise<void> {
+    if (this.maintenance)
+      throw new StructuredError("busy", "Index maintenance is in progress.", true);
     if (this.building) throw new StructuredError("busy", "Index rebuild is already running.", true);
     const run = this.buildInternal(signal);
     this.buildPromise = run;
@@ -396,82 +322,64 @@ export class IndexManager implements VaultSearchPort {
       if (this.buildPromise === run) this.buildPromise = undefined;
     }
   }
-  /** Synchronizes the committed corpus, embedding only notes whose content changed. */
-  async synchronize(signal: AbortSignal): Promise<void> {
-    await this.synchronizeWithPublication(signal);
-  }
-
-  async synchronizeWithPublication(signal: AbortSignal): Promise<boolean> {
-    if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
-    check(signal);
-    if (!this.loaded) await this.load();
-    if (!this.active || this.unavailable) {
-      await this.build(signal);
-      return true;
-    }
-
-    const paths = [...(await this.vault.listMarkdownPaths(signal))]
-      .map(normalizePath)
-      .filter((path) => this.isIndexEligible(path))
-      .sort();
-    const present = new Set(paths);
-    for (const path of paths)
-      this.queueOperation({ kind: this.active.snapshot.getNote(path) ? "modify" : "create", path });
-    for (const note of this.active.snapshot.notes)
-      if (!present.has(note.path)) this.queueOperation({ kind: "delete", path: note.path });
-    return this.reconcileQueuedChangesWithPublication(signal);
-  }
-
   async waitForBuild(): Promise<void> {
     await this.buildPromise;
   }
   private async buildInternal(signal: AbortSignal): Promise<void> {
-    if (this.building) throw new StructuredError("busy", "Index rebuild is already running.", true);
     check(signal);
     this.building = true;
-    this.corpus.enableDiagnostics();
-    this.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "full",
-      stage: "started",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
-    });
-    this.reportProgress({
-      operation: "full",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
-    });
-    const epoch = ++this.epoch;
     const started = Date.now();
-    let tx: CorpusTransaction | undefined;
-    let bundle: Bundle | undefined;
-    let encodedArtifacts = 0;
     try {
       if (!this.loaded) await this.load();
       const plan = await this.planFullIndex(signal);
-      tx = await this.corpus.stage(this.noteInputs(plan, signal), await this.fingerprintId(), {
-        signal,
-        onProgress: (event) => {
-          if (event.phase === "encode-write") {
-            encodedArtifacts = Math.max(encodedArtifacts, event.completed);
-          }
-        },
+      this.setState((await this.ensureClient().call("beginRebuild", {}, signal)) as SqliteState);
+      this.reportProgress({
+        operation: "full",
+        phase: "discover",
+        completed: plan.paths.length,
+        total: plan.paths.length,
+        unit: "paths",
+        determinate: true,
       });
       this.reportProgress({
         operation: "full",
-        phase: "encode-write",
-        completed: encodedArtifacts,
-        total: encodedArtifacts,
-        unit: "artifacts",
+        phase: "read",
+        completed: plan.paths.length,
+        total: plan.paths.length,
+        unit: "notes",
         determinate: true,
-        generationId: tx.snapshot.generationId,
+        estimated: true,
       });
+      this.reportProgress({
+        operation: "full",
+        phase: "chunk",
+        completed: 0,
+        ...(plan.estimatedTexts === undefined ? {} : { total: plan.estimatedTexts }),
+        unit: "texts",
+        determinate: plan.estimatedTexts !== undefined,
+        estimated: plan.estimatedTexts !== undefined,
+      });
+      let encoded = 0;
+      for await (const note of this.noteInputs(plan, signal)) {
+        check(signal);
+        const result = (await this.ensureClient().call("upsertNote", { note }, signal)) as {
+          state: SqliteState;
+        };
+        this.setState(result.state);
+        encoded++;
+        this.reportProgress({
+          operation: "full",
+          phase: "encode-write",
+          completed: encoded,
+          total: plan.paths.length,
+          unit: "artifacts",
+          determinate: true,
+          generationId: this.generationId(),
+        });
+      }
+      const finalWatermark = this.revision;
+      const exact = await this.discoverEligible(signal);
+      await this.finishIfStable(exact, signal, finalWatermark);
       this.reportProgress({
         operation: "full",
         phase: "validate",
@@ -479,55 +387,30 @@ export class IndexManager implements VaultSearchPort {
         total: 1,
         unit: "artifacts",
         determinate: true,
-        generationId: tx.snapshot.generationId,
+        generationId: this.generationId(),
       });
-      check(signal);
-      if (epoch !== this.epoch)
-        throw new StructuredError("cancelled", "Index rebuild cancelled.", true);
-      bundle = await this.derive(tx.snapshot, ++this.generation, signal);
-      this.reportProgress({
-        operation: "full",
-        phase: "activate",
-        completed: 0,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      check(signal);
-      await tx.commit();
-      this.reportProgress({
-        operation: "full",
-        phase: "activate",
-        completed: 1,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      const published = bundle;
-      bundle = undefined;
-      await this.swap(published);
-      this.unavailable = false;
-      await this.collectGarbage("full", tx.snapshot.generationId);
+      const finalState = this.state;
       this.emit({
         area: "index",
         event: "index_operation",
         operation: "build",
-        stage: "published",
-        generation: tx.snapshot.generationId,
+        stage: "completed",
         durationMs: Date.now() - started,
+        generation: this.generationId(),
+        counts: {
+          notes: finalState?.noteCount ?? 0,
+          chunks: finalState?.chunkCount ?? 0,
+          incomplete: finalState?.incomplete ? 1 : 0,
+        },
       });
     } catch (error) {
-      if (bundle) await bundle.retriever.close().catch(() => undefined);
-      if (tx) await tx.abort().catch(() => undefined);
       this.emit({
         area: "index",
         event: "index_operation",
         operation: "build",
         stage: signal.aborted ? "cancelled" : "failed",
-        error: projectDiagnosticError(error),
         durationMs: Date.now() - started,
+        error: projectDiagnosticError(error),
       });
       throw error;
     } finally {
@@ -538,59 +421,22 @@ export class IndexManager implements VaultSearchPort {
     const paths = [...(await this.vault.listMarkdownPaths(signal))]
       .map(normalizePath)
       .filter((path) => this.isIndexEligible(path))
-      .sort();
-    this.reportProgress({
-      operation: "full",
-      phase: "discover",
-      completed: paths.length,
-      total: paths.length,
-      unit: "paths",
-      determinate: true,
-    });
+      .sort(compareCodeUnits);
     const estimatedTexts = await this.vault.estimateMarkdownTextCount?.(
       paths,
       this.options.size ?? CHUNK_SIZE,
       this.options.overlap ?? CHUNK_OVERLAP,
       signal
     );
-    this.reportProgress({
-      operation: "full",
-      phase: "read",
-      completed: paths.length,
-      total: paths.length,
-      unit: "notes",
-      determinate: true,
-      estimated: true,
-    });
-    this.reportProgress({
-      operation: "full",
-      phase: "chunk",
-      completed: 0,
-      ...(estimatedTexts === undefined ? {} : { total: estimatedTexts }),
-      unit: "texts",
-      determinate: estimatedTexts !== undefined,
-      estimated: estimatedTexts !== undefined,
-    });
     return { paths, ...(estimatedTexts === undefined ? {} : { estimatedTexts }) };
   }
-
   private async *noteInputs(
     plan: FullIndexPlan,
     signal: AbortSignal
-  ): AsyncIterable<{
-    path: string;
-    contentId: string;
-    records: Array<{
-      ordinal: number;
-      startLine: number;
-      endLine: number;
-      text: string;
-      vector: readonly number[];
-    }>;
-  }> {
+  ): AsyncIterable<SqliteNoteInput> {
     const fingerprint = await this.fingerprintId();
     let embedded = 0;
-    const estimateFields = (completed: number) =>
+    const estimate = (completed: number) =>
       plan.estimatedTexts !== undefined && completed <= plan.estimatedTexts
         ? { total: plan.estimatedTexts, determinate: true as const, estimated: true }
         : { determinate: false as const };
@@ -598,12 +444,11 @@ export class IndexManager implements VaultSearchPort {
       operation: "full",
       phase: "embed",
       completed: 0,
-      ...estimateFields(0),
+      ...estimate(0),
       unit: "texts",
     });
     for (const path of plan.paths) {
       check(signal);
-      if (!this.isIndexEligible(path)) continue;
       const doc = await this.readMarkdownIfAvailable(path, signal, "full");
       if (!doc) continue;
       const chunks = chunkMarkdown(
@@ -614,14 +459,14 @@ export class IndexManager implements VaultSearchPort {
       );
       const vectors = chunks.length
         ? await this.embedding.embed(
-            chunks.map((c) => c.text),
+            chunks.map((chunk) => chunk.text),
             signal,
             (progress) =>
               this.reportProgress({
                 operation: "full",
                 phase: "embed",
                 completed: embedded + progress.completed,
-                ...estimateFields(embedded + progress.completed),
+                ...estimate(embedded + progress.completed),
                 unit: "texts",
               })
           )
@@ -631,22 +476,35 @@ export class IndexManager implements VaultSearchPort {
         operation: "full",
         phase: "embed",
         completed: embedded,
-        ...estimateFields(embedded),
+        ...estimate(embedded),
         unit: "texts",
       });
       if (
         vectors.length !== chunks.length ||
-        vectors.some((v) => v.length !== this.embedding.dimensions)
+        vectors.some((vector) => vector.length !== this.embedding.dimensions)
       )
         throw new StructuredError(
           "internal",
           "Embedding dimensions changed during indexing.",
           false
         );
+      const contentId = await deriveNoteContentId(fingerprint, doc.content);
+      const current = await this.readMarkdownIfAvailable(path, signal, "full");
+      if (!current || (await deriveNoteContentId(fingerprint, current.content)) !== contentId) {
+        this.queueChange();
+        continue;
+      }
       yield {
         path,
-        contentId: await deriveNoteContentId(fingerprint, doc.content),
-        records: chunks.map((c, i) => ({ ...c, ordinal: i, vector: vectors[i] })),
+        contentId,
+        chunks: chunks.map((chunk, index) => ({
+          id: `${contentId}:${index}`,
+          ordinal: index,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          text: chunk.text,
+          vector: new Float32Array(vectors[index]),
+        })),
       };
     }
     this.reportProgress({
@@ -658,542 +516,518 @@ export class IndexManager implements VaultSearchPort {
       determinate: true,
     });
   }
-  private async swap(bundle: Bundle): Promise<void> {
-    const old = this.active;
-    this.active = bundle;
-    if (old) await this.retireBundle(old);
+
+  async synchronize(signal: AbortSignal): Promise<IndexSyncResult> {
+    return this.runSynchronization(signal);
   }
 
-  /** Acquires a generation-stable reader for Lente. Retired bundles remain alive until release. */
-  acquireLenteLease(): LenteBundleLease | null {
-    const bundle = this.active;
-    if (!bundle || this.unavailable) return null;
-    bundle.leases++;
-    let released = false;
-    return {
-      generationId: bundle.snapshot.generationId,
-      retriever: bundle.retriever,
-      search: (query, mode, signal) =>
-        bundle.retriever.search({
-          query,
-          mode,
-          resultShape: "notes",
-          limit: 160,
-          feature: "lente",
-          semanticCandidateLimit: 160,
-          lexicalCandidateLimit: 160,
-          lexicalProfile: "lente",
-          signal,
-        }),
-      release: async () => {
-        if (released) return;
-        released = true;
-        bundle.leases = Math.max(0, bundle.leases - 1);
-        if (bundle.retired && bundle.leases === 0) await this.closeBundle(bundle);
-      },
-    };
-  }
-
-  /** Feature-specific Lente retrieval entry point; RAG search remains unchanged. */
-  async searchLente(
-    query: string,
-    mode: "hybrid" | "lexical" = "hybrid",
-    signal?: AbortSignal
-  ): Promise<readonly RetrievalResult[]> {
-    const lease = this.acquireLenteLease();
-    if (!lease) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
-    try {
-      return await lease.search(query, mode, signal);
-    } finally {
-      await lease.release();
-    }
-  }
-
-  private async closeBundle(bundle: Bundle): Promise<void> {
-    if (!bundle.closePromise) bundle.closePromise = bundle.retriever.close();
-    await bundle.closePromise;
-  }
-
-  private async retireBundle(bundle: Bundle): Promise<void> {
-    bundle.retired = true;
-    if (bundle.leases === 0) await this.closeBundle(bundle);
-  }
-  queueChange(path: string): void {
-    this.queueOperation({ kind: "modify", path });
-  }
-  queueOperation(operation: RevisionOperation): void {
-    const key =
-      operation.kind === "rename" ? `${operation.oldPath}\0${operation.path}` : operation.path;
-    this.queued.set(key, { operation, revision: ++this.revision });
-  }
-  queueRename(oldPath: string, path: string): void {
-    this.queueOperation({ kind: "rename", oldPath, path });
-  }
-  async reconcileQueuedChanges(signal: AbortSignal): Promise<void> {
-    this.lastReconciliationPublished = await this.reconcileQueuedChangesWithPublication(signal);
-  }
-
-  getLastReconciliationPublished(): boolean {
-    return this.lastReconciliationPublished;
-  }
-
-  async reconcileQueuedChangesWithPublication(signal: AbortSignal): Promise<boolean> {
-    if (!this.queued.size) return false;
-    if (this.building) {
-      await this.buildPromise;
-      return this.reconcileQueuedChangesWithPublication(signal);
-    }
-    if (!this.active || this.unavailable) {
-      await this.build(signal);
-      return true;
-    }
-    const run = this.reconcileIncremental(signal);
-    const pending = run.then(() => undefined);
-    this.buildPromise = pending;
-    void pending.catch(() => undefined);
-    try {
-      return await run;
-    } finally {
-      if (this.buildPromise === pending) this.buildPromise = undefined;
-    }
-  }
-  private async reconcileIncremental(signal: AbortSignal): Promise<boolean> {
-    if (this.building)
-      throw new StructuredError("busy", "Index reconciliation is already running.", true);
-    const captured = new Map(this.queued);
-    this.building = true;
-    this.corpus.enableDiagnostics();
+  private async runSynchronization(
+    signal: AbortSignal,
+    phase?: "queued"
+  ): Promise<IndexSyncResult> {
+    if (this.maintenance)
+      throw new StructuredError("busy", "Index maintenance is in progress.", true);
+    if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
+    check(signal);
+    const tracksBuilding = phase === "queued";
+    if (tracksBuilding) this.building = true;
+    const started = Date.now();
     this.emit({
       area: "index",
       event: "index_operation",
       operation: "incremental",
       stage: "started",
-      phase: "discover",
-      completed: 0,
-      unit: "paths",
-      determinate: false,
+      ...(phase ? { phase } : {}),
     });
-    const epoch = ++this.epoch;
-    let tx: CorpusTransaction | undefined;
-    let bundle: Bundle | undefined;
-    let encodedArtifacts = 0;
-    try {
-      const base = this.active?.snapshot;
-      if (!base) throw new Error("Index base is unavailable");
-      const fingerprint = await this.fingerprintId();
-      const present = new Set(
-        (await this.vault.listMarkdownPaths(signal))
-          .map(normalizePath)
-          .filter((path) => this.isIndexEligible(path))
-      );
-      const virtualNotes = new Map(base.notes.map((note) => [note.path, note.contentId]));
-      const changes: IncrementalChange[] = [];
-      const operations = [...captured.values()].sort((a, b) => a.revision - b.revision);
-      const readableState = new Set(base.notes.map((note) => note.path));
-      let readable = 0;
-      for (const { operation } of operations) {
-        const path = normalizePath(operation.path);
-        if (operation.kind === "rename") {
-          const oldPath = normalizePath(operation.oldPath);
-          if (!present.has(path)) readableState.delete(oldPath);
-          else if (readableState.delete(oldPath)) readableState.add(path);
-          else {
-            readable++;
-            readableState.add(path);
-          }
-        } else if (operation.kind === "delete" || !present.has(path)) {
-          readableState.delete(path);
-        } else if (operation.kind !== "unchanged") {
-          readable++;
-          readableState.add(path);
-        }
-      }
-      this.reportProgress({
-        operation: "incremental",
-        phase: "discover",
-        completed: captured.size,
-        total: captured.size,
-        unit: "paths",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "read",
-        completed: 0,
-        total: readable,
-        unit: "notes",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "chunk",
-        completed: 0,
-        unit: "chunks",
-        determinate: false,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "embed",
-        completed: 0,
-        unit: "texts",
-        determinate: false,
-      });
-      let read = 0;
-      let chunked = 0;
-      let embedded = 0;
-      for (const { operation } of operations) {
-        check(signal);
-        let readableOperation = operation;
-        if (operation.kind === "rename") {
-          const oldPath = normalizePath(operation.oldPath);
-          const newPath = normalizePath(operation.path);
-          if (!present.has(newPath)) {
-            changes.push({ type: "delete", path: oldPath });
-            virtualNotes.delete(oldPath);
-            continue;
-          }
-          const oldContentId = virtualNotes.get(oldPath);
-          if (oldContentId) {
-            changes.push({ type: "rename", path: newPath, previousPath: oldPath });
-            virtualNotes.delete(oldPath);
-            virtualNotes.set(newPath, oldContentId);
-            continue;
-          }
-          // A rename can be observed while a full build is still reading its old
-          // discovery snapshot. If the old path was skipped, index the new path.
-          readableOperation = { kind: "create", path: newPath };
-        }
-        const path = normalizePath(readableOperation.path);
-        if (readableOperation.kind === "unchanged") continue;
-        if (
-          readableOperation.kind === "delete" ||
-          !present.has(path) ||
-          !this.isIndexEligible(path)
-        ) {
-          changes.push({ type: "delete", path });
-          virtualNotes.delete(path);
-          continue;
-        }
-        const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
-        if (!doc) {
-          changes.push({ type: "delete", path });
-          virtualNotes.delete(path);
-          continue;
-        }
-        read++;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "read",
-          completed: read,
-          total: readable,
-          unit: "notes",
-          determinate: true,
-        });
-        const contentId = await deriveNoteContentId(fingerprint, doc.content);
-        if (virtualNotes.get(path) === contentId) continue;
-        const chunks = chunkMarkdown(
-          doc.content,
-          this.options.size ?? CHUNK_SIZE,
-          this.options.overlap ?? CHUNK_OVERLAP,
-          signal
-        );
-        chunked += chunks.length;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "chunk",
-          completed: chunked,
-          unit: "chunks",
-          determinate: false,
-        });
-        const vectors =
-          readableOperation.kind === "empty" || chunks.length === 0
-            ? []
-            : await this.embedding.embed(
-                chunks.map((c) => c.text),
-                signal,
-                (progress) =>
-                  this.reportProgress({
-                    operation: "incremental",
-                    phase: "embed",
-                    completed: embedded + progress.completed,
-                    unit: "texts",
-                    determinate: false,
-                  })
-              );
-        embedded += chunks.length;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "embed",
-          completed: embedded,
-          unit: "texts",
-          determinate: false,
-        });
-        if (vectors.length !== chunks.length) throw new Error("Embedding count mismatch");
-        changes.push({
-          type: readableOperation.kind === "empty" ? "empty" : readableOperation.kind,
-          path,
-          note: {
-            path,
-            contentId,
-            records: chunks.map((c, i) => ({ ...c, ordinal: i, vector: vectors[i] })),
-          },
-        });
-        virtualNotes.set(path, contentId);
-      }
-      this.reportProgress({
-        operation: "incremental",
-        phase: "chunk",
-        completed: chunked,
-        total: chunked,
-        unit: "chunks",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "embed",
-        completed: embedded,
-        total: embedded,
-        unit: "texts",
-        determinate: true,
-      });
-      if (changes.length === 0) {
-        for (const [key, value] of captured)
-          if (this.queued.get(key)?.revision === value.revision) this.queued.delete(key);
-        this.emit({
-          area: "index",
-          event: "index_operation",
-          operation: "incremental",
-          stage: "completed",
-          counts: { changes: 0 },
-        });
-        return false;
-      }
-      tx = await this.corpus.stageIncremental(base, changes, fingerprint, {
-        signal,
-        onProgress: (event) => {
-          if (event.phase === "encode-write") {
-            encodedArtifacts = Math.max(encodedArtifacts, event.completed);
-            this.reportProgress({
-              operation: "incremental",
-              phase: "encode-write",
-              completed: encodedArtifacts,
-              unit: "artifacts",
-              determinate: false,
-            });
-          } else {
-            this.reportProgress({
-              operation: "incremental",
-              phase: "validate",
-              completed: event.completed,
-              ...(event.total === undefined ? {} : { total: event.total }),
-              unit: "artifacts",
-              determinate: event.total !== undefined,
-            });
-          }
-        },
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "encode-write",
-        completed: encodedArtifacts,
-        total: encodedArtifacts,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      this.reportProgress({
-        operation: "incremental",
-        phase: "validate",
-        completed: 1,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      check(signal);
-      if (epoch !== this.epoch)
-        throw new StructuredError("cancelled", "Index reconciliation cancelled.", true);
-      bundle = await this.derive(tx.snapshot, ++this.generation, signal, "incremental");
-      check(signal);
-      this.reportProgress({
-        operation: "incremental",
-        phase: "activate",
-        completed: 0,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      await tx.commit();
-      this.reportProgress({
-        operation: "incremental",
-        phase: "activate",
-        completed: 1,
-        total: 1,
-        unit: "artifacts",
-        determinate: true,
-        generationId: tx.snapshot.generationId,
-      });
-      const published = bundle;
-      bundle = undefined;
-      await this.swap(published);
-      await this.collectGarbage("incremental", tx.snapshot.generationId);
-      for (const [key, value] of captured)
-        if (this.queued.get(key)?.revision === value.revision) this.queued.delete(key);
+    const complete = (changed: boolean): IndexSyncResult => {
       this.emit({
         area: "index",
         event: "index_operation",
         operation: "incremental",
-        stage: "published",
-        generation: tx.snapshot.generationId,
-        counts: { changes: captured.size },
+        stage: "completed",
+        ...(phase ? { phase } : {}),
+        durationMs: Date.now() - started,
+        generation: this.generationId(),
+        counts: {
+          changed: changed ? 1 : 0,
+          notes: this.state?.noteCount ?? 0,
+          chunks: this.state?.chunkCount ?? 0,
+          incomplete: this.state?.incomplete ? 1 : 0,
+        },
       });
-      return true;
+      return { changed, converged: this.state?.incomplete === false };
+    };
+    try {
+      if (!this.loaded) await this.load();
+      let changed = false;
+      const embeddingProgress = { completed: 0 };
+      // A vault can change while this pass is hashing or embedding. Repeat after
+      // the final discovery until both the event watermark and exact summaries
+      // agree. The bounded guard is only defensive; an actively edited vault
+      // remains incomplete and is retried by the plugin.
+      for (let pass = 0; pass < 8; pass++) {
+        const watermark = this.revision;
+        const discovered = await this.discoverEligible(signal);
+        changed ||= await this.reconcileDiscovered(discovered, signal, embeddingProgress);
+        const final = await this.discoverEligible(signal);
+        if (watermark !== this.revision || !sameSummaries(discovered, final)) continue;
+        const finished = await this.finishIfStable(final, signal, watermark);
+        if (finished && watermark === this.revision) {
+          this.reconciledRevision = Math.max(this.reconciledRevision, watermark);
+          return complete(changed);
+        }
+      }
+      return complete(changed);
     } catch (error) {
-      if (bundle) await bundle.retriever.close().catch(() => undefined);
-      if (tx) await tx.abort().catch(() => undefined);
       this.emit({
         area: "index",
         event: "index_operation",
         operation: "incremental",
         stage: signal.aborted ? "cancelled" : "failed",
+        ...(phase ? { phase } : {}),
+        durationMs: Date.now() - started,
         error: projectDiagnosticError(error),
       });
       throw error;
     } finally {
-      this.building = false;
+      if (tracksBuilding) this.building = false;
     }
   }
+
+  private async discoverEligible(signal: AbortSignal): Promise<readonly SqliteNoteSummary[]> {
+    const paths = [...(await this.vault.listMarkdownPaths(signal))]
+      .map(normalizePath)
+      .filter((path) => this.isIndexEligible(path))
+      .sort(compareCodeUnits);
+    const fingerprint = await this.fingerprintId();
+    const summaries: SqliteNoteSummary[] = [];
+    for (const path of paths) {
+      const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
+      if (doc)
+        summaries.push({ path, contentId: await deriveNoteContentId(fingerprint, doc.content) });
+    }
+    return summaries;
+  }
+
+  private async reconcileDiscovered(
+    discovered: readonly SqliteNoteSummary[],
+    signal: AbortSignal,
+    embeddingProgress: { completed: number }
+  ): Promise<boolean> {
+    const plan = (await this.ensureClient().call(
+      "planReconciliation",
+      { summaries: discovered },
+      signal
+    )) as SqliteReconciliationPlan;
+    this.setState(plan.state);
+    let changed = false;
+    for (const rename of plan.renames) {
+      const result = (await this.ensureClient().call(
+        "renameNote",
+        rename,
+        signal
+      )) as SqliteMutationResult;
+      this.setState(result.state);
+      changed ||= result.changed;
+    }
+
+    for (const summary of plan.upserts) {
+      check(signal);
+      const doc = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
+      if (!doc) continue;
+      const note = await this.prepareNote(summary.path, doc, signal, embeddingProgress);
+      if (!note) continue;
+      const latest = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
+      if (
+        !latest ||
+        (await deriveNoteContentId(await this.fingerprintId(), latest.content)) !== note.contentId
+      ) {
+        this.queueChange();
+        continue;
+      }
+      const result = (await this.ensureClient().call(
+        "upsertNote",
+        { note },
+        signal
+      )) as SqliteMutationResult;
+      this.setState(result.state);
+      changed ||= result.changed;
+    }
+
+    for (const note of plan.deletes) {
+      const result = (await this.ensureClient().call(
+        "deleteNote",
+        note,
+        signal
+      )) as SqliteMutationResult;
+      this.setState(result.state);
+      changed ||= result.changed;
+    }
+    return changed;
+  }
+  private async prepareNote(
+    path: string,
+    doc: IndexVaultDocument,
+    signal: AbortSignal,
+    embeddingProgress: { completed: number }
+  ): Promise<SqliteNoteInput | undefined> {
+    check(signal);
+    const fingerprint = await this.fingerprintId();
+    const contentId = await deriveNoteContentId(fingerprint, doc.content);
+    const chunks = chunkMarkdown(
+      doc.content,
+      this.options.size ?? CHUNK_SIZE,
+      this.options.overlap ?? CHUNK_OVERLAP,
+      signal
+    );
+    const completedBefore = embeddingProgress.completed;
+    const vectors = chunks.length
+      ? await this.embedding.embed(
+          chunks.map((chunk) => chunk.text),
+          signal,
+          (progress) => {
+            embeddingProgress.completed = Math.max(
+              embeddingProgress.completed,
+              completedBefore + progress.completed
+            );
+            this.reportProgress({
+              operation: "incremental",
+              phase: "embed",
+              completed: embeddingProgress.completed,
+              unit: "texts",
+              determinate: false,
+            });
+          }
+        )
+      : [];
+    embeddingProgress.completed = Math.max(
+      embeddingProgress.completed,
+      completedBefore + chunks.length
+    );
+    this.reportProgress({
+      operation: "incremental",
+      phase: "embed",
+      completed: embeddingProgress.completed,
+      unit: "texts",
+      determinate: false,
+    });
+    if (
+      vectors.length !== chunks.length ||
+      vectors.some((vector) => vector.length !== this.embedding.dimensions)
+    )
+      throw new StructuredError("internal", "Embedding dimensions changed during indexing.", false);
+    const current = await this.readMarkdownIfAvailable(path, signal, "incremental");
+    if (!current || (await deriveNoteContentId(fingerprint, current.content)) !== contentId) {
+      this.queueChange();
+      return undefined;
+    }
+    return {
+      path,
+      contentId,
+      chunks: chunks.map((chunk, index) => ({
+        id: `${contentId}:${index}`,
+        ordinal: index,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        text: chunk.text,
+        vector: new Float32Array(vectors[index]),
+      })),
+    };
+  }
+  private async finishIfStable(
+    summaries: readonly SqliteNoteSummary[],
+    signal: AbortSignal,
+    expectedRevision = this.revision
+  ): Promise<boolean> {
+    const expected = [...summaries].sort((a, b) => compareCodeUnits(a.path, b.path));
+    if (expectedRevision !== this.revision) {
+      await this.markIncomplete(signal);
+      return false;
+    }
+    const before = this.state?.changeCounter ?? 0;
+    const state = (await this.ensureClient().call(
+      "finishReconciliation",
+      { summaries: expected, observedChangeCounter: before },
+      signal
+    )) as SqliteState;
+    if (expectedRevision !== this.revision) {
+      await this.markIncomplete(signal);
+      return false;
+    }
+    this.setState(state);
+    return !state.incomplete;
+  }
+
+  private async markIncomplete(signal: AbortSignal): Promise<SqliteState> {
+    const state = (await this.ensureClient().call("markIncomplete", {}, signal)) as SqliteState;
+    this.setState(state);
+    return state;
+  }
+
+  queueChange(): void {
+    this.revision++;
+  }
+  async reconcileQueuedChanges(signal: AbortSignal): Promise<IndexSyncResult> {
+    if (this.revision === this.reconciledRevision) {
+      if (this.loaded && this.state?.incomplete) return this.runSynchronization(signal, "queued");
+      return { changed: false, converged: this.state?.incomplete === false };
+    }
+    if (this.building) {
+      await this.buildPromise;
+      if (this.building)
+        throw new StructuredError("busy", "Index update is already running.", true);
+    }
+    return this.runSynchronization(signal, "queued");
+  }
+
   async search(
     query: string,
     signal: AbortSignal,
     limit: number
   ): Promise<readonly ProvenanceRecord[]> {
-    const bundle = this.active;
-    if (!bundle || this.unavailable)
-      throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
-    check(signal);
-    const results = await bundle.retriever.search({
-      query,
-      mode: "hybrid",
-      resultShape: "chunks",
-      limit: Math.min(20, Math.max(0, limit)),
-      semanticCandidateLimit: 80,
-      lexicalCandidateLimit: 80,
-      signal,
-    });
-    return results.map((r) => this.provenance(r));
+    return (await this.retrieve(query, "hybrid", signal, Math.min(20, Math.max(0, limit)))).map(
+      (result) => ({
+        path: result.path,
+        startLine: result.startLine,
+        endLine: result.endLine,
+        excerpt: result.excerpt,
+        score: result.fusedScore,
+      })
+    );
   }
-  relatedSnapshot(path: string): RelatedIndexSnapshot | null {
-    const bundle = this.active;
-    if (!bundle || this.unavailable) return null;
-    const currentPath = normalizePath(path);
-    const note = bundle.snapshot.getNote(currentPath);
-    if (!note) return null;
-    return {
-      generationId: bundle.snapshot.generationId,
-      currentPath,
-      contentHash: note.contentId,
-      prepareQuery: async (signal) => {
-        check(signal);
-        const textParts: string[] = [];
-        let textLength = 0;
-        let vectorSum: Float64Array | undefined;
-        let firstVector: readonly number[] | Float32Array | undefined;
-        let vectorCount = 0;
-        for (const view of await bundle.snapshot.hydrateNote(currentPath)) {
-          for (const record of view.segment.records) {
-            check(signal);
-            if (!vectorSum) vectorSum = new Float64Array(record.vector.length);
-            if (record.vector.length !== vectorSum.length)
-              throw new StructuredError(
-                "internal",
-                "Related-note vector dimensions changed within the committed note.",
-                false
-              );
-            firstVector ??= record.vector;
-            for (let i = 0; i < vectorSum.length; i++) vectorSum[i] += record.vector[i];
-            vectorCount++;
-            if (textLength < CHUNK_SIZE) {
-              const separator = textParts.length ? "\n\n" : "";
-              const remaining = CHUNK_SIZE - textLength - separator.length;
-              if (remaining > 0) {
-                const piece = record.text.slice(0, remaining);
-                if (piece) {
-                  textParts.push(`${separator}${piece}`);
-                  textLength += separator.length + piece.length;
-                }
-              }
-            }
-          }
+  lenteState(): { readonly changeCounter: number; readonly generationId: string } | null {
+    if (!this.hasUsableIndex()) return null;
+    const changeCounter = this.changeCounter();
+    return { changeCounter, generationId: indexIdentity(changeCounter) };
+  }
+  searchLente(
+    query: string,
+    mode: "hybrid" | "lexical",
+    signal?: AbortSignal
+  ): Promise<readonly RetrievalResult[]> {
+    return this.retrieve(query, mode, signal, 160, undefined, undefined, "lente");
+  }
+  private async retrieve(
+    query: string,
+    mode: "hybrid" | "lexical" | "semantic" | "related",
+    signal: AbortSignal | undefined,
+    limit: number,
+    currentPath?: string,
+    vector?: readonly number[],
+    lexicalProfile: "voce" | "lente" = "voce"
+  ): Promise<readonly RetrievalResult[]> {
+    const started = Date.now();
+    const requestSignal = signal ?? new AbortController().signal;
+    try {
+      check(requestSignal);
+      if (this.maintenance)
+        throw new StructuredError("busy", "Index maintenance is in progress.", true);
+      if (!this.hasUsableIndex())
+        throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
+      let queryVector = vector ? new Float32Array(vector) : undefined;
+      if (mode !== "lexical" && !queryVector) {
+        try {
+          const values = await this.embedding.embed([query], requestSignal);
+          queryVector = new Float32Array(values[0] ?? []);
+        } catch {
+          if (requestSignal.aborted)
+            throw new StructuredError("cancelled", "Search cancelled.", true);
+          throw new QueryEmbeddingError();
         }
-        if (!vectorSum || !firstVector || vectorCount === 0) return null;
-        let normSquared = 0;
-        for (const value of vectorSum) normSquared += value * value;
-        const norm = Math.sqrt(normSquared);
-        const vector =
-          norm > 1e-12 ? Array.from(vectorSum, (value) => value / norm) : Array.from(firstVector);
-        return { text: textParts.join(""), vector };
-      },
-      search: async (query, vector, signal, limit) =>
-        (
-          await bundle.retriever.search({
-            query,
-            queryVector: vector,
-            // Related-note lookup runs automatically when the active note
-            // changes. Use its committed aggregate vector so this path
-            // never invokes Orama's synchronous whole-index text search
-            // on Obsidian's renderer thread.
-            mode: "related",
-            resultShape: "chunks",
-            currentPath,
-            limit: Math.min(128, limit),
-            semanticCandidateLimit: 128,
-            lexicalCandidateLimit: 0,
-            signal,
-          })
-        ).map((r) => ({
-          path: r.path,
-          score: r.fusedScore,
-          ...(r.semanticScore === undefined ? {} : { similarity: r.semanticScore }),
-          excerpt: r.excerpt,
-          startLine: r.startLine,
-          endLine: r.endLine,
-        })),
+        if (
+          queryVector.length !== this.embedding.dimensions ||
+          !queryVector.some((value) => value !== 0)
+        )
+          throw new QueryEmbeddingError();
+      }
+      const candidateLimit = lexicalProfile === "lente" ? 160 : mode === "related" ? 128 : 80;
+      const resultLimit = Math.max(0, Math.min(256, Math.floor(limit)));
+      const hits = (await this.ensureClient().call(
+        "retrieve",
+        {
+          ...(mode === "semantic" ? {} : { query }),
+          ...(queryVector ? { vector: queryVector } : {}),
+          limit: resultLimit,
+          semanticCandidateLimit: candidateLimit,
+          lexicalCandidateLimit: candidateLimit,
+          lexicalProfile,
+          ...(lexicalProfile === "lente" ? { resultShape: "notes" as const } : {}),
+          ...(currentPath ? { currentPath } : {}),
+        },
+        requestSignal
+      )) as readonly SqliteHit[];
+      const changeCounter = this.changeCounter();
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "search",
+        stage: "completed",
+        phase: mode,
+        durationMs: Date.now() - started,
+        generation: indexIdentity(changeCounter),
+        counts: { results: hits.length },
+      });
+      return hits.map((hit) => ({
+        path: hit.path,
+        startLine: hit.startLine,
+        endLine: hit.endLine,
+        excerpt: hit.text,
+        generationId: indexIdentity(changeCounter),
+        changeCounter,
+        chunkId: hit.id,
+        ordinal: hit.ordinal,
+        ...(hit.semanticScore === undefined ? {} : { semanticScore: hit.semanticScore }),
+        ...(hit.lexicalScore === undefined ? {} : { lexicalScore: hit.lexicalScore }),
+        fusedScore: hit.fusedScore ?? hit.score,
+      }));
+    } catch (error) {
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "search",
+        stage: requestSignal.aborted ? "cancelled" : "failed",
+        phase: mode,
+        durationMs: Date.now() - started,
+        error: projectDiagnosticError(error),
+      });
+      throw error;
+    }
+  }
+  relatedState(path: string): RelatedIndexState | null {
+    const currentPath = normalizePath(path);
+    if (!this.hasUsableIndex() || !this.isIndexEligible(currentPath)) return null;
+    const counter = this.changeCounter();
+    const identity = indexIdentity(counter);
+    return {
+      changeCounter: counter,
+      generationId: identity,
+      currentPath,
+      contentHash: identity,
     };
   }
-  async upsert(path: string, signal: AbortSignal): Promise<void> {
-    this.queueOperation({ kind: "modify", path });
-    await this.reconcileQueuedChanges(signal);
+  async findRelated(
+    path: string,
+    signal: AbortSignal,
+    limit: number
+  ): Promise<readonly RelatedIndexHit[]> {
+    check(signal);
+    const hits = (await this.ensureClient().call(
+      "findRelated",
+      { path: normalizePath(path), limit: Math.min(128, limit) },
+      signal
+    )) as readonly SqliteHit[];
+    return hits.map((hit) => ({
+      path: hit.path,
+      score: hit.score,
+      similarity: hit.score,
+      excerpt: hit.text,
+      startLine: hit.startLine,
+      endLine: hit.endLine,
+    }));
   }
-  async delete(path: string, signal: AbortSignal): Promise<void> {
-    this.queueOperation({ kind: "delete", path });
-    await this.reconcileQueuedChanges(signal);
+  async exportSnapshot(): Promise<IndexSnapshotExport> {
+    if (this.maintenance || this.building)
+      throw new StructuredError(
+        "busy",
+        "Index maintenance is unavailable while indexing is active.",
+        true
+      );
+    if (!this.loaded) await this.load();
+    this.maintenance = true;
+    try {
+      const bytes = (await this.ensureClient().call("export", {})) as ArrayBuffer;
+      if (
+        !(bytes instanceof ArrayBuffer) ||
+        bytes.byteLength === 0 ||
+        bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES
+      )
+        throw new StructuredError("invalid_request", "Snapshot bytes are invalid.", false);
+      const copy = bytes.slice(0);
+      const sha256 = await sha256Hex(copy);
+      const path = `${SQLITE_SNAPSHOT_NAMESPACE}/${sha256}.sqlite3`;
+      const adapter = this.snapshotAdapter;
+      if (!adapter)
+        throw new StructuredError("unavailable", "Snapshot storage is unavailable.", true);
+      if (adapter.mkdir) await adapter.mkdir(".trama");
+      if (adapter.mkdir) await adapter.mkdir(".trama/sqlite");
+      if (adapter.mkdir) await adapter.mkdir(SQLITE_SNAPSHOT_NAMESPACE);
+      const exists = adapter.exists ? await adapter.exists(path) : false;
+      let existing: ArrayBuffer | undefined;
+      if (exists || adapter.readBinary)
+        existing = await adapter.readBinary?.(path).catch(() => undefined);
+      if (!existing) await adapter.writeBinary(path, copy);
+      else if ((await sha256Hex(existing)) !== sha256)
+        throw new StructuredError(
+          "internal",
+          "Snapshot destination is immutable and occupied.",
+          false
+        );
+      const metadataPath = `${SQLITE_SNAPSHOT_NAMESPACE}/${sha256}.json`;
+      if (adapter.write && !(adapter.exists && (await adapter.exists(metadataPath))))
+        await adapter.write(
+          metadataPath,
+          JSON.stringify({
+            sha256,
+            size: copy.byteLength,
+            schemaVersion: this.state?.schemaVersion ?? 1,
+            dimensions: this.state?.dimensions ?? this.embedding.dimensions,
+            incomplete: this.state?.incomplete ?? true,
+          })
+        );
+      const state = this.state ?? ((await this.ensureClient().call("getState", {})) as SqliteState);
+      return { bytes: copy, sha256, size: copy.byteLength, path, incomplete: state.incomplete };
+    } finally {
+      this.maintenance = false;
+    }
+  }
+  async importSnapshot(snapshot: IndexSnapshotImport): Promise<SqliteState> {
+    if (this.maintenance || this.building)
+      throw new StructuredError(
+        "busy",
+        "Index maintenance is unavailable while indexing is active.",
+        true
+      );
+    if (
+      !(snapshot.bytes instanceof ArrayBuffer) ||
+      snapshot.bytes.byteLength === 0 ||
+      snapshot.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES
+    )
+      throw new StructuredError("limit_exceeded", "Snapshot is too large or empty.", false);
+    if (!/^[0-9a-f]{64}$/i.test(snapshot.sha256))
+      throw new StructuredError("invalid_request", "Snapshot checksum verification failed.", false);
+    const bytes = snapshot.bytes.slice(0);
+    const sha256 = await sha256Hex(bytes);
+    if (snapshot.sha256.toLowerCase() !== sha256)
+      throw new StructuredError("invalid_request", "Snapshot checksum verification failed.", false);
+    if (!this.loaded) await this.load();
+    this.maintenance = true;
+    try {
+      const previous = this.state?.changeCounter ?? 0;
+      const state = (await this.ensureClient().call("import", { bytes }, undefined)) as SqliteState;
+      if (!state.incomplete || state.changeCounter <= previous)
+        throw new StructuredError("internal", "Imported snapshot state is invalid.", false);
+      this.setState(state);
+      return state;
+    } finally {
+      this.maintenance = false;
+    }
   }
   invalidate(): void {
-    this.epoch++;
     this.unavailable = true;
-    const old = this.active;
-    this.active = null;
-    if (old) void this.retireBundle(old);
+    this.state = undefined;
   }
-  markUnavailable(): void {
+  async dispose(): Promise<void> {
     this.unavailable = true;
-    const old = this.active;
-    this.active = null;
-    if (old) void this.retireBundle(old);
-  }
-  private provenance(r: RetrievalResult): ProvenanceRecord {
-    return {
-      path: r.path,
-      startLine: r.startLine,
-      endLine: r.endLine,
-      excerpt: r.excerpt,
-      score: r.fusedScore,
-    };
+    await this.client?.shutdown().catch(() => undefined);
+    this.client = undefined;
   }
 
-  /** Eligibility is fixed for this manager and applied only while constructing the corpus. */
+  disposeImmediately(): void {
+    this.unavailable = true;
+    this.client?.terminateNow();
+    this.client = undefined;
+  }
+
   private isIndexEligible(path: string): boolean {
     try {
       const normalized = normalizePath(path);
@@ -1206,11 +1040,6 @@ export class IndexManager implements VaultSearchPort {
       return false;
     }
   }
-
-  private emit(record: TramaDiagnosticRecord): void {
-    emitTramaDiagnostic(this.diagnostics, record);
-  }
-
   private async readMarkdownIfAvailable(
     path: string,
     signal: AbortSignal,
@@ -1225,7 +1054,7 @@ export class IndexManager implements VaultSearchPort {
       try {
         available = (await this.vault.isMarkdownAvailable?.(path, signal)) ?? true;
       } catch {
-        // Preserve the original read error when availability cannot be checked.
+        /* preserve read error */
       }
       if (available) throw error;
       this.emit({
@@ -1239,7 +1068,11 @@ export class IndexManager implements VaultSearchPort {
       return undefined;
     }
   }
+  private emit(record: TramaDiagnosticRecord): void {
+    emitTramaDiagnostic(this.diagnostics, record);
+  }
   private reportProgress(progress: IndexProgress, emitDiagnostic = true): void {
+    const next = Object.freeze({ ...progress });
     if (emitDiagnostic)
       this.emit({
         area: "index",
@@ -1254,53 +1087,9 @@ export class IndexManager implements VaultSearchPort {
         ...(progress.generationId ? { generation: progress.generationId } : {}),
       });
     try {
-      this.onProgress?.(progress);
+      this.onProgress?.(next);
     } catch {
-      // Progress is observational and must not affect indexing.
-    }
-  }
-
-  private async collectGarbage(
-    operation: "full" | "incremental",
-    generationId: string
-  ): Promise<void> {
-    this.reportProgress({
-      operation,
-      phase: "GC",
-      completed: 0,
-      unit: "artifacts",
-      determinate: false,
-      generationId,
-    });
-    try {
-      const result = await this.corpus.collectGarbage((event) =>
-        this.reportProgress({
-          operation,
-          phase: "GC",
-          completed: event.completed,
-          ...(event.total === undefined ? {} : { total: event.total }),
-          unit: "artifacts",
-          determinate: event.total !== undefined,
-          generationId,
-        })
-      );
-      this.reportProgress({
-        operation,
-        phase: "GC",
-        completed: result.removed,
-        total: result.removed,
-        unit: "artifacts",
-        determinate: true,
-        generationId,
-      });
-    } catch (error) {
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "GC",
-        stage: "failed",
-        error: projectDiagnosticError(error),
-      });
+      /* observational */
     }
   }
 }

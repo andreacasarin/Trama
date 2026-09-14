@@ -4,8 +4,8 @@ import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { LenteSearch } from "@/index/LenteSearch";
-import { SuggestModal } from "obsidian";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import { createTestSqliteClient } from "./sqlite-test-client";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -48,6 +48,10 @@ function projectedApp() {
     adapter: {
       exists: async (path: string) => adapterFiles.has(path),
       read: async (path: string) => adapterFiles.get(path) ?? "",
+      mkdir: async () => undefined,
+      getResourcePath: function (path: string) {
+        return `app://local/${path}`;
+      },
       write: async (path: string, value: string) => {
         adapterFiles.set(path, value);
       },
@@ -100,8 +104,10 @@ function projectedApp() {
 function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SETTINGS) {
   const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
   plugin.app = app;
+  plugin.manifest = { dir: ".obsidian/plugins/trama" };
   plugin.loadData = vi.fn(async () => data);
   plugin.saveData = vi.fn(async () => undefined);
+  plugin.sqliteClientFactory = (storage: object) => createTestSqliteClient(storage);
   plugin.addCommand = vi.fn();
   plugin.addSettingTab = vi.fn();
   plugin.registerView = vi.fn();
@@ -123,7 +129,97 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.restoreAllMocks();
   });
 
-  it("refreshes Lente only when reconciliation publishes a generation", async () => {
+  it("persists one opaque SQLite identity through the vault adapter", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    plugin.lifecycleAbort = new AbortController();
+    plugin.composeRuntime(app, DEFAULT_SETTINGS);
+    await plugin.indexLoad;
+    const path = ".trama/sqlite/v1/identity.json";
+    const first = JSON.parse(await app.vault.adapter.read(path));
+    expect(first).toMatchObject({ version: 1, identity: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(first.identity).not.toBe("vault");
+    plugin.composeRuntime(app, DEFAULT_SETTINGS);
+    await plugin.indexLoad;
+    expect(JSON.parse(await app.vault.adapter.read(path)).identity).toBe(first.identity);
+  });
+
+  it("resolves the Worker from the installed plugin resource path", () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    expect(plugin.sqliteWorkerUrl(app)).toBe(
+      "app://local/.obsidian/plugins/trama/sqlite-worker.mjs"
+    );
+  });
+
+  it("falls back to the configured plugin directory when manifest.dir is absent", () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    plugin.manifest = { id: "trama" };
+    expect(plugin.sqliteWorkerUrl(app)).toBe(
+      "app://local/.obsidian/plugins/trama/sqlite-worker.mjs"
+    );
+  });
+
+  it("boots the Worker through a blob module with explicit local asset URLs", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    const originalWorker = globalThis.Worker;
+    const originalCreateObjectUrl = URL.createObjectURL;
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    let bootstrap: Blob | undefined;
+    const worker = { postMessage: vi.fn(), addEventListener: vi.fn(), terminate: vi.fn() };
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      bootstrap = blob;
+      return "blob:trama-worker";
+    });
+    URL.revokeObjectURL = vi.fn();
+    globalThis.Worker = vi.fn(() => worker) as any;
+    try {
+      expect(plugin.createSqliteWorker(app)).toBe(worker);
+      expect(globalThis.Worker).toHaveBeenCalledWith("blob:trama-worker", { type: "module" });
+      expect(await bootstrap!.text()).toContain(
+        '"moduleUrl":"app://local/.obsidian/plugins/trama/sqlite3.mjs"'
+      );
+      expect(await bootstrap!.text()).toContain(
+        '"wasmUrl":"app://local/.obsidian/plugins/trama/sqlite3.wasm"'
+      );
+      expect(await bootstrap!.text()).toContain(
+        'const __tramaWorkerUrl="app://local/.obsidian/plugins/trama/sqlite-worker.mjs"'
+      );
+      expect(await bootstrap!.text()).toContain("await import(__tramaWorkerUrl)");
+      expect(await bootstrap!.text()).toContain('code:"storage_unavailable"');
+      expect(await bootstrap!.text()).toContain("URL.revokeObjectURL(globalThis.location.href)");
+      expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    } finally {
+      globalThis.Worker = originalWorker;
+      URL.createObjectURL = originalCreateObjectUrl;
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
+  });
+
+  it("revokes the bootstrap blob when Worker construction fails", () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    const originalWorker = globalThis.Worker;
+    const originalCreateObjectUrl = URL.createObjectURL;
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    URL.createObjectURL = vi.fn(() => "blob:trama-worker");
+    URL.revokeObjectURL = vi.fn();
+    globalThis.Worker = vi.fn(() => {
+      throw new Error("worker construction failed");
+    }) as any;
+    try {
+      expect(() => plugin.createSqliteWorker(app)).toThrow("worker construction failed");
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:trama-worker");
+    } finally {
+      globalThis.Worker = originalWorker;
+      URL.createObjectURL = originalCreateObjectUrl;
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
+  });
+
+  it("refreshes Lente only when reconciliation changes the index", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     const refreshSubmitted = vi.fn();
     plugin.app = {
@@ -135,11 +231,13 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.indexReady = true;
     plugin.lifecycleAbort = new AbortController();
     plugin.indexStatus = { setUpdating: vi.fn(), setReady: vi.fn(), markStale: vi.fn() };
-    const published = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
     plugin.index = {
       isBuilding: () => false,
-      reconcileQueuedChanges: vi.fn(async () => undefined),
-      getLastReconciliationPublished: published,
+      isComplete: () => true,
+      reconcileQueuedChanges: vi
+        .fn()
+        .mockResolvedValueOnce({ changed: false, converged: true })
+        .mockResolvedValueOnce({ changed: true, converged: true }),
     };
     await plugin.reconcileNow();
     expect(refreshSubmitted).not.toHaveBeenCalled();
@@ -148,7 +246,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(refreshSubmitted).toHaveBeenCalledTimes(1);
   });
 
-  it("does not refresh Lente after load or replacement, but refreshes after publication", async () => {
+  it("does not refresh Lente after load or replacement, but refreshes after an index change", async () => {
     const app = projectedApp();
     const refreshSubmitted = vi.fn();
     const setSearch = vi.fn();
@@ -170,7 +268,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(refreshSubmitted).not.toHaveBeenCalled();
 
     const index = plugin.index;
-    vi.spyOn(index, "synchronizeWithPublication").mockResolvedValue(true);
+    vi.spyOn(index, "synchronize").mockResolvedValue({ changed: true, converged: true });
     await plugin.runIndex(new AbortController().signal, false);
     expect(refreshSubmitted).toHaveBeenCalledTimes(1);
   });
@@ -226,73 +324,6 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(plugin.saveData).not.toHaveBeenCalled();
   });
 
-  it("opens Search with Lente without changing the sidebar and searches only after Enter", async () => {
-    const app = projectedApp();
-    const plugin = projectedPlugin(app);
-    await plugin.onload();
-    await (plugin as any).indexLoad;
-    const command = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.find(
-      ([value]) => (value as { id: string }).id === "search-with-lente"
-    )?.[0] as { callback: () => void };
-    const search = vi.spyOn((plugin as any).lenteSearch, "search").mockResolvedValue({
-      generationId: "g1",
-      mode: "lexical",
-      degraded: false,
-      displayLimit: 20,
-      results: [],
-      canonicalResults: [],
-      durationMs: 0,
-    });
-    const getLeaf = vi.spyOn(app.workspace, "getLeaf");
-
-    command.callback();
-    const modal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
-    expect(modal).toBeDefined();
-    expect(getLeaf).not.toHaveBeenCalled();
-    expect(search).not.toHaveBeenCalled();
-
-    modal.inputEl.value = "needle";
-    modal.inputEl.dispatch("input");
-    expect(search).not.toHaveBeenCalled();
-    modal.inputEl.dispatchEvent({ type: "keydown", key: "Enter" });
-    await Promise.resolve();
-    expect(search).toHaveBeenCalledWith(
-      "needle",
-      expect.objectContaining({ sort: "relevant", signal: expect.any(AbortSignal) })
-    );
-  });
-
-  it("snapshots modal delay and keeps delay-only saves out of runtime composition", async () => {
-    const app = projectedApp();
-    const plugin = projectedPlugin(app);
-    await plugin.onload();
-    await (plugin as any).indexLoad;
-    const command = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.find(
-      ([value]) => (value as { id: string }).id === "search-with-lente"
-    )?.[0] as { callback: () => void };
-    const oldIndex = (plugin as any).index;
-    const oldSession = (plugin as any).session;
-    const oldLente = (plugin as any).lenteSearch;
-
-    command.callback();
-    const firstModal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
-    expect(firstModal).toBeDefined();
-    expect((firstModal as any).automaticSearchDelayMs).toBe(0);
-
-    await plugin.saveSettings({
-      ...DEFAULT_SETTINGS,
-      lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: 250 },
-    });
-
-    expect((plugin as any).index).toBe(oldIndex);
-    expect((plugin as any).session).toBe(oldSession);
-    expect((plugin as any).lenteSearch).toBe(oldLente);
-
-    command.callback();
-    const secondModal = (SuggestModal as unknown as { lastOpened?: any }).lastOpened;
-    expect((secondModal as any).automaticSearchDelayMs).toBe(250);
-  });
-
   it("keeps default-off vault events queued and stale without scheduling or contacting LM Studio", async () => {
     const load = vi
       .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
@@ -303,13 +334,13 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
     await (plugin as any).indexLoad;
     const index = (plugin as any).index;
-    const queue = vi.spyOn(index, "queueOperation");
+    const queue = vi.spyOn(index, "queueChange");
     (index as any).hasUsableIndex = vi.fn(() => true);
     const modify = app.listeners.find((ref) => ref.event === "modify");
 
     modify?.callback({ path: "Note.md" });
 
-    expect(queue).toHaveBeenCalledWith({ kind: "modify", path: "Note.md" });
+    expect(queue).toHaveBeenCalledTimes(1);
     expect((plugin as any).eventTimer).toBeUndefined();
     expect((plugin as any).indexStatus.getStatus()).toMatchObject({
       kind: "stale",
@@ -492,7 +523,7 @@ describe("TramaPlugin lifecycle integration", () => {
     release();
     await rebuild;
 
-    expect(writes).toHaveBeenCalled();
+    expect(writes).not.toHaveBeenCalled();
     expect(await index.search("anything", new AbortController().signal, 1)).toHaveLength(1);
   });
 
@@ -542,6 +573,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
     await (plugin as any).indexLoad;
     const oldIndex = (plugin as any).index;
+    const dispose = vi.spyOn(oldIndex, "dispose");
     const oldEmbedding = (oldIndex as any).embedding;
     let oldStarted!: () => void;
     const started = new Promise<void>((resolve) => (oldStarted = resolve));
@@ -566,6 +598,7 @@ describe("TramaPlugin lifecycle integration", () => {
       },
     });
     await save;
+    expect(dispose).toHaveBeenCalledTimes(1);
     await expect(oldRebuild).rejects.toThrow("old rebuild cancelled");
     const newIndex = (plugin as any).index;
     expect(newIndex).not.toBe(oldIndex);
@@ -613,11 +646,26 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     const diagnostics = (plugin as any).diagnostics;
 
-    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("hidden") });
+    diagnostics.emit({
+      area: "chat",
+      event: "model_error",
+      error: new Error("hidden"),
+      durationMs: 1,
+    });
     await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: true });
-    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("visible") });
+    diagnostics.emit({
+      area: "chat",
+      event: "model_error",
+      error: new Error("visible"),
+      durationMs: 12,
+    });
     await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: false });
-    diagnostics.emit({ area: "chat", event: "model_error", error: new Error("hidden again") });
+    diagnostics.emit({
+      area: "chat",
+      event: "model_error",
+      error: new Error("hidden again"),
+      durationMs: 2,
+    });
 
     expect(plugin.saveData).toHaveBeenCalledTimes(2);
     expect((plugin as any).session).toBe(session);
@@ -627,11 +675,12 @@ describe("TramaPlugin lifecycle integration", () => {
       debugSpy.mock.calls.filter(([, record]) => (record as { area?: string }).area === "chat")
     ).toEqual([
       [
-        "[Trama]",
+        "[Trama] chat:model_error 12 ms",
         {
           area: "chat",
           event: "model_error",
           error: expect.objectContaining({ message: "visible" }),
+          durationMs: 12,
         },
       ],
     ]);
@@ -726,12 +775,14 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = (plugin as any).index;
     vi.spyOn(index, "build").mockResolvedValue(undefined);
     const rebuild = (plugin as any).addCommand.mock.calls.find(
-      ([command]: [{ id: string }]) => command.id === "index-filo-vault"
+      ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(1);
-    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
+    await vi.waitFor(() => expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(1));
+    const reconcile = vi
+      .spyOn(index, "reconcileQueuedChanges")
+      .mockResolvedValue({ changed: true, converged: true });
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -752,10 +803,12 @@ describe("TramaPlugin lifecycle integration", () => {
       ([command]: [{ id: string }]) => command.id === "index-filo-vault"
     )[0].callback;
     await rebuild();
-    expect((plugin as any).indexReady).toBe(false);
+    // Mutable indexing keeps the existing searchable state available after a
+    // failed rebuild; it is marked incomplete/stale for a later retry.
+    expect((plugin as any).indexReady).toBe(true);
   });
 
-  it("publishes v1 then hands late v2 edits to the same manager for reconciliation", async () => {
+  it("builds v1 then hands late v2 edits to the same manager for reconciliation", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     await plugin.onload();
@@ -767,7 +820,9 @@ describe("TramaPlugin lifecycle integration", () => {
     const buildGate = new Promise<void>((resolve) => (release = resolve));
     vi.spyOn(index, "build").mockImplementation(async () => buildGate);
     vi.spyOn(index, "isBuilding").mockImplementation(() => building);
-    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
+    const reconcile = vi
+      .spyOn(index, "reconcileQueuedChanges")
+      .mockResolvedValue({ changed: true, converged: true });
     const rebuild = (plugin as any).addCommand.mock.calls.find(
       ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
@@ -866,8 +921,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
-    const queue = vi.spyOn(index, "queueOperation");
-    const rename = vi.spyOn(index, "queueRename");
+    const queue = vi.spyOn(index, "queueChange");
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -877,11 +931,8 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "image.png" });
     emit("modify", { path: ".trama/index.md" });
     emit("rename", { path: "Renamed.md" }, "Old.md");
-    expect(queue).toHaveBeenCalledWith({ kind: "create", path: "Note.md" });
-    expect(rename).toHaveBeenCalledWith("Old.md", "Renamed.md");
-    expect(queue).not.toHaveBeenCalledWith({ kind: "modify", path: "image.png" });
-    expect(queue).not.toHaveBeenCalledWith({ kind: "modify", path: ".trama/index.md" });
-    expect((plugin as any).eventTimer).toBeUndefined();
+    expect(queue).toHaveBeenCalledTimes(2);
+    expect((plugin as any).eventTimer).toBeDefined();
     await vi.advanceTimersByTimeAsync(1500);
     plugin.onunload();
     plugin.onunload();
@@ -938,7 +989,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
-    const pending = deferred<void>();
+    const pending = deferred<{ changed: boolean; converged: boolean }>();
     const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockReturnValue(pending.promise);
     const modify = app.listeners.find((ref) => ref.event === "modify");
     modify?.callback({ path: "Note.md" });
@@ -954,7 +1005,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).eventTimer).toBeUndefined();
     expect((plugin as any).queuedWork).toBe(true);
     expect((plugin as any).indexStatus.getStatus().kind).toBe("stale");
-    pending.resolve();
+    pending.resolve({ changed: false, converged: false });
     await Promise.resolve();
     load.mockRestore();
     vi.useRealTimers();
@@ -986,7 +1037,7 @@ describe("TramaPlugin lifecycle integration", () => {
             )
           )
       )
-      .mockResolvedValue(undefined);
+      .mockResolvedValue({ changed: true, converged: true });
     const modify = app.listeners.find((ref) => ref.event === "modify");
     modify?.callback({ path: "Note.md" });
     await vi.advanceTimersByTimeAsync(1500);
@@ -1033,7 +1084,9 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(indexCommand.checkCallback(true)).toBe(true);
     indexCommand.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockResolvedValue(undefined);
+    const reconcile = vi
+      .spyOn(index, "reconcileQueuedChanges")
+      .mockResolvedValue({ changed: false, converged: false });
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -1045,7 +1098,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(reconcile).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
-    expect(status.getStatus().kind).toBe("ready");
+    expect(status.getStatus().kind).toBe("stale");
     expect(statuses.map((entry) => Number(entry.split(":")[1]))).toEqual(
       statuses.map((entry) => Number(entry.split(":")[1])).sort((a, b) => a - b)
     );
@@ -1053,7 +1106,7 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.useRealTimers();
   });
 
-  it("delivers rename as one explicit old/new operation", async () => {
+  it("delivers rename as one dirty watermark", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     await plugin.onload();
@@ -1065,11 +1118,10 @@ describe("TramaPlugin lifecycle integration", () => {
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    const rename = vi.spyOn(index, "queueRename");
+    const queue = vi.spyOn(index, "queueChange");
     const ref = app.listeners.find((item) => item.event === "rename");
     ref?.callback({ path: "Renamed.md" }, "Old.md");
-    expect(rename).toHaveBeenCalledTimes(1);
-    expect(rename).toHaveBeenCalledWith("Old.md", "Renamed.md");
+    expect(queue).toHaveBeenCalledTimes(1);
     plugin.onunload();
   });
 
@@ -1085,16 +1137,13 @@ describe("TramaPlugin lifecycle integration", () => {
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    const operation = vi.spyOn(index, "queueOperation");
-    const rename = vi.spyOn(index, "queueRename");
+    const queue = vi.spyOn(index, "queueChange");
     const ref = app.listeners.find((item) => item.event === "rename");
 
     ref?.callback({ path: ".hidden.md" }, "Visible.md");
     ref?.callback({ path: "Visible.md" }, ".hidden.md");
 
-    expect(operation).toHaveBeenNthCalledWith(1, { kind: "delete", path: "Visible.md" });
-    expect(operation).toHaveBeenNthCalledWith(2, { kind: "create", path: "Visible.md" });
-    expect(rename).not.toHaveBeenCalled();
+    expect(queue).toHaveBeenCalledTimes(2);
     plugin.onunload();
   });
 

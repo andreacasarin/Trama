@@ -3,26 +3,29 @@
   "version": "0.1.0",
   "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
   "main": "main.js",
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
-    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "build": "node scripts/sqlite-wasm/build.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
+    "verify:sqlite": "node scripts/sqlite-wasm/verify.mjs",
     "install:plugin": "npm run build && node scripts/install-plugin.mjs",
+    "benchmark": "node scripts/benchmark/run.mjs",
     "format": "prettier --write '**/*.{js,mjs,ts,json,md}'",
     "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "npm run build && vitest run"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@types/node": "^22.0.0",
     "esbuild": "^0.25.0",
     "eslint": "^9.18.0",
+    "fflate": "^0.8.3",
     "obsidian": "^1.8.7",
     "prettier": "^3.8.3",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.68.0",
     "vitest": "^3.0.0"
-  },
-  "dependencies": {
-    "@orama/orama": "^3.1.18"
   }
 }

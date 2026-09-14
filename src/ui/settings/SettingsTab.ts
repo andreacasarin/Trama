@@ -18,6 +18,8 @@ export interface SettingsTabCallbacks {
   updateChatModel(value: string): Promise<void>;
   updateEmbeddingEndpoint(value: string): Promise<void>;
   updateEmbeddingModel(value: string): Promise<void>;
+  exportSnapshot?(): Promise<unknown>;
+  importSnapshot?(bytes: ArrayBuffer, sha256?: string): Promise<void>;
   addApprovedOrigin(endpoint: string): Promise<void>;
   removeApprovedOrigin(origin: EndpointApproval): Promise<void>;
   discoverModels(target: "chat" | "embedding"): Promise<readonly string[]>;
@@ -284,6 +286,32 @@ export class TramaSettingsTab extends PluginSettingTab {
 
   private advanced(settings: TramaSettings): void {
     new Setting(this.containerEl)
+      .setName("SQLite index snapshot")
+      .setDesc(
+        "Explicitly export an immutable backup, or import a selected backup. Imported indexes remain incomplete until Update or Rebuild index."
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Export snapshot")
+          .onClick(() => void this.run(() => this.controller.exportSnapshot?.()))
+      )
+      .addButton((button) =>
+        button.setButtonText("Import snapshot").onClick(() => {
+          const input = this.containerEl.createEl("input", { type: "file" });
+          input.setAttribute("accept", ".sqlite3,.sqlite");
+          input.hidden = true;
+          input.addEventListener("change", () => {
+            const file = (input as HTMLInputElement).files?.[0];
+            if (!file) return;
+            void this.run(async () => {
+              const match = file.name.match(/^([0-9a-f]{64})\.sqlite3$/i);
+              await this.controller.importSnapshot?.(await file.arrayBuffer(), match?.[1]);
+            });
+          });
+          input.click();
+        })
+      );
+    new Setting(this.containerEl)
       .setName("Detailed debugging")
       .setDesc(
         "Warning: detailed console diagnostics include sensitive rich chat data (full prompts, selected-note contents, requests/SSE events, tool arguments/results/errors) plus index metadata (paths, counts, timings, generation/status). No diagnostic file is created."
@@ -359,7 +387,7 @@ export class TramaSettingsTab extends PluginSettingTab {
         });
       });
   }
-  private async run(action: () => Promise<void> | undefined): Promise<void> {
+  private async run(action: () => Promise<unknown> | undefined): Promise<void> {
     try {
       await action();
       this.errorMessage = "";

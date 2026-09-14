@@ -89,6 +89,8 @@ export interface IndexProgress {
   readonly determinate: boolean;
   /** True when total is a fast metadata-based estimate rather than a completed count. */
   readonly estimated?: boolean;
+  /** Mutable-index cache token; unlike the legacy generation field it never denotes publication. */
+  readonly changeCounter?: number;
   readonly generationId?: string;
 }
 

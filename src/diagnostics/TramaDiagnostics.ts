@@ -31,6 +31,7 @@ export type TramaDiagnosticRecord =
       readonly event: "attachment_preflight_completed";
       readonly generation: number;
       readonly count: number;
+      readonly durationMs: number;
     }
   | {
       readonly area: "chat";
@@ -44,6 +45,7 @@ export type TramaDiagnosticRecord =
       readonly generation: number;
       readonly round: number;
       readonly finishReason: "stop" | "tool_calls" | "length";
+      readonly durationMs: number;
     }
   | {
       readonly area: "chat";
@@ -59,6 +61,7 @@ export type TramaDiagnosticRecord =
       readonly ok: boolean;
       readonly call: ToolCall;
       readonly result: ToolResult;
+      readonly durationMs: number;
     }
   | {
       readonly area: "chat";
@@ -73,6 +76,7 @@ export type TramaDiagnosticRecord =
       readonly code: string;
       readonly message: string;
       readonly error: unknown;
+      readonly durationMs: number;
     }
   | {
       readonly area: "chat";
@@ -80,9 +84,24 @@ export type TramaDiagnosticRecord =
       readonly body: Readonly<Record<string, unknown>>;
     }
   | { readonly area: "chat"; readonly event: "responses_sse_event"; readonly eventData: unknown }
-  | { readonly area: "chat"; readonly event: "model_response"; readonly response: ChatResponse }
-  | { readonly area: "chat"; readonly event: "model_error"; readonly error: unknown }
-  | { readonly area: "chat"; readonly event: "cancelled"; readonly generation: number }
+  | {
+      readonly area: "chat";
+      readonly event: "model_response";
+      readonly response: ChatResponse;
+      readonly durationMs: number;
+    }
+  | {
+      readonly area: "chat";
+      readonly event: "model_error";
+      readonly error: unknown;
+      readonly durationMs: number;
+    }
+  | {
+      readonly area: "chat";
+      readonly event: "cancelled";
+      readonly generation: number;
+      readonly durationMs: number;
+    }
   // Reserved metadata-only shapes for Slice 3. They intentionally have no context bag or raw error.
   | {
       readonly area: "index";
@@ -107,8 +126,9 @@ export type TramaDiagnosticRecord =
         | "manifest"
         | "vector"
         | "lexical"
+        | "search"
         | "GC";
-      readonly stage: "started" | "completed" | "published" | "failed" | "cancelled" | string;
+      readonly stage: "started" | "completed" | "failed" | "cancelled" | string;
       readonly phase?: string;
       readonly completed?: number;
       readonly total?: number;

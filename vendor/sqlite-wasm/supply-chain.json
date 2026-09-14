@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "sqlite": {
+    "version": "3.53.4",
+    "sourceArchive": "sqlite-src-3530400.zip",
+    "url": "https://sqlite.org/2026/sqlite-src-3530400.zip",
+    "archiveSha256": "d18fa15aec74d8c17e1463f861095adc01b5ad190256acb4f91d22f0368d232b",
+    "amalgamationArchive": "sqlite-amalgamation-3530400.zip",
+    "amalgamationUrl": "https://sqlite.org/2026/sqlite-amalgamation-3530400.zip",
+    "amalgamationArchiveSha256": "1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d",
+    "sourceId": "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc",
+    "amalgamationSha3_256": "628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e",
+    "license": "public-domain",
+    "evidence": "https://www.sqlite.org/releaselog/3_53_4.html"
+  },
+  "sqliteVector": {
+    "version": "1.0.0",
+    "sourceArchive": "sqlite-vector-1.0.0.tar.gz",
+    "url": "https://github.com/sqliteai/sqlite-vector/archive/refs/tags/1.0.0.tar.gz",
+    "archiveSha256": "dc93c5f2fac6e2d221f619cfa85ff5983ef1c4784664443f5511d0abc864707f",
+    "sourceCommit": "b68d34a",
+    "license": "Apache-2.0",
+    "evidence": "https://github.com/sqliteai/sqlite-vector/releases/tag/1.0.0"
+  },
+  "emscripten": {
+    "version": "4.0.11",
+    "image": "emscripten/emsdk",
+    "images": {
+      "linux/amd64": "sha256:f8a157011b8fa61bdaab875bb1f0f08695229dffe086448d14b53538cae16bd3",
+      "linux/arm64": "sha256:40f650d8dd0ec1d54e77692a4c84d636449eb15d397a0e93d3cdb59c434105d5"
+    },
+    "evidence": "https://hub.docker.com/layers/emscripten/emsdk/4.0.11/images/sha256-f8a157011b8fa61bdaab875bb1f0f08695229dffe086448d14b53538cae16bd3"
+  },
+  "build": {
+    "optimization": "-O2 -g3",
+    "threaded": false,
+    "exports": ["sqlite3__wasm_db_reset", "sqlite3__wasm_vfs_unlink", "sqlite3__wasm_init_wasmfs"],
+    "flags": [
+      "-DSQLITE_ENABLE_FTS5",
+      "-DSQLITE_ENABLE_RTREE",
+      "-DSQLITE_ENABLE_EXPLAIN_COMMENTS",
+      "-DSQLITE_ENABLE_UNKNOWN_SQL_FUNCTION",
+      "-DSQLITE_ENABLE_STMTVTAB",
+      "-DSQLITE_ENABLE_DBPAGE_VTAB",
+      "-DSQLITE_ENABLE_DBSTAT_VTAB",
+      "-DSQLITE_ENABLE_BYTECODE_VTAB",
+      "-DSQLITE_ENABLE_OFFSET_SQL_FUNC",
+      "-DSQLITE_ENABLE_COLUMN_METADATA",
+      "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+      "-DSQLITE_ENABLE_SESSION",
+      "-DSQLITE_OMIT_LOAD_EXTENSION",
+      "-DSQLITE_OMIT_DEPRECATED",
+      "-DSQLITE_OMIT_UTF16",
+      "-DSQLITE_OMIT_SHARED_CACHE",
+      "-DSQLITE_THREADSAFE=0",
+      "-DSQLITE_TEMP_STORE=2",
+      "-DSQLITE_OS_KV_OPTIONAL=1",
+      "-DSQLITE_DEFAULT_UNIX_VFS=\"unix-none\"",
+      "-DSQLITE_USE_URI=1",
+      "-DSQLITE_WASM_ENABLE_C_TESTS",
+      "-DSQLITE_CORE"
+    ],
+    "emccFlags": ["-O2", "-g3", "-Isqlite-vector", "--minify 0", "--no-entry", "-sWASM_BIGINT=1", "-sMODULARIZE", "-sDYNAMIC_EXECUTION=0", "-sNO_POLYFILL", "-sIMPORTED_MEMORY", "-sALLOW_MEMORY_GROWTH", "-sALLOW_TABLE_GROWTH", "-sENVIRONMENT=web,worker"],
+    "extraInit": "sqlite3_wasm_extra_init.c statically registers sqlite3_vector_init",
+    "architecture": "single-threaded Emscripten wasm32; no pthreads, no shared memory, no runtime extension loading"
+  }
+}
