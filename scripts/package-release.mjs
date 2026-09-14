@@ -6,10 +6,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { unzipSync, zipSync } from "fflate";
 import { PLUGIN_FILES } from "./plugin-files.mjs";
-import { getBuildContext, resolveMaterializedAssets } from "./sqlite-wasm/build.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-let materializedAssets;
 
 function fail(message) {
   throw new Error(message);
@@ -64,12 +62,7 @@ function sourceEntries(version) {
   validateVersion(version);
   validateRepositoryVersion(version);
   return PLUGIN_FILES.map((name) => {
-    const path =
-      name === "sqlite3.mjs" || name === "sqlite3.wasm"
-        ? (materializedAssets ??= resolveMaterializedAssets(getBuildContext({ rootDir: root })))[
-            name === "sqlite3.mjs" ? "modulePath" : "wasmPath"
-          ]
-        : join(root, name);
+    const path = join(root, name);
     if (!existsSync(path) || !statSync(path).isFile()) fail(`Missing release member: ${name}`);
     return [name, readFileSync(path)];
   });

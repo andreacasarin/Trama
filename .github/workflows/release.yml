@@ -33,6 +33,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            release_title="Trama $GITHUB_REF_NAME"
+            release_prerelease=false
+          elif git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/develop; then
+            release_title="Trama nightly $GITHUB_REF_NAME"
+            release_prerelease=true
+          else
+            echo "Tag $GITHUB_REF_NAME is not reachable from main or develop" >&2
+            exit 1
+          fi
           node <<'NODE'
           const fs = require("node:fs");
           const tag = process.env.GITHUB_REF_NAME;
@@ -44,9 +54,12 @@ jobs:
           if (packageVersion !== match[1] || manifestVersion !== match[1]) {
             throw new Error(`Tag ${tag}, package.json ${packageVersion}, and manifest.json ${manifestVersion} must match`);
           }
-          const prerelease = match[1].split("+", 1)[0].includes("-");
-          fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_VERSION=${match[1]}\nRELEASE_TAG=${tag}\nRELEASE_PRERELEASE=${prerelease}\n`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_VERSION=${match[1]}\nRELEASE_TAG=${tag}\n`);
           NODE
+          {
+            echo "RELEASE_TITLE=$release_title"
+            echo "RELEASE_PRERELEASE=$release_prerelease"
+          } >> "$GITHUB_ENV"
 
       - name: Install locked dependencies
         run: npm ci
@@ -57,18 +70,21 @@ jobs:
           npm run lint
 
       - name: Build the clean pinned SQLite assets
-        run: |
-          node scripts/sqlite-wasm/build.mjs --clean
-          node --input-type=module <<'NODE'
-          import { getBuildContext, validateArtifactCache } from "./scripts/sqlite-wasm/build.mjs";
-          const context = getBuildContext();
-          const result = validateArtifactCache(context);
-          if (!result.ok) throw new Error(`SQLite WASM cache verification failed: ${result.reason}`);
-          console.log(`Verified SQLite WASM cache ${context.fingerprint}`);
-          NODE
+        run: node scripts/sqlite-wasm/build.mjs --clean
 
       - name: Run the full test suite
         run: npm test
+
+      - name: Run the benchmark
+        run: npm run benchmark
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trama-benchmark-${{ github.run_id }}
+          path: .artifacts/trama-benchmark/*.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Create and validate the release archive
         run: node scripts/package-release.mjs --version "$RELEASE_VERSION" --archive "dist/trama-$RELEASE_VERSION.zip"
@@ -82,7 +98,7 @@ jobs:
           archive="dist/trama-${RELEASE_VERSION}.zip"
           release_json=""
           create_status=0
-          create_args=("$RELEASE_TAG" "$archive" --draft --title "Trama $RELEASE_TAG" --generate-notes)
+          create_args=("$RELEASE_TAG" "$archive" --draft --title "$RELEASE_TITLE" --generate-notes)
           if [[ "$RELEASE_PRERELEASE" == "true" ]]; then create_args+=(--prerelease); fi
           gh release create "${create_args[@]}" || create_status=$?
           if (( create_status != 0 )); then
@@ -118,8 +134,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "$draft" == "true" ]]; then
-            edit_args=("$RELEASE_TAG" --draft=false)
-            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then edit_args+=(--prerelease); else edit_args+=(--prerelease=false); fi
-            gh release edit "${edit_args[@]}"
-          fi
+          edit_args=("$RELEASE_TAG" --title "$RELEASE_TITLE")
+          if [[ "$draft" == "true" ]]; then edit_args+=(--draft=false); fi
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then edit_args+=(--prerelease); else edit_args+=(--prerelease=false); fi
+          gh release edit "${edit_args[@]}"

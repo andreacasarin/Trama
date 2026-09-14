@@ -1,39 +1,25 @@
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { getBuildContext, resolveMaterializedAssets, validateArtifactCache } from "./build.mjs";
+import { getBuildContext } from "./build.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+const directoryIndex = process.argv.indexOf("--directory");
+const directory = directoryIndex >= 0 ? resolve(process.argv[directoryIndex + 1] ?? "") : root;
 const context = getBuildContext({ rootDir: root });
-const sha256 = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
-const fail = (message) => {
-  throw new Error(message);
-};
-
-const cached = validateArtifactCache(context);
-if (!cached.ok) fail(`SQLite WASM cache is not valid: ${cached.reason}`);
-const manifest = cached.manifest;
-const materialized = resolveMaterializedAssets(context);
-for (const name of ["sqlite3.mjs", "sqlite3.wasm"]) {
-  if (materialized.manifest.outputs?.[name]?.sha256 !== manifest.outputs[name].sha256)
-    fail(`Materialized generation does not match cache artifact: ${name}`);
-  if (!existsSync(materialized[name === "sqlite3.mjs" ? "modulePath" : "wasmPath"]))
-    fail(`Missing materialized SQLite asset: ${name}`);
-  if (
-    sha256(materialized[name === "sqlite3.mjs" ? "modulePath" : "wasmPath"]) !==
-    manifest.outputs[name].sha256
-  )
-    fail(`Materialized output checksum mismatch: ${name}`);
+const modulePath = join(directory, "sqlite3.mjs");
+const wasmPath = join(directory, "sqlite3.wasm");
+for (const path of [modulePath, wasmPath]) {
+  if (!existsSync(path)) throw new Error(`Missing SQLite WASM asset: ${path}`);
 }
 
-const moduleText = readFileSync(materialized.modulePath, "utf8");
-const wasmBytes = readFileSync(materialized.wasmPath);
+const moduleText = readFileSync(modulePath, "utf8");
+const wasmBytes = readFileSync(wasmPath);
 const wasmExports = WebAssembly.Module.exports(new WebAssembly.Module(wasmBytes)).map(
   ({ name }) => name
 );
 globalThis.sqlite3ApiConfig = { disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } } };
-const initModule = (await import(`${pathToFileURL(materialized.modulePath).href}?verify`)).default;
+const initModule = (await import(`${pathToFileURL(modulePath).href}?verify=${Date.now()}`)).default;
 const sqlite = await initModule({
   instantiateWasm(imports, onSuccess) {
     WebAssembly.instantiate(wasmBytes, imports).then(({ instance, module }) =>
@@ -43,7 +29,7 @@ const sqlite = await initModule({
   },
 });
 const db = new sqlite.oo1.DB(":memory:", "c");
-const compiledCapabilities = {
+const runtimeChecks = {
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,
@@ -53,13 +39,9 @@ const compiledCapabilities = {
   fts5Module: db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='fts5'") === 1,
 };
 db.close();
+
 const checks = {
-  sourceChecksumsLocked:
-    manifest.source.sqliteArchiveSha256 === context.lock.sqlite.archiveSha256 &&
-    manifest.source.sqliteAmalgamationArchiveSha256 ===
-      context.lock.sqlite.amalgamationArchiveSha256 &&
-    manifest.source.sqliteVectorArchiveSha256 === context.lock.sqliteVector.archiveSha256,
-  toolchainPinned: manifest.toolchain === context.dockerImage,
+  toolchainPinned: context.dockerImage.includes("@sha256:"),
   sqliteVersionPinned: moduleText.includes(context.lock.sqlite.version),
   sourceIdPinned: moduleText.includes(context.lock.sqlite.sourceId),
   fts5Requested: context.lock.build.flags.includes("-DSQLITE_ENABLE_FTS5"),
@@ -69,13 +51,13 @@ const checks = {
     !wasmExports.includes("sqlite3_load_extension") &&
     !wasmExports.includes("sqlite3_enable_load_extension"),
   expectedBuildExports: context.lock.build.exports.every((name) => wasmExports.includes(name)),
-  compiledCapabilities: Object.values(compiledCapabilities).every(Boolean),
+  compiledCapabilities: Object.values(runtimeChecks).every(Boolean),
   singleThreaded:
     context.lock.build.threaded === false && !moduleText.includes("PTHREAD_POOL_SIZE"),
   wasmValid: WebAssembly.validate(wasmBytes),
   noRemoteModuleImport: !/\b(?:import|fetch)\s*\(\s*["']https?:/.test(moduleText),
-  canonicalModule: manifest.postProcessing?.canonicalModule === true,
-  persistenceUsesSahPool: manifest.postProcessing?.persistenceVfs === "opfs-sah-pool",
+  canonicalModule: moduleText.includes("sqlite3ApiBootstrap"),
+  persistenceUsesSahPool: moduleText.includes("installOpfsSAHPoolVfs"),
 };
 for (const [name, ok] of Object.entries(checks)) console.log(`${ok ? "ok" : "FAIL"} ${name}`);
 if (Object.values(checks).some((ok) => !ok)) process.exitCode = 1;

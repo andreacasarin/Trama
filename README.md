@@ -147,9 +147,9 @@ installation. Production startup is network-silent: it loads the packaged
 SQLite WASM assets and never downloads them at runtime.
 
 The pinned SQLite source, SQLite-Vector source, Emscripten image, flags, and
-build inputs are recorded in the repository's supply-chain metadata. A
-cache entry is reusable only when its fingerprint and output verification
-match those inputs. Release verification checks the pinned inputs, manifests,
+build inputs are recorded in the repository's supply-chain metadata. Generated
+assets are reused only while their input fingerprint and checksums match.
+Release verification checks the pinned inputs, compiled capabilities,
 version agreement, and the exact six-file package inventory. The generated
 bytes are not promised to be identical across build environments; reproducible
 verification is based on the pinned inputs and recorded digests.
@@ -178,6 +178,8 @@ The single 10,000-chunk Trama workload reports rebuild and unchanged-update time
 mutation timings, search latency, process RSS delta, package bytes, deterministic
 feature-path results, and snapshot size. Metrics unavailable to the in-memory Node
 harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
+CI renders the metrics as a GitHub Actions job summary and retains the complete JSON
+report as a downloadable workflow artifact.
 
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
 limitations include the cost of exact SQLite vector scans and maintaining FTS5 on large
