@@ -44,7 +44,8 @@ export class FiloView extends ItemView {
     private statusSource: StatusSource | IndexStatusController,
     private relatedSource: RelatedSource | RelatedNotes | undefined,
     private readonly runIndex?: (kind: "index" | "reindex") => Promise<void>,
-    private readonly cancelIndex?: () => void
+    private readonly cancelIndex?: () => void,
+    private readonly runPrepare?: () => Promise<void>
   ) {
     super(leaf);
     this.status = statusSource.getStatus();
@@ -128,7 +129,7 @@ export class FiloView extends ItemView {
     const path = this.currentPath();
     if (path !== this.activePath) this.expandedPaths.clear();
     this.activePath = path;
-    if (!path || !this.relatedSource || !this.status.hasLastGood) {
+    if (!path || !this.relatedSource || !this.semanticReady()) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
       this.requestKey = undefined;
@@ -187,10 +188,18 @@ export class FiloView extends ItemView {
       return;
     }
     const status = this.status;
+    const capabilities = status.capabilities;
     if (status.kind === "loading") {
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
         text: "Loading index…",
+      });
+      return;
+    }
+    if (capabilities?.availability === "unavailable") {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: "SQLite index is unavailable. Related notes cannot be loaded.",
       });
       return;
     }
@@ -219,6 +228,7 @@ export class FiloView extends ItemView {
       });
       if (status.canIndex) this.actionButton("Update index", "index");
       if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      this.renderFreshnessWarning(status.freshness);
       return;
     }
     if (status.kind === "error") {
@@ -229,6 +239,7 @@ export class FiloView extends ItemView {
       });
       if (status.canReindex) this.actionButton("Rebuild index", "reindex");
       else if (status.canIndex) this.actionButton("Build index", "index");
+      this.renderFreshnessWarning(status.freshness);
       return;
     }
     if (status.kind === "cancelled") {
@@ -239,6 +250,7 @@ export class FiloView extends ItemView {
       });
       if (status.canReindex) this.actionButton("Rebuild index", "reindex");
       else if (status.canIndex) this.actionButton("Build index", "index");
+      this.renderFreshnessWarning(status.freshness);
       return;
     }
     if (status.kind === "updating") {
@@ -259,6 +271,23 @@ export class FiloView extends ItemView {
       else if (status.canIndex) this.actionButton("Build index", "index");
       return;
     }
+    if (capabilities && !capabilities.semantic.searchable) {
+      const message =
+        capabilities.semantic.activity === "updating"
+          ? "Preparing semantic search…"
+          : capabilities.semantic.state === "partial"
+            ? "Semantic index is incomplete. Update the notes or prepare vectors to discover related notes."
+            : capabilities.semantic.state === "incompatible"
+              ? "Stored semantic vectors are incompatible. Prepare the semantic index to refresh them."
+              : "Prepare the semantic index to discover related notes.";
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: message,
+      });
+      if (capabilities.semantic.activity !== "updating") this.prepareButton();
+      this.renderFreshnessWarning(capabilities.freshness);
+      return;
+    }
     if (!this.related) {
       this.root.createDiv({
         cls: this.relatedError
@@ -268,7 +297,46 @@ export class FiloView extends ItemView {
       });
       return;
     }
+    if (this.related.unavailableReason) {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text:
+          this.related.unavailableReason === "incomplete-vectors"
+            ? "Semantic coverage is incomplete. Prepare the semantic index to discover related notes."
+            : "Semantic related notes are unavailable. Prepare the semantic index when available.",
+      });
+      this.prepareButton();
+      this.renderFreshnessWarning(this.related.freshness);
+      return;
+    }
     this.renderRows();
+    this.renderFreshnessWarning(capabilities?.freshness ?? this.related?.freshness);
+  }
+
+  private semanticReady(): boolean {
+    return (
+      this.status.capabilities?.semantic.searchable === true ||
+      (!this.status.capabilities && this.status.hasLastGood)
+    );
+  }
+
+  private renderFreshnessWarning(freshness?: string): void {
+    if (freshness !== "snapshot-loaded") return;
+    this.root.createDiv({
+      cls: "setting-item-description mod-warning trama-filo__message",
+      text: "Snapshot loaded — not locally reconciled. Related notes reflect the synchronized snapshot.",
+    });
+  }
+
+  private prepareButton(): void {
+    const runPrepare = this.runPrepare ?? (this.statusSource as any).prepare;
+    if (typeof runPrepare !== "function") return;
+    const button = this.root.createEl("button", {
+      cls: "trama-filo__action",
+      text: "Prepare semantic index",
+      attr: { type: "button", "aria-label": "Prepare semantic index" },
+    });
+    button.addEventListener("click", () => void runPrepare.call(this.statusSource));
   }
 
   private renderProgress(status: IndexStatus): boolean {

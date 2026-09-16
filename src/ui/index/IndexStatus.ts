@@ -7,6 +7,7 @@ import {
   TramaDiagnosticRecord,
 } from "@/diagnostics/TramaDiagnostics";
 import type { IndexProgress } from "@/domain/contracts";
+import type { IndexCapabilities, IndexFreshness } from "@/domain/contracts";
 
 export type IndexStatusKind =
   | "loading"
@@ -15,6 +16,7 @@ export type IndexStatusKind =
   | "updating"
   | "stale"
   | "building"
+  | "preparing"
   | "cancelling"
   | "cancelled"
   | "error"
@@ -30,7 +32,13 @@ export interface IndexStatus {
   readonly message?: string;
   readonly canIndex: boolean;
   readonly canReindex: boolean;
+  readonly canPrepare: boolean;
   readonly canCancel: boolean;
+  /** Latest orthogonal capability snapshot, independent of the operation kind. */
+  readonly capabilities?: IndexCapabilities;
+  readonly freshness?: IndexFreshness;
+  readonly publicationId?: string;
+  readonly publicationWarning?: string;
 }
 
 const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
@@ -63,6 +71,7 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
 interface StatusActions {
   index(signal: AbortSignal): Promise<void>;
   reindex(signal: AbortSignal): Promise<void>;
+  prepare?(signal: AbortSignal): Promise<void>;
   cancel(): void;
 }
 interface StatusTiming {
@@ -148,6 +157,24 @@ export class IndexStatusController {
   setReady(silent = false): void {
     this.set("ready", true, undefined, !silent);
   }
+  setCapabilities(capabilities: IndexCapabilities): void {
+    this.status = {
+      ...this.status,
+      capabilities,
+      freshness: capabilities.freshness,
+      publicationId: capabilities.publicationId,
+      revision: ++this.revision,
+    };
+    for (const listener of [...this.listeners]) listener(this.status);
+  }
+  setPublicationWarning(message?: string): void {
+    this.status = {
+      ...this.status,
+      ...(message ? { publicationWarning: message } : { publicationWarning: undefined }),
+      revision: ++this.revision,
+    };
+    for (const listener of [...this.listeners]) listener(this.status);
+  }
   setUpdating(): void {
     this.set("updating", true, "Updating index…");
   }
@@ -166,6 +193,7 @@ export class IndexStatusController {
   reportProgress(progress: IndexProgress): void {
     if (
       this.status.kind !== "building" &&
+      this.status.kind !== "preparing" &&
       this.status.kind !== "cancelling" &&
       this.status.kind !== "updating"
     )
@@ -251,6 +279,12 @@ export class IndexStatusController {
     this.actions.cancel();
   }
 
+  /** Starts explicit semantic preparation through the same controller used by
+   * Build/Update/Rebuild, so progress and cancellation share one fence. */
+  prepare(): Promise<void> {
+    return this.run("prepare");
+  }
+
   private set(
     kind: IndexStatusKind,
     hasLastGood: boolean,
@@ -277,7 +311,16 @@ export class IndexStatusController {
         kind === "ready" ||
         kind === "stale" ||
         ((kind === "cancelled" || kind === "error" || kind === "empty") && hasLastGood),
-      canCancel: kind === "building",
+      canPrepare:
+        kind === "ready" ||
+        kind === "stale" ||
+        (kind === "cancelled" && hasLastGood) ||
+        (kind === "error" && hasLastGood),
+      canCancel: kind === "building" || kind === "preparing",
+      capabilities: this.status.capabilities,
+      freshness: this.status.freshness,
+      publicationId: this.status.publicationId,
+      publicationWarning: this.status.publicationWarning,
     };
     if (emitDiagnostic)
       this.emitDiagnostic({
@@ -297,26 +340,35 @@ export class IndexStatusController {
       message,
       canIndex: false,
       canReindex: false,
+      canPrepare: false,
       canCancel: false,
     };
   }
   private emitDiagnostic(record: TramaDiagnosticRecord): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
-  private async start(kind: "index" | "reindex"): Promise<void> {
+  private async start(kind: "index" | "reindex" | "prepare"): Promise<void> {
     if (this.controller) return;
+    if (kind === "prepare" && !this.actions.prepare) return;
     const elapsedMs = startDiagnosticTimer(() => this.timing.now());
     this.controller = new AbortController();
-    this.set("building", this.status.hasLastGood, "Building index…");
+    this.set(
+      kind === "prepare" ? "preparing" : "building",
+      this.status.hasLastGood,
+      kind === "prepare" ? "Preparing semantic search…" : "Building index…"
+    );
     try {
       await (kind === "index"
         ? this.actions.index(this.controller.signal)
-        : this.actions.reindex(this.controller.signal));
-      if (this.status.kind === "building") this.set("ready", true);
+        : kind === "reindex"
+          ? this.actions.reindex(this.controller.signal)
+          : this.actions.prepare!(this.controller.signal));
+      if (this.status.kind === "building" || this.status.kind === "preparing")
+        this.set("ready", true);
       this.emitDiagnostic({
         area: "index",
         event: "index_operation",
-        operation: kind === "index" ? "incremental" : "full",
+        operation: kind === "index" || kind === "prepare" ? "incremental" : "full",
         stage: "user-completed",
         durationMs: elapsedMs(),
       });
@@ -334,9 +386,10 @@ export class IndexStatusController {
   }
 
   /** Starts the requested operation when its command is currently available. */
-  run(kind: "index" | "reindex"): Promise<void> {
+  run(kind: "index" | "reindex" | "prepare"): Promise<void> {
     if (kind === "index" && !this.status.canIndex) return Promise.resolve();
     if (kind === "reindex" && !this.status.canReindex) return Promise.resolve();
+    if (kind === "prepare" && !this.status.canPrepare) return Promise.resolve();
     return this.start(kind);
   }
 }

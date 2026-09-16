@@ -9,6 +9,7 @@ import {
 } from "@/index/LenteSearch";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
+import type { IndexFreshness } from "@/domain/contracts";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
 
@@ -235,13 +236,32 @@ export class LenteView extends ItemView {
       : this.lastError
         ? this.errorMessage
         : this.batch && this.submitted && this.batch.results.length === 0
-          ? "No matching notes found."
-          : this.batch?.degraded
-            ? "Lexical-only results (embeddings unavailable)."
+          ? this.searchStatus("No matching notes found.")
+          : this.batch
+            ? this.searchStatus()
             : this.submitted
               ? ""
               : "Submit a query to search your vault.";
     this.renderRows();
+  }
+  private searchStatus(prefix = ""): string {
+    if (!this.batch) return prefix;
+    const messages: string[] = [];
+    if (prefix) messages.push(prefix);
+    if (this.batch.degraded) {
+      messages.push(
+        this.batch.degradationReason === "query-embedding-failed"
+          ? "Lexical-only results (query embedding failed)."
+          : "Lexical-only results (semantic search unavailable)."
+      );
+    } else if (this.batch.mode === "lexical") {
+      messages.push("Lexical search ready.");
+    }
+    if (this.batch.freshness === "snapshot-loaded")
+      messages.push("Snapshot loaded; not reconciled with the current vault.");
+    else if (this.batch.freshness === "unknown")
+      messages.push("Index may be stale; update required.");
+    return messages.join(" ");
   }
   private messageForError(error: unknown): string {
     const code =

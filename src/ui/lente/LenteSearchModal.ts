@@ -1,5 +1,6 @@
 import { Keymap, SuggestModal, type App } from "obsidian";
 import type { LenteBatch, LenteResult, LenteSearchOptions } from "@/index/LenteSearch";
+import type { IndexFreshness } from "@/domain/contracts";
 
 export interface LenteSearchPort {
   search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
@@ -12,9 +13,19 @@ type ModalState =
       readonly kind: "results";
       readonly query: string;
       readonly results: readonly LenteResult[];
+      readonly mode: LenteBatch["mode"];
       readonly degraded: boolean;
+      readonly degradationReason?: LenteBatch["degradationReason"];
+      readonly freshness?: IndexFreshness;
     }
-  | { readonly kind: "empty"; readonly query: string; readonly degraded: boolean }
+  | {
+      readonly kind: "empty";
+      readonly query: string;
+      readonly mode: LenteBatch["mode"];
+      readonly degraded: boolean;
+      readonly degradationReason?: LenteBatch["degradationReason"];
+      readonly freshness?: IndexFreshness;
+    }
   | { readonly kind: "busy"; readonly query: string }
   | { readonly kind: "unavailable"; readonly query: string }
   | { readonly kind: "error"; readonly query: string };
@@ -184,8 +195,23 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
       }
       const results = [...batch.results];
       this.state = results.length
-        ? { kind: "results", query: normalized, results, degraded: batch.degraded }
-        : { kind: "empty", query: normalized, degraded: batch.degraded };
+        ? {
+            kind: "results",
+            query: normalized,
+            results,
+            mode: batch.mode,
+            degraded: batch.degraded,
+            ...(batch.degradationReason ? { degradationReason: batch.degradationReason } : {}),
+            ...(batch.freshness ? { freshness: batch.freshness } : {}),
+          }
+        : {
+            kind: "empty",
+            query: normalized,
+            mode: batch.mode,
+            degraded: batch.degraded,
+            ...(batch.degradationReason ? { degradationReason: batch.degradationReason } : {}),
+            ...(batch.freshness ? { freshness: batch.freshness } : {}),
+          };
       this.updateStatus();
       this.refreshSuggestions();
     } catch (error) {
@@ -304,9 +330,13 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
       case "loading":
         return "Searching…";
       case "empty":
-        return this.state.degraded
-          ? "No matching notes (lexical-only; embeddings unavailable)."
-          : "No matching notes";
+        return this.searchStatus(
+          this.state.mode,
+          this.state.degraded,
+          this.state.degradationReason,
+          this.state.freshness,
+          "No matching notes"
+        );
       case "busy":
         return "Updating index";
       case "unavailable":
@@ -314,8 +344,37 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
       case "error":
         return "Search failed";
       case "results":
-        return this.state.degraded ? "Lexical-only results (embeddings unavailable)." : "";
+        return this.searchStatus(
+          this.state.mode,
+          this.state.degraded,
+          this.state.degradationReason,
+          this.state.freshness
+        );
     }
+  }
+
+  private searchStatus(
+    mode: LenteBatch["mode"],
+    degraded: boolean,
+    degradationReason: LenteBatch["degradationReason"],
+    freshness: IndexFreshness | undefined,
+    prefix = ""
+  ): string {
+    const messages: string[] = [];
+    if (prefix) messages.push(prefix);
+    if (degraded) {
+      messages.push(
+        degradationReason === "query-embedding-failed"
+          ? "Lexical-only results (query embedding failed)."
+          : "Lexical-only results (semantic search unavailable)."
+      );
+    } else if (mode === "lexical") {
+      messages.push("Lexical search ready.");
+    }
+    if (freshness === "snapshot-loaded")
+      messages.push("Snapshot loaded; not reconciled with the current vault.");
+    else if (freshness === "unknown") messages.push("Index may be stale; update required.");
+    return messages.join(" ");
   }
 
   private errorCode(error: unknown): string | undefined {
