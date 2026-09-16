@@ -87,7 +87,12 @@ export function createTestSqliteClient(
     let result: unknown;
     switch (method) {
       case "boot":
-        result = opened.database.boot(value.fingerprint, value.dimensions);
+        result = opened.database.boot(
+          value.corpusFingerprint ?? value.fingerprint,
+          value.dimensions,
+          value.embeddingFingerprint ?? "",
+          value.buildIdentity
+        );
         break;
       case "getState":
         return opened.database.getState();
@@ -113,6 +118,19 @@ export function createTestSqliteClient(
       case "finishReconciliation":
         result = opened.database.finishReconciliation(value.summaries, value.observedChangeCounter);
         break;
+      case "listMissingVectors":
+        return opened.database.listMissingVectors(
+          value.embeddingFingerprint ?? opened.database.getState().embeddingFingerprint,
+          value.limit,
+          value.afterChunkPk
+        );
+      case "storeVectors":
+        result = opened.database.storeVectors(
+          value.vectors,
+          value.embeddingFingerprint,
+          value.observedChangeCounter
+        );
+        break;
       case "retrieve":
         return opened.database.retrieve(value.query, value.vector, value.limit, value.currentPath, {
           semanticCandidateLimit: value.semanticCandidateLimit,
@@ -122,6 +140,89 @@ export function createTestSqliteClient(
         });
       case "findRelated":
         return opened.database.findRelated(value.path, value.vector, value.limit);
+      case "finalizePublication":
+        result = opened.database.finalizePublication(
+          value.publicationId,
+          value.expectedChangeCounter
+        );
+        break;
+      case "preparePublication": {
+        const state = opened.database.getState();
+        const candidate = await open(await serialized(opened));
+        try {
+          candidate.database.boot(
+            state.corpusFingerprint,
+            state.dimensions,
+            state.embeddingFingerprint,
+            state.buildIdentity
+          );
+          candidate.database.setPublicationId(value.publicationId);
+          const bytes = (await serialized(candidate)).slice().buffer;
+          result = {
+            publicationId: value.publicationId,
+            state: candidate.database.getState(),
+            bytes,
+            byteSize: bytes.byteLength,
+            durationMs: 0,
+            copyBytes: bytes.byteLength,
+          };
+        } finally {
+          candidate.database.close();
+        }
+        break;
+      }
+      case "inspectPublication": {
+        const state = opened.database.getState();
+        const candidate = await open(new Uint8Array(value.bytes));
+        try {
+          candidate.database.validateSnapshot(
+            value.corpusFingerprint ?? state.corpusFingerprint,
+            value.dimensions ?? state.dimensions,
+            value.embeddingFingerprint ?? state.embeddingFingerprint,
+            value.buildIdentity ?? state.buildIdentity
+          );
+          const candidateState = candidate.database.getState();
+          if (!candidateState.publicationId)
+            throw sqliteError("incompatible_state", "Publication ID is missing");
+          result = {
+            valid: true,
+            publicationId: candidateState.publicationId,
+            state: candidateState,
+            byteSize: value.bytes.byteLength,
+          };
+        } finally {
+          candidate.database.close();
+        }
+        break;
+      }
+      case "adoptPublication": {
+        const prior = opened.database.getState();
+        const candidate = await open(new Uint8Array(value.bytes));
+        try {
+          candidate.database.validateSnapshot(
+            prior.corpusFingerprint,
+            prior.dimensions,
+            prior.embeddingFingerprint,
+            prior.buildIdentity
+          );
+          const candidateState = candidate.database.getState();
+          if (
+            value.expectedPublicationId &&
+            value.expectedPublicationId !== candidateState.publicationId
+          )
+            throw sqliteError("incompatible_state", "Publication ID changed during adoption");
+          candidate.database.markSnapshotLoaded();
+          const adoptedState = candidate.database.getState();
+          opened.database.close();
+          opened = candidate;
+          openedPromise = Promise.resolve(candidate);
+          result = adoptedState;
+        } catch (error) {
+          if (opened.database !== candidate.database) candidate.database.close();
+          throw error;
+        }
+        break;
+      }
       case "export": {
         const state = opened.database.getState();
         opened.database.validateSnapshot(state.fingerprint, state.dimensions);

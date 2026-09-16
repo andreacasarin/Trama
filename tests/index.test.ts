@@ -3,6 +3,7 @@ import { StructuredError, type IndexProgress } from "@/domain/contracts";
 import { projectDiagnosticError, type TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 import { CHUNK_OVERLAP, CHUNK_SIZE, chunkMarkdown } from "@/index/chunking";
 import { IndexManager, createIndexFingerprint } from "@/index/IndexManager";
+import { LenteSearch } from "@/index/LenteSearch";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
 import { createTestSqliteClient } from "./sqlite-test-client";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
@@ -160,7 +161,7 @@ describe("semantic index module", () => {
         event: "index_operation",
         operation: "search",
         stage: "completed",
-        phase: "hybrid",
+        phase: "lexical",
         durationMs: expect.any(Number),
         counts: { results: 1 },
       })
@@ -179,6 +180,44 @@ describe("semantic index module", () => {
       incomplete: false,
       changeCounter: expect.any(Number),
     });
+    expect(setup.manager.lenteState()).toMatchObject({
+      semantic: { state: "empty", searchable: false },
+      freshness: "locally-reconciled",
+    });
+  });
+
+  it("keeps default vault search lexical while allowing explicit hybrid retrieval", async () => {
+    const setup = manager({ "a.md": "alpha note" });
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+    setup.model.embed.mockClear();
+
+    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
+    expect(setup.model.embed).not.toHaveBeenCalled();
+
+    await expect(setup.manager.search("alpha", signal, 5, "hybrid")).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
+    expect(setup.model.embed).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports lexical degradation when hybrid query embedding fails", async () => {
+    const setup = manager({ "a.md": "alpha note" });
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+    setup.model.embed.mockClear();
+    setup.model.embed.mockRejectedValueOnce(new Error("embedding service unavailable"));
+
+    const lente = new LenteSearch(setup.manager, { getMtime: () => 1 });
+    await expect(lente.search("alpha")).resolves.toMatchObject({
+      mode: "lexical",
+      degraded: true,
+      degradationReason: "query-embedding-failed",
+      results: [expect.objectContaining({ path: "a.md" })],
+    });
+    expect(setup.model.embed).toHaveBeenCalledTimes(1);
   });
 
   it("keeps unchanged synchronization write-free and embedding-free", async () => {
@@ -194,7 +233,7 @@ describe("semantic index module", () => {
     await expect(setup.manager.getState()).resolves.toEqual(before);
   });
 
-  it("reopens a complete backend fenced incomplete without startup embedding", async () => {
+  it("reopens a complete backend without startup embedding or invalidation", async () => {
     const identity = {};
     const setup = manager({ "a.md": "alpha" }, identity);
     await setup.manager.build(signal);
@@ -210,7 +249,7 @@ describe("semantic index module", () => {
       { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
     );
     await expect(reopened.load()).resolves.toBe(true);
-    await expect(reopened.getState()).resolves.toMatchObject({ incomplete: true, noteCount: 1 });
+    await expect(reopened.getState()).resolves.toMatchObject({ incomplete: false, noteCount: 1 });
     expect(setup.model.embed).not.toHaveBeenCalled();
   });
 
@@ -256,19 +295,34 @@ describe("semantic index module", () => {
   it("leaves a cancelled rebuild explicitly incomplete and searchable", async () => {
     const setup = manager({ "a.md": "alpha", "b.md": "beta" });
     const abort = new AbortController();
-    setup.model.embed.mockImplementationOnce(async () => {
-      abort.abort();
-      return [[1, 0]];
-    });
-    await expect(setup.manager.build(abort.signal)).rejects.toMatchObject({ code: "cancelled" });
-    await expect(setup.manager.getState()).resolves.toMatchObject({ incomplete: true });
+    const cancelling = new IndexManager(
+      {
+        ...fixture({ "a.md": "alpha", "b.md": "beta" }),
+        readMarkdown: async (path: string, requestSignal: AbortSignal) => {
+          if (path === "a.md") abort.abort();
+          if (requestSignal.aborted) throw new StructuredError("cancelled", "cancelled", true);
+          return { path, content: path === "a.md" ? "alpha" : "beta" };
+        },
+      },
+      setup.model,
+      {},
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      { sqliteClient: createTestSqliteClient({}) }
+    );
+    await expect(cancelling.build(abort.signal)).rejects.toMatchObject({ code: "cancelled" });
+    await expect(cancelling.getState()).resolves.toMatchObject({ incomplete: true });
   });
 
   it("preserves the semantic-only related-note path", async () => {
     const setup = manager({ "a.md": "alpha", "b.md": "beta" });
     await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
     const embeddingCalls = setup.model.embed.mock.calls.length;
-    expect(setup.manager.relatedState("a.md")).not.toBeNull();
+    expect(setup.manager.relatedState("a.md")).toMatchObject({
+      semantic: { state: "ready", searchable: true },
+      freshness: "locally-reconciled",
+    });
     await setup.manager.findRelated("a.md", signal, 128);
     expect(setup.model.embed.mock.calls.length).toBe(embeddingCalls);
   });
@@ -279,6 +333,82 @@ describe("semantic index module", () => {
       createIndexFingerprint("http://127.0.0.1:1234/v1", "m", 2)
     );
     expect(chunkMarkdown("one\ntwo\nthree", 7, 2)).toEqual(chunkMarkdown("one\ntwo\nthree", 7, 2));
+  });
+
+  it("persists snapshot freshness through adoption and restart boundaries", async () => {
+    const sourceIdentity = {};
+    const source = manager({ "a.md": "alpha" }, sourceIdentity);
+    await source.manager.build(signal);
+    const prepared = await source.manager.preparePublication("remote-publication");
+
+    const receiverIdentity = {};
+    const receiver = manager({ "a.md": "alpha" }, receiverIdentity);
+    await receiver.manager.load();
+    await receiver.manager.adoptPublication(prepared.bytes, "remote-publication");
+    expect((await receiver.manager.getState())?.snapshotLoaded).toBe(true);
+    expect(receiver.manager.freshnessState()).toBe("snapshot-loaded");
+
+    const adoptedRestart = manager({ "a.md": "alpha" }, receiverIdentity);
+    await adoptedRestart.manager.load();
+    expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(true);
+    expect(adoptedRestart.manager.freshnessState()).toBe("snapshot-loaded");
+
+    await expect(adoptedRestart.manager.update(signal)).resolves.toEqual({
+      changed: false,
+      converged: true,
+    });
+    expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(false);
+    expect(adoptedRestart.manager.freshnessState()).toBe("locally-reconciled");
+
+    const afterNoOpRestart = manager({ "a.md": "alpha" }, receiverIdentity);
+    await afterNoOpRestart.manager.load();
+    expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
+    expect(afterNoOpRestart.manager.freshnessState()).toBe("locally-reconciled");
+
+    const localState = await afterNoOpRestart.manager.getState();
+    const localPrepared = await afterNoOpRestart.manager.preparePublication("local-publication");
+    await afterNoOpRestart.manager.finalizePublication(
+      "local-publication",
+      localState!.changeCounter
+    );
+    expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
+    expect(localPrepared.state.snapshotLoaded).toBe(false);
+
+    const reconciledRestart = manager({ "a.md": "alpha" }, receiverIdentity);
+    await reconciledRestart.manager.load();
+    expect((await reconciledRestart.manager.getState())?.snapshotLoaded).toBe(false);
+    expect(reconciledRestart.manager.freshnessState()).toBe("locally-reconciled");
+  });
+
+  it("blocks local writes and adoption until publication installs and stamps the same ID", async () => {
+    const setup = manager({ "a.md": "alpha" });
+    await setup.manager.build(signal);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const installing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const publishing = setup.manager.publishPublication("locked-publication", async (prepared) => {
+      entered();
+      await gate;
+      return prepared.bytes;
+    });
+    await installing;
+    expect(setup.manager.isInMaintenance()).toBe(true);
+    await expect(setup.manager.update(signal)).rejects.toMatchObject({ code: "busy" });
+    await expect(setup.manager.build(signal)).rejects.toMatchObject({ code: "busy" });
+    await expect(setup.manager.prepareSemantic(signal)).rejects.toMatchObject({ code: "busy" });
+    await expect(setup.manager.adoptPublication(new ArrayBuffer(1))).rejects.toMatchObject({
+      code: "busy",
+    });
+    release();
+    const result = await publishing;
+    expect(result.prepared.publicationId).toBe("locked-publication");
+    expect((await setup.manager.getState())?.publicationId).toBe("locked-publication");
+    expect(setup.manager.isInMaintenance()).toBe(false);
   });
 
   it("projects hostile diagnostics to safe metadata", () => {
@@ -311,7 +441,7 @@ describe("semantic index module", () => {
     expect(progress.every((entry) => entry.completed >= 0)).toBe(true);
   });
 
-  it("advances status from full-build chunking into embedding", async () => {
+  it("keeps full-build progress lexical-only after chunking", async () => {
     const model = embeddings();
     const target: { value?: IndexManager } = {};
     const status = new IndexStatusController({} as any, {
@@ -339,12 +469,12 @@ describe("semantic index module", () => {
     await status.run("reindex");
 
     const chunkIndex = observed.indexOf("chunk:0");
-    const embedIndex = observed.findIndex((entry) => entry.startsWith("embed:"));
     expect(chunkIndex).toBeGreaterThanOrEqual(0);
-    expect(embedIndex).toBeGreaterThan(chunkIndex);
+    expect(observed.findIndex((entry) => entry.startsWith("embed:"))).toBe(-1);
+    expect(model.embed).not.toHaveBeenCalled();
   });
 
-  it("reports cumulative incremental embedding progress across changed notes", async () => {
+  it("keeps incremental synchronization embedding-free", async () => {
     const contents = { "a.md": "alpha", "b.md": "beta" };
     const progress: IndexProgress[] = [];
     const model = {
@@ -380,13 +510,10 @@ describe("semantic index module", () => {
 
     await index.synchronize(signal);
 
-    const updates = progress.filter(
-      (value) => value.operation === "incremental" && value.phase === "embed"
-    );
-    expect(updates.length).toBeGreaterThanOrEqual(2);
-    expect(updates.at(-1)?.completed).toBeGreaterThan(updates[0].completed);
-    expect(updates.every((value) => value.total === undefined && !value.determinate)).toBe(true);
-    expect(updates.every((value) => value.changeCounter === undefined)).toBe(true);
+    expect(
+      progress.some((value) => value.operation === "incremental" && value.phase === "embed")
+    ).toBe(false);
+    expect(model.embed).not.toHaveBeenCalled();
   });
 
   it("preserves the usable index when full-build planning fails", async () => {

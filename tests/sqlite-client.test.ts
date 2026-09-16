@@ -52,6 +52,30 @@ describe("SqliteWorkerClient", () => {
     expect(worker.listenerCount("messageerror")).toBe(0);
   });
 
+  it("sends lexical-only chunks without requiring vector transferables", async () => {
+    const worker = new FakeWorker();
+    const client = new SqliteWorkerClient(worker);
+
+    await client.call("upsertNote", {
+      note: {
+        path: "lexical.md",
+        contentId: "a".repeat(64),
+        chunks: [
+          {
+            id: `${"a".repeat(64)}:0`,
+            ordinal: 0,
+            startLine: 1,
+            endLine: 1,
+            text: "lexical only",
+          },
+        ],
+      },
+    });
+
+    expect(worker.messages[0].value.method).toBe("upsertNote");
+    expect(worker.messages[0].transfer).toEqual([]);
+  });
+
   it("rejects pending calls on a Worker crash", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);

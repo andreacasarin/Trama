@@ -252,13 +252,18 @@ function linkProvenance(
 }
 
 export interface VaultSearchPort {
-  search(query: string, signal: AbortSignal, limit: number): Promise<readonly ProvenanceRecord[]>;
+  search(
+    query: string,
+    signal: AbortSignal,
+    limit: number,
+    mode?: "lexical" | "hybrid"
+  ): Promise<readonly ProvenanceRecord[]>;
 }
 export class VaultSearchTool implements ReadonlyTool {
   readonly definition = {
     name: "vault_search",
     description:
-      "Search eligible notes in the committed index using an exact term, phrase, or natural-language concept. Returns matching passages with excerpts, note paths, and line ranges; use read_note on a returned path for fuller context.",
+      "Search eligible notes in the committed index using an exact term, phrase, or natural-language concept through its lexical corpus (without embeddings). Returns matching passages with excerpts, note paths, and line ranges; use read_note on a returned path for fuller context.",
     inputSchema: {
       type: "object",
       properties: {
@@ -271,7 +276,7 @@ export class VaultSearchTool implements ReadonlyTool {
       additionalProperties: false,
     },
   } as const;
-  static readonly MAX_RESULTS = 20;
+  static readonly MAX_RESULTS = 7;
   constructor(private readonly searchPort: VaultSearchPort) {}
   async execute(input: unknown, signal: AbortSignal): Promise<ToolResult> {
     const data = objectInput(input);

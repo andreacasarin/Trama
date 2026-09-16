@@ -1,5 +1,7 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 5;
+export const SQLITE_PROTOCOL_VERSION = 4;
+export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
 export function schemaSql(dimensions: number): string {
   if (!Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096)
@@ -15,12 +17,17 @@ CREATE TABLE IF NOT EXISTS index_state (
   id INTEGER PRIMARY KEY CHECK (id=1),
   app_version TEXT NOT NULL,
   schema_version INTEGER NOT NULL,
+  protocol_version INTEGER NOT NULL,
+  build_identity TEXT NOT NULL,
   extraction_version INTEGER NOT NULL,
   chunk_algorithm_version INTEGER NOT NULL,
   dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-  fingerprint TEXT NOT NULL,
+  corpus_fingerprint TEXT NOT NULL,
+  embedding_fingerprint TEXT NOT NULL,
   incomplete INTEGER NOT NULL CHECK (incomplete IN (0,1)),
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
+  publication_id TEXT,
+  snapshot_loaded INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_loaded IN (0,1)),
   reconciliation_summary TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE TABLE IF NOT EXISTS notes (
@@ -32,6 +39,7 @@ CREATE INDEX IF NOT EXISTS notes_content_id ON notes(content_id);
 CREATE TABLE IF NOT EXISTS chunks (
   chunk_pk INTEGER PRIMARY KEY,
   note_pk INTEGER NOT NULL REFERENCES notes(note_pk) ON DELETE CASCADE,
+  content_id TEXT COLLATE BINARY NOT NULL,
   chunk_id TEXT COLLATE BINARY NOT NULL,
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
   start_line INTEGER NOT NULL CHECK (start_line >= 1),
@@ -39,11 +47,19 @@ CREATE TABLE IF NOT EXISTS chunks (
   path_text TEXT COLLATE BINARY NOT NULL,
   filename TEXT COLLATE BINARY NOT NULL,
   body TEXT NOT NULL,
-  embedding BLOB NOT NULL,
   UNIQUE(note_pk, ordinal),
   UNIQUE(note_pk, chunk_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS chunks_note_ordinal ON chunks(note_pk, ordinal);
+CREATE INDEX IF NOT EXISTS chunks_content_id ON chunks(content_id);
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+  chunk_pk INTEGER PRIMARY KEY REFERENCES chunks(chunk_pk) ON DELETE CASCADE,
+  content_id TEXT COLLATE BINARY NOT NULL,
+  chunk_id TEXT COLLATE BINARY NOT NULL,
+  embedding_fingerprint TEXT COLLATE BINARY NOT NULL,
+  vector BLOB NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS chunk_vectors_fingerprint ON chunk_vectors(embedding_fingerprint);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   body, path_text, filename, content='chunks', content_rowid='chunk_pk', tokenize='unicode61 remove_diacritics 2'
 );

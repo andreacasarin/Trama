@@ -50,6 +50,34 @@ describe("SQLite hydrated retrieval", () => {
     index.close();
   });
 
+  it("orders equal Hybrid scores by UTF-16 code units", async () => {
+    const index = await database();
+    const notes = [
+      { path: "Å.md", contentId: "a".repeat(64) },
+      { path: "a\u030a.md", contentId: "b".repeat(64) },
+    ];
+    for (const note of notes)
+      index.upsertNote({
+        ...note,
+        chunks: [
+          {
+            id: `${note.contentId}:0`,
+            ordinal: 0,
+            startLine: 1,
+            endLine: 1,
+            text: "same needle",
+            vector: new Float32Array([1, 0]),
+          },
+        ],
+      });
+
+    const hits = index.retrieve("needle", new Float32Array([1, 0]), 2, undefined, {
+      lexicalProfile: "voce",
+    });
+    expect(hits.map((hit) => hit.path)).toEqual(["a\u030a.md", "Å.md"]);
+    index.close();
+  });
+
   it("keeps hostile and Unicode keyword input literal and deterministic", async () => {
     const index = await database();
     const id = "c".repeat(64);

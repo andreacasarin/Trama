@@ -174,10 +174,14 @@ function cloneRequest<M extends SqliteMethod>(
   const transfer: ArrayBuffer[] = [];
   if (payload.vector instanceof Float32Array && payload.vector.buffer instanceof ArrayBuffer)
     transfer.push(payload.vector.buffer);
-  const note = payload.note as { chunks?: readonly { vector: Float32Array }[] } | undefined;
+  const note = payload.note as { chunks?: readonly { vector?: Float32Array }[] } | undefined;
   if (note?.chunks)
     for (const chunk of note.chunks)
-      if (chunk.vector.buffer instanceof ArrayBuffer) transfer.push(chunk.vector.buffer);
+      if (chunk.vector?.buffer instanceof ArrayBuffer) transfer.push(chunk.vector.buffer);
   if (payload.bytes instanceof ArrayBuffer) transfer.push(payload.bytes);
+  const vectors = payload.vectors as readonly { vector?: Float32Array }[] | undefined;
+  if (vectors)
+    for (const item of vectors)
+      if (item.vector?.buffer instanceof ArrayBuffer) transfer.push(item.vector.buffer);
   return { request: cloned, transfer };
 }

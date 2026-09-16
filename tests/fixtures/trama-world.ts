@@ -1,8 +1,13 @@
 import type { EmbeddingModel, ReadonlyVault } from "@/domain/contracts";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
-import { IndexManager, type IndexVaultPort, type SnapshotDataAdapter } from "@/index/IndexManager";
+import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { LenteSearch } from "@/index/LenteSearch";
 import { RelatedNotes } from "@/index/RelatedNotes";
+import { PublicationManager } from "@/index/publications/PublicationManager";
+import {
+  PublicationStore,
+  type PublicationDataAdapter,
+} from "@/index/publications/PublicationStore";
 import { ReadNoteTool, ToolRegistry, VaultSearchTool } from "@/tools/ToolRegistry";
 import { createTestSqliteClient } from "../sqlite-test-client";
 
@@ -84,18 +89,31 @@ class FixtureVault implements IndexVaultPort, ReadonlyVault {
   }
 }
 
-class FixtureSnapshots implements SnapshotDataAdapter {
-  private readonly values = new Map<string, ArrayBuffer>();
+class FixturePublicationAdapter implements PublicationDataAdapter {
+  readonly files = new Map<string, Uint8Array>();
+
   async exists(path: string): Promise<boolean> {
-    return this.values.has(path);
+    return this.files.has(path);
   }
   async readBinary(path: string): Promise<ArrayBuffer> {
-    const value = this.values.get(path);
-    if (!value) throw new Error(`Missing fixture snapshot: ${path}`);
-    return value.slice(0);
+    const value = this.files.get(path);
+    if (!value) throw new Error(`Missing fixture publication: ${path}`);
+    return value.slice().buffer;
   }
   async writeBinary(path: string, value: ArrayBuffer): Promise<void> {
-    this.values.set(path, value.slice(0));
+    this.files.set(path, new Uint8Array(value.slice(0)));
+  }
+  async mkdir(): Promise<void> {
+    // The in-memory adapter does not need directories.
+  }
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const value = this.files.get(oldPath);
+    if (!value) throw new Error(`Missing fixture staged publication: ${oldPath}`);
+    this.files.set(newPath, value);
+    this.files.delete(oldPath);
+  }
+  async remove(path: string): Promise<void> {
+    this.files.delete(path);
   }
 }
 
@@ -103,8 +121,9 @@ export class TramaTestWorld {
   readonly vault = new FixtureVault();
   readonly embedding = new FixtureEmbedding();
   readonly diagnostics: TramaDiagnosticRecord[] = [];
-  readonly snapshots = new FixtureSnapshots();
+  readonly publicationAdapter = new FixturePublicationAdapter();
   readonly index: IndexManager;
+  readonly publicationManager: PublicationManager;
   readonly lente: LenteSearch;
   readonly filo: RelatedNotes;
   readonly tools: ToolRegistry;
@@ -113,14 +132,21 @@ export class TramaTestWorld {
     this.index = new IndexManager(
       this.vault,
       this.embedding,
-      this.snapshots,
+      identity,
       "http://fixture.invalid/v1",
       "fixture",
       {
         sqliteClient: createTestSqliteClient(identity),
-        snapshotAdapter: this.snapshots,
+        publicationDirectory: "Trama/index",
       },
       { emit: (record) => this.diagnostics.push(record) }
+    );
+    this.publicationManager = new PublicationManager(
+      this.index,
+      new PublicationStore(this.publicationAdapter, {
+        directory: "Trama/index",
+        temporaryToken: () => "fixture",
+      })
     );
     this.lente = new LenteSearch(this.index, {
       getMtime: (path) => this.vault.mtimes.get(path) ?? null,
@@ -131,9 +157,32 @@ export class TramaTestWorld {
 
   async build(): Promise<void> {
     await this.index.build(signal);
+    const state = await this.index.getState();
+    if (state) {
+      await this.publicationManager.publishAfterSuccessfulOperation({
+        operation: "build",
+        changed: true,
+        converged: !state.incomplete,
+        state,
+      });
+    }
   }
   async update(): Promise<void> {
     this.index.queueChange();
-    await this.index.synchronize(signal);
+    const result = await this.index.synchronize(signal);
+    const state = await this.index.getState();
+    if (state) {
+      await this.publicationManager.publishAfterSuccessfulOperation({
+        operation: "update",
+        changed: result.changed,
+        converged: result.converged,
+        state,
+      });
+    }
+  }
+
+  async prepare(): Promise<void> {
+    const result = await this.index.prepareSemantic(signal);
+    await this.publicationManager.publishAfterSuccessfulOperation(result);
   }
 }

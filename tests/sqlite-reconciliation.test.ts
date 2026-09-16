@@ -108,7 +108,7 @@ describe("mutable SQLite reconciliation", () => {
     database.close();
   });
 
-  it("durably re-marks a published state incomplete for a late vault event", async () => {
+  it("preserves a published state across Worker restart", async () => {
     const { index, database } = await openIndex();
     index.upsertNote({ path: "note.md", contentId: id("d"), chunks: [] });
     const published = index.finishReconciliation(
@@ -117,11 +117,11 @@ describe("mutable SQLite reconciliation", () => {
     );
     expect(published.incomplete).toBe(false);
     const reopened = index.boot(id("f"), 2);
-    expect(reopened).toMatchObject({ incomplete: true, noteCount: 1 });
-    expect(reopened.changeCounter).toBe(published.changeCounter + 1);
+    expect(reopened).toMatchObject({ incomplete: false, noteCount: 1 });
+    expect(reopened.changeCounter).toBe(published.changeCounter);
     const fenced = index.markIncomplete();
     expect(fenced).toMatchObject({ incomplete: true });
-    expect(fenced.changeCounter).toBeGreaterThan(published.changeCounter);
+    expect(fenced.changeCounter).toBe(published.changeCounter + 1);
     index.close();
     database.close();
   });

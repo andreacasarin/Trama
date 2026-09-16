@@ -21,6 +21,7 @@ describe("SQLite schema/query foundation", () => {
     const sql = schemaSql(768);
     expect(sql).toContain("PRAGMA synchronous=FULL");
     expect(sql).toContain("STRICT");
+    expect(sql).toContain("snapshot_loaded INTEGER NOT NULL DEFAULT 0");
     expect(sql).toContain("COLLATE BINARY");
     expect(sql).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5");
     expect(sql).not.toContain("chunks_vec");
@@ -62,6 +63,72 @@ describe("SQLite schema/query foundation", () => {
       path: "renamed.md",
       score: beforeRename.score,
     });
+    index.close();
+  });
+
+  it("reports the full note count in durable state", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(db);
+    index.boot("c".repeat(64), 2);
+    index.upsertNote({ path: "one.md", contentId: "1".repeat(64), chunks: [] });
+    index.upsertNote({ path: "two.md", contentId: "2".repeat(64), chunks: [] });
+    expect(index.getState()).toMatchObject({ noteCount: 2, chunkCount: 0 });
+    index.close();
+  });
+
+  it("persists snapshot provenance and clears it at stable reconciliation", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(db);
+    index.boot("c".repeat(64), 2);
+    const mutation = index.upsertNote({
+      path: "a.md",
+      contentId: "1".repeat(64),
+      chunks: [],
+    });
+    const summaries = [{ path: "a.md", contentId: "1".repeat(64), chunkCount: 0 }];
+    const state = index.finishReconciliation(summaries, mutation.state.changeCounter);
+    expect(state).toMatchObject({ incomplete: false, snapshotLoaded: false });
+    expect(index.markSnapshotLoaded().snapshotLoaded).toBe(true);
+    const noOp = index.finishReconciliation(summaries, index.getState().changeCounter);
+    expect(noOp).toMatchObject({ incomplete: false, snapshotLoaded: false });
+    index.close();
+  });
+
+  it("rejects candidate vectors whose chunk identity does not match", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(db);
+    index.boot("c".repeat(64), 2);
+    index.upsertNote({
+      path: "a.md",
+      contentId: "1".repeat(64),
+      chunks: [{ id: "chunk-1", ordinal: 0, startLine: 1, endLine: 1, text: "alpha" }],
+    });
+    db.exec({
+      sql: "INSERT INTO chunk_vectors(chunk_pk,content_id,chunk_id,embedding_fingerprint,vector) VALUES(?,?,?,?,?)",
+      bind: [1, "wrong", "chunk-1", "", new Uint8Array(new Float32Array([1, 0]).buffer)],
+    });
+    expect(() => index.validateSnapshot("c".repeat(64), 2, "")).toThrow("chunk/content identity");
+    index.close();
+  });
+
+  it("rejects candidate vectors that are non-finite or outside normalization tolerance", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(db);
+    index.boot("c".repeat(64), 2);
+    index.upsertNote({
+      path: "a.md",
+      contentId: "1".repeat(64),
+      chunks: [{ id: "chunk-1", ordinal: 0, startLine: 1, endLine: 1, text: "alpha" }],
+    });
+    db.exec({
+      sql: "INSERT INTO chunk_vectors(chunk_pk,content_id,chunk_id,embedding_fingerprint,vector) VALUES(?,?,?,?,?)",
+      bind: [1, "1".repeat(64), "chunk-1", "", new Uint8Array(new Float32Array([2, 0]).buffer)],
+    });
+    expect(() => index.validateSnapshot("c".repeat(64), 2, "")).toThrow("not normalized");
     index.close();
   });
 });
