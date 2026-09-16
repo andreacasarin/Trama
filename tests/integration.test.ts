@@ -32,6 +32,31 @@ const vault: ReadonlyVault = {
 };
 
 describe("integration composition seams", () => {
+  it("surfaces SQLite as unavailable when the packaged mobile runtime cannot start", async () => {
+    const index = new IndexManager(
+      {
+        listMarkdownPaths: async () => [],
+        readMarkdown: async () => ({ path: "missing.md", content: "" }),
+      },
+      new FakeEmbedding(),
+      {},
+      "http://127.0.0.1:1234/v1",
+      "embed-v1",
+      {
+        workerFactory: () => {
+          throw new Error("WASM unavailable");
+        },
+      }
+    );
+
+    await expect(index.load()).resolves.toBe(false);
+    expect(index.capabilities()).toMatchObject({
+      availability: "unavailable",
+      lexical: { state: "unavailable", activity: "idle", searchable: false },
+      semantic: { state: "unavailable", activity: "idle", searchable: false },
+    });
+  });
+
   it("builds, persists, reloads, and searches a semantic index without network", async () => {
     const embedding = new FakeEmbedding();
     const storage = {};

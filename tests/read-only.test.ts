@@ -275,10 +275,10 @@ describe("read-only vault and tools module", () => {
         await expect(
           new VaultSearchTool({ search }).execute({ query: "needle" }, signal)
         ).resolves.toMatchObject({
-          data: { results: [{ path: "result-20.md" }] },
-          provenance: [{ path: "result-20.md" }],
+          data: { results: [{ path: "result-7.md" }] },
+          provenance: [{ path: "result-7.md" }],
         });
-        expect(search).toHaveBeenCalledWith("needle", signal, 20);
+        expect(search).toHaveBeenCalledWith("needle", signal, 7);
       });
     });
   });

@@ -410,6 +410,8 @@ describe("TramaPlugin lifecycle integration", () => {
     await expect(oldIndex.search("old", new AbortController().signal, 1)).rejects.toMatchObject({
       code: "unavailable",
     });
+    // The old corpus may contain newly excluded content, so it is not a
+    // usable last-good index; an explicit Update/Rebuild is required.
     expect((plugin as any).indexStatus.getStatus().kind).toBe("index-required");
     expect(lenteView.refreshSubmitted).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -422,7 +424,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(read.ok).toBe(true);
   });
 
-  it("mobile activation registers no runtime surfaces and makes no fetch", async () => {
+  it("mobile activation registers shared runtime surfaces and makes no fetch", async () => {
     Platform.isDesktopApp = false;
     const app = projectedApp();
     const plugin = projectedPlugin(app);
@@ -430,10 +432,10 @@ describe("TramaPlugin lifecycle integration", () => {
 
     await plugin.onload();
 
-    expect(plugin.isDesktopLoaded()).toBe(false);
-    expect(plugin.addCommand).not.toHaveBeenCalled();
-    expect(plugin.registerView).not.toHaveBeenCalled();
-    expect(plugin.registerEvent).not.toHaveBeenCalled();
+    expect(plugin.isDesktopLoaded()).toBe(true);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(7);
+    expect(plugin.registerView).toHaveBeenCalledTimes(3);
+    expect(plugin.registerEvent).toHaveBeenCalledTimes(4);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -503,28 +505,27 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
     await (plugin as any).indexLoad;
     const index = (plugin as any).index;
-    const embedding = (index as any).embedding;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
-    embedding.embed = vi.fn(async (texts: readonly string[]) => {
+    const read = app.vault.read;
+    app.vault.read = vi.fn(async (file: { path: string }) => {
       await gate;
-      return texts.map(() => [1, ...Array(embedding.dimensions - 1).fill(0)]);
+      return read(file);
     });
     const writes = vi.spyOn(app.vault.adapter, "write");
     const rebuild = index.build(new AbortController().signal);
-    await vi.waitFor(() => expect(embedding.embed).toHaveBeenCalled());
+    await vi.waitFor(() => expect(app.vault.read).toHaveBeenCalled());
 
     await plugin.saveSettings({
       ...DEFAULT_SETTINGS,
       chat: { ...DEFAULT_SETTINGS.chat, modelId: "chat-v2" },
     });
     expect((plugin as any).index).toBe(index);
-    expect((plugin as any).index.embedding).toBe(embedding);
     release();
     await rebuild;
 
     expect(writes).not.toHaveBeenCalled();
-    expect(await index.search("anything", new AbortController().signal, 1)).toHaveLength(1);
+    expect(await index.search("contents", new AbortController().signal, 1)).toHaveLength(1);
   });
 
   it("applies parameter-only chat saves to the next request without replacing the conversation", async () => {
@@ -574,18 +575,16 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     const oldIndex = (plugin as any).index;
     const dispose = vi.spyOn(oldIndex, "dispose");
-    const oldEmbedding = (oldIndex as any).embedding;
     let oldStarted!: () => void;
     const started = new Promise<void>((resolve) => (oldStarted = resolve));
-    oldEmbedding.embed = vi.fn(
-      async (_texts: readonly string[], signal: AbortSignal) =>
-        new Promise<readonly number[][]>((_resolve, reject) => {
-          oldStarted();
-          signal.addEventListener("abort", () => reject(new Error("old rebuild cancelled")), {
-            once: true,
-          });
-        })
-    );
+    const read = app.vault.read;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+    app.vault.read = vi.fn(async (file: { path: string }) => {
+      oldStarted();
+      await readGate;
+      return read(file);
+    });
     const oldRebuild = oldIndex.build((plugin as any).lifecycleAbort.signal);
     await started;
 
@@ -597,9 +596,10 @@ describe("TramaPlugin lifecycle integration", () => {
         modelId: "embed-v2",
       },
     });
+    releaseRead();
     await save;
     expect(dispose).toHaveBeenCalledTimes(1);
-    await expect(oldRebuild).rejects.toThrow("old rebuild cancelled");
+    await expect(oldRebuild).rejects.toThrow("Operation cancelled");
     const newIndex = (plugin as any).index;
     expect(newIndex).not.toBe(oldIndex);
     expect(newIndex.fingerprint().modelId).toBe("embed-v2");
@@ -607,12 +607,8 @@ describe("TramaPlugin lifecycle integration", () => {
       code: "unavailable",
     });
 
-    const newEmbedding = (newIndex as any).embedding;
-    newEmbedding.embed = vi.fn(async (texts: readonly string[]) =>
-      texts.map(() => [1, ...Array(newEmbedding.dimensions - 1).fill(0)])
-    );
     await newIndex.build(new AbortController().signal);
-    expect(newEmbedding.embed).toHaveBeenCalled();
+    expect(newIndex.isComplete()).toBe(true);
   });
 
   it("keeps the committed runtime untouched when settings persistence rejects", async () => {
@@ -895,7 +891,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(plugin.indexReady).toBe(false);
   });
 
-  it("ignores an old unavailable load after a replacement index loads ready", async () => {
+  it("does not infer readiness from a mocked load without index capabilities", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app) as any;
     const first = deferred<boolean>();
@@ -910,7 +906,7 @@ describe("TramaPlugin lifecycle integration", () => {
     second.resolve(true);
     await Promise.all([first.promise, second.promise]);
     await Promise.resolve();
-    expect(plugin.indexReady).toBe(true);
+    expect(plugin.indexReady).toBe(false);
   });
 
   it("debounces visible Markdown changes, ignores excluded files, and unloads idempotently", async () => {
@@ -1084,6 +1080,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(indexCommand.checkCallback(true)).toBe(true);
     indexCommand.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    await vi.waitFor(() => expect(status.getStatus().kind).toBe("ready"));
     const reconcile = vi
       .spyOn(index, "reconcileQueuedChanges")
       .mockResolvedValue({ changed: false, converged: false });
@@ -1170,6 +1167,50 @@ describe("TramaPlugin lifecycle integration", () => {
       message: "Creating embeddings — 2 of 4 texts",
       progress: { operation: "incremental", phase: "embed", completed: 2, total: 4 },
     });
+  });
+
+  it("routes semantic preparation through status progress and cancellation", async () => {
+    let preparationSignal!: AbortSignal;
+    const cancelled = vi.fn();
+    const status = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      prepare: (signal) => {
+        preparationSignal = signal;
+        return new Promise<void>((_resolve, reject) =>
+          signal.addEventListener("abort", () => reject(new Error("cancelled")), {
+            once: true,
+          })
+        );
+      },
+      cancel: cancelled,
+    });
+    status.setReady();
+    const run = status.prepare();
+    await vi.waitFor(() =>
+      expect(status.getStatus()).toMatchObject({
+        kind: "preparing",
+        canPrepare: false,
+        canCancel: true,
+      })
+    );
+    status.reportProgress({
+      operation: "incremental",
+      phase: "build-vector",
+      completed: 2,
+      total: 4,
+      unit: "chunks",
+      determinate: true,
+    });
+    expect(status.getStatus()).toMatchObject({
+      kind: "preparing",
+      progress: { completed: 2, total: 4 },
+    });
+    status.cancel();
+    await run;
+    expect(preparationSignal.aborted).toBe(true);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(status.getStatus()).toMatchObject({ kind: "cancelled", canPrepare: true });
   });
 
   it("keeps the registered reindex command unavailable during incremental updating", async () => {
