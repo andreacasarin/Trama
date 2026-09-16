@@ -1,4 +1,13 @@
 import { EndpointApproval, EndpointPolicy } from "@/security/EndpointPolicy";
+import {
+  DEFAULT_PUBLICATION_DIRECTORY,
+  normalizePublicationDirectory as normalizeStoredPublicationDirectory,
+} from "@/index/publications/PublicationStore";
+
+/** Normalizes the synchronized SQLite publication folder. Invalid persisted values use the safe default. */
+export function normalizePublicationDirectory(value: unknown): string {
+  return normalizeStoredPublicationDirectory(value);
+}
 
 export interface ChatSettings {
   readonly endpoint: string;
@@ -24,7 +33,8 @@ export interface FiloSettings {
   readonly excludedPaths: readonly string[];
 }
 export interface TramaSettings {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 4;
+  readonly publicationDirectory: string;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly lente: LenteSettings;
@@ -119,7 +129,8 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
-  schemaVersion: 3,
+  schemaVersion: 4,
+  publicationDirectory: DEFAULT_PUBLICATION_DIRECTORY,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
     modelId: "",
@@ -152,7 +163,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      ![2, 3].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
+      ![2, 3, 4].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -173,6 +184,9 @@ export class SettingsStore {
       string,
       unknown
     >;
+    const publicationDirectory = normalizeStoredPublicationDirectory(
+      (input as { publicationDirectory?: unknown }).publicationDirectory
+    );
     const chatEndpoint = this.string(rawChat.endpoint, DEFAULT_SETTINGS.chat.endpoint);
     const embeddingEndpoint = this.string(
       rawEmbedding.endpoint,
@@ -207,14 +221,12 @@ export class SettingsStore {
         : DEFAULT_SETTINGS.lente.automaticSearchDelayMs,
     };
     const filo = {
-      // Automatic reconciliation currently rebuilds the full derived lexical
-      // index, so persisted opt-in is disabled until that work is incremental
-      // or moved off the renderer thread.
-      automaticUpdates: false,
+      automaticUpdates: rawFilo.automaticUpdates === true,
       excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
     };
     this.value = {
-      schemaVersion: 3,
+      schemaVersion: 4,
+      publicationDirectory,
       chat: Object.freeze(chat),
       embedding: Object.freeze(embedding),
       lente: Object.freeze(lente),
@@ -299,8 +311,10 @@ export class SettingsStore {
     const embeddingEndpoint = policy.normalize(next.embedding.endpoint);
     const chatControls = this.validateChatControls(next.chat);
     const lente = this.validateLente(next.lente);
+    const publicationDirectory = this.strictPublicationDirectory(next.publicationDirectory);
     return {
-      schemaVersion: 3,
+      schemaVersion: 4,
+      publicationDirectory,
       chat: Object.freeze({
         endpoint: chatEndpoint,
         modelId: next.chat.modelId,
@@ -315,6 +329,12 @@ export class SettingsStore {
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
       detailedDebug: next.detailedDebug === true,
     };
+  }
+  private strictPublicationDirectory(value: unknown): string {
+    const normalized = normalizeStoredPublicationDirectory(value, "");
+    if (!normalized || normalized === "")
+      throw new Error("Publication directory must be a valid vault-relative folder.");
+    return normalized;
   }
   private validateLente(lente: LenteSettings): LenteSettings {
     if (!isLenteSearchMethod(lente.searchMethod)) {

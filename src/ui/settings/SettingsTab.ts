@@ -18,14 +18,18 @@ export interface SettingsTabCallbacks {
   updateChatModel(value: string): Promise<void>;
   updateEmbeddingEndpoint(value: string): Promise<void>;
   updateEmbeddingModel(value: string): Promise<void>;
-  exportSnapshot?(): Promise<unknown>;
-  importSnapshot?(bytes: ArrayBuffer, sha256?: string): Promise<void>;
   addApprovedOrigin(endpoint: string): Promise<void>;
   removeApprovedOrigin(origin: EndpointApproval): Promise<void>;
   discoverModels(target: "chat" | "embedding"): Promise<readonly string[]>;
+  prepareSemantic?(): Promise<void>;
+  retryPublication?(): Promise<void>;
+  checkPublication?(): Promise<void>;
+  getIndexStatus?(): { publicationWarning?: string } | undefined;
+  getPublicationMetrics?(): { byteSize: number; durationMs: number } | undefined;
 }
 
 export interface SettingsDraft {
+  publicationDirectory?: string;
   chatEndpoint: string;
   chatModelId: string;
   chatTemperature: number;
@@ -36,6 +40,7 @@ export interface SettingsDraft {
   lenteSearchMethod: LenteSearchMethod;
   lenteMaxResults: number;
   lenteAutomaticSearchDelayMs: number;
+  filoAutomaticUpdates?: boolean;
   filoExcludedPaths: readonly string[];
 }
 
@@ -76,6 +81,7 @@ export function projectSettingsWithDraft(
   else delete chat.reasoningEffort;
   return {
     ...settings,
+    publicationDirectory: draft.publicationDirectory ?? settings.publicationDirectory,
     chat,
     embedding: {
       ...settings.embedding,
@@ -88,7 +94,7 @@ export function projectSettingsWithDraft(
       automaticSearchDelayMs: draft.lenteAutomaticSearchDelayMs,
     },
     filo: {
-      automaticUpdates: false,
+      automaticUpdates: draft.filoAutomaticUpdates ?? settings.filo.automaticUpdates,
       excludedPaths: normalizeExcludedPaths(draft.filoExcludedPaths),
     },
   };
@@ -124,7 +130,9 @@ export class TramaSettingsTab extends PluginSettingTab {
       lenteSearchMethod: settings.lente.searchMethod,
       lenteMaxResults: settings.lente.maxResults,
       lenteAutomaticSearchDelayMs: settings.lente.automaticSearchDelayMs,
+      filoAutomaticUpdates: settings.filo.automaticUpdates,
       filoExcludedPaths: [...settings.filo.excludedPaths],
+      publicationDirectory: settings.publicationDirectory,
     });
 
     this.sectionHeading("Lente");
@@ -176,7 +184,58 @@ export class TramaSettingsTab extends PluginSettingTab {
       draft.embeddingEndpoint = value;
     });
     this.modelSelector("embedding", draft);
+    new Setting(this.containerEl)
+      .setName("Update index automatically")
+      .setDesc("Reconcile Markdown changes after a short delay. This never contacts an AI service.")
+      .addToggle((toggle) => {
+        toggle.setValue(draft.filoAutomaticUpdates ?? false);
+        toggle.onChange((value) => {
+          draft.filoAutomaticUpdates = value;
+        });
+      });
     this.exclusions(draft);
+
+    this.sectionHeading("Index & sync");
+    new Setting(this.containerEl)
+      .setName("Synchronized SQLite folder")
+      .setDesc(
+        "Vault-relative folder for index.sqlite3. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
+      )
+      .addText((text) => {
+        text.setValue(draft.publicationDirectory ?? "Trama/index");
+        text.onChange((value) => {
+          draft.publicationDirectory = value;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Semantic index")
+      .setDesc(
+        "Keyword indexing is local and network-silent. Prepare semantic vectors only when you explicitly choose it."
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Prepare semantic index")
+          .onClick(() => void this.run(() => this.controller.prepareSemantic?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Check synchronized file")
+          .onClick(() => void this.run(() => this.controller.checkPublication?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Retry publication")
+          .onClick(() => void this.run(() => this.controller.retryPublication?.()))
+      );
+    const status = this.controller.getIndexStatus?.();
+    if (status?.publicationWarning)
+      this.containerEl.createEl("p", { text: status.publicationWarning, cls: "mod-warning" });
+    const metrics = this.controller.getPublicationMetrics?.();
+    if (metrics)
+      this.containerEl.createEl("p", {
+        text: `Last publication: ${metrics.byteSize} bytes in ${metrics.durationMs} ms.`,
+        cls: "setting-item-description",
+      });
 
     this.sectionHeading("Advanced");
     this.advanced(settings);
@@ -220,7 +279,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       .setDesc(
         isChat
           ? "Click Discover to query LM Studio, then choose an AI model."
-          : "Used by Filo indexing and Hybrid Lente search; changing it requires a full reindex. Click Discover to query LM Studio."
+          : "Used by Filo indexing and Hybrid Lente search; changing it requires semantic preparation while the lexical index remains available. Click Discover to query LM Studio."
       )
       .addDropdown((dropdown) => {
         if (!selectedModel) dropdown.addOption("", "Select a model");
@@ -285,32 +344,6 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
 
   private advanced(settings: TramaSettings): void {
-    new Setting(this.containerEl)
-      .setName("SQLite index snapshot")
-      .setDesc(
-        "Explicitly export an immutable backup, or import a selected backup. Imported indexes remain incomplete until Update or Rebuild index."
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Export snapshot")
-          .onClick(() => void this.run(() => this.controller.exportSnapshot?.()))
-      )
-      .addButton((button) =>
-        button.setButtonText("Import snapshot").onClick(() => {
-          const input = this.containerEl.createEl("input", { type: "file" });
-          input.setAttribute("accept", ".sqlite3,.sqlite");
-          input.hidden = true;
-          input.addEventListener("change", () => {
-            const file = (input as HTMLInputElement).files?.[0];
-            if (!file) return;
-            void this.run(async () => {
-              const match = file.name.match(/^([0-9a-f]{64})\.sqlite3$/i);
-              await this.controller.importSnapshot?.(await file.arrayBuffer(), match?.[1]);
-            });
-          });
-          input.click();
-        })
-      );
     new Setting(this.containerEl)
       .setName("Detailed debugging")
       .setDesc(

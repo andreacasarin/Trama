@@ -4,6 +4,7 @@ import {
   isExcludedPath,
   normalizeExcludedPath,
   normalizeExcludedPaths,
+  normalizePublicationDirectory,
   SettingsStore,
 } from "@/settings/Settings";
 
@@ -20,7 +21,8 @@ describe("Settings module", () => {
         const store = new SettingsStore();
         const loaded = store.load({ schemaVersion: 2, chat: {}, embedding: {} });
 
-        expect(loaded.schemaVersion).toBe(3);
+        expect(loaded.schemaVersion).toBe(4);
+        expect(loaded.publicationDirectory).toBe("Trama/index");
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
@@ -49,7 +51,7 @@ describe("Settings module", () => {
           automaticSearchDelayMs: 0,
         });
         expect(loaded.filo).toEqual({
-          automaticUpdates: false,
+          automaticUpdates: true,
           excludedPaths: ["Projects", "private/notes"],
         });
         expect(Object.isFrozen(DEFAULT_SETTINGS.lente)).toBe(true);
@@ -148,6 +150,23 @@ describe("Settings module", () => {
         const store = new SettingsStore();
         expect(store.load({ schemaVersion: 1, chat: { maxTokens: 4096 } })).toBe(DEFAULT_SETTINGS);
       });
+
+      it("normalizes a safe publication folder and falls back for invalid persisted values", () => {
+        expect(normalizePublicationDirectory(" ./Trama\\index// ")).toBe("Trama/index");
+        for (const value of [
+          "",
+          "/absolute",
+          "C:\\index",
+          "folder/../index",
+          "folder/./index",
+          "bad\0path",
+        ])
+          expect(normalizePublicationDirectory(value)).toBe("Trama/index");
+        expect(
+          new SettingsStore().load({ schemaVersion: 4, publicationDirectory: " ./sync\\folder/ " })
+            .publicationDirectory
+        ).toBe("sync/folder");
+      });
     });
     describe("save()", () => {
       it("normalizes and persists independent chat and embedding endpoints", () => {
@@ -157,7 +176,7 @@ describe("Settings module", () => {
           chat: { ...DEFAULT_SETTINGS.chat, endpoint: "http://127.0.0.1:1234" },
           embedding: { ...DEFAULT_SETTINGS.embedding, endpoint: "http://127.0.0.1:4321/v1" },
         });
-        expect(settings.schemaVersion).toBe(3);
+        expect(settings.schemaVersion).toBe(4);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
         expect(settings.detailedDebug).toBe(false);
@@ -238,6 +257,15 @@ describe("Settings module", () => {
           })
         ).toThrow();
         expect(store.get()).toBe(before);
+      });
+
+      it("rejects invalid publication folders without changing the committed snapshot", () => {
+        const store = new SettingsStore();
+        const before = store.get();
+        for (const publicationDirectory of ["", "/absolute", "C:\\index", "folder/../index"]) {
+          expect(() => store.stage({ ...DEFAULT_SETTINGS, publicationDirectory })).toThrow();
+          expect(store.get()).toBe(before);
+        }
       });
       it("normalizes and deduplicates approved origins", () => {
         const store = new SettingsStore();
