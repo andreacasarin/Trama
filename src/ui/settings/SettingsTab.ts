@@ -1,6 +1,7 @@
 import { PluginSettingTab, Setting } from "obsidian";
 import { Plugin } from "obsidian";
 import { EndpointApproval } from "@/security/EndpointPolicy";
+import type { IndexCapabilities } from "@/domain/contracts";
 import {
   normalizeExcludedPaths,
   normalizeExcludedPath,
@@ -22,9 +23,13 @@ export interface SettingsTabCallbacks {
   removeApprovedOrigin(origin: EndpointApproval): Promise<void>;
   discoverModels(target: "chat" | "embedding"): Promise<readonly string[]>;
   prepareSemantic?(): Promise<void>;
+  updateLexical?(): Promise<void>;
+  rebuildLexical?(): Promise<void>;
+  rebuildSemantic?(): Promise<void>;
+  rebuildBothIndexes?(): Promise<void>;
   retryPublication?(): Promise<void>;
   checkPublication?(): Promise<void>;
-  getIndexStatus?(): { publicationWarning?: string } | undefined;
+  getIndexStatus?(): { publicationWarning?: string; capabilities?: IndexCapabilities } | undefined;
   getPublicationMetrics?(): { byteSize: number; durationMs: number } | undefined;
 }
 
@@ -185,7 +190,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     });
     this.modelSelector("embedding", draft);
     new Setting(this.containerEl)
-      .setName("Update index automatically")
+      .setName("Update lexical index automatically")
       .setDesc("Reconcile Markdown changes after a short delay. This never contacts an AI service.")
       .addToggle((toggle) => {
         toggle.setValue(draft.filoAutomaticUpdates ?? false);
@@ -195,7 +200,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       });
     this.exclusions(draft);
 
-    this.sectionHeading("Index & sync");
+    this.sectionHeading("Lexical & semantic indexes and sync");
     new Setting(this.containerEl)
       .setName("Synchronized SQLite folder")
       .setDesc(
@@ -207,16 +212,53 @@ export class TramaSettingsTab extends PluginSettingTab {
           draft.publicationDirectory = value;
         });
       });
+    const status = this.controller.getIndexStatus?.();
+    if (status?.capabilities) {
+      for (const channel of ["lexical", "semantic"] as const) {
+        const current = status.capabilities[channel];
+        this.containerEl.createEl("p", {
+          text: `${channel === "lexical" ? "Lexical" : "Semantic"} index: ${current.state} · ${current.activity}`,
+        });
+      }
+    }
     new Setting(this.containerEl)
-      .setName("Semantic index")
-      .setDesc(
-        "Keyword indexing is local and network-silent. Prepare semantic vectors only when you explicitly choose it."
+      .setName("Lexical index")
+      .setDesc("Local and network-silent. Update changed notes or rebuild all notes.")
+      .addButton((button) =>
+        button
+          .setButtonText("Update lexical index")
+          .onClick(() => void this.run(() => this.controller.updateLexical?.()))
       )
       .addButton((button) =>
         button
-          .setButtonText("Prepare semantic index")
+          .setButtonText("Rebuild lexical index")
+          .onClick(() => void this.run(() => this.controller.rebuildLexical?.()))
+      );
+    new Setting(this.containerEl)
+      .setName("Semantic index")
+      .setDesc(
+        "Uses the embedding service. Update missing vectors or rebuild all semantic vectors."
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Update semantic index")
           .onClick(() => void this.run(() => this.controller.prepareSemantic?.()))
       )
+      .addButton((button) =>
+        button
+          .setButtonText("Rebuild semantic index")
+          .onClick(() => void this.run(() => this.controller.rebuildSemantic?.()))
+      );
+    new Setting(this.containerEl)
+      .setName("Both indexes")
+      .setDesc("Rebuild lexical notes first, then regenerate every semantic vector.")
+      .addButton((button) =>
+        button
+          .setButtonText("Rebuild both indexes")
+          .onClick(() => void this.run(() => this.controller.rebuildBothIndexes?.()))
+      );
+    new Setting(this.containerEl)
+      .setName("Index synchronization")
       .addButton((button) =>
         button
           .setButtonText("Check synchronized file")
@@ -227,7 +269,6 @@ export class TramaSettingsTab extends PluginSettingTab {
           .setButtonText("Retry publication")
           .onClick(() => void this.run(() => this.controller.retryPublication?.()))
       );
-    const status = this.controller.getIndexStatus?.();
     if (status?.publicationWarning)
       this.containerEl.createEl("p", { text: status.publicationWarning, cls: "mod-warning" });
     const metrics = this.controller.getPublicationMetrics?.();
@@ -279,7 +320,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       .setDesc(
         isChat
           ? "Click Discover to query LM Studio, then choose an AI model."
-          : "Used by Filo indexing and Hybrid Lente search; changing it requires semantic preparation while the lexical index remains available. Click Discover to query LM Studio."
+          : "Used by Filo indexing and Hybrid Lente search; changing it requires updating the semantic index while the lexical index remains available. Click Discover to query LM Studio."
       )
       .addDropdown((dropdown) => {
         if (!selectedModel) dropdown.addOption("", "Select a model");
@@ -312,7 +353,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Excluded files and directories")
       .setDesc(
-        "Vault-relative paths omitted from the Filo index and Lente search. After changing this list, reindex the vault to apply it."
+        "Vault-relative paths omitted from the lexical index. Rebuild the lexical index after changing this list."
       )
       .addText((text) => {
         text.setPlaceholder("Projects/Private");

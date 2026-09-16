@@ -132,7 +132,6 @@ export class TramaTestWorld {
     this.index = new IndexManager(
       this.vault,
       this.embedding,
-      identity,
       "http://fixture.invalid/v1",
       "fixture",
       {

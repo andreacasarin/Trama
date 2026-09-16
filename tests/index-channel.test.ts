@@ -18,7 +18,6 @@ const state: SqliteState = {
   vectorCount: 1,
   vectorCoverage: "complete",
   semanticReady: true,
-  fingerprint: "legacy",
 };
 
 describe("search index channels", () => {
@@ -47,7 +46,7 @@ describe("search index channels", () => {
     expect(lexicalIndex.status({ ...state, noteCount: 0 }, true, false).state).toBe("empty");
   });
 
-  it("requires complete compatible semantic coverage", () => {
+  it("searches available semantic vectors while reporting partial coverage", () => {
     expect(semanticIndex.status({ ...state, vectorCount: 0 }, true, false).state).toBe("empty");
     expect(
       semanticIndex.status(
@@ -55,7 +54,7 @@ describe("search index channels", () => {
         true,
         false
       )
-    ).toMatchObject({ state: "partial", searchable: false });
+    ).toMatchObject({ state: "partial", searchable: true });
     expect(semanticIndex.status({ ...state, semanticReady: false }, true, false)).toMatchObject({
       state: "partial",
       searchable: false,
@@ -69,6 +68,6 @@ describe("search index channels", () => {
     ).toMatchObject({ state: "incompatible", searchable: false });
     expect(
       semanticIndex.status({ ...state, incomplete: true, semanticReady: false }, true, false)
-    ).toMatchObject({ state: "partial", searchable: false });
+    ).toMatchObject({ state: "partial", searchable: true });
   });
 });

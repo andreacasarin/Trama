@@ -101,9 +101,6 @@ export function isExcludedPath(path: unknown, excludedPaths: readonly string[]):
   );
 }
 
-// Descriptive aliases keep the pure helpers convenient at call sites.
-export const matchesExcludedPath = isExcludedPath;
-
 function isValidTemperature(value: unknown): value is number {
   return (
     typeof value === "number" &&

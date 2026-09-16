@@ -180,10 +180,6 @@ export class MutableSqliteDatabase {
     this.initializeVector();
     return this.getState();
   }
-  /** Compatibility overload for old callers. */
-  bootLegacy(fingerprint: string, dimensions: number): SqliteState {
-    return this.boot(fingerprint, dimensions, "");
-  }
   getState(): SqliteState {
     this.ensureOpen();
     const s = rows(this.db, "SELECT * FROM index_state WHERE id=1")[0];
@@ -213,7 +209,6 @@ export class MutableSqliteDatabase {
       vectorCoverage: coverage,
       semanticReady: coverage === "complete" && !Number(s.incomplete),
       ...(s.publication_id == null ? {} : { publicationId: String(s.publication_id) }),
-      fingerprint: String(s.corpus_fingerprint),
     };
   }
   listNotes(): readonly { path: string; contentId: string; chunkCount: number }[] {
@@ -272,6 +267,16 @@ export class MutableSqliteDatabase {
     transaction(this.db, () => {
       this.markMutation();
     });
+    return this.getState();
+  }
+
+  clearVectors(): SqliteState {
+    this.ensureOpen();
+    if (this.getState().vectorCount > 0)
+      transaction(this.db, () => {
+        this.db.exec("DELETE FROM chunk_vectors");
+        this.markMutation(false);
+      });
     return this.getState();
   }
 
@@ -354,24 +359,6 @@ export class MutableSqliteDatabase {
               chunk.text,
             ],
           });
-        // Narrow compatibility path for old callers; all new callers use storeVectors.
-        if (chunk.vector) {
-          const chunkPk = Number(
-            prior?.chunk_pk ??
-              rows(this.db, "SELECT chunk_pk FROM chunks WHERE note_pk=? AND chunk_id=?", [
-                pk,
-                chunk.id,
-              ])[0]?.chunk_pk ??
-              0
-          );
-          this.putVector(
-            chunk.id,
-            note.contentId,
-            chunk.vector,
-            this.embeddingFingerprint,
-            chunkPk
-          );
-        }
       }
     });
     return { changed: true, status: "changed", state: this.getState() };
@@ -809,18 +796,6 @@ export class MutableSqliteDatabase {
     transaction(this.db, () => this.db.exec("UPDATE index_state SET snapshot_loaded=1 WHERE id=1"));
     return this.getState();
   }
-  /** @deprecated import alias; publications use adoptPublication in the Worker. */
-  markImported(previousChangeCounter: number): SqliteState {
-    const state = this.getState();
-    transaction(this.db, () =>
-      this.db.exec({
-        sql: "UPDATE index_state SET incomplete=1,change_counter=? WHERE id=1",
-        bind: [Math.max(state.changeCounter + 1, previousChangeCounter + 1)],
-      })
-    );
-    return this.getState();
-  }
-
   private noteMatches(pk: number, note: SqliteNoteInput): boolean {
     const current = rows(
       this.db,

@@ -17,6 +17,7 @@ type ModalState =
       readonly degraded: boolean;
       readonly degradationReason?: LenteBatch["degradationReason"];
       readonly freshness?: IndexFreshness;
+      readonly semanticPartial?: boolean;
     }
   | {
       readonly kind: "empty";
@@ -25,6 +26,7 @@ type ModalState =
       readonly degraded: boolean;
       readonly degradationReason?: LenteBatch["degradationReason"];
       readonly freshness?: IndexFreshness;
+      readonly semanticPartial?: boolean;
     }
   | { readonly kind: "busy"; readonly query: string }
   | { readonly kind: "unavailable"; readonly query: string }
@@ -203,6 +205,7 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
             degraded: batch.degraded,
             ...(batch.degradationReason ? { degradationReason: batch.degradationReason } : {}),
             ...(batch.freshness ? { freshness: batch.freshness } : {}),
+            ...(batch.semanticPartial ? { semanticPartial: true } : {}),
           }
         : {
             kind: "empty",
@@ -211,6 +214,7 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
             degraded: batch.degraded,
             ...(batch.degradationReason ? { degradationReason: batch.degradationReason } : {}),
             ...(batch.freshness ? { freshness: batch.freshness } : {}),
+            ...(batch.semanticPartial ? { semanticPartial: true } : {}),
           };
       this.updateStatus();
       this.refreshSuggestions();
@@ -335,12 +339,13 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
           this.state.degraded,
           this.state.degradationReason,
           this.state.freshness,
+          this.state.semanticPartial,
           "No matching notes"
         );
       case "busy":
-        return "Updating index";
+        return "Lexical or semantic index operation in progress";
       case "unavailable":
-        return "Index unavailable";
+        return "Lexical index unavailable";
       case "error":
         return "Search failed";
       case "results":
@@ -348,7 +353,8 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
           this.state.mode,
           this.state.degraded,
           this.state.degradationReason,
-          this.state.freshness
+          this.state.freshness,
+          this.state.semanticPartial
         );
     }
   }
@@ -358,6 +364,7 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
     degraded: boolean,
     degradationReason: LenteBatch["degradationReason"],
     freshness: IndexFreshness | undefined,
+    semanticPartial: boolean | undefined,
     prefix = ""
   ): string {
     const messages: string[] = [];
@@ -373,7 +380,9 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
     }
     if (freshness === "snapshot-loaded")
       messages.push("Snapshot loaded; not reconciled with the current vault.");
-    else if (freshness === "unknown") messages.push("Index may be stale; update required.");
+    else if (freshness === "unknown") messages.push("Lexical index may be stale; update required.");
+    if (semanticPartial)
+      messages.push("Semantic index is incomplete; search uses available vectors.");
     return messages.join(" ");
   }
 

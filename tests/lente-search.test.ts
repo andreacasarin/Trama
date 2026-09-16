@@ -132,6 +132,27 @@ describe("LenteSearch", () => {
     expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
   });
 
+  it("uses available semantic vectors and labels partial coverage", async () => {
+    const search = vi.fn(async () => [hit("indexed.md", 1)]);
+    const service = new LenteSearch(
+      {
+        lenteState: () => ({
+          ...readyState,
+          semantic: { state: "partial", activity: "idle", searchable: true },
+        }),
+        searchLente: search,
+      },
+      { getMtime: () => 1 }
+    );
+
+    await expect(service.search("needle")).resolves.toMatchObject({
+      mode: "hybrid",
+      semanticPartial: true,
+      results: [expect.objectContaining({ path: "indexed.md" })],
+    });
+    expect(search).toHaveBeenCalledWith("needle", "hybrid", undefined);
+  });
+
   it("applies a configured display limit without shrinking the candidate pool", async () => {
     const candidates = Array.from({ length: 30 }, (_, index) =>
       hit(`note-${index}.md`, 1 - index / 100)

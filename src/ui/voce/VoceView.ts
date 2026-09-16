@@ -447,12 +447,22 @@ export class VoceView extends ItemView {
         text:
           this.relatedResult.unavailableReason === "incomplete-vectors"
             ? "Related-note suggestions are unavailable until semantic coverage is complete."
-            : "Related-note suggestions are unavailable. Prepare the semantic index when available.",
+            : "Related-note suggestions are unavailable. Update the semantic index when available.",
       });
     } else if (this.relatedResult?.freshness === "snapshot-loaded") {
       this.attachments.createDiv({
         cls: "setting-item-description mod-warning trama-voce__context-warning",
         text: "Search suggestions reflect a synchronized snapshot that is not locally reconciled.",
+      });
+    } else if (this.relatedResult?.freshness === "unknown") {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text: "Index may be stale; suggestions reflect indexed content until an update.",
+      });
+    } else if (this.relatedResult?.semanticPartial) {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text: "Semantic index is incomplete; suggestions use available vectors.",
       });
     }
     for (const path of paths) {

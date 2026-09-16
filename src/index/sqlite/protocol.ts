@@ -2,13 +2,12 @@
 export const SQLITE_PROTOCOL_VERSION = 4 as const;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
+export const SQLITE_MAX_MARKDOWN = 256 * 1024 * 1024;
 export const SQLITE_MAX_NOTES = 100_000;
 export const SQLITE_MAX_CHUNKS = 1_000_000;
 export const SQLITE_MAX_RESULTS = 256;
 export const SQLITE_MAX_VECTOR_BATCH = 512;
 export const SQLITE_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
-/** @deprecated Publication is now one configured file; retained for source compatibility. */
-export const SQLITE_SNAPSHOT_NAMESPACE = ".trama/sqlite/v1/snapshots";
 
 export type SqliteMethod =
   | "boot"
@@ -17,7 +16,9 @@ export type SqliteMethod =
   | "planReconciliation"
   | "markIncomplete"
   | "beginRebuild"
-  | "upsertNote"
+  | "clearVectors"
+  | "hashMarkdown"
+  | "upsertMarkdown"
   | "renameNote"
   | "deleteNote"
   | "finishReconciliation"
@@ -29,8 +30,6 @@ export type SqliteMethod =
   | "finalizePublication"
   | "inspectPublication"
   | "adoptPublication"
-  | "export"
-  | "import"
   | "cancelQueued"
   | "shutdown";
 
@@ -40,7 +39,6 @@ export interface SqliteChunkInput {
   readonly startLine: number;
   readonly endLine: number;
   readonly text: string;
-  /** @deprecated Vectors are separate from lexical upserts. */ readonly vector?: Float32Array;
 }
 export interface SqliteNoteInput {
   readonly path: string;
@@ -65,7 +63,6 @@ export interface SqliteState {
   readonly vectorCoverage: VectorCoverage;
   readonly semanticReady: boolean;
   readonly publicationId?: string;
-  /** @deprecated */ readonly fingerprint: string;
 }
 export interface SqliteNoteSummary {
   readonly path: string;
@@ -134,19 +131,26 @@ export interface PublicationInspection {
 
 export interface SqliteRequestPayloads {
   boot: {
-    readonly corpusFingerprint?: string;
+    readonly corpusFingerprint: string;
     readonly embeddingFingerprint?: string;
     readonly buildIdentity?: string;
     readonly dimensions: number;
     readonly identity?: string;
-    /** @deprecated */ readonly fingerprint?: string;
   };
   getState: Record<string, never>;
   listNotes: Record<string, never>;
   planReconciliation: { readonly summaries: readonly SqliteNoteSummary[] };
   markIncomplete: Record<string, never>;
   beginRebuild: Record<string, never>;
-  upsertNote: { readonly note: SqliteNoteInput };
+  clearVectors: Record<string, never>;
+  hashMarkdown: { readonly markdown: string; readonly corpusFingerprint: string };
+  upsertMarkdown: {
+    readonly path: string;
+    readonly markdown: string;
+    readonly expectedContentId: string;
+    readonly size: number;
+    readonly overlap: number;
+  };
   renameNote: { readonly from: string; readonly to: string; readonly contentId?: string };
   deleteNote: { readonly path: string; readonly contentId?: string };
   finishReconciliation: {
@@ -191,8 +195,6 @@ export interface SqliteRequestPayloads {
     readonly buildIdentity?: string;
     readonly dimensions?: number;
   };
-  export: Record<string, never>;
-  import: { readonly bytes: ArrayBuffer };
   cancelQueued: { readonly requestId?: number };
   shutdown: Record<string, never>;
 }
@@ -250,7 +252,9 @@ const METHODS: readonly SqliteMethod[] = [
   "planReconciliation",
   "markIncomplete",
   "beginRebuild",
-  "upsertNote",
+  "clearVectors",
+  "hashMarkdown",
+  "upsertMarkdown",
   "renameNote",
   "deleteNote",
   "finishReconciliation",
@@ -262,8 +266,6 @@ const METHODS: readonly SqliteMethod[] = [
   "finalizePublication",
   "inspectPublication",
   "adoptPublication",
-  "export",
-  "import",
   "cancelQueued",
   "shutdown",
 ];
@@ -297,22 +299,6 @@ function validId(value: unknown): value is string {
     typeof value === "string" && value.length > 0 && value.length <= 512 && !value.includes("\0")
   );
 }
-function validChunk(chunk: unknown): chunk is SqliteChunkInput {
-  if (!chunk || typeof chunk !== "object") return false;
-  const c = chunk as SqliteChunkInput;
-  return (
-    validId(c.id) &&
-    Number.isSafeInteger(c.ordinal) &&
-    c.ordinal >= 0 &&
-    Number.isSafeInteger(c.startLine) &&
-    c.startLine >= 1 &&
-    Number.isSafeInteger(c.endLine) &&
-    c.endLine >= c.startLine &&
-    typeof c.text === "string" &&
-    c.text.length <= SQLITE_MAX_TEXT &&
-    (c.vector === undefined || validVector(c.vector))
-  );
-}
 function validSummary(value: unknown): value is SqliteNoteSummary {
   if (!value || typeof value !== "object") return false;
   const s = value as SqliteNoteSummary;
@@ -332,29 +318,35 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
     throw sqliteError("invalid_request", "Invalid payload");
   const value = payload as Record<string, any>;
   if (method === "boot") {
-    const corpus = value.corpusFingerprint ?? value.fingerprint;
     if (
-      !validHash(corpus) ||
+      !validHash(value.corpusFingerprint) ||
       (value.embeddingFingerprint !== undefined && !validHash(value.embeddingFingerprint)) ||
       !Number.isSafeInteger(value.dimensions) ||
       value.dimensions < 1 ||
       value.dimensions > 4096
     )
       throw sqliteError("invalid_request", "Invalid boot payload");
-  } else if (method === "upsertNote") {
-    const note = value.note;
+  } else if (method === "hashMarkdown") {
     if (
-      !note ||
-      !validPath(note.path) ||
-      !validHash(note.contentId) ||
-      !Array.isArray(note.chunks) ||
-      note.chunks.length > SQLITE_MAX_CHUNKS ||
-      !note.chunks.every(validChunk)
+      typeof value.markdown !== "string" ||
+      value.markdown.length > SQLITE_MAX_MARKDOWN ||
+      !validHash(value.corpusFingerprint)
     )
-      throw sqliteError("invalid_request", "Invalid note payload");
-    const ids = new Set(note.chunks.map((c: SqliteChunkInput) => `${c.ordinal}\0${c.id}`));
-    if (ids.size !== note.chunks.length)
-      throw sqliteError("invalid_request", "Duplicate chunk identity");
+      throw sqliteError("invalid_request", "Invalid Markdown hash payload");
+  } else if (method === "upsertMarkdown") {
+    if (
+      !validPath(value.path) ||
+      typeof value.markdown !== "string" ||
+      value.markdown.length > SQLITE_MAX_MARKDOWN ||
+      !validHash(value.expectedContentId) ||
+      !Number.isSafeInteger(value.size) ||
+      value.size < 1 ||
+      value.size > SQLITE_MAX_TEXT ||
+      !Number.isSafeInteger(value.overlap) ||
+      value.overlap < 0 ||
+      value.overlap >= value.size
+    )
+      throw sqliteError("invalid_request", "Invalid Markdown upsert payload");
   } else if (method === "renameNote") {
     if (
       !validPath(value.from) ||
@@ -432,11 +424,7 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       value.expectedChangeCounter < 0
     )
       throw sqliteError("invalid_request", "Invalid publication finalization payload");
-  } else if (
-    method === "inspectPublication" ||
-    method === "adoptPublication" ||
-    method === "import"
-  ) {
+  } else if (method === "inspectPublication" || method === "adoptPublication") {
     if (
       !(value.bytes instanceof ArrayBuffer) ||
       value.bytes.byteLength === 0 ||

@@ -13,7 +13,10 @@ export interface PublicationIndexPort {
     install: (prepared: PublicationPrepared) => Promise<T>,
     settle?: (committed: boolean) => Promise<void>
   ): Promise<{ prepared: PublicationPrepared; installed: T }>;
-  inspectPublication(bytes: ArrayBuffer): Promise<PublicationInspection>;
+  inspectPublication(
+    bytes: ArrayBuffer,
+    transferOwnership?: boolean
+  ): Promise<PublicationInspection>;
   adoptPublication(bytes: ArrayBuffer, expectedPublicationId?: string): Promise<SqliteState>;
   getState?(): Promise<SqliteState | undefined>;
   capabilities?(): IndexCapabilities;
@@ -83,18 +86,15 @@ export class PublicationManager {
   constructor(
     private readonly index: PublicationIndexPort,
     storeOrAdapter: PublicationStore | PublicationDataAdapter,
-    optionsOrDirectory: PublicationManagerOptions | string = {}
+    options: PublicationManagerOptions = {}
   ) {
-    const options = typeof optionsOrDirectory === "string" ? {} : optionsOrDirectory;
     this.store =
       storeOrAdapter instanceof PublicationStore
         ? storeOrAdapter
-        : new PublicationStore(
-            storeOrAdapter,
-            typeof optionsOrDirectory === "string"
-              ? { directory: optionsOrDirectory }
-              : { directory: options.directory, temporaryToken: options.temporaryToken }
-          );
+        : new PublicationStore(storeOrAdapter, {
+            directory: options.directory,
+            temporaryToken: options.temporaryToken,
+          });
     this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
@@ -119,10 +119,6 @@ export class PublicationManager {
     return this.publishAfterSuccessfulOperation(result);
   }
 
-  async publishAfterOperation(result: SuccessfulOperation): Promise<PublicationResult> {
-    return this.publishAfterSuccessfulOperation(result);
-  }
-
   async publish(): Promise<PublicationResult> {
     return this.serialize(() => this.publishSerialized());
   }
@@ -132,21 +128,9 @@ export class PublicationManager {
     return this.publish();
   }
 
-  async retry(): Promise<PublicationResult> {
-    return this.retryPublication();
-  }
-
   /** Inspect and adopt the exact configured file. Adoption never publishes. */
   async adoptCurrent(): Promise<AdoptionResult> {
     return this.serialize(() => this.adoptSerialized());
-  }
-
-  async adopt(): Promise<AdoptionResult> {
-    return this.adoptCurrent();
-  }
-
-  async adoptPublication(bytes: ArrayBuffer): Promise<AdoptionResult> {
-    return this.serialize(() => this.adoptBytesSerialized(bytes));
   }
 
   /** Coalesce duplicate/out-of-order vault events for the exact target only. */
@@ -197,7 +181,7 @@ export class PublicationManager {
           const stageDurationMs = Date.now() - stageStarted;
           try {
             phase = "inspect";
-            const inspection = await this.index.inspectPublication(staged.bytes);
+            const inspection = await this.index.inspectPublication(staged.bytes, true);
             if (inspection.publicationId !== id)
               throw new StructuredError("internal", "Publication ID changed in staged copy.", true);
             phase = "replace";

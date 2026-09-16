@@ -13,12 +13,10 @@ import {
   CHUNK_SIZE,
   EXTRACTION_VERSION,
   INDEX_SCHEMA_VERSION,
-  chunkMarkdown,
 } from "@/index/chunking";
 import {
   compareCodeUnits,
   corpusIdentityInput,
-  deriveNoteContentId,
   embeddingIdentityInput,
   indexIdentity,
   isPathExcluded,
@@ -32,7 +30,6 @@ import {
   SQLITE_SNAPSHOT_MAX_BYTES,
   sqliteError,
   type SqliteHit,
-  type SqliteNoteInput,
   type SqliteState,
   type SqliteNoteSummary,
   type SqliteReconciliationPlan,
@@ -191,6 +188,8 @@ export class IndexManager implements VaultSearchPort {
   private unavailable = false;
   private building = false;
   private maintenance = false;
+  private maintenanceFinished?: Promise<void>;
+  private releaseMaintenance?: () => void;
   private preparing = false;
   private freshness: IndexFreshness = "unknown";
   private loadPromise?: Promise<boolean>;
@@ -204,7 +203,6 @@ export class IndexManager implements VaultSearchPort {
   constructor(
     private readonly vault: IndexVaultPort,
     private readonly embedding: EmbeddingModel,
-    storage: object,
     private readonly embeddingBaseUrl: string,
     private readonly modelId: string,
     private readonly options: {
@@ -296,6 +294,24 @@ export class IndexManager implements VaultSearchPort {
   }
   isInMaintenance(): boolean {
     return this.maintenance;
+  }
+  private async waitForMaintenance(signal: AbortSignal): Promise<void> {
+    while (this.maintenance) {
+      await this.maintenanceFinished;
+      check(signal);
+    }
+  }
+  private beginMaintenance(): void {
+    this.maintenance = true;
+    this.maintenanceFinished = new Promise<void>((resolve) => {
+      this.releaseMaintenance = resolve;
+    });
+  }
+  private endMaintenance(): void {
+    this.maintenance = false;
+    this.releaseMaintenance?.();
+    this.releaseMaintenance = undefined;
+    this.maintenanceFinished = undefined;
   }
   isComplete(): boolean {
     return this.state?.incomplete === false;
@@ -391,9 +407,10 @@ export class IndexManager implements VaultSearchPort {
   }
 
   async build(signal: AbortSignal): Promise<void> {
-    if (this.maintenance)
-      throw new StructuredError("busy", "Index maintenance is in progress.", true);
+    await this.waitForMaintenance(signal);
     if (this.building) throw new StructuredError("busy", "Index rebuild is already running.", true);
+    if (this.preparing)
+      throw new StructuredError("busy", "Semantic index preparation is already running.", true);
     const run = this.buildInternal(signal);
     this.buildPromise = run;
     try {
@@ -440,23 +457,60 @@ export class IndexManager implements VaultSearchPort {
         estimated: plan.estimatedTexts !== undefined,
       });
       let encoded = 0;
+      let chunked = 0;
       for await (const note of this.noteInputs(plan, signal)) {
         check(signal);
-        const result = (await this.ensureClient().call("upsertNote", { note }, signal)) as {
-          state: SqliteState;
-        };
+        const result = (await this.ensureClient().call(
+          "upsertMarkdown",
+          {
+            path: note.path,
+            markdown: note.markdown,
+            expectedContentId: note.contentId,
+            size: this.options.size ?? CHUNK_SIZE,
+            overlap: this.options.overlap ?? CHUNK_OVERLAP,
+          },
+          signal
+        )) as SqliteMutationResult & { chunkCount: number };
+        if (result.rescan) {
+          this.queueChange();
+          continue;
+        }
         this.setState(result.state);
+        chunked += result.chunkCount;
+        this.reportProgress(
+          {
+            operation: "full",
+            phase: "chunk",
+            completed: chunked,
+            ...(plan.estimatedTexts === undefined || chunked > plan.estimatedTexts
+              ? { determinate: false as const }
+              : { total: plan.estimatedTexts, determinate: true as const, estimated: true }),
+            unit: "texts",
+          },
+          false
+        );
         encoded++;
-        this.reportProgress({
-          operation: "full",
-          phase: "encode-write",
-          completed: encoded,
-          total: plan.paths.length,
-          unit: "artifacts",
-          determinate: true,
-          generationId: this.generationId(),
-        });
+        this.reportProgress(
+          {
+            operation: "full",
+            phase: "encode-write",
+            completed: encoded,
+            total: plan.paths.length,
+            unit: "notes",
+            determinate: true,
+            generationId: this.generationId(),
+          },
+          false
+        );
       }
+      this.reportProgress({
+        operation: "full",
+        phase: "chunk",
+        completed: chunked,
+        total: chunked,
+        unit: "texts",
+        determinate: true,
+      });
       const finalWatermark = this.revision;
       const exact = await this.discoverEligible(signal);
       await this.finishIfStable(exact, signal, finalWatermark);
@@ -520,64 +574,33 @@ export class IndexManager implements VaultSearchPort {
   private async *noteInputs(
     plan: FullIndexPlan,
     signal: AbortSignal
-  ): AsyncIterable<SqliteNoteInput> {
+  ): AsyncIterable<{ path: string; markdown: string; contentId: string }> {
     const fingerprint = await this.corpusFingerprintId();
-    let chunked = 0;
-    const estimate = (completed: number) =>
-      plan.estimatedTexts !== undefined && completed <= plan.estimatedTexts
-        ? { total: plan.estimatedTexts, determinate: true as const, estimated: true }
-        : { determinate: false as const };
-    this.reportProgress({
-      operation: "full",
-      phase: "chunk",
-      completed: 0,
-      ...estimate(0),
-      unit: "texts",
-    });
     for (const path of plan.paths) {
       check(signal);
       const doc = await this.readMarkdownIfAvailable(path, signal, "full");
       if (!doc) continue;
-      const chunks = chunkMarkdown(
-        doc.content,
-        this.options.size ?? CHUNK_SIZE,
-        this.options.overlap ?? CHUNK_OVERLAP,
-        signal
-      );
-      chunked += chunks.length;
-      this.reportProgress({
-        operation: "full",
-        phase: "chunk",
-        completed: chunked,
-        ...estimate(chunked),
-        unit: "texts",
-      });
-      const contentId = await deriveNoteContentId(fingerprint, doc.content);
+      check(signal);
+      const contentId = await this.hashMarkdown(doc.content, fingerprint, signal);
       const current = await this.readMarkdownIfAvailable(path, signal, "full");
-      if (!current || (await deriveNoteContentId(fingerprint, current.content)) !== contentId) {
+      if (!current) {
         this.queueChange();
         continue;
       }
-      yield {
-        path,
-        contentId,
-        chunks: chunks.map((chunk, index) => ({
-          id: `${contentId}:${index}`,
-          ordinal: index,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          text: chunk.text,
-        })),
-      };
+      yield { path, markdown: current.content, contentId };
     }
-    this.reportProgress({
-      operation: "full",
-      phase: "chunk",
-      completed: chunked,
-      total: chunked,
-      unit: "texts",
-      determinate: true,
-    });
+  }
+
+  private async hashMarkdown(
+    markdown: string,
+    corpusFingerprint: string,
+    signal: AbortSignal
+  ): Promise<string> {
+    return (await this.ensureClient().call(
+      "hashMarkdown",
+      { markdown, corpusFingerprint },
+      signal
+    )) as string;
   }
 
   async synchronize(signal: AbortSignal): Promise<IndexSyncResult> {
@@ -597,9 +620,10 @@ export class IndexManager implements VaultSearchPort {
     signal: AbortSignal,
     phase?: "queued"
   ): Promise<IndexSyncResult> {
-    if (this.maintenance)
-      throw new StructuredError("busy", "Index maintenance is in progress.", true);
+    await this.waitForMaintenance(signal);
     if (this.building) throw new StructuredError("busy", "Index update is already running.", true);
+    if (this.preparing)
+      throw new StructuredError("busy", "Semantic index preparation is already running.", true);
     check(signal);
     this.building = true;
     const started = Date.now();
@@ -637,9 +661,9 @@ export class IndexManager implements VaultSearchPort {
       // remains incomplete and is retried by the plugin.
       for (let pass = 0; pass < 8; pass++) {
         const watermark = this.revision;
-        const discovered = await this.discoverEligible(signal);
+        const discovered = await this.discoverEligible(signal, "build-lexical");
         changed ||= await this.reconcileDiscovered(discovered, signal);
-        const final = await this.discoverEligible(signal);
+        const final = await this.discoverEligible(signal, "validate");
         if (watermark !== this.revision || !sameSummaries(discovered, final)) continue;
         const finished = await this.finishIfStable(final, signal, watermark);
         if (finished && watermark === this.revision) {
@@ -672,17 +696,46 @@ export class IndexManager implements VaultSearchPort {
     }
   }
 
-  private async discoverEligible(signal: AbortSignal): Promise<readonly SqliteNoteSummary[]> {
+  private async discoverEligible(
+    signal: AbortSignal,
+    progressPhase?: "build-lexical" | "validate"
+  ): Promise<readonly SqliteNoteSummary[]> {
     const paths = [...(await this.vault.listMarkdownPaths(signal))]
       .map(normalizePath)
       .filter((path) => this.isIndexEligible(path))
       .sort(compareCodeUnits);
     const fingerprint = await this.corpusFingerprintId();
     const summaries: SqliteNoteSummary[] = [];
-    for (const path of paths) {
+    if (progressPhase)
+      this.reportProgress({
+        operation: "incremental",
+        phase: progressPhase,
+        completed: 0,
+        total: paths.length,
+        unit: "notes",
+        determinate: true,
+      });
+    for (const [index, path] of paths.entries()) {
       const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
-      if (doc)
-        summaries.push({ path, contentId: await deriveNoteContentId(fingerprint, doc.content) });
+      if (doc) {
+        check(signal);
+        summaries.push({
+          path,
+          contentId: await this.hashMarkdown(doc.content, fingerprint, signal),
+        });
+      }
+      if (progressPhase)
+        this.reportProgress(
+          {
+            operation: "incremental",
+            phase: progressPhase,
+            completed: index + 1,
+            total: paths.length,
+            unit: "notes",
+            determinate: true,
+          },
+          false
+        );
     }
     return summaries;
   }
@@ -698,6 +751,20 @@ export class IndexManager implements VaultSearchPort {
     )) as SqliteReconciliationPlan;
     this.setState(plan.state);
     let changed = false;
+    const total = plan.renames.length + plan.upserts.length + plan.deletes.length;
+    let completed = 0;
+    const reportWrite = () =>
+      this.reportProgress(
+        {
+          operation: "incremental",
+          phase: "encode-write",
+          completed: ++completed,
+          total,
+          unit: "notes",
+          determinate: true,
+        },
+        false
+      );
     for (const rename of plan.renames) {
       const result = (await this.ensureClient().call(
         "renameNote",
@@ -706,30 +773,31 @@ export class IndexManager implements VaultSearchPort {
       )) as SqliteMutationResult;
       this.setState(result.state);
       changed ||= result.changed;
+      reportWrite();
     }
 
     for (const summary of plan.upserts) {
       check(signal);
       const doc = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
       if (!doc) continue;
-      const note = await this.prepareNote(summary.path, doc, signal);
-      if (!note) continue;
-      const latest = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
-      if (
-        !latest ||
-        (await deriveNoteContentId(await this.corpusFingerprintId(), latest.content)) !==
-          note.contentId
-      ) {
+      const result = (await this.ensureClient().call(
+        "upsertMarkdown",
+        {
+          path: summary.path,
+          markdown: doc.content,
+          expectedContentId: summary.contentId,
+          size: this.options.size ?? CHUNK_SIZE,
+          overlap: this.options.overlap ?? CHUNK_OVERLAP,
+        },
+        signal
+      )) as SqliteMutationResult;
+      if (result.rescan) {
         this.queueChange();
         continue;
       }
-      const result = (await this.ensureClient().call(
-        "upsertNote",
-        { note },
-        signal
-      )) as SqliteMutationResult;
       this.setState(result.state);
       changed ||= result.changed;
+      reportWrite();
     }
 
     for (const note of plan.deletes) {
@@ -740,39 +808,9 @@ export class IndexManager implements VaultSearchPort {
       )) as SqliteMutationResult;
       this.setState(result.state);
       changed ||= result.changed;
+      reportWrite();
     }
     return changed;
-  }
-  private async prepareNote(
-    path: string,
-    doc: IndexVaultDocument,
-    signal: AbortSignal
-  ): Promise<SqliteNoteInput | undefined> {
-    check(signal);
-    const fingerprint = await this.corpusFingerprintId();
-    const contentId = await deriveNoteContentId(fingerprint, doc.content);
-    const chunks = chunkMarkdown(
-      doc.content,
-      this.options.size ?? CHUNK_SIZE,
-      this.options.overlap ?? CHUNK_OVERLAP,
-      signal
-    );
-    const current = await this.readMarkdownIfAvailable(path, signal, "incremental");
-    if (!current || (await deriveNoteContentId(fingerprint, current.content)) !== contentId) {
-      this.queueChange();
-      return undefined;
-    }
-    return {
-      path,
-      contentId,
-      chunks: chunks.map((chunk, index) => ({
-        id: `${contentId}:${index}`,
-        ordinal: index,
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-        text: chunk.text,
-      })),
-    };
   }
   private async finishIfStable(
     summaries: readonly SqliteNoteSummary[],
@@ -808,6 +846,7 @@ export class IndexManager implements VaultSearchPort {
 
   queueChange(): void {
     this.revision++;
+    this.freshness = "unknown";
   }
 
   private notifySuccessfulOperation(result: IndexOperationResult): void {
@@ -835,24 +874,53 @@ export class IndexManager implements VaultSearchPort {
 
   /** Enriches the lexical corpus in bounded, resumable batches. */
   async prepareSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    if (this.building || this.maintenance || this.preparing)
+    return this.runSemanticPreparation(signal, false);
+  }
+
+  async rebuildSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    return this.runSemanticPreparation(signal, true);
+  }
+
+  private async runSemanticPreparation(
+    signal: AbortSignal,
+    rebuild: boolean
+  ): Promise<SemanticPrepareResult> {
+    await this.waitForMaintenance(signal);
+    if (this.building || this.preparing)
       throw new StructuredError("busy", "Index maintenance is already running.", true);
     check(signal);
-    if (!this.loaded) await this.load();
-    if (this.unavailable || !this.state)
-      throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
     this.preparing = true;
     let stored = 0;
     let skipped = 0;
-    const embeddingFingerprint = await this.embeddingFingerprintId();
-    const batchSize = Math.min(512, Math.max(1, Math.floor(this.options.prepareBatchSize ?? 128)));
+    const operation = rebuild ? "full" : "incremental";
     const started = Date.now();
+    const initialRevision = this.revision;
     try {
+      if (!this.loaded) await this.load();
+      if (this.unavailable || !this.state)
+        throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+      const embeddingFingerprint = await this.embeddingFingerprintId();
+      const batchSize = Math.min(
+        512,
+        Math.max(1, Math.floor(this.options.prepareBatchSize ?? 128))
+      );
+      if (rebuild)
+        this.setState((await this.ensureClient().call("clearVectors", {}, signal)) as SqliteState);
+      const totalMissing = this.state.chunkCount - this.state.compatibleVectorCount;
+      this.reportProgress({
+        operation,
+        phase: "build-vector",
+        completed: 0,
+        total: totalMissing,
+        unit: "chunks",
+        determinate: true,
+      });
       let afterChunkPk = 0;
       for (;;) {
         check(signal);
+        // Vault edits queue a later lexical update; this run finishes vectors
+        // for the committed SQLite corpus without applying those edits mid-run.
         const observedChangeCounter = this.changeCounter();
-        const observedRevision = this.revision;
         const missing = (await this.ensureClient().call(
           "listMissingVectors",
           { embeddingFingerprint, limit: batchSize, afterChunkPk },
@@ -863,14 +931,17 @@ export class IndexManager implements VaultSearchPort {
           missing.map((item) => item.text),
           signal,
           (progress) =>
-            this.reportProgress({
-              operation: "incremental",
-              phase: "build-vector",
-              completed: stored + progress.completed,
-              total: stored + missing.length,
-              unit: "chunks",
-              determinate: true,
-            })
+            this.reportProgress(
+              {
+                operation,
+                phase: "build-vector",
+                completed: stored + progress.completed,
+                total: Math.max(totalMissing, stored + missing.length),
+                unit: "chunks",
+                determinate: true,
+              },
+              false
+            )
         );
         if (
           vectors.length !== missing.length ||
@@ -881,14 +952,6 @@ export class IndexManager implements VaultSearchPort {
             "Embedding dimensions changed during preparation.",
             false
           );
-        // Vault events are an independent stale fence until reconciliation
-        // commits them to SQLite. Never attach a delayed batch after one.
-        if (this.revision !== observedRevision) {
-          skipped += missing.length;
-          // Leave the batch uncommitted. The caller must reconcile the vault
-          // change before preparation can safely resume.
-          break;
-        }
         const result = (await this.ensureClient().call(
           "storeVectors",
           {
@@ -911,19 +974,23 @@ export class IndexManager implements VaultSearchPort {
         if (result.skipped && result.state.changeCounter !== observedChangeCounter)
           afterChunkPk = 0;
         else afterChunkPk = missing.at(-1)!.chunkPk;
-        this.reportProgress({
-          operation: "incremental",
-          phase: "build-vector",
-          completed: stored,
-          unit: "chunks",
-          determinate: false,
-        });
+        this.reportProgress(
+          {
+            operation,
+            phase: "build-vector",
+            completed: stored,
+            total: Math.max(totalMissing, stored),
+            unit: "chunks",
+            determinate: true,
+          },
+          false
+        );
       }
       const finalState = this.state!;
       const result: SemanticPrepareResult = {
-        operation: "prepare",
+        operation: rebuild ? "rebuild" : "prepare",
         changed: stored > 0,
-        converged: finalState.semanticReady,
+        converged: finalState.semanticReady && this.revision === initialRevision,
         state: finalState,
         stored,
         skipped,
@@ -932,7 +999,7 @@ export class IndexManager implements VaultSearchPort {
       this.emit({
         area: "index",
         event: "index_operation",
-        operation: "incremental",
+        operation,
         stage: "completed",
         phase: "build-vector",
         durationMs: Date.now() - started,
@@ -948,41 +1015,6 @@ export class IndexManager implements VaultSearchPort {
     return this.prepareSemantic(signal);
   }
 
-  async preparePublication(publicationId: string): Promise<PublicationPrepared> {
-    if (this.building || this.preparing || this.maintenance)
-      throw new StructuredError("busy", "Index maintenance is already running.", true);
-    if (!publicationId)
-      throw new StructuredError("invalid_request", "Publication ID is required.", false);
-    if (!this.loaded) await this.load();
-    if (this.unavailable || !this.state)
-      throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    if (this.state.incomplete)
-      throw new StructuredError("busy", "Index must be converged before publication.", true);
-    this.maintenance = true;
-    try {
-      return (await this.ensureClient().call("preparePublication", {
-        publicationId,
-      })) as PublicationPrepared;
-    } finally {
-      this.maintenance = false;
-    }
-  }
-
-  async finalizePublication(
-    publicationId: string,
-    expectedChangeCounter: number
-  ): Promise<SqliteState | undefined> {
-    if (!this.loaded) await this.load();
-    if (this.unavailable || !this.state)
-      throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    const state = (await this.ensureClient().call("finalizePublication", {
-      publicationId,
-      expectedChangeCounter,
-    })) as SqliteState | undefined;
-    if (state) this.setState(state);
-    return state;
-  }
-
   /** Keep local mutations and adoption out until the vault copy and live ID agree. */
   async publishPublication<T>(
     publicationId: string,
@@ -993,7 +1025,7 @@ export class IndexManager implements VaultSearchPort {
       throw new StructuredError("busy", "Index maintenance is already running.", true);
     if (!publicationId)
       throw new StructuredError("invalid_request", "Publication ID is required.", false);
-    this.maintenance = true;
+    this.beginMaintenance();
     try {
       if (!this.loaded) await this.load();
       if (this.unavailable || !this.state)
@@ -1019,11 +1051,14 @@ export class IndexManager implements VaultSearchPort {
       await settle(true);
       return { prepared, installed };
     } finally {
-      this.maintenance = false;
+      this.endMaintenance();
     }
   }
 
-  async inspectPublication(bytes: ArrayBuffer): Promise<PublicationInspection> {
+  async inspectPublication(
+    bytes: ArrayBuffer,
+    transferOwnership = false
+  ): Promise<PublicationInspection> {
     if (
       !(bytes instanceof ArrayBuffer) ||
       !bytes.byteLength ||
@@ -1033,13 +1068,18 @@ export class IndexManager implements VaultSearchPort {
     if (!this.loaded) await this.load();
     if (this.unavailable || !this.state)
       throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    return (await this.ensureClient().call("inspectPublication", {
-      bytes,
-      corpusFingerprint: await this.corpusFingerprintId(),
-      embeddingFingerprint: await this.embeddingFingerprintId(),
-      buildIdentity: SQLITE_BUILD_IDENTITY,
-      dimensions: this.embedding.dimensions,
-    })) as PublicationInspection;
+    return (await this.ensureClient().call(
+      "inspectPublication",
+      {
+        bytes,
+        corpusFingerprint: await this.corpusFingerprintId(),
+        embeddingFingerprint: await this.embeddingFingerprintId(),
+        buildIdentity: SQLITE_BUILD_IDENTITY,
+        dimensions: this.embedding.dimensions,
+      },
+      undefined,
+      { transferOwnedBytes: transferOwnership }
+    )) as PublicationInspection;
   }
 
   /** Adopt a validated publication directly; no Markdown reconciliation or republish follows. */
@@ -1052,11 +1092,11 @@ export class IndexManager implements VaultSearchPort {
       bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES
     )
       throw new StructuredError("invalid_request", "Publication bytes are invalid.", false);
-    if (!this.loaded) await this.load();
-    if (this.unavailable || !this.state)
-      throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    this.maintenance = true;
+    this.beginMaintenance();
     try {
+      if (!this.loaded) await this.load();
+      if (this.unavailable || !this.state)
+        throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
       const state = (await this.ensureClient().call("adoptPublication", {
         bytes,
         expectedPublicationId,
@@ -1074,7 +1114,7 @@ export class IndexManager implements VaultSearchPort {
           : "locally-reconciled";
       return state;
     } finally {
-      this.maintenance = false;
+      this.endMaintenance();
     }
   }
 
@@ -1143,7 +1183,7 @@ export class IndexManager implements VaultSearchPort {
       if ((mode === "semantic" || mode === "related") && !semanticReady)
         throw new StructuredError(
           "unavailable",
-          "Semantic vectors are not ready. Prepare the semantic index first.",
+          "Semantic vectors are not ready. Update the semantic index first.",
           true
         );
       let queryVector = vector ? new Float32Array(vector) : undefined;
@@ -1242,7 +1282,7 @@ export class IndexManager implements VaultSearchPort {
     if (!this.hasUsableIndex() || !this.isSemanticReady())
       throw new StructuredError(
         "unavailable",
-        "Semantic vectors are not ready. Prepare the semantic index first.",
+        "Semantic vectors are not ready. Update the semantic index first.",
         true
       );
     const hits = (await this.ensureClient().call(

@@ -3,10 +3,7 @@ import {
   PublicationManager,
   type PublicationIndexPort,
 } from "@/index/publications/PublicationManager";
-import {
-  PublicationStore,
-  type PublicationDataAdapter,
-} from "@/index/publications/PublicationStore";
+import { type PublicationDataAdapter } from "@/index/publications/PublicationStore";
 import type {
   PublicationInspection,
   PublicationPrepared,
@@ -30,7 +27,6 @@ const state = (publicationId?: string): SqliteState => ({
   vectorCoverage: "complete",
   semanticReady: true,
   ...(publicationId ? { publicationId } : {}),
-  fingerprint: "legacy",
 });
 
 function setup() {
@@ -113,10 +109,32 @@ describe("PublicationManager", () => {
     expect(fixture.getLive().publicationId).toBe("publication-1");
   });
 
+  it("can finish publication after inspection transfers the read-back buffer", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter, {
+      idFactory: () => "transferred",
+    });
+    vi.mocked(fixture.index.inspectPublication).mockImplementation(
+      async (bytes, transferOwnership) => {
+        expect(transferOwnership).toBe(true);
+        structuredClone(bytes, { transfer: [bytes] });
+        return {
+          valid: true,
+          publicationId: "transferred",
+          state: state("transferred"),
+          byteSize: 3,
+        };
+      }
+    );
+
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect([...new Uint8Array((await manager.store.read())!)]).toEqual([9, 8, 7]);
+  });
+
   it("coalesces exact-file events and adopts a differing ID without republishing", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter, { debounceMs: 100 });
-    await manager.store.install(fixture.bytes, "remote");
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
     manager.notifyFileEvent("Trama/index/index.sqlite3");
     manager.notifyFileEvent("Trama/index/index.sqlite3");
     manager.notifyFileEvent("other.md");
@@ -157,7 +175,7 @@ describe("PublicationManager", () => {
     const manager = new PublicationManager(fixture.index, fixture.adapter, {
       idFactory: () => "publication-3",
     });
-    await manager.store.install(fixture.bytes, "old");
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "old"));
     const oldBytes = await manager.store.read();
     vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(new Error("invalid SQLite"));
     await expect(manager.publish()).resolves.toMatchObject({

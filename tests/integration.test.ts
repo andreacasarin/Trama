@@ -39,7 +39,6 @@ describe("integration composition seams", () => {
         readMarkdown: async () => ({ path: "missing.md", content: "" }),
       },
       new FakeEmbedding(),
-      {},
       "http://127.0.0.1:1234/v1",
       "embed-v1",
       {
@@ -69,24 +68,14 @@ describe("integration composition seams", () => {
       },
     };
     const sqliteClient = createTestSqliteClient(storage);
-    const first = new IndexManager(
-      port,
-      embedding,
-      storage,
-      "http://127.0.0.1:1234/v1",
-      "embed-v1",
-      { sqliteClient }
-    );
+    const first = new IndexManager(port, embedding, "http://127.0.0.1:1234/v1", "embed-v1", {
+      sqliteClient,
+    });
     await first.build(new AbortController().signal);
     expect(await first.search("alpha", new AbortController().signal, 10)).toHaveLength(2);
-    const restarted = new IndexManager(
-      port,
-      embedding,
-      storage,
-      "http://127.0.0.1:1234/v1",
-      "embed-v1",
-      { sqliteClient: createTestSqliteClient(storage) }
-    );
+    const restarted = new IndexManager(port, embedding, "http://127.0.0.1:1234/v1", "embed-v1", {
+      sqliteClient: createTestSqliteClient(storage),
+    });
     expect(await restarted.load()).toBe(true);
   });
 

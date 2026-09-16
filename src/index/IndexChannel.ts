@@ -26,7 +26,7 @@ export const semanticIndex: IndexChannel = {
     if (state.compatibleVectorCount === 0)
       return { state: "incompatible", activity, searchable: false };
     if (state.incomplete || state.vectorCoverage === "partial")
-      return { state: "partial", activity, searchable: false };
+      return { state: "partial", activity, searchable: true };
     return state.semanticReady
       ? { state: "ready", activity, searchable: true }
       : { state: "partial", activity, searchable: false };

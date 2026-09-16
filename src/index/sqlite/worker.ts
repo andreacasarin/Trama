@@ -3,7 +3,6 @@ import { SqliteScheduler } from "./scheduler";
 import {
   closeWorkerDatabase,
   exportOpfsDatabase,
-  type OpfsSAHPoolUtilLike,
   type WorkerStorageState,
 } from "./worker-lifecycle";
 import {
@@ -15,6 +14,7 @@ import {
   sqliteError,
 } from "./protocol";
 import { SQLITE_BUILD_IDENTITY } from "../../build/identity";
+import { hashMarkdown, upsertMarkdown } from "./markdown";
 
 type SqliteModule = {
   oo1: { DB: new (name: string, mode: string) => SqliteConnection };
@@ -41,6 +41,14 @@ const scheduler = new SqliteScheduler();
 let sqliteModulePromise: Promise<SqliteModule> | undefined;
 let databaseIdentity = "default";
 let maintenance = false;
+let bootConfig:
+  | {
+      corpusFingerprint: string;
+      embeddingFingerprint: string;
+      buildIdentity: string;
+      dimensions: number;
+    }
+  | undefined;
 
 async function initializeSqlite(): Promise<SqliteModule> {
   const assets = (
@@ -99,6 +107,19 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
   });
   storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
   storage.database = new MutableSqliteDatabase(storage.connection);
+  if (bootConfig) {
+    try {
+      storage.database.boot(
+        bootConfig.corpusFingerprint,
+        bootConfig.dimensions,
+        bootConfig.embeddingFingerprint,
+        bootConfig.buildIdentity
+      );
+    } catch (error) {
+      closeConnection();
+      throw error;
+    }
+  }
   return storage.database;
 }
 function closeConnection(): void {
@@ -247,18 +268,28 @@ async function adoptPublication(bytes: ArrayBuffer, payload: any): Promise<unkno
     throw error;
   }
 }
-async function handle(request: SqliteRequest): Promise<unknown> {
+async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unknown> {
   const p: any = request.payload;
-  if (request.method === "boot")
-    return (await openDatabase(p.identity ?? "default")).boot(
-      p.corpusFingerprint ?? p.fingerprint,
-      p.dimensions,
-      p.embeddingFingerprint ?? "",
-      p.buildIdentity ?? SQLITE_BUILD_IDENTITY
+  if (request.method === "boot") {
+    const config = {
+      corpusFingerprint: p.corpusFingerprint as string,
+      dimensions: p.dimensions as number,
+      embeddingFingerprint: (p.embeddingFingerprint ?? "") as string,
+      buildIdentity: (p.buildIdentity ?? SQLITE_BUILD_IDENTITY) as string,
+    };
+    const state = (await openDatabase(p.identity ?? "default")).boot(
+      config.corpusFingerprint,
+      config.dimensions,
+      config.embeddingFingerprint,
+      config.buildIdentity
     );
+    bootConfig = config;
+    return state;
+  }
   if (request.method === "shutdown") {
     scheduler.shutdown();
     closeConnection();
+    bootConfig = undefined;
     return { closed: true };
   }
   if (
@@ -267,13 +298,10 @@ async function handle(request: SqliteRequest): Promise<unknown> {
       "finalizePublication",
       "inspectPublication",
       "adoptPublication",
-      "export",
-      "import",
     ].includes(request.method)
   ) {
     if (request.method === "preparePublication") return preparePublication(p.publicationId);
     const db = await openDatabase();
-    const state = db.getState();
     if (request.method === "finalizePublication") {
       const result = db.finalizePublication(p.publicationId, p.expectedChangeCounter);
       if (!result)
@@ -286,11 +314,7 @@ async function handle(request: SqliteRequest): Promise<unknown> {
     }
     if (request.method === "inspectPublication") return inspectPublication(p.bytes, p);
     if (request.method === "adoptPublication") return adoptPublication(p.bytes, p);
-    if (request.method === "export") {
-      db.validateSnapshot(state.corpusFingerprint, state.dimensions, state.embeddingFingerprint);
-      return liveBytes();
-    }
-    return adoptPublication(p.bytes, {});
+    throw sqliteError("unsupported", "Unknown maintenance method");
   }
   const db = await openDatabase();
   switch (request.method) {
@@ -304,8 +328,12 @@ async function handle(request: SqliteRequest): Promise<unknown> {
       return db.markIncomplete();
     case "beginRebuild":
       return db.beginRebuild();
-    case "upsertNote":
-      return db.upsertNote(p.note);
+    case "clearVectors":
+      return db.clearVectors();
+    case "hashMarkdown":
+      return hashMarkdown(p.markdown, p.corpusFingerprint, signal);
+    case "upsertMarkdown":
+      return upsertMarkdown(db, p.path, p.markdown, p.expectedContentId, p.size, p.overlap, signal);
     case "renameNote":
       return db.renameNote(p.from, p.to, p.contentId);
     case "deleteNote":
@@ -367,12 +395,10 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
     "finalizePublication",
     "inspectPublication",
     "adoptPublication",
-    "export",
-    "import",
   ].includes(request.method);
   if (isMaintenance) maintenance = true;
   void scheduler
-    .enqueue(request.id, () => handle(request))
+    .enqueue(request.id, (signal) => handle(request, signal))
     .then(
       (result) => {
         if (isMaintenance) maintenance = false;

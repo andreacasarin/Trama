@@ -25,7 +25,6 @@ describe("mutable SQLite reconciliation", () => {
           startLine: 1,
           endLine: 1,
           text: "same",
-          vector: new Float32Array([1, 0]),
         },
       ],
     });

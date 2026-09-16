@@ -2,9 +2,47 @@ import { describe, expect, it } from "vitest";
 import { literalTerms, safeFtsQuery } from "@/index/sqlite/database";
 import { schemaSql } from "@/index/sqlite/schema";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
+import { hashMarkdown, upsertMarkdown } from "@/index/sqlite/markdown";
+import { chunkMarkdown } from "@/index/chunking";
 import { loadTestSqlite } from "./sqlite-test-client";
 
 describe("SQLite schema/query foundation", () => {
+  it("hashes and chunks Markdown before one guarded lexical upsert", async () => {
+    const sqlite = await loadTestSqlite();
+    const raw = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(raw);
+    const fingerprint = "c".repeat(64);
+    const markdown = "alpha\r\nbeta\n" + "long ".repeat(100);
+    index.boot(fingerprint, 2);
+    const contentId = await hashMarkdown(markdown, fingerprint);
+
+    const stale = await upsertMarkdown(index, "note.md", markdown, "0".repeat(64), 100, 10);
+    expect(stale).toMatchObject({ status: "state_changed", changed: false, rescan: true });
+    expect(index.getState().noteCount).toBe(0);
+
+    const result = await upsertMarkdown(index, "note.md", markdown, contentId, 100, 10);
+    expect(result.chunkCount).toBe(chunkMarkdown(markdown, 100, 10).length);
+    expect(index.listNotes()).toMatchObject([{ path: "note.md", contentId }]);
+    expect(index.retrieve("long", undefined, 5)).toHaveLength(5);
+    index.close();
+  });
+
+  it("does not write a note after an indexing job is cancelled", async () => {
+    const sqlite = await loadTestSqlite();
+    const raw = new sqlite.oo1.DB(":memory:", "c");
+    const index = new MutableSqliteDatabase(raw);
+    const fingerprint = "c".repeat(64);
+    index.boot(fingerprint, 2);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      upsertMarkdown(index, "note.md", "alpha", "0".repeat(64), 384, 64, controller.signal)
+    ).rejects.toMatchObject({ error: { code: "cancelled" } });
+    expect(index.getState().noteCount).toBe(0);
+    index.close();
+  });
+
   it("bounds literal FTS terms without evaluating query grammar", () => {
     expect(literalTerms('alpha OR beta "quoted" -tag')).toEqual([
       "alpha",
@@ -49,11 +87,23 @@ describe("SQLite schema/query foundation", () => {
             startLine: 1,
             endLine: 1,
             text: "alpha",
-            vector: new Float32Array([1, 0]),
           },
         ],
       }).changed
     ).toBe(true);
+    const [missing] = index.listMissingVectors("", 1);
+    index.storeVectors(
+      [
+        {
+          chunkPk: missing.chunkPk,
+          chunkId: missing.chunkId,
+          contentId: missing.contentId,
+          vector: new Float32Array([1, 0]),
+        },
+      ],
+      "",
+      index.getState().changeCounter
+    );
     expect(index.retrieve("alpha", undefined, 5)[0].path).toBe("a.md");
     expect(index.retrieve(undefined, new Float32Array([1, 0]), 5)[0].score).toBe(1);
     const beforeRename = index.retrieve(undefined, new Float32Array([1, 0]), 1)[0];

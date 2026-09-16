@@ -9,7 +9,6 @@ import {
 } from "@/index/LenteSearch";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
-import type { IndexFreshness } from "@/domain/contracts";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
 
@@ -260,7 +259,9 @@ export class LenteView extends ItemView {
     if (this.batch.freshness === "snapshot-loaded")
       messages.push("Snapshot loaded; not reconciled with the current vault.");
     else if (this.batch.freshness === "unknown")
-      messages.push("Index may be stale; update required.");
+      messages.push("Lexical index may be stale; update required.");
+    if (this.batch.semanticPartial)
+      messages.push("Semantic index is incomplete; search uses available vectors.");
     return messages.join(" ");
   }
   private messageForError(error: unknown): string {
@@ -268,8 +269,8 @@ export class LenteView extends ItemView {
       error && typeof error === "object" && "code" in error
         ? (error as { code?: unknown }).code
         : undefined;
-    if (code === "busy") return "Updating index…";
-    if (code === "unavailable") return "Index unavailable. Reindex required.";
+    if (code === "busy") return "Lexical or semantic index operation in progress…";
+    if (code === "unavailable") return "Lexical index unavailable. Rebuild lexical index.";
     return "Search failed. Try again.";
   }
   private renderRows(): void {

@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { ReadonlyVault } from "@/domain/contracts";
 import {
   CurrentNoteTool,
   DiscoverLinksTool,

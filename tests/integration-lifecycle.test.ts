@@ -230,9 +230,15 @@ describe("TramaPlugin lifecycle integration", () => {
     };
     plugin.indexReady = true;
     plugin.lifecycleAbort = new AbortController();
-    plugin.indexStatus = { setUpdating: vi.fn(), setReady: vi.fn(), markStale: vi.fn() };
+    plugin.indexStatus = {
+      setUpdating: vi.fn(),
+      setReady: vi.fn(),
+      markStale: vi.fn(),
+      setCapabilities: vi.fn(),
+    };
     plugin.index = {
       isBuilding: () => false,
+      capabilities: () => ({ semantic: { activity: "idle" } }),
       isComplete: () => true,
       reconcileQueuedChanges: vi
         .fn()
@@ -282,7 +288,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(7);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(10);
     expect(plugin.registerView).toHaveBeenCalledTimes(3);
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
     expect(plugin.registerView).toHaveBeenCalledWith("trama-filo", expect.any(Function));
@@ -294,6 +300,9 @@ describe("TramaPlugin lifecycle integration", () => {
     ).toEqual([
       "index-filo-vault",
       "reindex-filo-vault",
+      "prepare-semantic-index",
+      "rebuild-semantic-index",
+      "rebuild-both-indexes",
       "cancel-filo-indexing",
       "open-voce",
       "open-filo",
@@ -433,10 +442,33 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(7);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(10);
     expect(plugin.registerView).toHaveBeenCalledTimes(3);
     expect(plugin.registerEvent).toHaveBeenCalledTimes(4);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds lexical before semantic through the combined command", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const order: string[] = [];
+    vi.spyOn(plugin.index, "build").mockImplementation(async () => {
+      order.push("lexical");
+    });
+    vi.spyOn(plugin.index, "isComplete").mockReturnValue(true);
+    vi.spyOn(plugin.index, "rebuildSemantic").mockImplementation(async () => {
+      order.push("semantic");
+      return { operation: "rebuild", changed: true, converged: true, state: {} } as any;
+    });
+    const command = plugin.addCommand.mock.calls.find(
+      ([item]: [{ id: string }]) => item.id === "rebuild-both-indexes"
+    )[0].callback;
+
+    command();
+    await vi.waitFor(() => expect(order).toEqual(["lexical", "semantic"]));
+    await vi.waitFor(() => expect(plugin.getIndexStatus()?.kind).toBe("ready"));
   });
 
   it("replaces chat and embedding composition on saved settings and invalidates the old index", async () => {
@@ -599,7 +631,7 @@ describe("TramaPlugin lifecycle integration", () => {
     releaseRead();
     await save;
     expect(dispose).toHaveBeenCalledTimes(1);
-    await expect(oldRebuild).rejects.toThrow("Operation cancelled");
+    await expect(oldRebuild).rejects.toMatchObject({ code: "cancelled" });
     const newIndex = (plugin as any).index;
     expect(newIndex).not.toBe(oldIndex);
     expect(newIndex.fingerprint().modelId).toBe("embed-v2");
@@ -1164,7 +1196,7 @@ describe("TramaPlugin lifecycle integration", () => {
 
     expect(status.getStatus()).toMatchObject({
       kind: "updating",
-      message: "Creating embeddings — 2 of 4 texts",
+      message: "Embedding semantic index chunks — 2 of 4 texts",
       progress: { operation: "incremental", phase: "embed", completed: 2, total: 4 },
     });
   });
@@ -1327,7 +1359,7 @@ describe("TramaPlugin lifecycle integration", () => {
 
     expect(status.getStatus()).toMatchObject({
       etaSeconds: 8,
-      message: "Creating embeddings — 4 of about 20 texts · about 8 sec remaining",
+      message: "Embedding semantic index chunks — 4 of about 20 texts · about 8 sec remaining",
     });
   });
 });

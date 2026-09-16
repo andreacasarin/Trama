@@ -77,6 +77,7 @@ export interface LenteBatch {
   readonly freshness?: IndexFreshness;
   readonly publicationId?: string;
   readonly displayLimit: number;
+  readonly semanticPartial?: boolean;
   readonly results: readonly LenteResult[];
   /** Full deterministic candidate pool retained for local sort/display projection. */
   readonly canonicalResults?: readonly LenteResult[];
@@ -144,6 +145,7 @@ export class LenteSearch {
         degraded,
         ...(degradationReason ? { degradationReason } : {}),
         ...(state.freshness ? { freshness: state.freshness } : {}),
+        ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
         ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         displayLimit,
         results,

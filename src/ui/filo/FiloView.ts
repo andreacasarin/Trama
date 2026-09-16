@@ -192,30 +192,30 @@ export class FiloView extends ItemView {
     if (status.kind === "loading") {
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
-        text: "Loading index…",
+        text: "Loading lexical and semantic indexes…",
       });
       return;
     }
     if (capabilities?.availability === "unavailable") {
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: "SQLite index is unavailable. Related notes cannot be loaded.",
+        text: "SQLite lexical and semantic indexes are unavailable. Related notes cannot be loaded.",
       });
       return;
     }
     if (status.kind === "index-required") {
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
-        text: "Index your vault to discover related notes.",
+        text: "Build the lexical index, then update the semantic index to discover related notes.",
       });
-      if (status.canIndex) this.actionButton("Build index", "index");
+      if (status.canIndex) this.actionButton("Build lexical index", "index");
       return;
     }
-    if (status.kind === "building" || status.kind === "cancelling") {
+    if (status.kind === "building" || status.kind === "preparing" || status.kind === "cancelling") {
       if (status.kind === "cancelling" || !this.renderProgress(status))
         this.root.createDiv({
           cls: "setting-item-description trama-filo__message",
-          text: status.message ?? "Building index…",
+          text: status.message ?? "Updating lexical or semantic index…",
         });
       if (status.canCancel) this.actionButton("Cancel", "cancel");
       return;
@@ -224,10 +224,10 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Index has changes; update required.",
+        text: status.message ?? "Lexical index has changes; update required.",
       });
-      if (status.canIndex) this.actionButton("Update index", "index");
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      if (status.canIndex) this.actionButton("Update lexical index", "index");
+      if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -235,10 +235,12 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Indexing failed.",
+        text: status.message ?? "Lexical or semantic indexing failed.",
       });
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Build index", "index");
+      if (status.channel === "semantic") {
+        if (status.canPrepare) this.semanticButtons();
+      } else if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
+      else if (status.canIndex) this.actionButton("Build lexical index", "index");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -246,10 +248,12 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Indexing cancelled.",
+        text: status.message ?? "Lexical or semantic indexing cancelled.",
       });
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Build index", "index");
+      if (status.channel === "semantic") {
+        if (status.canPrepare) this.semanticButtons();
+      } else if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
+      else if (status.canIndex) this.actionButton("Build lexical index", "index");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -258,7 +262,7 @@ export class FiloView extends ItemView {
       if (!this.renderProgress(status))
         this.root.createDiv({
           cls: "setting-item-description trama-filo__message",
-          text: "Updating index…",
+          text: "Updating lexical index…",
         });
       return;
     }
@@ -267,24 +271,24 @@ export class FiloView extends ItemView {
         cls: "setting-item-description trama-filo__message",
         text: "No related notes found.",
       });
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Build index", "index");
+      if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
+      else if (status.canIndex) this.actionButton("Build lexical index", "index");
       return;
     }
     if (capabilities && !capabilities.semantic.searchable) {
       const message =
         capabilities.semantic.activity === "updating"
-          ? "Preparing semantic search…"
+          ? "Updating semantic index…"
           : capabilities.semantic.state === "partial"
-            ? "Semantic index is incomplete. Update the notes or prepare vectors to discover related notes."
+            ? "Semantic index is incomplete. Update the lexical index or semantic vectors to discover related notes."
             : capabilities.semantic.state === "incompatible"
-              ? "Stored semantic vectors are incompatible. Prepare the semantic index to refresh them."
-              : "Prepare the semantic index to discover related notes.";
+              ? "Stored semantic vectors are incompatible. Update the semantic index to refresh them."
+              : "Update the semantic index to discover related notes.";
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
         text: message,
       });
-      if (capabilities.semantic.activity !== "updating") this.prepareButton();
+      if (capabilities.semantic.activity !== "updating") this.semanticButtons();
       this.renderFreshnessWarning(capabilities.freshness);
       return;
     }
@@ -302,14 +306,21 @@ export class FiloView extends ItemView {
         cls: "setting-item-description mod-warning trama-filo__message",
         text:
           this.related.unavailableReason === "incomplete-vectors"
-            ? "Semantic coverage is incomplete. Prepare the semantic index to discover related notes."
-            : "Semantic related notes are unavailable. Prepare the semantic index when available.",
+            ? "Semantic coverage is incomplete. Update the semantic index to discover related notes."
+            : "Semantic related notes are unavailable. Update the semantic index when available.",
       });
-      this.prepareButton();
+      this.semanticButtons();
       this.renderFreshnessWarning(this.related.freshness);
       return;
     }
     this.renderRows();
+    if (capabilities?.semantic.state === "partial") {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: "Semantic index is incomplete; related notes use available vectors.",
+      });
+      this.semanticButtons();
+    }
     this.renderFreshnessWarning(capabilities?.freshness ?? this.related?.freshness);
   }
 
@@ -321,22 +332,30 @@ export class FiloView extends ItemView {
   }
 
   private renderFreshnessWarning(freshness?: string): void {
-    if (freshness !== "snapshot-loaded") return;
+    if (freshness !== "snapshot-loaded" && freshness !== "unknown") return;
     this.root.createDiv({
       cls: "setting-item-description mod-warning trama-filo__message",
-      text: "Snapshot loaded — not locally reconciled. Related notes reflect the synchronized snapshot.",
+      text:
+        freshness === "snapshot-loaded"
+          ? "Snapshot loaded — not locally reconciled. Related notes reflect the synchronized snapshot."
+          : "Index may be stale; related notes reflect the indexed content until an update.",
     });
   }
 
-  private prepareButton(): void {
-    const runPrepare = this.runPrepare ?? (this.statusSource as any).prepare;
-    if (typeof runPrepare !== "function") return;
-    const button = this.root.createEl("button", {
-      cls: "trama-filo__action",
-      text: "Prepare semantic index",
-      attr: { type: "button", "aria-label": "Prepare semantic index" },
-    });
-    button.addEventListener("click", () => void runPrepare.call(this.statusSource));
+  private semanticButtons(): void {
+    const source = this.statusSource as IndexStatusController;
+    const actions = [
+      ["Update semantic index", () => this.runPrepare?.() ?? source.run("prepare")],
+      ["Rebuild semantic index", () => source.run("rebuild-semantic")],
+    ] as const;
+    for (const [label, run] of actions) {
+      const button = this.root.createEl("button", {
+        cls: "trama-filo__action",
+        text: label,
+        attr: { type: "button", "aria-label": label },
+      });
+      button.addEventListener("click", () => void run());
+    }
   }
 
   private renderProgress(status: IndexStatus): boolean {

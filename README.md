@@ -6,7 +6,7 @@ Trama is an Obsidian plugin for local AI conversation and semantic connections o
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer** on a device that can reach the configured endpoint, load a chat model and (when desired) an embedding model, and enable its local OpenAI-compatible server.
 2. Configure the chat model, embedding model, and optional publication folder in plugin settings. The default synchronized file is `Trama/index/index.sqlite3`.
-3. Use **Update index** from the command palette for the initial explicit lexical index. This step makes no AI request. Use **Prepare semantic index** when embeddings are available, then open **Voce**, **Filo**, or **Lente**.
+3. Use **Update lexical index** from the command palette for the initial explicit lexical index. This step makes no AI request. Use **Update semantic index** when embeddings are available, then open **Voce**, **Filo**, or **Lente**.
 
 The live index is one mutable SQLite WASM database persisted through the official
 OPFS SAH pool. Trama publishes exactly one synchronized artifact,
@@ -16,7 +16,7 @@ it affects future publications and does not move or delete the old folder. The
 publication folder is automatically excluded from Markdown indexing.
 
 Build, Update, and Rebuild reconcile lexical notes/chunks/FTS without embeddings.
-**Prepare semantic index** is explicit and resumable: it adds compatible vectors
+**Update semantic index** is explicit and resumable: it adds compatible vectors
 in bounded batches and can be retried after an interruption or provider failure.
 Search remains available while semantic coverage is none or partial. A loaded
 publication is immediately searchable and reports **snapshot loaded — not locally
@@ -29,7 +29,7 @@ publication on device A, wait for Obsidian Sync or iCloud to converge, then inde
 on device B. The provider chooses the last/authoritative file version (including
 its conflict behavior); Trama adopts any differing valid file and does not compare
 timestamps or invent a merge. Concurrent writers can lose derived work and may
-need a new Update/Prepare.
+need a new lexical or semantic Update.
 
 ## Filo related notes
 
@@ -55,20 +55,23 @@ inside the mutable SQLite backend.
 
 Indexing is explicit the first time. After a usable index exists, visible Markdown
 create, modify, delete, and rename events are coalesced for about 1.5 seconds and
-processed as per-note incremental updates. **Update index** is the normal offline lexical
+processed as per-note incremental updates. **Update lexical index** is the normal offline lexical
 reconciliation mode: it scans the current vault, compares committed content identities,
 updates notes/chunks/FTS, and removes deleted paths without contacting an AI service.
-**Rebuild index** remains the explicit forced lexical reconciliation for recovery or
-configuration refresh. **Prepare semantic index** is the explicit action that requests
-vectors for missing or incompatible chunks. If a note is moved or deleted while
-either pass is running, that stale path is logged and skipped, then the queued vault event
-is reconciled without failing the whole operation. An interrupted or failed pass may leave
+**Rebuild lexical index** is the explicit forced lexical reconciliation for recovery or
+configuration refresh. **Update semantic index** requests vectors for missing or
+incompatible chunks. **Rebuild semantic index** discards existing vectors and regenerates
+them; **Rebuild lexical and semantic indexes** runs both rebuilds in that order. If a note is moved or deleted during
+lexical indexing, that stale path is logged and skipped, then the queued vault event
+is reconciled without failing the whole operation. Semantic preparation finishes against
+the committed SQLite notes even if vault notes change during the run. It then reports
+the index as stale; a lexical Update followed by semantic Update processes only changed
+notes and missing vectors, without rebuilding everything. An interrupted or failed pass may leave
 the searchable index incomplete; a later Update or Rebuild reconciles it deterministically
 while search remains available.
 
-During a full rebuild, index status estimates lexical chunk work from file-size
-metadata calibrated by a deterministic sample of at most 32 notes passed through the
-real chunker. **Prepare semantic index** reports bounded vector-batch progress and
+During a full lexical rebuild, status reports note and estimated chunk progress with time
+estimates. Hashing and chunking run in the SQLite Worker. **Update semantic index** reports whole-job vector progress and
 keeps already committed batches when a provider request fails or is cancelled.
 
 ## Voce chat

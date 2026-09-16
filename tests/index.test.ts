@@ -10,6 +10,12 @@ import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 const signal = new AbortController().signal;
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => (resolve = done));
+  return { promise, resolve };
+}
+
 function fixture(contents: Record<string, string>) {
   return {
     listMarkdownPaths: async () => Object.keys(contents),
@@ -49,14 +55,11 @@ function manager(contents: Record<string, string>, identity: object = {}, model 
   return {
     contents,
     model,
-    manager: new IndexManager(
-      fixture(contents),
-      model,
-      identity,
-      "HTTP://127.0.0.1:1234/v1/",
-      "embed",
-      { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
-    ),
+    manager: new IndexManager(fixture(contents), model, "HTTP://127.0.0.1:1234/v1/", "embed", {
+      size: 100,
+      overlap: 10,
+      sqliteClient: createTestSqliteClient(identity),
+    }),
   };
 }
 
@@ -78,14 +81,11 @@ function racedManager(
     return result;
   });
   const model = embeddings();
-  const target = new IndexManager(
-    fixture(contents),
-    model,
-    identity,
-    "HTTP://127.0.0.1:1234/v1/",
-    "embed",
-    { size: 100, overlap: 10, sqliteClient: client }
-  );
+  const target = new IndexManager(fixture(contents), model, "HTTP://127.0.0.1:1234/v1/", "embed", {
+    size: 100,
+    overlap: 10,
+    sqliteClient: client,
+  });
   return {
     manager: target,
     arm: () => (armed = true),
@@ -96,11 +96,40 @@ function racedManager(
 }
 
 describe("semantic index module", () => {
+  it("hashes and chunks build and update notes through the SQLite Worker boundary", async () => {
+    const contents = { "note.md": "alpha\nfirst" };
+    const identity = {};
+    const base = createTestSqliteClient(identity);
+    const methods: string[] = [];
+    const client = new SqliteWorkerClient(undefined, async (method, payload, requestSignal) => {
+      methods.push(method);
+      return base.call(method, payload, requestSignal);
+    });
+    const index = new IndexManager(
+      fixture(contents),
+      embeddings(),
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      { sqliteClient: client }
+    );
+
+    await index.build(signal);
+    expect(methods).toContain("hashMarkdown");
+    expect(methods).toContain("upsertMarkdown");
+    expect(methods).not.toContain("upsertNote");
+    methods.length = 0;
+    contents["note.md"] = "beta\nsecond";
+    await index.update(signal);
+    expect(methods).toContain("hashMarkdown");
+    expect(methods).toContain("upsertMarkdown");
+    expect(methods).not.toContain("upsertNote");
+    expect(await index.search("second", signal, 5)).toHaveLength(1);
+  });
+
   it("fails safe when no Worker is injected instead of creating a memory backend", async () => {
     const setup = new IndexManager(
       fixture({ "unavailable.md": "alpha" }),
       embeddings(),
-      {},
       "http://127.0.0.1:1234/v1",
       "embed"
     );
@@ -112,7 +141,6 @@ describe("semantic index module", () => {
     const setup = new IndexManager(
       fixture({ "unavailable.md": "alpha" }),
       embeddings(),
-      {},
       "http://127.0.0.1:1234/v1",
       "embed",
       {
@@ -136,7 +164,6 @@ describe("semantic index module", () => {
     const setup = new IndexManager(
       fixture({ "private.md": "alpha PRIVATE_SENTINEL" }),
       embeddings(),
-      {},
       "http://127.0.0.1:1234/v1",
       "embed",
       { size: 100, overlap: 10, sqliteClient: createTestSqliteClient({}) },
@@ -203,6 +230,124 @@ describe("semantic index module", () => {
     expect(setup.model.embed).toHaveBeenCalledTimes(1);
   });
 
+  it("reports semantic preparation against the whole missing-vector count", async () => {
+    const progress: IndexProgress[] = [];
+    const model = embeddings();
+    const index = new IndexManager(
+      fixture({ "a.md": "alpha", "b.md": "beta" }),
+      model,
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      {
+        prepareBatchSize: 1,
+        onProgress: (value) => progress.push(value),
+        sqliteClient: createTestSqliteClient({}),
+      }
+    );
+
+    await index.build(signal);
+    await index.prepareSemantic(signal);
+
+    const vectors = progress.filter((value) => value.phase === "build-vector");
+    expect(vectors[0]).toMatchObject({ completed: 0, total: 2, determinate: true });
+    expect(vectors.at(-1)).toMatchObject({ completed: 2, total: 2, determinate: true });
+    expect(vectors.every((value) => value.total === 2)).toBe(true);
+  });
+
+  it("rebuilds semantic vectors without rebuilding the lexical index", async () => {
+    const setup = manager({ "a.md": "alpha", "b.md": "beta" });
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+    const before = await setup.manager.getState();
+    const pending = deferred<(0 | 1)[][]>();
+    setup.model.embed.mockImplementationOnce(() => pending.promise);
+
+    const rebuild = setup.manager.rebuildSemantic(signal);
+    await vi.waitFor(() =>
+      expect(setup.manager.getCapabilities().semantic).toMatchObject({
+        activity: "updating",
+        searchable: false,
+      })
+    );
+    await vi.waitFor(async () =>
+      expect(await setup.manager.getState()).toMatchObject({ vectorCount: 0, noteCount: 2 })
+    );
+    expect(await setup.manager.search("alpha", signal, 5)).toHaveLength(1);
+    pending.resolve([
+      [1, 0],
+      [0, 1],
+    ]);
+    await expect(rebuild).resolves.toMatchObject({
+      operation: "rebuild",
+      stored: 2,
+      converged: true,
+    });
+    expect((await setup.manager.getState())?.changeCounter).toBeGreaterThan(before!.changeCounter);
+  });
+
+  it("finishes semantic preparation for its indexed corpus despite queued note edits", async () => {
+    const contents = { "a.md": "alpha", "b.md": "beta" };
+    const model = embeddings();
+    const progress: IndexProgress[] = [];
+    const index = new IndexManager(fixture(contents), model, "http://127.0.0.1:1234/v1", "embed", {
+      prepareBatchSize: 1,
+      onProgress: (value) => progress.push(value),
+      sqliteClient: createTestSqliteClient({}),
+    });
+    await index.build(signal);
+    const pending = deferred<(0 | 1)[][]>();
+    model.embed.mockImplementationOnce(() => pending.promise);
+
+    const preparation = index.prepareSemantic(signal);
+    await vi.waitFor(() => expect(model.embed).toHaveBeenCalledOnce());
+    contents["a.md"] = "alpha changed";
+    index.queueChange();
+    await expect(index.synchronize(signal)).rejects.toMatchObject({ code: "busy" });
+    await expect(index.build(signal)).rejects.toMatchObject({ code: "busy" });
+    pending.resolve([[1, 0]]);
+
+    await expect(preparation).resolves.toMatchObject({ converged: false, stored: 2, skipped: 0 });
+    expect(model.embed).toHaveBeenCalledTimes(2);
+    expect(progress.filter((value) => value.phase === "build-vector").at(-1)).toMatchObject({
+      completed: 2,
+      total: 2,
+    });
+    expect(index.capabilities()).toMatchObject({
+      freshness: "unknown",
+      semantic: { state: "ready", searchable: true },
+    });
+    await expect(index.synchronize(signal)).resolves.toMatchObject({ converged: true });
+    await expect(index.prepareSemantic(signal)).resolves.toMatchObject({
+      converged: true,
+      stored: 1,
+    });
+  });
+
+  it("keeps indexed lexical and semantic results available while notes are stale", async () => {
+    const setup = manager({ "a.md": "alpha", "b.md": "alpha beta", "c.md": "beta" });
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+
+    setup.contents["c.md"] = "gamma";
+    setup.manager.queueChange();
+    expect(setup.manager.freshnessState()).toBe("unknown");
+    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
+    await expect(setup.manager.findRelated("a.md", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "b.md" })])
+    );
+
+    await setup.manager.synchronize(signal);
+    expect(setup.manager.capabilities().semantic).toMatchObject({
+      state: "partial",
+      searchable: true,
+    });
+    await expect(setup.manager.findRelated("a.md", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "b.md" })])
+    );
+  });
+
   it("reports lexical degradation when hybrid query embedding fails", async () => {
     const setup = manager({ "a.md": "alpha note" });
     await setup.manager.build(signal);
@@ -243,7 +388,6 @@ describe("semantic index module", () => {
     const reopened = new IndexManager(
       fixture({ "a.md": "alpha" }),
       setup.model,
-      identity,
       "HTTP://127.0.0.1:1234/v1/",
       "embed",
       { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
@@ -305,7 +449,6 @@ describe("semantic index module", () => {
         },
       },
       setup.model,
-      {},
       "http://127.0.0.1:1234/v1",
       "embed",
       { sqliteClient: createTestSqliteClient({}) }
@@ -339,7 +482,10 @@ describe("semantic index module", () => {
     const sourceIdentity = {};
     const source = manager({ "a.md": "alpha" }, sourceIdentity);
     await source.manager.build(signal);
-    const prepared = await source.manager.preparePublication("remote-publication");
+    const { prepared } = await source.manager.publishPublication(
+      "remote-publication",
+      async () => undefined
+    );
 
     const receiverIdentity = {};
     const receiver = manager({ "a.md": "alpha" }, receiverIdentity);
@@ -365,11 +511,9 @@ describe("semantic index module", () => {
     expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
     expect(afterNoOpRestart.manager.freshnessState()).toBe("locally-reconciled");
 
-    const localState = await afterNoOpRestart.manager.getState();
-    const localPrepared = await afterNoOpRestart.manager.preparePublication("local-publication");
-    await afterNoOpRestart.manager.finalizePublication(
+    const { prepared: localPrepared } = await afterNoOpRestart.manager.publishPublication(
       "local-publication",
-      localState!.changeCounter
+      async () => undefined
     );
     expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
     expect(localPrepared.state.snapshotLoaded).toBe(false);
@@ -398,14 +542,19 @@ describe("semantic index module", () => {
     });
     await installing;
     expect(setup.manager.isInMaintenance()).toBe(true);
-    await expect(setup.manager.update(signal)).rejects.toMatchObject({ code: "busy" });
-    await expect(setup.manager.build(signal)).rejects.toMatchObject({ code: "busy" });
-    await expect(setup.manager.prepareSemantic(signal)).rejects.toMatchObject({ code: "busy" });
+    const updating = setup.manager.update(signal);
+    let updateFinished = false;
+    void updating.then(() => {
+      updateFinished = true;
+    });
+    await Promise.resolve();
+    expect(updateFinished).toBe(false);
     await expect(setup.manager.adoptPublication(new ArrayBuffer(1))).rejects.toMatchObject({
       code: "busy",
     });
     release();
     const result = await publishing;
+    await expect(updating).resolves.toMatchObject({ converged: true });
     expect(result.prepared.publicationId).toBe("locked-publication");
     expect((await setup.manager.getState())?.publicationId).toBe("locked-publication");
     expect(setup.manager.isInMaintenance()).toBe(false);
@@ -431,7 +580,6 @@ describe("semantic index module", () => {
     const setup = new IndexManager(
       fixture({ "a.md": "alpha" }),
       embeddings(),
-      {},
       "http://127.0.0.1:1234/v1",
       "embed",
       { onProgress: (value) => progress.push(value), sqliteClient: createTestSqliteClient({}) }
@@ -456,7 +604,6 @@ describe("semantic index module", () => {
     target.value = new IndexManager(
       fixture({ "a.md": "alpha" }),
       model,
-      {},
       "http://127.0.0.1:1234/v1",
       "embed",
       {
@@ -490,19 +637,12 @@ describe("semantic index module", () => {
         }
       ),
     };
-    const index = new IndexManager(
-      fixture(contents),
-      model,
-      {},
-      "http://127.0.0.1:1234/v1",
-      "embed",
-      {
-        size: 20,
-        overlap: 0,
-        onProgress: (value) => progress.push(value),
-        sqliteClient: createTestSqliteClient({}),
-      }
-    );
+    const index = new IndexManager(fixture(contents), model, "http://127.0.0.1:1234/v1", "embed", {
+      size: 20,
+      overlap: 0,
+      onProgress: (value) => progress.push(value),
+      sqliteClient: createTestSqliteClient({}),
+    });
     await index.build(signal);
     progress.length = 0;
     contents["a.md"] = "alpha ".repeat(12);
@@ -519,7 +659,7 @@ describe("semantic index module", () => {
   it("preserves the usable index when full-build planning fails", async () => {
     const contents = { "a.md": "alpha" };
     const vault = fixture(contents);
-    const setup = new IndexManager(vault, embeddings(), {}, "http://127.0.0.1:1234/v1", "embed", {
+    const setup = new IndexManager(vault, embeddings(), "http://127.0.0.1:1234/v1", "embed", {
       sqliteClient: createTestSqliteClient({}),
     });
     await setup.build(signal);

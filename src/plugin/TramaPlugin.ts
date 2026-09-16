@@ -61,6 +61,7 @@ export class TramaPlugin extends Plugin {
   private indexLoad?: Promise<boolean>;
   private indexLoaded = false;
   private indexReady = false;
+  private combinedRebuildLexicalPhase = false;
   private compositionRevision = 0;
   private readonly pendingVaultChanges = new Set<string>();
   private eventTimer?: ReturnType<typeof setTimeout>;
@@ -150,6 +151,8 @@ export class TramaPlugin extends Plugin {
         index: (signal) => this.runIndex(signal, false),
         reindex: (signal) => this.runFullIndex(signal),
         prepare: (signal) => this.runSemanticPreparation(signal),
+        rebuildSemantic: (signal) => this.runSemanticPreparation(signal, true),
+        rebuildBoth: (signal) => this.runBothIndexes(signal),
         cancel: () => this.semanticAbort?.abort(),
       },
       this.diagnostics
@@ -373,7 +376,6 @@ export class TramaPlugin extends Plugin {
     const manager = new IndexManager(
       indexVault,
       embedding,
-      app.vault,
       settings.embedding.endpoint,
       settings.embedding.modelId,
       {
@@ -384,6 +386,7 @@ export class TramaPlugin extends Plugin {
         sqliteIdentity: this.resolveSqliteIdentity(app.vault.adapter),
         sqliteClient: this.sqliteClientFactory?.(app.vault),
         onSuccessfulOperation: (result) => {
+          if (this.combinedRebuildLexicalPhase && result.operation === "rebuild") return;
           void this.publishAfterIndexOperation(manager, composedPublication, result);
         },
         onProgress: (progress) => this.indexStatus?.reportProgress(progress),
@@ -696,11 +699,38 @@ export class TramaPlugin extends Plugin {
     }
   }
 
-  private async runSemanticPreparation(signal: AbortSignal): Promise<void> {
+  async updateLexical(): Promise<void> {
+    await this.indexStatus?.run("index");
+  }
+
+  async rebuildLexical(): Promise<void> {
+    await this.indexStatus?.run("reindex");
+  }
+
+  async rebuildSemantic(): Promise<void> {
+    await this.indexStatus?.run("rebuild-semantic");
+  }
+
+  async rebuildBothIndexes(): Promise<void> {
+    await this.indexStatus?.run("rebuild-both");
+  }
+
+  private async runSemanticPreparation(signal: AbortSignal, rebuild = false): Promise<void> {
     if (!this.index) throw new Error("Index is not initialized.");
-    await this.index.prepareSemantic(signal);
-    this.indexReady = true;
-    this.updateIndexCapabilities(this.index);
+    try {
+      const result = rebuild
+        ? await this.index.rebuildSemantic(signal)
+        : await this.index.prepareSemantic(signal);
+      this.indexReady = true;
+      this.updateIndexCapabilities(this.index);
+      if (!result.converged && this.queuedWork)
+        this.indexStatus?.markStale(
+          this.index.hasUsableIndex(),
+          "Semantic indexing finished for the indexed notes. Unindexed note changes remain; update the lexical index, then update missing semantic vectors."
+        );
+    } finally {
+      if (this.queuedWork && this.getSettings().filo.automaticUpdates) this.scheduleReconcile();
+    }
   }
 
   getIndexStatus(): ReturnType<IndexStatusController["getStatus"]> | undefined {
@@ -817,7 +847,20 @@ export class TramaPlugin extends Plugin {
     return this.runIndex(signal, true);
   }
 
-  private async runIndex(signal: AbortSignal, force: boolean): Promise<void> {
+  private async runBothIndexes(signal: AbortSignal): Promise<void> {
+    this.combinedRebuildLexicalPhase = true;
+    try {
+      await this.runIndex(signal, true, false);
+    } finally {
+      this.combinedRebuildLexicalPhase = false;
+    }
+    if (!this.index?.isComplete())
+      throw new Error("Lexical index did not converge; semantic index was not rebuilt.");
+    this.indexStatus?.beginSemanticRebuild();
+    await this.runSemanticPreparation(signal, true);
+  }
+
+  private async runIndex(signal: AbortSignal, force: boolean, settleStatus = true): Promise<void> {
     if (this.eventTimer) clearTimeout(this.eventTimer);
     this.eventTimer = undefined;
     this.stopAutomaticWork(false);
@@ -835,9 +878,11 @@ export class TramaPlugin extends Plugin {
     if (result.changed && app?.workspace) this.refreshOpenLente(app);
     this.pendingVaultChanges.clear();
     if (this.queuedWork) await this.reconcileNow("explicit", signal).catch(() => undefined);
-    else if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
-    else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
-    else this.indexStatus?.setReady();
+    else if (settleStatus) {
+      if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
+      else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
+      else this.indexStatus?.setReady();
+    }
   }
 
   private scheduleReconcile(): void {
@@ -870,6 +915,10 @@ export class TramaPlugin extends Plugin {
     // Explicit builds own the user-facing state. The queued work remains in
     // IndexManager and is picked up after the build commits or fails.
     if (manager.isBuilding()) return;
+    if (manager.capabilities().semantic.activity === "updating") {
+      this.queuedWork = true;
+      return;
+    }
     if (this.reconcilePromise) return this.reconcilePromise;
     this.queuedWork = false;
     if (source === "automatic") this.indexStatus?.setUpdating();
@@ -968,10 +1017,11 @@ export class TramaPlugin extends Plugin {
     this.queuedWork = true;
     this.index.queueChange();
     if (this.getSettings().filo.automaticUpdates) {
-      if (!this.index.isBuilding()) this.indexStatus?.setUpdating();
+      if (!this.index.isBuilding() && this.index.capabilities().semantic.activity !== "updating")
+        this.indexStatus?.setUpdating();
       this.scheduleReconcile();
     } else {
-      this.markQueuedWorkStale();
+      if (this.index.capabilities().semantic.activity !== "updating") this.markQueuedWorkStale();
     }
   }
 

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { SqliteWorkerClient, type SqliteCallHandler } from "@/index/sqlite/client";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import { sqliteError } from "@/index/sqlite/protocol";
+import { hashMarkdown, upsertMarkdown } from "@/index/sqlite/markdown";
 
 interface TestStorage {
   snapshot?: Uint8Array;
@@ -80,6 +81,20 @@ export function createTestSqliteClient(
   const persist = async (opened: OpenDatabase) => {
     durable.snapshot = await serialized(opened);
   };
+  const reopen = async (opened: OpenDatabase): Promise<OpenDatabase> => {
+    const state = opened.database.getState();
+    const snapshot = await serialized(opened);
+    opened.database.close();
+    const next = await open(snapshot);
+    next.database.boot(
+      state.corpusFingerprint,
+      state.dimensions,
+      state.embeddingFingerprint,
+      state.buildIdentity
+    );
+    openedPromise = Promise.resolve(next);
+    return next;
+  };
   const handler: SqliteCallHandler = async (method, payload, signal) => {
     if (signal?.aborted) throw sqliteError("cancelled", "Request cancelled", true);
     let opened = await current();
@@ -88,7 +103,7 @@ export function createTestSqliteClient(
     switch (method) {
       case "boot":
         result = opened.database.boot(
-          value.corpusFingerprint ?? value.fingerprint,
+          value.corpusFingerprint,
           value.dimensions,
           value.embeddingFingerprint ?? "",
           value.buildIdentity
@@ -106,8 +121,21 @@ export function createTestSqliteClient(
       case "beginRebuild":
         result = opened.database.beginRebuild();
         break;
-      case "upsertNote":
-        result = opened.database.upsertNote(value.note);
+      case "clearVectors":
+        result = opened.database.clearVectors();
+        break;
+      case "hashMarkdown":
+        return hashMarkdown(value.markdown, value.corpusFingerprint, signal);
+      case "upsertMarkdown":
+        result = await upsertMarkdown(
+          opened.database,
+          value.path,
+          value.markdown,
+          value.expectedContentId,
+          value.size,
+          value.overlap,
+          signal
+        );
         break;
       case "renameNote":
         result = opened.database.renameNote(value.from, value.to, value.contentId);
@@ -168,6 +196,7 @@ export function createTestSqliteClient(
           };
         } finally {
           candidate.database.close();
+          opened = await reopen(opened);
         }
         break;
       }
@@ -192,6 +221,7 @@ export function createTestSqliteClient(
           };
         } finally {
           candidate.database.close();
+          opened = await reopen(opened);
         }
         break;
       }
@@ -221,26 +251,6 @@ export function createTestSqliteClient(
           if (opened.database !== candidate.database) candidate.database.close();
           throw error;
         }
-        break;
-      }
-      case "export": {
-        const state = opened.database.getState();
-        opened.database.validateSnapshot(state.fingerprint, state.dimensions);
-        return (await serialized(opened)).slice().buffer;
-      }
-      case "import": {
-        const prior = opened.database.getState();
-        const candidate = await open(new Uint8Array(value.bytes));
-        try {
-          candidate.database.validateSnapshot(prior.fingerprint, prior.dimensions);
-        } catch (error) {
-          candidate.database.close();
-          throw error;
-        }
-        opened.database.close();
-        opened = candidate;
-        openedPromise = Promise.resolve(candidate);
-        result = candidate.database.markImported(prior.changeCounter);
         break;
       }
       case "cancelQueued":

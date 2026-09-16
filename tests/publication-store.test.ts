@@ -34,6 +34,17 @@ function adapter() {
   return value;
 }
 
+async function install(store: PublicationStore, bytes: ArrayBuffer, token?: string) {
+  const staged = await store.stage(bytes, token);
+  try {
+    await store.replace(staged);
+    return staged;
+  } catch (error) {
+    await store.removeTemporary(staged.temporaryPath);
+    throw error;
+  }
+}
+
 describe("PublicationStore", () => {
   it("normalizes a captured vault-relative directory and fixes the target filename", () => {
     expect(normalizePublicationDirectory(" ./Trama\\index// ")).toBe("Trama/index");
@@ -50,7 +61,7 @@ describe("PublicationStore", () => {
       directory: "Trama/index",
       temporaryToken: () => "fixed",
     });
-    const result = await store.install(new Uint8Array([1, 2, 3]).buffer);
+    const result = await install(store, new Uint8Array([1, 2, 3]).buffer);
     expect(result.byteSize).toBe(3);
     expect(storage.files.has("Trama/index/index.sqlite3")).toBe(true);
     expect(storage.files.has("Trama/index/index.sqlite3.trama-tmp-fixed")).toBe(false);
@@ -59,7 +70,7 @@ describe("PublicationStore", () => {
     ]);
   });
 
-  it("does not replace the target when adapter readback is corrupted", async () => {
+  it("returns the read-back bytes for Worker validation without a main-thread comparison", async () => {
     const storage = adapter();
     const original = storage.readBinary;
     storage.readBinary = async (path) => {
@@ -68,10 +79,20 @@ describe("PublicationStore", () => {
       return bytes;
     };
     const store = new PublicationStore(storage, { directory: "Trama/index" });
-    await expect(store.install(new Uint8Array([1]).buffer)).rejects.toMatchObject({
-      code: "internal",
-    });
+    const staged = await store.stage(new Uint8Array([1]).buffer);
+    expect([...new Uint8Array(staged.bytes)]).toEqual([0]);
     expect(storage.files.has(store.path)).toBe(false);
+  });
+
+  it("removes the temporary file when read-back fails", async () => {
+    const storage = adapter();
+    storage.readBinary = async () => {
+      throw new Error("read failed");
+    };
+    const store = new PublicationStore(storage, { directory: "Trama/index" });
+
+    await expect(store.stage(new Uint8Array([1]).buffer, "failed")).rejects.toThrow("read failed");
+    expect(storage.files.has(store.temporaryPath("failed"))).toBe(false);
   });
 
   it("requires atomic rename and preserves the old target when it is unavailable", async () => {
@@ -80,7 +101,7 @@ describe("PublicationStore", () => {
     storage.files.set(store.path, new Uint8Array([7, 7]));
     storage.rename = undefined;
 
-    await expect(store.install(new Uint8Array([1, 2, 3]).buffer)).rejects.toMatchObject({
+    await expect(install(store, new Uint8Array([1, 2, 3]).buffer)).rejects.toMatchObject({
       code: "internal",
       retryable: true,
     });
@@ -96,7 +117,7 @@ describe("PublicationStore", () => {
     };
     const store = new PublicationStore(storage, { directory: "Trama/index" });
     storage.files.set(store.path, new Uint8Array([7, 7]));
-    await store.install(new Uint8Array([1, 2, 3]).buffer, "next");
+    await install(store, new Uint8Array([1, 2, 3]).buffer, "next");
     expect([...storage.files.get(store.path)!]).toEqual([1, 2, 3]);
     expect(storage.files.has(store.backupPath)).toBe(false);
   });
@@ -111,7 +132,7 @@ describe("PublicationStore", () => {
     };
     const store = new PublicationStore(storage, { directory: "Trama/index" });
     storage.files.set(store.path, new Uint8Array([7, 7]));
-    await expect(store.install(new Uint8Array([1, 2, 3]).buffer, "bad")).rejects.toThrow(
+    await expect(install(store, new Uint8Array([1, 2, 3]).buffer, "bad")).rejects.toThrow(
       "promote failed"
     );
     expect([...storage.files.get(store.path)!]).toEqual([7, 7]);

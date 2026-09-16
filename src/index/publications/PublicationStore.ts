@@ -10,9 +10,6 @@ export interface PublicationDataAdapter {
   remove?(path: string): Promise<void>;
 }
 
-/** Short boundary alias for callers that do not need the Obsidian-specific name. */
-export type DataAdapter = PublicationDataAdapter;
-
 export interface PublicationStoreOptions {
   /** Defaults to `Trama/index`, the persisted POC publication location. */
   readonly directory?: unknown;
@@ -62,10 +59,6 @@ function normalizeDirectory(value: unknown): string | undefined {
   return parts.join("/");
 }
 
-function copyBytes(bytes: ArrayBuffer): ArrayBuffer {
-  return bytes.slice(0);
-}
-
 function safeToken(value: string): string {
   const token = value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
   return token || "candidate";
@@ -86,10 +79,6 @@ export class PublicationStore {
     this.directory = normalizePublicationDirectory(options.directory);
     this.path = `${this.directory}/${PUBLICATION_FILE}`;
     this.token = options.temporaryToken ?? (() => randomToken());
-  }
-
-  get targetPath(): string {
-    return this.path;
   }
 
   temporaryPath(token = this.token()): string {
@@ -131,22 +120,27 @@ export class PublicationStore {
   async stage(bytes: ArrayBuffer, token?: string): Promise<StagedPublication> {
     if (!(bytes instanceof ArrayBuffer) || bytes.byteLength === 0)
       throw new StructuredError("invalid_request", "Publication bytes are empty.", false);
+    const byteSize = bytes.byteLength;
     await this.ensureDirectory();
     await this.recoverTransient();
-    const staged = copyBytes(bytes);
     const temporaryPath = this.temporaryPath(token);
-    await this.adapter.writeBinary(temporaryPath, staged);
-    const readback = await this.adapter.readBinary(temporaryPath);
-    if (readback.byteLength !== staged.byteLength || !sameBytes(readback, staged)) {
+    await this.adapter.writeBinary(temporaryPath, bytes);
+    let readback: ArrayBuffer;
+    try {
+      readback = await this.adapter.readBinary(temporaryPath);
+    } catch (error) {
+      await this.removeQuietly(temporaryPath);
+      throw error;
+    }
+    if (readback.byteLength !== byteSize) {
       await this.removeQuietly(temporaryPath);
       throw new StructuredError("internal", "Publication readback validation failed.", true);
     }
     return {
       temporaryPath,
       bytes: readback,
-      byteSize: readback.byteLength,
-      // The staged copy and adapter readback are the operation-scoped copies.
-      copyBytes: staged.byteLength + readback.byteLength,
+      byteSize,
+      copyBytes: readback.byteLength,
     };
   }
 
@@ -206,17 +200,6 @@ export class PublicationStore {
     if (hadPrevious) await this.adapter.rename(this.backupPath, this.path);
   }
 
-  async install(bytes: ArrayBuffer, token?: string): Promise<StagedPublication> {
-    const staged = await this.stage(bytes, token);
-    try {
-      await this.replace(staged);
-      return staged;
-    } catch (error) {
-      await this.removeQuietly(staged.temporaryPath);
-      throw error;
-    }
-  }
-
   async removeTemporary(path: string): Promise<void> {
     if (!path.startsWith(`${this.path}.trama-tmp-`)) return;
     await this.removeQuietly(path);
@@ -239,14 +222,6 @@ export class PublicationStore {
       return false;
     }
   }
-}
-
-function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
-  if (a.byteLength !== b.byteLength) return false;
-  const left = new Uint8Array(a);
-  const right = new Uint8Array(b);
-  for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
-  return true;
 }
 
 function randomToken(): string {

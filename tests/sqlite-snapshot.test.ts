@@ -60,7 +60,7 @@ function adapter() {
 }
 
 function manager(identity: object, indexVault: IndexVaultPort = vault): IndexManager {
-  return new IndexManager(indexVault, embedding, identity, "http://embedding", "model", {
+  return new IndexManager(indexVault, embedding, "http://embedding", "model", {
     publicationDirectory: "Trama/index",
     sqliteClient: createTestSqliteClient(identity),
   });
@@ -137,6 +137,21 @@ describe("single-file SQLite publications", () => {
     ).resolves.toMatchObject({ published: true, publicationId: "no-op-publication" });
   });
 
+  it("can prepare semantic vectors after publication reopens the live database", async () => {
+    const storage = adapter();
+    const index = manager({});
+    const publisher = publication(index, storage, () => "reopen-publication");
+    const signal = new AbortController().signal;
+
+    await index.build(signal);
+    await publisher.publish();
+    await expect(index.prepareSemantic(signal)).resolves.toMatchObject({
+      stored: 1,
+      converged: true,
+    });
+    await expect(index.findRelated("one.md", signal, 5)).resolves.toEqual([]);
+  });
+
   it("adopts a differing publication ID and ignores the same file on restart", async () => {
     const storage = adapter();
     const source = manager({});
@@ -181,11 +196,11 @@ describe("single-file SQLite publications", () => {
     );
     await receiver.load();
     const receiverPublisher = publication(receiver, storage);
-    const prepare = vi.spyOn(receiver, "preparePublication");
+    const publish = vi.spyOn(receiver, "publishPublication");
     const adoption = await receiverPublisher.adoptOnStartup();
 
     expect(adoption).toMatchObject({ adopted: true, publicationId: "z-from-provider" });
-    expect(prepare).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
     expect(readMarkdown).not.toHaveBeenCalled();
     expect((await receiver.getState())?.publicationId).toBe("z-from-provider");
     expect(await receiver.search("alpha", new AbortController().signal, 5)).toHaveLength(1);
@@ -194,7 +209,7 @@ describe("single-file SQLite publications", () => {
   it("uses a changed configured folder and only publishes its exact target", async () => {
     const storage = adapter();
     const identity = {};
-    const index = new IndexManager(vault, embedding, identity, "http://embedding", "model", {
+    const index = new IndexManager(vault, embedding, "http://embedding", "model", {
       publicationDirectory: "Mobile/TramaData",
       sqliteClient: createTestSqliteClient(identity),
     });
@@ -234,6 +249,27 @@ describe("single-file SQLite publications", () => {
     expect(storage.files.has("Trama/index/index.sqlite3")).toBe(true);
   });
 
+  it("rejects a corrupted temporary-file readback before replacing the publication", async () => {
+    const storage = adapter();
+    const index = manager({});
+    const publisher = publication(index, storage, () => "corrupt-readback");
+    await index.build(new AbortController().signal);
+    const readBinary = storage.readBinary;
+    storage.readBinary = async (path) => {
+      const bytes = await readBinary(path);
+      if (path.includes("trama-tmp")) new Uint8Array(bytes)[68] ^= 1;
+      return bytes;
+    };
+
+    await expect(publisher.publish()).resolves.toMatchObject({
+      published: false,
+      warning: { phase: "inspect" },
+    });
+    expect(storage.files.has(publisher.store.path)).toBe(false);
+    expect([...storage.files.keys()]).toEqual([]);
+    expect(await index.search("alpha", new AbortController().signal, 5)).toHaveLength(1);
+  });
+
   it("restores the previous vault file before unblocking writes if local ID finalization fails", async () => {
     const storage = adapter();
     const identity = {};
@@ -243,7 +279,7 @@ describe("single-file SQLite publications", () => {
       if (failFinalize && method === "finalizePublication") throw new Error("finalize failed");
       return base.call(method, payload, signal);
     });
-    const index = new IndexManager(vault, embedding, identity, "http://embedding", "model", {
+    const index = new IndexManager(vault, embedding, "http://embedding", "model", {
       publicationDirectory: "Trama/index",
       sqliteClient: client,
     });

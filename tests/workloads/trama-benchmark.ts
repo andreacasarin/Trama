@@ -168,7 +168,7 @@ function manager(
   embedding: BenchmarkEmbedding,
   identity: object
 ): IndexManager {
-  return new IndexManager(vault, embedding, identity, "http://benchmark.invalid/v1", "fixture", {
+  return new IndexManager(vault, embedding, "http://benchmark.invalid/v1", "fixture", {
     sqliteClient: createTestSqliteClient(identity, { persistMutations: false }),
     publicationDirectory: "Trama/index",
   });

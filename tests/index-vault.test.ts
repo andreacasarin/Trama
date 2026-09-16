@@ -90,7 +90,7 @@ describe("ObsidianIndexVault", () => {
     );
   });
 
-  it("calibrates the metadata estimate with the real chunker", async () => {
+  it("estimates chunk work from metadata without reading or chunking notes", async () => {
     const content = Array.from({ length: 80 }, () => "x".repeat(250)).join("\n");
     const files = [
       { path: "one.md", stat: { size: content.length } },
@@ -113,11 +113,11 @@ describe("ObsidianIndexVault", () => {
         64,
         new AbortController().signal
       )
-    ).resolves.toBeGreaterThan(2);
-    expect(read).toHaveBeenCalledTimes(2);
+    ).resolves.toBe(Math.ceil(content.length / 320));
+    expect(read).not.toHaveBeenCalled();
   });
 
-  it("bounds estimation work to a deterministic 32-note sample", async () => {
+  it("does not sample or read a large vault during estimation", async () => {
     const files = Array.from({ length: 100 }, (_, index) => ({
       path: `note-${index}.md`,
       stat: { size: 1_000 + index },
@@ -140,6 +140,6 @@ describe("ObsidianIndexVault", () => {
         new AbortController().signal
       )
     ).resolves.toBeGreaterThan(0);
-    expect(read).toHaveBeenCalledTimes(32);
+    expect(read).not.toHaveBeenCalled();
   });
 });

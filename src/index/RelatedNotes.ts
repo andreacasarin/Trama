@@ -31,6 +31,7 @@ export interface RelatedNotesResult {
   readonly currentPath: string;
   readonly contentHash: string;
   readonly freshness?: IndexFreshness;
+  readonly semanticPartial?: boolean;
   readonly publicationId?: string;
   readonly unavailableReason?: "semantic-unavailable" | "incomplete-vectors";
   readonly results: readonly RelatedNoteResult[];
@@ -91,6 +92,7 @@ export class RelatedNotes {
         contentHash: state?.contentHash ?? "",
         results: [],
         ...(state?.freshness ? { freshness: state.freshness } : {}),
+        ...(state?.semantic?.state === "partial" ? { semanticPartial: true } : {}),
         ...(state?.publicationId ? { publicationId: state.publicationId } : {}),
       };
       this.publish(result, state ? this.key(state) : "");
@@ -104,6 +106,7 @@ export class RelatedNotes {
         currentPath: state.currentPath,
         contentHash: state.contentHash,
         ...(state.freshness ? { freshness: state.freshness } : {}),
+        ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
         ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         unavailableReason: readiness,
         results: [],
@@ -268,6 +271,7 @@ export class RelatedNotes {
       contentHash: state.contentHash,
       results,
       ...(state.freshness ? { freshness: state.freshness } : {}),
+      ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
       ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
