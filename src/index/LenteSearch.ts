@@ -1,4 +1,4 @@
-import { StructuredError } from "@/domain/contracts";
+import type { IndexFreshness } from "@/domain/contracts";
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import {
   emitTramaDiagnostic,
@@ -7,11 +7,17 @@ import {
   startDiagnosticTimer,
 } from "@/diagnostics/TramaDiagnostics";
 import type { LenteNoteStatPort } from "@/vault/readOnly/ObsidianLenteNoteStats";
-import { isQueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
+import {
+  searchVault,
+  type VaultRetrievalPort,
+  type VaultSearchHit,
+  type VaultSearchMethod,
+  type VaultSearchMode,
+} from "@/index/VaultSearch";
 
 export type LenteSort = "relevant" | "updated";
-export type LenteRetrievalMode = "hybrid" | "lexical";
-export type LenteSearchMethod = "hybrid" | "keyword";
+export type LenteRetrievalMode = VaultSearchMode;
+export type LenteSearchMethod = VaultSearchMethod;
 
 export interface LenteSearchOptions {
   readonly searchMethod?: LenteSearchMethod;
@@ -20,28 +26,7 @@ export interface LenteSearchOptions {
   readonly signal?: AbortSignal;
 }
 
-export interface LenteRetrievalPort {
-  lenteState(): { readonly changeCounter: number; readonly generationId: string } | null;
-  searchLente(
-    query: string,
-    mode: LenteRetrievalMode,
-    signal?: AbortSignal
-  ): Promise<readonly LenteHit[]>;
-}
-
-export interface LenteHit {
-  readonly path: string;
-  readonly startLine: number;
-  readonly endLine: number;
-  readonly excerpt: string;
-  readonly generationId?: string;
-  readonly changeCounter?: number;
-  readonly chunkId: string;
-  readonly ordinal: number;
-  readonly semanticScore?: number;
-  readonly lexicalScore?: number;
-  readonly fusedScore: number;
-}
+export type LenteHit = VaultSearchHit;
 
 export interface LenteResult {
   readonly path: string;
@@ -63,7 +48,12 @@ export interface LenteBatch {
   readonly changeCounter?: number;
   readonly mode: LenteRetrievalMode;
   readonly degraded: boolean;
+  /** Why hybrid retrieval was reduced to lexical-only results, when applicable. */
+  readonly degradationReason?: "semantic-unavailable" | "query-embedding-failed";
+  readonly freshness?: IndexFreshness;
+  readonly publicationId?: string;
   readonly displayLimit: number;
+  readonly semanticPartial?: boolean;
   readonly results: readonly LenteResult[];
   /** Full deterministic candidate pool retained for local sort/display projection. */
   readonly canonicalResults?: readonly LenteResult[];
@@ -79,35 +69,24 @@ export class LenteSearch {
   static readonly MAX_RESULTS = MAX_RESULTS;
 
   constructor(
-    private readonly retrieval: LenteRetrievalPort,
+    private readonly retrieval: VaultRetrievalPort,
     private readonly stats: LenteNoteStatPort,
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {}
 
   async search(query: string, options: LenteSearchOptions = {}): Promise<LenteBatch> {
-    const normalized = query.trim();
-    if (!normalized)
-      throw new StructuredError("invalid_request", "Search query must not be empty.", false);
     const elapsedMs = startDiagnosticTimer();
-    const signal = options.signal;
-    if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
-    const state = this.retrieval.lenteState();
-    if (!state) throw new StructuredError("unavailable", "Semantic index is unavailable.", true);
-    const method = options.searchMethod ?? "hybrid";
     const displayLimit = appliedDisplayLimit(options.maxResults);
-    let mode: LenteRetrievalMode = method === "keyword" ? "lexical" : "hybrid";
-    let degraded = false;
+    let mode: LenteRetrievalMode = options.searchMethod === "keyword" ? "lexical" : "hybrid";
     try {
-      let raw: readonly LenteHit[];
-      try {
-        raw = await this.retrieval.searchLente(normalized, mode, signal);
-      } catch (error) {
-        if (mode !== "hybrid" || !this.canFallback(error, signal)) throw error;
-        mode = "lexical";
-        degraded = true;
-        raw = await this.retrieval.searchLente(normalized, "lexical", signal);
-      }
-      if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", true);
+      const {
+        hits: raw,
+        state,
+        degraded,
+        degradationReason,
+        mode: effectiveMode,
+      } = await searchVault(this.retrieval, query, options);
+      mode = effectiveMode;
       const generationId = raw[0]?.generationId ?? state.generationId;
       const changeCounter = raw[0]?.changeCounter ?? state.changeCounter;
       const canonicalResults = selectLenteResults(
@@ -123,6 +102,10 @@ export class LenteSearch {
         changeCounter,
         mode,
         degraded,
+        ...(degradationReason ? { degradationReason } : {}),
+        ...(state.freshness ? { freshness: state.freshness } : {}),
+        ...(state.semantic.state === "partial" ? { semanticPartial: true } : {}),
+        ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         displayLimit,
         results,
         canonicalResults,
@@ -141,7 +124,7 @@ export class LenteSearch {
       emitTramaDiagnostic(this.diagnostics, {
         area: "index",
         event: "lente_search",
-        generation: state.generationId,
+        generation: this.retrieval.vaultSearchState()?.generationId,
         mode,
         resultCount: 0,
         durationMs: elapsedMs(),
@@ -150,12 +133,6 @@ export class LenteSearch {
       } as never);
       throw error;
     }
-  }
-
-  private canFallback(error: unknown, signal?: AbortSignal): boolean {
-    if (signal?.aborted) return false;
-    if (!error || typeof error !== "object") return false;
-    return isQueryEmbeddingError(error);
   }
 }
 

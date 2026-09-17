@@ -1,4 +1,5 @@
 import { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
+import type { IndexFreshness } from "@/domain/contracts";
 import { compareCodeUnits } from "@/index/Identity";
 import {
   emitTramaDiagnostic,
@@ -29,6 +30,10 @@ export interface RelatedNotesResult {
   readonly generationId?: string;
   readonly currentPath: string;
   readonly contentHash: string;
+  readonly freshness?: IndexFreshness;
+  readonly semanticPartial?: boolean;
+  readonly publicationId?: string;
+  readonly unavailableReason?: "semantic-unavailable" | "incomplete-vectors";
   readonly results: readonly RelatedNoteResult[];
 }
 
@@ -86,8 +91,27 @@ export class RelatedNotes {
         currentPath: state?.currentPath ?? currentPath,
         contentHash: state?.contentHash ?? "",
         results: [],
+        ...(state?.freshness ? { freshness: state.freshness } : {}),
+        ...(state?.semantic?.state === "partial" ? { semanticPartial: true } : {}),
+        ...(state?.publicationId ? { publicationId: state.publicationId } : {}),
       };
       this.publish(result, state ? this.key(state) : "");
+      return result;
+    }
+    const readiness = this.relatedReadiness(state);
+    if (readiness) {
+      const result: RelatedNotesResult = {
+        changeCounter: state.changeCounter,
+        generationId: state.generationId,
+        currentPath: state.currentPath,
+        contentHash: state.contentHash,
+        ...(state.freshness ? { freshness: state.freshness } : {}),
+        ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
+        ...(state.publicationId ? { publicationId: state.publicationId } : {}),
+        unavailableReason: readiness,
+        results: [],
+      };
+      this.publish(result, this.key(state));
       return result;
     }
     const key = this.key(state);
@@ -246,15 +270,23 @@ export class RelatedNotes {
       currentPath: state.currentPath,
       contentHash: state.contentHash,
       results,
+      ...(state.freshness ? { freshness: state.freshness } : {}),
+      ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
+      ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
 
+  private relatedReadiness(state: RelatedIndexState): RelatedNotesResult["unavailableReason"] {
+    if (!state.semantic || state.semantic.searchable) return undefined;
+    return state.semantic.state === "partial" ? "incomplete-vectors" : "semantic-unavailable";
+  }
+
   private key(state: RelatedIndexState): string {
-    return `${state.changeCounter ?? state.generationId ?? 0}\0${state.currentPath}\0${state.contentHash}`;
+    return `${state.changeCounter ?? state.generationId ?? 0}\0${state.currentPath}\0${state.contentHash}\0${state.freshness ?? ""}\0${state.publicationId ?? ""}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.changeCounter ?? result.generationId ?? 0}\0${result.currentPath}\0${result.contentHash}`;
+    return `${result.changeCounter ?? result.generationId ?? 0}\0${result.currentPath}\0${result.contentHash}\0${result.freshness ?? ""}\0${result.publicationId ?? ""}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

@@ -299,7 +299,7 @@ describe("ChatSession module", () => {
           { complete },
           new ToolRegistry([]),
           vault(
-            (path, requestSignal) =>
+            (_path, requestSignal) =>
               new Promise((done) => {
                 signal = requestSignal;
                 resolve = done;

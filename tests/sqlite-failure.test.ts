@@ -44,7 +44,7 @@ describe("SQLite mutation failure boundaries", () => {
     const worker = new DelayedWorker();
     const client = new SqliteWorkerClient(worker);
     const first = client.call("getState", {});
-    const second = client.call("listNotes", {});
+    const second = client.call("markIncomplete", {});
     worker.emit("error", { error: new Error("crashed") });
     await expect(first).rejects.toThrow("crashed");
     await expect(second).rejects.toThrow("crashed");

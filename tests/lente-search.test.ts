@@ -13,6 +13,12 @@ const hit = (path: string, fusedScore: number, ordinal = 0): LenteHit => ({
   fusedScore,
 });
 
+const readyState = {
+  generationId: "g1",
+  changeCounter: 1,
+  semantic: { state: "ready" as const, activity: "idle" as const, searchable: true },
+};
+
 describe("LenteSearch", () => {
   it("collapses notes, drops missing live files, and sorts by live mtime", () => {
     const results = selectLenteResults(
@@ -51,7 +57,7 @@ describe("LenteSearch", () => {
       .mockRejectedValueOnce(new QueryEmbeddingError())
       .mockResolvedValueOnce([hit("note.md", 1)]);
     const service = new LenteSearch(
-      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
+      { vaultSearchState: () => readyState, retrieveVaultCandidates: search },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle")).resolves.toMatchObject({
@@ -64,7 +70,10 @@ describe("LenteSearch", () => {
   it("uses keyword retrieval without marking the result degraded", async () => {
     const search = vi.fn(async () => [hit("note.md", 1)]);
     const service = new LenteSearch(
-      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
+      {
+        vaultSearchState: () => readyState,
+        retrieveVaultCandidates: search,
+      },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle", { searchMethod: "keyword" })).resolves.toMatchObject({
@@ -75,13 +84,88 @@ describe("LenteSearch", () => {
     expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
   });
 
+  it("gates hybrid retrieval on semantic readiness and carries snapshot freshness", async () => {
+    const search = vi.fn(async () => [hit("snapshot.md", 1)]);
+    const service = new LenteSearch(
+      {
+        vaultSearchState: () => ({
+          changeCounter: 4,
+          generationId: "g4",
+          semantic: { state: "empty", activity: "idle", searchable: false },
+          freshness: "snapshot-loaded",
+          publicationId: "pub-4",
+        }),
+        retrieveVaultCandidates: search,
+      },
+      { getMtime: () => 1 }
+    );
+
+    await expect(service.search("needle")).resolves.toMatchObject({
+      mode: "lexical",
+      degraded: true,
+      degradationReason: "semantic-unavailable",
+      freshness: "snapshot-loaded",
+      publicationId: "pub-4",
+    });
+    expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
+  });
+
+  it.each([
+    ["no vectors", "empty"],
+    ["partial vectors", "partial"],
+    ["incompatible vectors", "incompatible"],
+  ] as const)("reports lexical degradation for %s coverage", async (_label, channelState) => {
+    const search = vi.fn(async () => [hit("lexical.md", 1)]);
+    const service = new LenteSearch(
+      {
+        vaultSearchState: () => ({
+          ...readyState,
+          semantic: { state: channelState, activity: "idle", searchable: false },
+        }),
+        retrieveVaultCandidates: search,
+      },
+      { getMtime: () => 1 }
+    );
+
+    await expect(service.search("needle")).resolves.toMatchObject({
+      mode: "lexical",
+      degraded: true,
+      degradationReason: "semantic-unavailable",
+    });
+    expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
+  });
+
+  it("uses available semantic vectors and labels partial coverage", async () => {
+    const search = vi.fn(async () => [hit("indexed.md", 1)]);
+    const service = new LenteSearch(
+      {
+        vaultSearchState: () => ({
+          ...readyState,
+          semantic: { state: "partial", activity: "idle", searchable: true },
+        }),
+        retrieveVaultCandidates: search,
+      },
+      { getMtime: () => 1 }
+    );
+
+    await expect(service.search("needle")).resolves.toMatchObject({
+      mode: "hybrid",
+      semanticPartial: true,
+      results: [expect.objectContaining({ path: "indexed.md" })],
+    });
+    expect(search).toHaveBeenCalledWith("needle", "hybrid", undefined);
+  });
+
   it("applies a configured display limit without shrinking the candidate pool", async () => {
     const candidates = Array.from({ length: 30 }, (_, index) =>
       hit(`note-${index}.md`, 1 - index / 100)
     );
     const search = vi.fn(async () => candidates);
     const service = new LenteSearch(
-      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
+      {
+        vaultSearchState: () => readyState,
+        retrieveVaultCandidates: search,
+      },
       { getMtime: () => 1 }
     );
     const result = await service.search("needle", { maxResults: 5 });
@@ -105,13 +189,17 @@ describe("LenteSearch", () => {
       else search.mockRejectedValue(error);
       const service = new LenteSearch(
         {
-          lenteState: () => ({ generationId: "g1", changeCounter: 1 }),
-          searchLente: search,
+          vaultSearchState: () => readyState,
+          retrieveVaultCandidates: search,
         },
         { getMtime: () => 1 }
       );
       if (fallback)
-        await expect(service.search("needle")).resolves.toMatchObject({ mode: "lexical" });
+        await expect(service.search("needle")).resolves.toMatchObject({
+          mode: "lexical",
+          degraded: true,
+          degradationReason: "query-embedding-failed",
+        });
       else await expect(service.search("needle")).rejects.toBe(error);
       expect(search).toHaveBeenCalledTimes(fallback ? 2 : 1);
     }

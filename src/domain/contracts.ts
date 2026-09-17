@@ -68,6 +68,25 @@ export interface EmbeddingProgress {
 }
 
 export type IndexOperation = "full" | "incremental" | "startup";
+
+/** Both search channels use the same readiness and activity vocabulary. */
+export type IndexAvailability = "unavailable" | "available";
+export type IndexChannelState = "unavailable" | "empty" | "partial" | "ready" | "incompatible";
+export type IndexChannelActivity = "idle" | "updating";
+export interface IndexChannelStatus {
+  readonly state: IndexChannelState;
+  readonly activity: IndexChannelActivity;
+  readonly searchable: boolean;
+}
+export type IndexFreshness = "locally-reconciled" | "snapshot-loaded" | "unknown";
+
+export interface IndexCapabilities {
+  readonly availability: IndexAvailability;
+  readonly lexical: IndexChannelStatus;
+  readonly semantic: IndexChannelStatus;
+  readonly freshness: IndexFreshness;
+  readonly publicationId?: string;
+}
 export type IndexProgressPhase =
   | "discover"
   | "read"

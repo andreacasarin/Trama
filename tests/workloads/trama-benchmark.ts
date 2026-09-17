@@ -2,9 +2,14 @@ import { statSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { ChatSession } from "@/chat/ChatSession";
 import type { ChatModel, EmbeddingModel, ReadonlyVault } from "@/domain/contracts";
-import { IndexManager, type IndexVaultPort, type SnapshotDataAdapter } from "@/index/IndexManager";
+import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { LenteSearch } from "@/index/LenteSearch";
 import { RelatedNotes } from "@/index/RelatedNotes";
+import { PublicationManager } from "@/index/publications/PublicationManager";
+import {
+  PublicationStore,
+  type PublicationDataAdapter,
+} from "@/index/publications/PublicationStore";
 import { ToolRegistry, VaultSearchTool } from "@/tools/ToolRegistry";
 import { createTestSqliteClient } from "../sqlite-test-client";
 import type { Workload, WorkloadMutation, WorkloadNote } from "./generator";
@@ -116,18 +121,30 @@ class BenchmarkEmbedding implements EmbeddingModel {
   }
 }
 
-class MemorySnapshots implements SnapshotDataAdapter {
+class MemoryPublicationAdapter implements PublicationDataAdapter {
   readonly binary = new Map<string, ArrayBuffer>();
   async exists(path: string): Promise<boolean> {
     return this.binary.has(path);
   }
   async readBinary(path: string): Promise<ArrayBuffer> {
     const value = this.binary.get(path);
-    if (!value) throw new Error(`Missing benchmark snapshot: ${path}`);
+    if (!value) throw new Error(`Missing benchmark publication: ${path}`);
     return value.slice(0);
   }
   async writeBinary(path: string, value: ArrayBuffer): Promise<void> {
     this.binary.set(path, value.slice(0));
+  }
+  async mkdir(): Promise<void> {
+    // The in-memory adapter does not need directories.
+  }
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const value = this.binary.get(oldPath);
+    if (!value) throw new Error(`Missing staged benchmark publication: ${oldPath}`);
+    this.binary.set(newPath, value);
+    this.binary.delete(oldPath);
+  }
+  async remove(path: string): Promise<void> {
+    this.binary.delete(path);
   }
 }
 
@@ -149,12 +166,11 @@ function packageBytes(): number | "unsupported" {
 function manager(
   vault: BenchmarkVault,
   embedding: BenchmarkEmbedding,
-  snapshots: MemorySnapshots,
   identity: object
 ): IndexManager {
-  return new IndexManager(vault, embedding, snapshots, "http://benchmark.invalid/v1", "fixture", {
+  return new IndexManager(vault, embedding, "http://benchmark.invalid/v1", "fixture", {
     sqliteClient: createTestSqliteClient(identity, { persistMutations: false }),
-    snapshotAdapter: snapshots,
+    publicationDirectory: "Trama/index",
   });
 }
 
@@ -162,12 +178,21 @@ export async function runTramaBenchmark(workload: Workload): Promise<TramaBenchm
   const rssBefore = process.memoryUsage().rss;
   const vault = new BenchmarkVault(workload.notes);
   const embedding = new BenchmarkEmbedding(workload);
-  const snapshots = new MemorySnapshots();
-  const index = manager(vault, embedding, snapshots, {});
+  const publicationAdapter = new MemoryPublicationAdapter();
+  const index = manager(vault, embedding, {});
+  const publication = new PublicationManager(
+    index,
+    new PublicationStore(publicationAdapter, { directory: "Trama/index" })
+  );
   const durationMs: Record<string, number> = {};
 
   durationMs.fullBuild = await elapsed(() => index.build(signal));
   const initialState = await index.getState();
+  // Measure lexical build separately from explicit semantic preparation. This
+  // proves the build path remains usable with no embedding request while the
+  // publication records the fully prepared single-file snapshot.
+  durationMs.prepare = await elapsed(() => index.prepareSemantic(signal));
+  if (await index.getState()) durationMs.publish = await elapsed(() => publication.publish());
   durationMs.unchangedUpdate = await elapsed(() => index.synchronize(signal));
 
   const lente = new LenteSearch(index, { getMtime: (path) => vault.mtimes.get(path) ?? null });
@@ -184,14 +209,29 @@ export async function runTramaBenchmark(workload: Workload): Promise<TramaBenchm
   for (const mutation of workload.mutations) {
     if (mutation.kind !== "unchanged") vault.apply(mutation);
     index.queueChange();
-    durationMs[`${mutation.kind}Update`] = await elapsed(() => index.synchronize(signal));
+    let syncResult: { changed: boolean; converged: boolean } | undefined;
+    durationMs[`${mutation.kind}Update`] = await elapsed(async () => {
+      syncResult = await index.synchronize(signal);
+    });
+    const state = await index.getState();
+    if (state && syncResult?.converged)
+      await publication.publishAfterSuccessfulOperation({
+        operation: "update",
+        changed: syncResult.changed,
+        converged: syncResult.converged,
+        state,
+      });
   }
 
-  const snapshot = await index.exportSnapshot();
-  const restarted = manager(vault, embedding, snapshots, {});
-  durationMs.snapshotRestore = await elapsed(async () => {
+  const publicationBytes = await publication.store.read();
+  const restarted = manager(vault, embedding, {});
+  const restartedPublication = new PublicationManager(
+    restarted,
+    new PublicationStore(publicationAdapter, { directory: "Trama/index" })
+  );
+  durationMs.publicationAdopt = await elapsed(async () => {
     await restarted.load();
-    await restarted.importSnapshot(snapshot);
+    await restartedPublication.adoptCurrent();
   });
 
   let round = 0;
@@ -234,7 +274,11 @@ export async function runTramaBenchmark(workload: Workload): Promise<TramaBenchm
     },
     bytes: {
       package: packageBytes(),
-      snapshot: snapshot.size,
+      publication: publicationBytes?.byteLength ?? "unsupported",
+      publicationCopyBytes: publication.metrics?.copyBytes ?? "unsupported",
+      publicationDurationMs: publication.metrics?.durationMs ?? "unsupported",
+      publicationStageDurationMs: publication.metrics?.stageDurationMs ?? "unsupported",
+      publicationReplaceDurationMs: publication.metrics?.replaceDurationMs ?? "unsupported",
       processRssDelta: rssAfter - rssBefore,
     },
     unsupported: ["OPFS restart", "real LM Studio inference", "real Obsidian UI"],

@@ -1,28 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 
-describe("SQLite snapshot plugin maintenance", () => {
-  it("stops automatic work and delegates explicit export/import", async () => {
+describe("SQLite publication plugin maintenance", () => {
+  it("delegates publication retry and synchronized-file adoption", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    const exported = {
-      bytes: new ArrayBuffer(2),
-      sha256: "a".repeat(64),
-      size: 2,
-      path: ".trama/sqlite/v1/snapshots/x.sqlite3",
-      incomplete: true,
+    plugin.publicationManager = {
+      publish: vi.fn().mockResolvedValue({ published: true, publicationId: "local-1" }),
+      adoptCurrent: vi.fn().mockResolvedValue({
+        adopted: true,
+        publicationId: "remote-1",
+        state: { publicationId: "remote-1" },
+      }),
     };
-    plugin.index = {
-      exportSnapshot: vi.fn().mockResolvedValue(exported),
-      importSnapshot: vi.fn().mockResolvedValue(undefined),
-      hasUsableIndex: () => true,
+    plugin.index = { capabilities: () => ({}) };
+    plugin.indexStatus = undefined;
+
+    await expect(plugin.retryPublication()).resolves.toBeUndefined();
+    await expect(plugin.checkPublication()).resolves.toBeUndefined();
+    expect(plugin.publicationManager.publish).toHaveBeenCalledTimes(1);
+    expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not adopt or publish when the synchronized file is absent", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.publicationManager = {
+      publish: vi.fn(),
+      adoptCurrent: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
     };
-    plugin.stopAutomaticWork = vi.fn();
-    await expect(plugin.exportSnapshot()).resolves.toEqual(exported);
-    await plugin.importSnapshot(exported.bytes, exported.sha256);
-    expect(plugin.stopAutomaticWork).toHaveBeenCalledTimes(2);
-    expect(plugin.index.importSnapshot).toHaveBeenCalledWith({
-      bytes: exported.bytes,
-      sha256: exported.sha256,
-    });
+    plugin.index = { capabilities: () => ({}) };
+    plugin.indexStatus = undefined;
+
+    await plugin.checkPublication();
+    expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
+    expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
   });
 });

@@ -93,6 +93,7 @@ export class VoceView extends ItemView {
   private relatedUnsubscribe?: () => void;
   private relatedAbort?: AbortController;
   private relatedRequestGeneration = 0;
+  private relatedResult?: RelatedNotesResult;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -122,9 +123,13 @@ export class VoceView extends ItemView {
     this.relatedAbort = undefined;
     this.relatedRequestGeneration++;
     this.relatedNotes = relatedNotes;
+    this.relatedResult = undefined;
     if (!this.isViewOpen) return;
     this.relatedUnsubscribe = relatedNotes?.subscribe((result: RelatedNotesResult) => {
-      if (this.acceptsRelatedResult(result)) this.renderAttachments();
+      if (this.acceptsRelatedResult(result)) {
+        this.relatedResult = result;
+        this.renderAttachments();
+      }
     });
     this.refreshRelated();
     this.renderAttachments();
@@ -198,7 +203,10 @@ export class VoceView extends ItemView {
       })
     );
     this.relatedUnsubscribe = this.relatedNotes?.subscribe((result: RelatedNotesResult) => {
-      if (this.acceptsRelatedResult(result)) this.renderAttachments();
+      if (this.acceptsRelatedResult(result)) {
+        this.relatedResult = result;
+        this.renderAttachments();
+      }
     });
     this.refreshRelated();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
@@ -220,6 +228,7 @@ export class VoceView extends ItemView {
     this.relatedRequestGeneration++;
     this.relatedAbort?.abort();
     this.relatedAbort = undefined;
+    this.relatedResult = undefined;
     return Promise.resolve();
   }
 
@@ -432,6 +441,30 @@ export class VoceView extends ItemView {
       ...suggestions,
       ...this.selectedAttachmentPaths.filter((path) => !suggestions.includes(path)),
     ];
+    if (this.relatedResult?.unavailableReason) {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text:
+          this.relatedResult.unavailableReason === "incomplete-vectors"
+            ? "Related-note suggestions are unavailable until semantic coverage is complete."
+            : "Related-note suggestions are unavailable. Update the semantic index when available.",
+      });
+    } else if (this.relatedResult?.freshness === "snapshot-loaded") {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text: "Search suggestions reflect a synchronized snapshot that is not locally reconciled.",
+      });
+    } else if (this.relatedResult?.freshness === "unknown") {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text: "Index may be stale; suggestions reflect indexed content until an update.",
+      });
+    } else if (this.relatedResult?.semanticPartial) {
+      this.attachments.createDiv({
+        cls: "setting-item-description mod-warning trama-voce__context-warning",
+        text: "Semantic index is incomplete; suggestions use available vectors.",
+      });
+    }
     for (const path of paths) {
       const isSelected = selected.has(path);
       const button = this.attachments.createEl("button", {
@@ -473,6 +506,7 @@ export class VoceView extends ItemView {
     const path = this.activePath();
     this.relatedAbort?.abort();
     const generation = ++this.relatedRequestGeneration;
+    this.relatedResult = undefined;
     this.renderAttachments();
     if (!path || !this.relatedNotes) return;
     const controller = new AbortController();
@@ -481,7 +515,10 @@ export class VoceView extends ItemView {
       .find(path, controller.signal, 7)
       .then((result) => {
         if (generation !== this.relatedRequestGeneration || controller.signal.aborted) return;
-        if (this.acceptsRelatedResult(result)) this.renderAttachments();
+        if (this.acceptsRelatedResult(result)) {
+          this.relatedResult = result;
+          this.renderAttachments();
+        }
       })
       .catch(() => undefined);
   }

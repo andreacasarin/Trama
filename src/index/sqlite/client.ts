@@ -33,7 +33,7 @@ interface Pending {
   readonly cleanup: () => void;
 }
 
-/** Main-thread RPC client. Requests own IDs and never expose caller-owned buffers to a Worker. */
+/** Main-thread RPC client. Requests copy caller buffers unless ownership is explicitly transferred. */
 export class SqliteWorkerClient {
   private nextId = 1;
   private closed = false;
@@ -57,7 +57,8 @@ export class SqliteWorkerClient {
   call<M extends SqliteMethod>(
     method: M,
     payload: SqliteRequestPayloads[M],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options: { readonly transferOwnedBytes?: boolean } = {}
   ): Promise<any> {
     if (this.closed)
       return Promise.reject(sqliteError("storage_unavailable", "Worker client is closed"));
@@ -97,7 +98,14 @@ export class SqliteWorkerClient {
       this.pending.set(id, { resolve, reject, cleanup });
       signal?.addEventListener("abort", onAbort!, { once: true });
       try {
-        const copied = cloneRequest(request);
+        if (options.transferOwnedBytes && method !== "inspectPublication")
+          throw new Error("Only staged publication inspection can transfer ownership");
+        const copied = options.transferOwnedBytes
+          ? {
+              request,
+              transfer: [(payload as SqliteRequestPayloads["inspectPublication"]).bytes],
+            }
+          : cloneRequest(request);
         this.worker!.postMessage(copied.request, copied.transfer);
       } catch (error) {
         settled = true;
@@ -169,15 +177,18 @@ export class SqliteWorkerClient {
 function cloneRequest<M extends SqliteMethod>(
   request: SqliteRequest<M>
 ): { request: SqliteRequest<M>; transfer: ArrayBuffer[] } {
+  // These payloads contain only strings and numbers; postMessage performs the one required clone.
+  if (request.method === "hashMarkdown" || request.method === "upsertMarkdown")
+    return { request, transfer: [] };
   const cloned = structuredClone(request) as SqliteRequest<M>;
   const payload = cloned.payload as Record<string, unknown>;
   const transfer: ArrayBuffer[] = [];
   if (payload.vector instanceof Float32Array && payload.vector.buffer instanceof ArrayBuffer)
     transfer.push(payload.vector.buffer);
-  const note = payload.note as { chunks?: readonly { vector: Float32Array }[] } | undefined;
-  if (note?.chunks)
-    for (const chunk of note.chunks)
-      if (chunk.vector.buffer instanceof ArrayBuffer) transfer.push(chunk.vector.buffer);
   if (payload.bytes instanceof ArrayBuffer) transfer.push(payload.bytes);
+  const vectors = payload.vectors as readonly { vector?: Float32Array }[] | undefined;
+  if (vectors)
+    for (const item of vectors)
+      if (item.vector?.buffer instanceof ArrayBuffer) transfer.push(item.vector.buffer);
   return { request: cloned, transfer };
 }

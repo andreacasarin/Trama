@@ -31,6 +31,44 @@ describe("RelatedNotes", () => {
     expect(zeroLimit.search).not.toHaveBeenCalled();
   });
 
+  it("does not retrieve until compatible vector coverage is complete", async () => {
+    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const source = {
+      relatedState: () => ({
+        ...current.value,
+        semantic: { state: "partial" as const, activity: "idle" as const, searchable: false },
+        freshness: "snapshot-loaded" as const,
+        publicationId: "pub-1",
+      }),
+      findRelated: current.search,
+    };
+
+    await expect(new RelatedNotes(source).find("current.md", signal)).resolves.toMatchObject({
+      results: [],
+      unavailableReason: "incomplete-vectors",
+      freshness: "snapshot-loaded",
+      publicationId: "pub-1",
+    });
+    expect(current.search).not.toHaveBeenCalled();
+  });
+
+  it("uses available related-note vectors when semantic coverage is partial", async () => {
+    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const source = {
+      relatedState: () => ({
+        ...current.value,
+        semantic: { state: "partial" as const, activity: "idle" as const, searchable: true },
+      }),
+      findRelated: current.search,
+    };
+
+    await expect(new RelatedNotes(source).find("current.md", signal)).resolves.toMatchObject({
+      semanticPartial: true,
+      results: [expect.objectContaining({ path: "a.md" })],
+    });
+    expect(current.search).toHaveBeenCalledOnce();
+  });
+
   it("prepares once, excludes current, aggregates max score, caps, and sorts ties", async () => {
     const hits = [
       { path: "current.md", score: 99 },

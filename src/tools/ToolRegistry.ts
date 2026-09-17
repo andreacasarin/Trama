@@ -1,4 +1,5 @@
 import { ProvenanceRecord, ReadonlyVault, StructuredErrorShape } from "@/domain/contracts";
+import { searchVault, type VaultRetrievalPort } from "@/index/VaultSearch";
 
 export interface JsonSchema {
   readonly type: "object";
@@ -251,14 +252,11 @@ function linkProvenance(
   });
 }
 
-export interface VaultSearchPort {
-  search(query: string, signal: AbortSignal, limit: number): Promise<readonly ProvenanceRecord[]>;
-}
 export class VaultSearchTool implements ReadonlyTool {
   readonly definition = {
     name: "vault_search",
     description:
-      "Search eligible notes in the committed index using an exact term, phrase, or natural-language concept. Returns matching passages with excerpts, note paths, and line ranges; use read_note on a returned path for fuller context.",
+      "Search eligible notes in the committed index using an exact term, phrase, or natural-language concept through hybrid semantic and lexical retrieval. Falls back to lexical search when embeddings are unavailable. Returns matching passages with excerpts, note paths, and line ranges; use read_note on a returned path for fuller context.",
     inputSchema: {
       type: "object",
       properties: {
@@ -271,14 +269,23 @@ export class VaultSearchTool implements ReadonlyTool {
       additionalProperties: false,
     },
   } as const;
-  static readonly MAX_RESULTS = 20;
-  constructor(private readonly searchPort: VaultSearchPort) {}
+  static readonly MAX_RESULTS = 7;
+  constructor(private readonly searchPort: VaultRetrievalPort) {}
   async execute(input: unknown, signal: AbortSignal): Promise<ToolResult> {
     const data = objectInput(input);
     if (!data || typeof data.query !== "string" || !data.query.trim())
       return invalid("query must be a non-empty string");
     try {
-      const results = await this.searchPort.search(data.query, signal, VaultSearchTool.MAX_RESULTS);
+      const batch = await searchVault(this.searchPort, data.query, { signal });
+      const results: ProvenanceRecord[] = batch.hits
+        .slice(0, VaultSearchTool.MAX_RESULTS)
+        .map((hit) => ({
+          path: hit.path,
+          startLine: hit.startLine,
+          endLine: hit.endLine,
+          excerpt: hit.excerpt,
+          score: hit.fusedScore,
+        }));
       return { ok: true, data: { results }, provenance: results };
     } catch (e) {
       return failure(e);

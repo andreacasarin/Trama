@@ -32,6 +32,30 @@ const vault: ReadonlyVault = {
 };
 
 describe("integration composition seams", () => {
+  it("surfaces SQLite as unavailable when the packaged mobile runtime cannot start", async () => {
+    const index = new IndexManager(
+      {
+        listMarkdownPaths: async () => [],
+        readMarkdown: async () => ({ path: "missing.md", content: "" }),
+      },
+      new FakeEmbedding(),
+      "http://127.0.0.1:1234/v1",
+      "embed-v1",
+      {
+        workerFactory: () => {
+          throw new Error("WASM unavailable");
+        },
+      }
+    );
+
+    await expect(index.load()).resolves.toBe(false);
+    expect(index.capabilities()).toMatchObject({
+      availability: "unavailable",
+      lexical: { state: "unavailable", activity: "idle", searchable: false },
+      semantic: { state: "unavailable", activity: "idle", searchable: false },
+    });
+  });
+
   it("builds, persists, reloads, and searches a semantic index without network", async () => {
     const embedding = new FakeEmbedding();
     const storage = {};
@@ -44,24 +68,14 @@ describe("integration composition seams", () => {
       },
     };
     const sqliteClient = createTestSqliteClient(storage);
-    const first = new IndexManager(
-      port,
-      embedding,
-      storage,
-      "http://127.0.0.1:1234/v1",
-      "embed-v1",
-      { sqliteClient }
-    );
+    const first = new IndexManager(port, embedding, "http://127.0.0.1:1234/v1", "embed-v1", {
+      sqliteClient,
+    });
     await first.build(new AbortController().signal);
     expect(await first.search("alpha", new AbortController().signal, 10)).toHaveLength(2);
-    const restarted = new IndexManager(
-      port,
-      embedding,
-      storage,
-      "http://127.0.0.1:1234/v1",
-      "embed-v1",
-      { sqliteClient: createTestSqliteClient(storage) }
-    );
+    const restarted = new IndexManager(port, embedding, "http://127.0.0.1:1234/v1", "embed-v1", {
+      sqliteClient: createTestSqliteClient(storage),
+    });
     expect(await restarted.load()).toBe(true);
   });
 
@@ -91,7 +105,14 @@ describe("integration composition seams", () => {
     const registry = new ToolRegistry([
       new ReadNoteTool(vault),
       new FollowLinkTool(vault),
-      new VaultSearchTool({ search: async () => [] }),
+      new VaultSearchTool({
+        vaultSearchState: () => ({
+          changeCounter: 1,
+          generationId: "test",
+          semantic: { state: "empty", activity: "idle", searchable: false },
+        }),
+        retrieveVaultCandidates: async () => [],
+      }),
     ]);
     const state = await new ChatSession(model, registry, vault).send({
       content: "trace links",
@@ -209,7 +230,17 @@ describe("integration composition seams", () => {
     });
     const session = new ChatSession(
       chat,
-      new ToolRegistry([new ReadNoteTool(vault), new VaultSearchTool({ search: async () => [] })]),
+      new ToolRegistry([
+        new ReadNoteTool(vault),
+        new VaultSearchTool({
+          vaultSearchState: () => ({
+            changeCounter: 1,
+            generationId: "test",
+            semantic: { state: "empty", activity: "idle", searchable: false },
+          }),
+          retrieveVaultCandidates: async () => [],
+        }),
+      ]),
       vault
     );
 

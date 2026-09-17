@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MutableSqliteDatabase, type SqliteConnection } from "@/index/sqlite/database";
+import type { SqliteChunkInput, SqliteNoteInput } from "@/index/sqlite/protocol";
 import { loadTestSqlite } from "./sqlite-test-client";
 
 async function database(
@@ -20,6 +21,36 @@ async function database(
   return index;
 }
 
+function upsertNote(
+  index: MutableSqliteDatabase,
+  note: Omit<SqliteNoteInput, "chunks"> & {
+    chunks: readonly (SqliteChunkInput & { vector: Float32Array })[];
+  }
+): void {
+  index.upsertNote({
+    ...note,
+    chunks: note.chunks.map(({ id, ordinal, startLine, endLine, text }) => ({
+      id,
+      ordinal,
+      startLine,
+      endLine,
+      text,
+    })),
+  });
+  const vectors = new Map(note.chunks.map((chunk) => [chunk.id, chunk.vector]));
+  const missing = index.listMissingVectors("", note.chunks.length);
+  index.storeVectors(
+    missing.map((chunk) => ({
+      chunkPk: chunk.chunkPk,
+      chunkId: chunk.chunkId,
+      contentId: chunk.contentId,
+      vector: vectors.get(chunk.chunkId)!,
+    })),
+    "",
+    index.getState().changeCounter
+  );
+}
+
 describe("SQLite hydrated retrieval", () => {
   it("fuses channels by chunk identity and retains semantic/lexical evidence", async () => {
     const index = await database();
@@ -37,8 +68,8 @@ describe("SQLite hydrated retrieval", () => {
         },
       ],
     });
-    index.upsertNote(note("a.md", "a".repeat(64), "needle alpha", [1, 0]));
-    index.upsertNote(note("b.md", "b".repeat(64), "needle beta", [0, 1]));
+    upsertNote(index, note("a.md", "a".repeat(64), "needle alpha", [1, 0]));
+    upsertNote(index, note("b.md", "b".repeat(64), "needle beta", [0, 1]));
     const hits = index.retrieve("needle", new Float32Array([1, 0]), 10, undefined, {
       semanticCandidateLimit: 10,
       lexicalCandidateLimit: 10,
@@ -50,10 +81,38 @@ describe("SQLite hydrated retrieval", () => {
     index.close();
   });
 
+  it("orders equal Hybrid scores by UTF-16 code units", async () => {
+    const index = await database();
+    const notes = [
+      { path: "Å.md", contentId: "a".repeat(64) },
+      { path: "a\u030a.md", contentId: "b".repeat(64) },
+    ];
+    for (const note of notes)
+      upsertNote(index, {
+        ...note,
+        chunks: [
+          {
+            id: `${note.contentId}:0`,
+            ordinal: 0,
+            startLine: 1,
+            endLine: 1,
+            text: "same needle",
+            vector: new Float32Array([1, 0]),
+          },
+        ],
+      });
+
+    const hits = index.retrieve("needle", new Float32Array([1, 0]), 2, undefined, {
+      lexicalProfile: "voce",
+    });
+    expect(hits.map((hit) => hit.path)).toEqual(["a\u030a.md", "Å.md"]);
+    index.close();
+  });
+
   it("keeps hostile and Unicode keyword input literal and deterministic", async () => {
     const index = await database();
     const id = "c".repeat(64);
-    index.upsertNote({
+    upsertNote(index, {
       path: "folder/Ä.md",
       contentId: id,
       chunks: [
@@ -81,7 +140,7 @@ describe("SQLite hydrated retrieval", () => {
   it("limits note-shaped lexical candidates after choosing one chunk per note", async () => {
     const index = await database();
     const dominant = "d".repeat(64);
-    index.upsertNote({
+    upsertNote(index, {
       path: "dominant.md",
       contentId: dominant,
       chunks: Array.from({ length: 80 }, (_, ordinal) => ({
@@ -95,7 +154,7 @@ describe("SQLite hydrated retrieval", () => {
     });
     for (let ordinal = 0; ordinal < 9; ordinal++) {
       const contentId = (ordinal + 1).toString(16).repeat(64);
-      index.upsertNote({
+      upsertNote(index, {
         path: `other-${ordinal}.md`,
         contentId,
         chunks: [
@@ -126,7 +185,7 @@ describe("SQLite hydrated retrieval", () => {
     const index = await database(2, (sql) => statements.push(sql));
     for (let note = 0; note < 12; note++) {
       const contentId = note.toString(16).padStart(64, "0");
-      index.upsertNote({
+      upsertNote(index, {
         path: `note-${note.toString().padStart(2, "0")}.md`,
         contentId,
         chunks: [
@@ -162,7 +221,7 @@ describe("SQLite hydrated retrieval", () => {
     const index = await database(2, (sql) => statements.push(sql));
     for (let note = 0; note < 20; note++) {
       const contentId = note.toString(16).padStart(64, "0");
-      index.upsertNote({
+      upsertNote(index, {
         path: `tie-${note.toString().padStart(2, "0")}.md`,
         contentId,
         chunks: [
@@ -202,7 +261,7 @@ describe("SQLite hydrated retrieval", () => {
     const index = await database();
     const current = "d".repeat(64);
     const related = "e".repeat(64);
-    index.upsertNote({
+    upsertNote(index, {
       path: "current.md",
       contentId: current,
       chunks: [
@@ -216,7 +275,7 @@ describe("SQLite hydrated retrieval", () => {
         },
       ],
     });
-    index.upsertNote({
+    upsertNote(index, {
       path: "related.md",
       contentId: related,
       chunks: [
@@ -253,10 +312,11 @@ describe("SQLite hydrated retrieval", () => {
       })),
     });
     const current = "f".repeat(64);
-    index.upsertNote(makeNote("current.md", current, 1));
-    index.upsertNote(makeNote("dominant.md", "1".repeat(64), 130));
+    upsertNote(index, makeNote("current.md", current, 1));
+    upsertNote(index, makeNote("dominant.md", "1".repeat(64), 130));
     for (let note = 0; note < 8; note++)
-      index.upsertNote(
+      upsertNote(
+        index,
         makeNote(
           `other-${note}.md`,
           `${(note + 2)
@@ -285,10 +345,11 @@ describe("SQLite hydrated retrieval", () => {
         vector: new Float32Array([1, 0]),
       })),
     });
-    index.upsertNote(makeNote("current.md", "7".repeat(64), 1));
-    index.upsertNote(makeNote("dominant.md", "8".repeat(64), 4_100));
+    upsertNote(index, makeNote("current.md", "7".repeat(64), 1));
+    upsertNote(index, makeNote("dominant.md", "8".repeat(64), 4_100));
     for (let note = 0; note < 8; note++)
-      index.upsertNote(
+      upsertNote(
+        index,
         makeNote(`tie-${note}.md`, `${(note + 9).toString(16).repeat(64).slice(0, 64)}`, 1)
       );
 

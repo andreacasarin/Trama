@@ -1,4 +1,4 @@
-export const INDEX_SCHEMA_VERSION = 3;
+export const INDEX_SCHEMA_VERSION = 5;
 export const EXTRACTION_VERSION = 1;
 export const CHUNK_ALGORITHM_VERSION = 2;
 export const CHUNK_SIZE = 384;

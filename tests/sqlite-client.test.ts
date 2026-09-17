@@ -52,6 +52,33 @@ describe("SqliteWorkerClient", () => {
     expect(worker.listenerCount("messageerror")).toBe(0);
   });
 
+  it("sends raw Markdown without requiring vector transferables", async () => {
+    const worker = new FakeWorker();
+    const client = new SqliteWorkerClient(worker);
+
+    await client.call("upsertMarkdown", {
+      path: "lexical.md",
+      markdown: "lexical only",
+      expectedContentId: "a".repeat(64),
+      size: 384,
+      overlap: 64,
+    });
+
+    expect(worker.messages[0].value.method).toBe("upsertMarkdown");
+    expect(worker.messages[0].transfer).toEqual([]);
+  });
+
+  it("transfers owned publication readback without copying it on the main thread", async () => {
+    const worker = new FakeWorker();
+    const client = new SqliteWorkerClient(worker);
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+
+    await client.call("inspectPublication", { bytes }, undefined, { transferOwnedBytes: true });
+
+    expect(worker.messages[0].value.payload.bytes).toBe(bytes);
+    expect(worker.messages[0].transfer).toEqual([bytes]);
+  });
+
   it("rejects pending calls on a Worker crash", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);

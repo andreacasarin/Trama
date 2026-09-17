@@ -25,5 +25,8 @@ export interface OpfsSAHPoolUtilLike {
 
 export function exportOpfsDatabase(pool: OpfsSAHPoolUtilLike, name: string): ArrayBuffer {
   const bytes = pool.exportFile(name);
-  return bytes instanceof ArrayBuffer ? bytes.slice(0) : (bytes.slice().buffer as ArrayBuffer);
+  // The official pool already transfers ownership when it returns an
+  // ArrayBuffer. Uint8Array results are copied because their backing store may
+  // be shared with the pool's access handle.
+  return bytes instanceof ArrayBuffer ? bytes : (bytes.slice().buffer as ArrayBuffer);
 }

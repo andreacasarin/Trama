@@ -10,18 +10,35 @@ describe("Trama feature journeys", () => {
     const world = new TramaTestWorld();
     await world.build();
 
+    // Lexical indexing is independent of AI. Semantic consumers remain gated
+    // until the explicit, resumable preparation action is requested.
+    expect(world.embedding.calls).toBe(0);
+    expect((await world.filo.find("Atlas/Garden.md", signal)).results).toEqual([]);
+
     const keyword = await world.lente.search("garden", { searchMethod: "keyword" });
     expect(keyword.mode).toBe("lexical");
     expect(keyword.results).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "Atlas/Garden.md" })])
     );
-    expect((await world.filo.find("Atlas/Garden.md", signal)).results).toEqual(
+    const withoutVectors = await world.lente.search("garden");
+    expect(withoutVectors).toMatchObject({
+      mode: "lexical",
+      degraded: true,
+      degradationReason: "semantic-unavailable",
+    });
+    await world.prepare();
+    expect(world.embedding.calls).toBeGreaterThan(0);
+    expect((await world.filo.find("Atlas/Garden.md", signal, 7, true)).results).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "Atlas/Seeds.md" })])
     );
     const voce = await world.tools.execute("vault_search", { query: "Tokyo" }, signal);
     expect(voce.ok).toBe(true);
     expect(voce.provenance).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "Unicode/東京.md" })])
+    );
+    const lente = await world.lente.search("Tokyo");
+    expect(voce.provenance.map((hit) => hit.path)).toEqual(
+      lente.canonicalResults?.slice(0, 7).map((hit) => hit.path)
     );
     expect(JSON.stringify(await world.index.search("garden", signal, 20))).not.toContain(
       "PRIVATE_FIXTURE_SENTINEL"
@@ -32,6 +49,7 @@ describe("Trama feature journeys", () => {
     const world = new TramaTestWorld();
     await world.build();
     const afterBuild = world.embedding.calls;
+    expect(afterBuild).toBe(0);
 
     await world.index.synchronize(signal);
     expect(world.embedding.calls).toBe(afterBuild);
@@ -41,6 +59,8 @@ describe("Trama feature journeys", () => {
     const afterAdd = world.embedding.calls;
     world.vault.set("Kitchen/Pasta.md", "Alpha garden herbs for pasta.");
     await world.update();
+    expect(world.embedding.calls).toBe(afterAdd);
+    await world.prepare();
     expect(world.embedding.calls).toBeGreaterThan(afterAdd);
     const afterModify = world.embedding.calls;
 

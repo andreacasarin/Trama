@@ -4,6 +4,5 @@
   "version": "0.1.0",
   "minAppVersion": "1.7.2",
   "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
-  "author": "Andrea Casarin",
-  "isDesktopOnly": true
+  "author": "Andrea Casarin"
 }

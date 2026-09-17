@@ -4,6 +4,78 @@
  */
 const encoder = new TextEncoder();
 
+/** Normalize a vault-relative path without changing its case. */
+export function normalizeVaultPath(path: string): string {
+  return path
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
+}
+
+/** Exact-path or directory-boundary matching used by corpus inputs. */
+export function isPathExcluded(path: string, excludedPath: string): boolean {
+  const candidate = normalizeVaultPath(path);
+  const excluded = normalizeVaultPath(excludedPath);
+  return !!excluded && (candidate === excluded || candidate.startsWith(`${excluded}/`));
+}
+
+export function normalizeEmbeddingEndpoint(value: string): string {
+  return value.trim().replace(/\/$/, "").toLowerCase();
+}
+
+export interface CorpusIdentityInput {
+  readonly schemaVersion: number;
+  readonly extractionVersion: number;
+  readonly chunking: {
+    readonly algorithmVersion: number;
+    readonly size: number;
+    readonly overlap: number;
+  };
+  readonly excludedPaths: readonly string[];
+}
+
+export interface EmbeddingIdentityInput {
+  readonly embeddingBaseUrl: string;
+  readonly modelId: string;
+  readonly dimensions: number;
+  readonly preprocessingVersion?: number | string;
+}
+
+function canonical(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+/** Stable JSON input for the corpus identity; embedding settings are excluded. */
+export function corpusIdentityInput(input: CorpusIdentityInput): string {
+  return canonical({
+    schemaVersion: input.schemaVersion,
+    extractionVersion: input.extractionVersion,
+    chunking: input.chunking,
+    excludedPaths: [...new Set(input.excludedPaths.map(normalizeVaultPath))].sort(compareCodeUnits),
+  });
+}
+
+/** Stable JSON input for the configured semantic embedding space. */
+export function embeddingIdentityInput(input: EmbeddingIdentityInput): string {
+  return canonical({
+    endpoint: normalizeEmbeddingEndpoint(input.embeddingBaseUrl),
+    modelId: input.modelId,
+    dimensions: input.dimensions,
+    ...(input.preprocessingVersion === undefined
+      ? {}
+      : { preprocessingVersion: input.preprocessingVersion }),
+  });
+}
+
+export function createCorpusFingerprint(input: CorpusIdentityInput): Promise<string> {
+  return sha256Hex(corpusIdentityInput(input));
+}
+
+export function createEmbeddingFingerprint(input: EmbeddingIdentityInput): Promise<string> {
+  return sha256Hex(embeddingIdentityInput(input));
+}
+
 /** Locale-independent UTF-16 code-unit ordering for persisted and ranked data. */
 export function compareCodeUnits(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;

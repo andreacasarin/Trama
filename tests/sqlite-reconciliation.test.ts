@@ -25,7 +25,6 @@ describe("mutable SQLite reconciliation", () => {
           startLine: 1,
           endLine: 1,
           text: "same",
-          vector: new Float32Array([1, 0]),
         },
       ],
     });
@@ -108,7 +107,35 @@ describe("mutable SQLite reconciliation", () => {
     database.close();
   });
 
-  it("durably re-marks a published state incomplete for a late vault event", async () => {
+  it("pairs same-content renames by binary path order and deletes extra rows at finish", async () => {
+    const { index, database } = await openIndex();
+    index.upsertNote({ path: "old-b.md", contentId: id("a"), chunks: [] });
+    index.upsertNote({ path: "old-a.md", contentId: id("a"), chunks: [] });
+    const summaries = [
+      { path: "new-b.md", contentId: id("a"), chunkCount: 0 },
+      { path: "new-a.md", contentId: id("a"), chunkCount: 0 },
+    ];
+    expect(index.planReconciliation(summaries).renames).toEqual([
+      { from: "old-a.md", to: "new-a.md", contentId: id("a") },
+      { from: "old-b.md", to: "new-b.md", contentId: id("a") },
+    ]);
+    index.upsertNote({ path: "new-a.md", contentId: id("a"), chunks: [] });
+    index.upsertNote({ path: "new-b.md", contentId: id("a"), chunks: [] });
+    expect(index.finishReconciliation(summaries, index.getState().changeCounter)).toMatchObject({
+      incomplete: false,
+      noteCount: 2,
+    });
+    const paths: string[] = [];
+    database.exec({
+      sql: "SELECT path FROM notes ORDER BY path",
+      rowMode: "object",
+      callback: (row: Record<string, unknown>) => paths.push(String(row.path)),
+    });
+    expect(paths).toEqual(["new-a.md", "new-b.md"]);
+    index.close();
+  });
+
+  it("preserves a published state across Worker restart", async () => {
     const { index, database } = await openIndex();
     index.upsertNote({ path: "note.md", contentId: id("d"), chunks: [] });
     const published = index.finishReconciliation(
@@ -117,11 +144,11 @@ describe("mutable SQLite reconciliation", () => {
     );
     expect(published.incomplete).toBe(false);
     const reopened = index.boot(id("f"), 2);
-    expect(reopened).toMatchObject({ incomplete: true, noteCount: 1 });
-    expect(reopened.changeCounter).toBe(published.changeCounter + 1);
+    expect(reopened).toMatchObject({ incomplete: false, noteCount: 1 });
+    expect(reopened.changeCounter).toBe(published.changeCounter);
     const fenced = index.markIncomplete();
     expect(fenced).toMatchObject({ incomplete: true });
-    expect(fenced.changeCounter).toBeGreaterThan(published.changeCounter);
+    expect(fenced.changeCounter).toBe(published.changeCounter + 1);
     index.close();
     database.close();
   });

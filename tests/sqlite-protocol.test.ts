@@ -4,26 +4,42 @@ import { SQLITE_PROTOCOL_VERSION, validateRequest, sqliteError } from "@/index/s
 const hash = "a".repeat(64);
 
 describe("SQLite protocol", () => {
-  it("accepts bounded requests", () => {
-    const vector = new Float32Array([1, 0]);
-    const request = {
+  it("validates bounded Markdown jobs before they reach the Worker", () => {
+    const envelope = (method: string, payload: object) => ({
       v: SQLITE_PROTOCOL_VERSION,
       id: 1,
-      method: "upsertNote" as const,
-      payload: {
-        note: {
-          path: "notes/a.md",
-          contentId: hash,
-          chunks: [
-            { id: `${hash}:0`, ordinal: 0, startLine: 1, endLine: 1, text: "hello", vector },
-          ],
-        },
-      },
-    };
-    expect(() => validateRequest(request)).not.toThrow();
+      method,
+      payload,
+    });
+    expect(() =>
+      validateRequest(envelope("hashMarkdown", { markdown: "alpha", corpusFingerprint: hash }))
+    ).not.toThrow();
+    expect(() => validateRequest(envelope("clearVectors", {}))).not.toThrow();
+    expect(() =>
+      validateRequest(
+        envelope("upsertMarkdown", {
+          path: "note.md",
+          markdown: "alpha",
+          expectedContentId: hash,
+          size: 384,
+          overlap: 64,
+        })
+      )
+    ).not.toThrow();
+    expect(() =>
+      validateRequest(
+        envelope("upsertMarkdown", {
+          path: "note.md",
+          markdown: "alpha",
+          expectedContentId: hash,
+          size: 384,
+          overlap: 384,
+        })
+      )
+    ).toThrow();
   });
 
-  it("rejects unsafe paths, duplicate chunk identities, and unbounded limits", () => {
+  it("rejects unsafe paths and unbounded limits", () => {
     expect(() => validateRequest({ v: 1, id: 1, method: "getState", payload: {} })).toThrow();
     expect(() =>
       validateRequest({
@@ -31,36 +47,6 @@ describe("SQLite protocol", () => {
         id: 1,
         method: "deleteNote",
         payload: { path: "../secret.md" },
-      })
-    ).toThrow();
-    const note = {
-      path: "a.md",
-      contentId: hash,
-      chunks: [
-        {
-          id: `${hash}:0`,
-          ordinal: 0,
-          startLine: 1,
-          endLine: 1,
-          text: "a",
-          vector: new Float32Array([1]),
-        },
-        {
-          id: `${hash}:0`,
-          ordinal: 0,
-          startLine: 1,
-          endLine: 1,
-          text: "b",
-          vector: new Float32Array([1]),
-        },
-      ],
-    };
-    expect(() =>
-      validateRequest({
-        v: SQLITE_PROTOCOL_VERSION,
-        id: 1,
-        method: "upsertNote",
-        payload: { note },
       })
     ).toThrow();
     expect(() =>
