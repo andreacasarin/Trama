@@ -105,7 +105,14 @@ describe("integration composition seams", () => {
     const registry = new ToolRegistry([
       new ReadNoteTool(vault),
       new FollowLinkTool(vault),
-      new VaultSearchTool({ search: async () => [] }),
+      new VaultSearchTool({
+        vaultSearchState: () => ({
+          changeCounter: 1,
+          generationId: "test",
+          semantic: { state: "empty", activity: "idle", searchable: false },
+        }),
+        retrieveVaultCandidates: async () => [],
+      }),
     ]);
     const state = await new ChatSession(model, registry, vault).send({
       content: "trace links",
@@ -223,7 +230,17 @@ describe("integration composition seams", () => {
     });
     const session = new ChatSession(
       chat,
-      new ToolRegistry([new ReadNoteTool(vault), new VaultSearchTool({ search: async () => [] })]),
+      new ToolRegistry([
+        new ReadNoteTool(vault),
+        new VaultSearchTool({
+          vaultSearchState: () => ({
+            changeCounter: 1,
+            generationId: "test",
+            semantic: { state: "empty", activity: "idle", searchable: false },
+          }),
+          retrieveVaultCandidates: async () => [],
+        }),
+      ]),
       vault
     );
 

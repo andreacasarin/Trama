@@ -5,7 +5,7 @@ describe("SQLite publication plugin maintenance", () => {
   it("delegates publication retry and synchronized-file adoption", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.publicationManager = {
-      retryPublication: vi.fn().mockResolvedValue({ published: true, publicationId: "local-1" }),
+      publish: vi.fn().mockResolvedValue({ published: true, publicationId: "local-1" }),
       adoptCurrent: vi.fn().mockResolvedValue({
         adopted: true,
         publicationId: "remote-1",
@@ -17,14 +17,14 @@ describe("SQLite publication plugin maintenance", () => {
 
     await expect(plugin.retryPublication()).resolves.toBeUndefined();
     await expect(plugin.checkPublication()).resolves.toBeUndefined();
-    expect(plugin.publicationManager.retryPublication).toHaveBeenCalledTimes(1);
+    expect(plugin.publicationManager.publish).toHaveBeenCalledTimes(1);
     expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
   });
 
   it("does not adopt or publish when the synchronized file is absent", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.publicationManager = {
-      retryPublication: vi.fn(),
+      publish: vi.fn(),
       adoptCurrent: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
     };
     plugin.index = { capabilities: () => ({}) };
@@ -32,6 +32,6 @@ describe("SQLite publication plugin maintenance", () => {
 
     await plugin.checkPublication();
     expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationManager.retryPublication).not.toHaveBeenCalled();
+    expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
   });
 });

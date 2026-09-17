@@ -63,18 +63,14 @@ function manager(contents: Record<string, string>, identity: object = {}, model 
   };
 }
 
-function racedManager(
-  contents: Record<string, string>,
-  hookMethod: "listNotes" | "finishReconciliation",
-  repeat = false
-) {
+function racedManager(contents: Record<string, string>, repeat = false) {
   const identity = {};
   const base = createTestSqliteClient(identity);
   let armed = false;
   let fired = 0;
   const client = new SqliteWorkerClient(undefined, async (method, payload, requestSignal) => {
     const result = await base.call(method, payload, requestSignal);
-    if (armed && method === hookMethod && (repeat || fired === 0)) {
+    if (armed && method === "finishReconciliation" && (repeat || fired === 0)) {
       fired++;
       target.queueChange();
     }
@@ -119,7 +115,7 @@ describe("semantic index module", () => {
     expect(methods).not.toContain("upsertNote");
     methods.length = 0;
     contents["note.md"] = "beta\nsecond";
-    await index.update(signal);
+    await index.synchronize(signal);
     expect(methods).toContain("hashMarkdown");
     expect(methods).toContain("upsertMarkdown");
     expect(methods).not.toContain("upsertNote");
@@ -207,24 +203,24 @@ describe("semantic index module", () => {
       incomplete: false,
       changeCounter: expect.any(Number),
     });
-    expect(setup.manager.lenteState()).toMatchObject({
+    expect(setup.manager.vaultSearchState()).toMatchObject({
       semantic: { state: "empty", searchable: false },
       freshness: "locally-reconciled",
     });
   });
 
-  it("keeps default vault search lexical while allowing explicit hybrid retrieval", async () => {
+  it("defaults vault search to hybrid and allows explicit lexical retrieval", async () => {
     const setup = manager({ "a.md": "alpha note" });
     await setup.manager.build(signal);
     await setup.manager.prepareSemantic(signal);
     setup.model.embed.mockClear();
 
-    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
+    await expect(setup.manager.search("alpha", signal, 5, "lexical")).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
     );
     expect(setup.model.embed).not.toHaveBeenCalled();
 
-    await expect(setup.manager.search("alpha", signal, 5, "hybrid")).resolves.toEqual(
+    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
     );
     expect(setup.model.embed).toHaveBeenCalledTimes(1);
@@ -264,7 +260,7 @@ describe("semantic index module", () => {
 
     const rebuild = setup.manager.rebuildSemantic(signal);
     await vi.waitFor(() =>
-      expect(setup.manager.getCapabilities().semantic).toMatchObject({
+      expect(setup.manager.capabilities().semantic).toMatchObject({
         activity: "updating",
         searchable: false,
       })
@@ -330,7 +326,7 @@ describe("semantic index module", () => {
 
     setup.contents["c.md"] = "gamma";
     setup.manager.queueChange();
-    expect(setup.manager.freshnessState()).toBe("unknown");
+    expect(setup.manager.capabilities().freshness).toBe("unknown");
     await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
     );
@@ -492,24 +488,24 @@ describe("semantic index module", () => {
     await receiver.manager.load();
     await receiver.manager.adoptPublication(prepared.bytes, "remote-publication");
     expect((await receiver.manager.getState())?.snapshotLoaded).toBe(true);
-    expect(receiver.manager.freshnessState()).toBe("snapshot-loaded");
+    expect(receiver.manager.capabilities().freshness).toBe("snapshot-loaded");
 
     const adoptedRestart = manager({ "a.md": "alpha" }, receiverIdentity);
     await adoptedRestart.manager.load();
     expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(true);
-    expect(adoptedRestart.manager.freshnessState()).toBe("snapshot-loaded");
+    expect(adoptedRestart.manager.capabilities().freshness).toBe("snapshot-loaded");
 
-    await expect(adoptedRestart.manager.update(signal)).resolves.toEqual({
+    await expect(adoptedRestart.manager.synchronize(signal)).resolves.toEqual({
       changed: false,
       converged: true,
     });
     expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(adoptedRestart.manager.freshnessState()).toBe("locally-reconciled");
+    expect(adoptedRestart.manager.capabilities().freshness).toBe("locally-reconciled");
 
     const afterNoOpRestart = manager({ "a.md": "alpha" }, receiverIdentity);
     await afterNoOpRestart.manager.load();
     expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(afterNoOpRestart.manager.freshnessState()).toBe("locally-reconciled");
+    expect(afterNoOpRestart.manager.capabilities().freshness).toBe("locally-reconciled");
 
     const { prepared: localPrepared } = await afterNoOpRestart.manager.publishPublication(
       "local-publication",
@@ -521,7 +517,7 @@ describe("semantic index module", () => {
     const reconciledRestart = manager({ "a.md": "alpha" }, receiverIdentity);
     await reconciledRestart.manager.load();
     expect((await reconciledRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(reconciledRestart.manager.freshnessState()).toBe("locally-reconciled");
+    expect(reconciledRestart.manager.capabilities().freshness).toBe("locally-reconciled");
   });
 
   it("blocks local writes and adoption until publication installs and stamps the same ID", async () => {
@@ -542,7 +538,7 @@ describe("semantic index module", () => {
     });
     await installing;
     expect(setup.manager.isInMaintenance()).toBe(true);
-    const updating = setup.manager.update(signal);
+    const updating = setup.manager.synchronize(signal);
     let updateFinished = false;
     void updating.then(() => {
       updateFinished = true;
@@ -684,7 +680,7 @@ describe("semantic index module", () => {
 
   it("retries when an event arrives during final reconciliation", async () => {
     const contents = { "a.md": "alpha" };
-    const setup = racedManager(contents, "finishReconciliation");
+    const setup = racedManager(contents);
     await setup.manager.build(signal);
     contents["a.md"] = "beta";
     setup.arm();
@@ -698,7 +694,7 @@ describe("semantic index module", () => {
 
   it("stops incomplete when every finish RPC races a vault event", async () => {
     const contents = { "a.md": "alpha" };
-    const setup = racedManager(contents, "finishReconciliation", true);
+    const setup = racedManager(contents, true);
     await setup.manager.build(signal);
     contents["a.md"] = "beta";
     setup.arm();

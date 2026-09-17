@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { literalTerms, safeFtsQuery } from "@/index/sqlite/database";
+import { literalTerms } from "@/index/sqlite/database";
 import { schemaSql } from "@/index/sqlite/schema";
-import { MutableSqliteDatabase } from "@/index/sqlite/database";
+import { MutableSqliteDatabase, type SqliteConnection } from "@/index/sqlite/database";
 import { hashMarkdown, upsertMarkdown } from "@/index/sqlite/markdown";
 import { chunkMarkdown } from "@/index/chunking";
 import { loadTestSqlite } from "./sqlite-test-client";
+
+function noteRows(db: SqliteConnection): Record<string, unknown>[] {
+  const result: Record<string, unknown>[] = [];
+  db.exec({
+    sql: "SELECT path,content_id AS contentId FROM notes ORDER BY path",
+    rowMode: "object",
+    callback: (row) => result.push(row),
+  });
+  return result;
+}
 
 describe("SQLite schema/query foundation", () => {
   it("hashes and chunks Markdown before one guarded lexical upsert", async () => {
@@ -22,7 +32,7 @@ describe("SQLite schema/query foundation", () => {
 
     const result = await upsertMarkdown(index, "note.md", markdown, contentId, 100, 10);
     expect(result.chunkCount).toBe(chunkMarkdown(markdown, 100, 10).length);
-    expect(index.listNotes()).toMatchObject([{ path: "note.md", contentId }]);
+    expect(noteRows(raw)).toMatchObject([{ path: "note.md", contentId }]);
     expect(index.retrieve("long", undefined, 5)).toHaveLength(5);
     index.close();
   });
@@ -52,7 +62,6 @@ describe("SQLite schema/query foundation", () => {
       "-tag",
     ]);
     expect(literalTerms("   ")).toEqual([]);
-    expect(safeFtsQuery("alpha OR beta")).toBe('"alpha" AND "or" AND "beta"');
   });
 
   it("declares strict state, binary identities, and synchronous FTS triggers", () => {
@@ -108,7 +117,7 @@ describe("SQLite schema/query foundation", () => {
     expect(index.retrieve(undefined, new Float32Array([1, 0]), 5)[0].score).toBe(1);
     const beforeRename = index.retrieve(undefined, new Float32Array([1, 0]), 1)[0];
     expect(index.renameNote("a.md", "renamed.md").changed).toBe(true);
-    expect(index.listNotes()[0].path).toBe("renamed.md");
+    expect(noteRows(db)[0].path).toBe("renamed.md");
     expect(index.retrieve(undefined, new Float32Array([1, 0]), 1)[0]).toMatchObject({
       path: "renamed.md",
       score: beforeRename.score,
@@ -124,6 +133,43 @@ describe("SQLite schema/query foundation", () => {
     index.upsertNote({ path: "one.md", contentId: "1".repeat(64), chunks: [] });
     index.upsertNote({ path: "two.md", contentId: "2".repeat(64), chunks: [] });
     expect(index.getState()).toMatchObject({ noteCount: 2, chunkCount: 0 });
+    index.close();
+  });
+
+  it("uses an indexed chunk lookup and skips FTS updates for line-only changes", async () => {
+    const sqlite = await loadTestSqlite();
+    const raw = new sqlite.oo1.DB(":memory:", "c");
+    const statements: string[] = [];
+    const db: SqliteConnection = {
+      exec: (options) => {
+        statements.push(typeof options === "string" ? options : options.sql);
+        raw.exec(options);
+      },
+      close: () => raw.close(),
+    };
+    const index = new MutableSqliteDatabase(db);
+    index.boot("c".repeat(64), 2);
+    const contentId = "a".repeat(64);
+    const first = {
+      path: "a.md",
+      contentId,
+      chunks: [{ id: `${contentId}:0`, ordinal: 0, startLine: 1, endLine: 1, text: "alpha" }],
+    };
+    index.upsertNote(first);
+    statements.length = 0;
+    index.upsertNote({ ...first, chunks: [{ ...first.chunks[0], startLine: 2, endLine: 2 }] });
+    expect(statements).toContain(
+      "SELECT chunk_pk,ordinal,start_line,end_line,path_text,filename,body,content_id FROM chunks WHERE note_pk=? AND chunk_id=?"
+    );
+    expect(statements).toContain(
+      "UPDATE chunks SET content_id=?,ordinal=?,start_line=?,end_line=? WHERE chunk_pk=?"
+    );
+    expect(
+      statements.some((sql) =>
+        sql.startsWith("UPDATE chunks SET content_id=?,ordinal=?,start_line=?,end_line=?,path_text")
+      )
+    ).toBe(false);
+    expect(index.retrieve("alpha", undefined, 5)).toHaveLength(1);
     index.close();
   });
 

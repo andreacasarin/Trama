@@ -115,17 +115,8 @@ export class PublicationManager {
     return this.publish();
   }
 
-  async autoPublish(result: SuccessfulOperation): Promise<PublicationResult> {
-    return this.publishAfterSuccessfulOperation(result);
-  }
-
   async publish(): Promise<PublicationResult> {
     return this.serialize(() => this.publishSerialized());
-  }
-
-  /** Retry publication from the current local index without rebuilding it. */
-  async retryPublication(): Promise<PublicationResult> {
-    return this.publish();
   }
 
   /** Inspect and adopt the exact configured file. Adoption never publishes. */
@@ -160,10 +151,6 @@ export class PublicationManager {
       });
     }
     return this.eventPromise;
-  }
-
-  async adoptOnStartup(): Promise<AdoptionResult> {
-    return this.adoptCurrent();
   }
 
   private async publishSerialized(): Promise<PublicationResult> {

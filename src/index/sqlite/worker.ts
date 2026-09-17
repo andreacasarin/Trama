@@ -320,8 +320,6 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
   switch (request.method) {
     case "getState":
       return db.getState();
-    case "listNotes":
-      return db.listNotes();
     case "planReconciliation":
       return db.planReconciliation(p.summaries);
     case "markIncomplete":

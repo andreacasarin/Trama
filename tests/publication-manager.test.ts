@@ -96,7 +96,7 @@ describe("PublicationManager", () => {
       idFactory: () => "publication-1",
       onMetrics: (value) => metrics.push(value),
     });
-    const result = await manager.autoPublish({
+    const result = await manager.publishAfterSuccessfulOperation({
       operation: "build",
       changed: true,
       converged: true,
@@ -163,7 +163,7 @@ describe("PublicationManager", () => {
       warning: { phase: "stage" },
     });
     expect(fixture.getLive().publicationId).toBeUndefined();
-    await expect(manager.retryPublication()).resolves.toMatchObject({
+    await expect(manager.publish()).resolves.toMatchObject({
       published: true,
       publicationId: "publication-2",
     });

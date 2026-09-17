@@ -128,7 +128,7 @@ describe("single-file SQLite publications", () => {
     const state = await index.getState();
 
     await expect(
-      publisher.autoPublish({
+      publisher.publishAfterSuccessfulOperation({
         operation: "update",
         changed: false,
         converged: true,
@@ -162,7 +162,7 @@ describe("single-file SQLite publications", () => {
     const restarted = manager({});
     const receiver = publication(restarted, storage);
     await restarted.load();
-    await expect(receiver.adoptOnStartup()).resolves.toMatchObject({
+    await expect(receiver.adoptCurrent()).resolves.toMatchObject({
       adopted: true,
       publicationId: "remote-1",
     });
@@ -171,7 +171,7 @@ describe("single-file SQLite publications", () => {
       lexical: { state: "ready", activity: "idle", searchable: true },
       freshness: "snapshot-loaded",
     });
-    await expect(receiver.adoptOnStartup()).resolves.toMatchObject({
+    await expect(receiver.adoptCurrent()).resolves.toMatchObject({
       adopted: false,
       ignored: "same-id",
       publicationId: "remote-1",
@@ -197,7 +197,7 @@ describe("single-file SQLite publications", () => {
     await receiver.load();
     const receiverPublisher = publication(receiver, storage);
     const publish = vi.spyOn(receiver, "publishPublication");
-    const adoption = await receiverPublisher.adoptOnStartup();
+    const adoption = await receiverPublisher.adoptCurrent();
 
     expect(adoption).toMatchObject({ adopted: true, publicationId: "z-from-provider" });
     expect(publish).not.toHaveBeenCalled();
@@ -242,7 +242,7 @@ describe("single-file SQLite publications", () => {
     expect(await index.search("alpha", new AbortController().signal, 5)).toEqual(before);
 
     storage.failWrites = false;
-    await expect(publisher.retryPublication()).resolves.toMatchObject({
+    await expect(publisher.publish()).resolves.toMatchObject({
       published: true,
       publicationId: "retry-publication",
     });

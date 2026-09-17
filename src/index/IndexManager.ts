@@ -6,7 +6,7 @@ import {
   type IndexProgress,
   type ProvenanceRecord,
 } from "@/domain/contracts";
-import type { VaultSearchPort } from "@/tools/ToolRegistry";
+import { searchVault, type VaultRetrievalPort } from "@/index/VaultSearch";
 import {
   CHUNK_ALGORITHM_VERSION,
   CHUNK_OVERLAP,
@@ -174,14 +174,7 @@ function sameSummaries(a: readonly SqliteNoteSummary[], b: readonly SqliteNoteSu
     if (a[index].path !== b[index].path || a[index].contentId !== b[index].contentId) return false;
   return true;
 }
-function isPersistedSnapshotLoaded(state: SqliteState): boolean {
-  const persisted = state as SqliteState & {
-    readonly snapshotLoaded?: boolean;
-    readonly snapshot_loaded?: boolean;
-  };
-  return persisted.snapshotLoaded === true || persisted.snapshot_loaded === true;
-}
-export class IndexManager implements VaultSearchPort {
+export class IndexManager implements VaultRetrievalPort {
   private client?: SqliteWorkerClient;
   private state?: SqliteState;
   private loaded = false;
@@ -316,7 +309,7 @@ export class IndexManager implements VaultSearchPort {
   isComplete(): boolean {
     return this.state?.incomplete === false;
   }
-  getCapabilities(): IndexCapabilities {
+  capabilities(): IndexCapabilities {
     const state = this.state;
     const available = this.loaded && !this.unavailable;
     return {
@@ -326,15 +319,6 @@ export class IndexManager implements VaultSearchPort {
       freshness: this.freshness,
       ...(state?.publicationId ? { publicationId: state.publicationId } : {}),
     };
-  }
-  capabilities(): IndexCapabilities {
-    return this.getCapabilities();
-  }
-  isSemanticReady(): boolean {
-    return this.getCapabilities().semantic.searchable;
-  }
-  freshnessState(): IndexFreshness {
-    return this.freshness;
   }
   hasUsableIndex(): boolean {
     return (
@@ -363,15 +347,15 @@ export class IndexManager implements VaultSearchPort {
       });
     try {
       const sqliteIdentity = await (this.options.sqliteIdentity ?? "default-vault");
-      const state = await this.ensureClient().call("boot", {
+      const state = (await this.ensureClient().call("boot", {
         corpusFingerprint: await this.corpusFingerprintId(),
         embeddingFingerprint: await this.embeddingFingerprintId(),
         buildIdentity: SQLITE_BUILD_IDENTITY,
         dimensions: this.embedding.dimensions,
         identity: await sha256Hex(sqliteIdentity),
-      });
-      this.setState(state as SqliteState);
-      this.freshness = isPersistedSnapshotLoaded(state as SqliteState)
+      })) as SqliteState;
+      this.setState(state);
+      this.freshness = state.snapshotLoaded
         ? "snapshot-loaded"
         : state.incomplete
           ? "unknown"
@@ -607,15 +591,6 @@ export class IndexManager implements VaultSearchPort {
     return this.runSynchronization(signal);
   }
 
-  /** Explicit aliases keep the lifecycle vocabulary clear for callers. */
-  async update(signal: AbortSignal): Promise<IndexSyncResult> {
-    return this.synchronize(signal);
-  }
-
-  async rebuild(signal: AbortSignal): Promise<void> {
-    return this.build(signal);
-  }
-
   private async runSynchronization(
     signal: AbortSignal,
     phase?: "queued"
@@ -834,7 +809,7 @@ export class IndexManager implements VaultSearchPort {
     }
     this.setState(state);
     if (!state.incomplete)
-      this.freshness = isPersistedSnapshotLoaded(state) ? "snapshot-loaded" : "locally-reconciled";
+      this.freshness = state.snapshotLoaded ? "snapshot-loaded" : "locally-reconciled";
     return !state.incomplete;
   }
 
@@ -1011,10 +986,6 @@ export class IndexManager implements VaultSearchPort {
     }
   }
 
-  async prepare(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.prepareSemantic(signal);
-  }
-
   /** Keep local mutations and adoption out until the vault copy and live ID agree. */
   async publishPublication<T>(
     publicationId: string,
@@ -1109,7 +1080,7 @@ export class IndexManager implements VaultSearchPort {
       this.unavailable = false;
       this.freshness = state.incomplete
         ? "unknown"
-        : isPersistedSnapshotLoaded(state)
+        : state.snapshotLoaded
           ? "snapshot-loaded"
           : "locally-reconciled";
       return state;
@@ -1122,19 +1093,21 @@ export class IndexManager implements VaultSearchPort {
     query: string,
     signal: AbortSignal,
     limit: number,
-    mode: "lexical" | "hybrid" = "lexical"
+    mode: "lexical" | "hybrid" = "hybrid"
   ): Promise<readonly ProvenanceRecord[]> {
-    return (await this.retrieve(query, mode, signal, Math.min(20, Math.max(0, limit)))).map(
-      (result) => ({
-        path: result.path,
-        startLine: result.startLine,
-        endLine: result.endLine,
-        excerpt: result.excerpt,
-        score: result.fusedScore,
-      })
-    );
+    const batch = await searchVault(this, query, {
+      signal,
+      searchMethod: mode === "lexical" ? "keyword" : "hybrid",
+    });
+    return batch.hits.slice(0, Math.min(20, Math.max(0, limit))).map((hit) => ({
+      path: hit.path,
+      startLine: hit.startLine,
+      endLine: hit.endLine,
+      excerpt: hit.excerpt,
+      score: hit.fusedScore,
+    }));
   }
-  lenteState(): {
+  vaultSearchState(): {
     readonly changeCounter: number;
     readonly generationId: string;
     readonly semantic: IndexCapabilities["semantic"];
@@ -1144,7 +1117,7 @@ export class IndexManager implements VaultSearchPort {
     if (!this.hasUsableIndex()) return null;
     const changeCounter = this.changeCounter();
     const state = this.state!;
-    const capabilities = this.getCapabilities();
+    const capabilities = this.capabilities();
     return {
       changeCounter,
       generationId: indexIdentity(changeCounter),
@@ -1153,7 +1126,7 @@ export class IndexManager implements VaultSearchPort {
       ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
-  searchLente(
+  retrieveVaultCandidates(
     query: string,
     mode: "hybrid" | "lexical",
     signal?: AbortSignal
@@ -1178,7 +1151,7 @@ export class IndexManager implements VaultSearchPort {
       if (!this.hasUsableIndex())
         throw new StructuredError("unavailable", "Lexical index is unavailable.", true);
       let effectiveMode = mode;
-      const semanticReady = this.getCapabilities().semantic.searchable;
+      const semanticReady = this.capabilities().semantic.searchable;
       if (mode === "hybrid" && !semanticReady) effectiveMode = "lexical";
       if ((mode === "semantic" || mode === "related") && !semanticReady)
         throw new StructuredError(
@@ -1259,7 +1232,11 @@ export class IndexManager implements VaultSearchPort {
   }
   relatedState(path: string): RelatedIndexState | null {
     const currentPath = normalizePath(path);
-    if (!this.hasUsableIndex() || !this.isSemanticReady() || !this.isIndexEligible(currentPath))
+    if (
+      !this.hasUsableIndex() ||
+      !this.capabilities().semantic.searchable ||
+      !this.isIndexEligible(currentPath)
+    )
       return null;
     const counter = this.changeCounter();
     const identity = indexIdentity(counter);
@@ -1268,7 +1245,7 @@ export class IndexManager implements VaultSearchPort {
       generationId: identity,
       currentPath,
       contentHash: identity,
-      semantic: this.getCapabilities().semantic,
+      semantic: this.capabilities().semantic,
       freshness: this.freshness,
       ...(this.state?.publicationId ? { publicationId: this.state.publicationId } : {}),
     };
@@ -1279,7 +1256,7 @@ export class IndexManager implements VaultSearchPort {
     limit: number
   ): Promise<readonly RelatedIndexHit[]> {
     check(signal);
-    if (!this.hasUsableIndex() || !this.isSemanticReady())
+    if (!this.hasUsableIndex() || !this.capabilities().semantic.searchable)
       throw new StructuredError(
         "unavailable",
         "Semantic vectors are not ready. Update the semantic index first.",

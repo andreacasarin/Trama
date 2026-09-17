@@ -57,7 +57,7 @@ describe("LenteSearch", () => {
       .mockRejectedValueOnce(new QueryEmbeddingError())
       .mockResolvedValueOnce([hit("note.md", 1)]);
     const service = new LenteSearch(
-      { lenteState: () => readyState, searchLente: search },
+      { vaultSearchState: () => readyState, retrieveVaultCandidates: search },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle")).resolves.toMatchObject({
@@ -70,7 +70,10 @@ describe("LenteSearch", () => {
   it("uses keyword retrieval without marking the result degraded", async () => {
     const search = vi.fn(async () => [hit("note.md", 1)]);
     const service = new LenteSearch(
-      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
+      {
+        vaultSearchState: () => readyState,
+        retrieveVaultCandidates: search,
+      },
       { getMtime: () => 1 }
     );
     await expect(service.search("needle", { searchMethod: "keyword" })).resolves.toMatchObject({
@@ -85,14 +88,14 @@ describe("LenteSearch", () => {
     const search = vi.fn(async () => [hit("snapshot.md", 1)]);
     const service = new LenteSearch(
       {
-        lenteState: () => ({
+        vaultSearchState: () => ({
           changeCounter: 4,
           generationId: "g4",
           semantic: { state: "empty", activity: "idle", searchable: false },
           freshness: "snapshot-loaded",
           publicationId: "pub-4",
         }),
-        searchLente: search,
+        retrieveVaultCandidates: search,
       },
       { getMtime: () => 1 }
     );
@@ -115,11 +118,11 @@ describe("LenteSearch", () => {
     const search = vi.fn(async () => [hit("lexical.md", 1)]);
     const service = new LenteSearch(
       {
-        lenteState: () => ({
+        vaultSearchState: () => ({
           ...readyState,
           semantic: { state: channelState, activity: "idle", searchable: false },
         }),
-        searchLente: search,
+        retrieveVaultCandidates: search,
       },
       { getMtime: () => 1 }
     );
@@ -136,11 +139,11 @@ describe("LenteSearch", () => {
     const search = vi.fn(async () => [hit("indexed.md", 1)]);
     const service = new LenteSearch(
       {
-        lenteState: () => ({
+        vaultSearchState: () => ({
           ...readyState,
           semantic: { state: "partial", activity: "idle", searchable: true },
         }),
-        searchLente: search,
+        retrieveVaultCandidates: search,
       },
       { getMtime: () => 1 }
     );
@@ -159,7 +162,10 @@ describe("LenteSearch", () => {
     );
     const search = vi.fn(async () => candidates);
     const service = new LenteSearch(
-      { lenteState: () => ({ generationId: "g1", changeCounter: 1 }), searchLente: search },
+      {
+        vaultSearchState: () => readyState,
+        retrieveVaultCandidates: search,
+      },
       { getMtime: () => 1 }
     );
     const result = await service.search("needle", { maxResults: 5 });
@@ -183,8 +189,8 @@ describe("LenteSearch", () => {
       else search.mockRejectedValue(error);
       const service = new LenteSearch(
         {
-          lenteState: () => readyState,
-          searchLente: search,
+          vaultSearchState: () => readyState,
+          retrieveVaultCandidates: search,
         },
         { getMtime: () => 1 }
       );

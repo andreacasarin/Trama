@@ -107,6 +107,34 @@ describe("mutable SQLite reconciliation", () => {
     database.close();
   });
 
+  it("pairs same-content renames by binary path order and deletes extra rows at finish", async () => {
+    const { index, database } = await openIndex();
+    index.upsertNote({ path: "old-b.md", contentId: id("a"), chunks: [] });
+    index.upsertNote({ path: "old-a.md", contentId: id("a"), chunks: [] });
+    const summaries = [
+      { path: "new-b.md", contentId: id("a"), chunkCount: 0 },
+      { path: "new-a.md", contentId: id("a"), chunkCount: 0 },
+    ];
+    expect(index.planReconciliation(summaries).renames).toEqual([
+      { from: "old-a.md", to: "new-a.md", contentId: id("a") },
+      { from: "old-b.md", to: "new-b.md", contentId: id("a") },
+    ]);
+    index.upsertNote({ path: "new-a.md", contentId: id("a"), chunks: [] });
+    index.upsertNote({ path: "new-b.md", contentId: id("a"), chunks: [] });
+    expect(index.finishReconciliation(summaries, index.getState().changeCounter)).toMatchObject({
+      incomplete: false,
+      noteCount: 2,
+    });
+    const paths: string[] = [];
+    database.exec({
+      sql: "SELECT path FROM notes ORDER BY path",
+      rowMode: "object",
+      callback: (row: Record<string, unknown>) => paths.push(String(row.path)),
+    });
+    expect(paths).toEqual(["new-a.md", "new-b.md"]);
+    index.close();
+  });
+
   it("preserves a published state across Worker restart", async () => {
     const { index, database } = await openIndex();
     index.upsertNote({ path: "note.md", contentId: id("d"), chunks: [] });

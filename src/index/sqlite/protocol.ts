@@ -12,7 +12,6 @@ export const SQLITE_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 export type SqliteMethod =
   | "boot"
   | "getState"
-  | "listNotes"
   | "planReconciliation"
   | "markIncomplete"
   | "beginRebuild"
@@ -138,7 +137,6 @@ export interface SqliteRequestPayloads {
     readonly identity?: string;
   };
   getState: Record<string, never>;
-  listNotes: Record<string, never>;
   planReconciliation: { readonly summaries: readonly SqliteNoteSummary[] };
   markIncomplete: Record<string, never>;
   beginRebuild: Record<string, never>;
@@ -248,7 +246,6 @@ export function sqliteError(
 const METHODS: readonly SqliteMethod[] = [
   "boot",
   "getState",
-  "listNotes",
   "planReconciliation",
   "markIncomplete",
   "beginRebuild",

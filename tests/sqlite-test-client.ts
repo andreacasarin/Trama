@@ -111,8 +111,6 @@ export function createTestSqliteClient(
         break;
       case "getState":
         return opened.database.getState();
-      case "listNotes":
-        return opened.database.listNotes();
       case "planReconciliation":
         return opened.database.planReconciliation(value.summaries);
       case "markIncomplete":

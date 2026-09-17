@@ -36,6 +36,10 @@ describe("Trama feature journeys", () => {
     expect(voce.provenance).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "Unicode/東京.md" })])
     );
+    const lente = await world.lente.search("Tokyo");
+    expect(voce.provenance.map((hit) => hit.path)).toEqual(
+      lente.canonicalResults?.slice(0, 7).map((hit) => hit.path)
+    );
     expect(JSON.stringify(await world.index.search("garden", signal, 20))).not.toContain(
       "PRIVATE_FIXTURE_SENTINEL"
     );

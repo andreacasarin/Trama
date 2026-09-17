@@ -18,11 +18,6 @@ import {
 } from "./schema";
 import { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
-export interface SqliteStatement {
-  bind(values: readonly unknown[]): SqliteStatement;
-  stepReset(): SqliteStatement;
-  finalize(): void;
-}
 export interface SqliteConnection {
   exec(
     options:
@@ -34,7 +29,6 @@ export interface SqliteConnection {
           readonly callback?: (row: Record<string, unknown>) => void;
         }
   ): void;
-  prepare?(sql: string): SqliteStatement;
   close(): void;
 }
 const APP_VERSION = "trama";
@@ -64,6 +58,24 @@ function transaction(db: SqliteConnection, body: () => void): void {
       /* preserve original */
     }
     throw error;
+  }
+}
+function withExpectedNotes<T>(
+  db: SqliteConnection,
+  summaries: readonly SqliteNoteSummary[],
+  body: () => T
+): T {
+  db.exec(
+    "CREATE TEMP TABLE reconciliation_expected(path TEXT PRIMARY KEY COLLATE BINARY, content_id TEXT NOT NULL, chunk_count INTEGER)"
+  );
+  try {
+    db.exec({
+      sql: "INSERT INTO reconciliation_expected(path,content_id,chunk_count) SELECT json_extract(value,'$.path'),json_extract(value,'$.contentId'),json_extract(value,'$.chunkCount') FROM json_each(?)",
+      bind: [JSON.stringify(summaries)],
+    });
+    return body();
+  } finally {
+    db.exec("DROP TABLE reconciliation_expected");
   }
 }
 function normalizedVector(vector: Float32Array, dimensions: number): Uint8Array {
@@ -211,43 +223,57 @@ export class MutableSqliteDatabase {
       ...(s.publication_id == null ? {} : { publicationId: String(s.publication_id) }),
     };
   }
-  listNotes(): readonly { path: string; contentId: string; chunkCount: number }[] {
-    this.ensureOpen();
-    return rows(
-      this.db,
-      "SELECT n.path,n.content_id AS contentId,count(c.chunk_pk) AS chunkCount FROM notes n LEFT JOIN chunks c ON c.note_pk=n.note_pk GROUP BY n.note_pk ORDER BY n.path COLLATE BINARY"
-    ).map((r) => ({
-      path: String(r.path),
-      contentId: String(r.contentId),
-      chunkCount: Number(r.chunkCount),
-    }));
-  }
   planReconciliation(summaries: readonly SqliteNoteSummary[]): SqliteReconciliationPlan {
-    const actual = this.listNotes();
-    const expected = [...summaries].sort((a, b) => a.path.localeCompare(b.path));
-    const missing = actual.filter((a) => !expected.some((e) => e.path === a.path));
-    const added = expected.filter((e) => !actual.some((a) => a.path === e.path));
-    const renames: { from: string; to: string; contentId: string }[] = [];
-    for (const old of [...missing]) {
-      const ix = added.findIndex((n) => n.contentId === old.contentId);
-      if (ix >= 0) {
-        const [n] = added.splice(ix, 1);
-        renames.push({ from: old.path, to: n.path, contentId: old.contentId });
-      }
-    }
-    const upserts = expected.filter((n) => {
-      const old = actual.find((a) => a.path === n.path);
-      return (!old || old.contentId !== n.contentId) && !renames.some((r) => r.to === n.path);
-    });
-    const deletes = missing.filter((n) => !renames.some((r) => r.from === n.path));
+    this.ensureOpen();
+    const planned = withExpectedNotes(this.db, summaries, () =>
+      rows(
+        this.db,
+        `WITH missing AS MATERIALIZED (
+         SELECT n.path,n.content_id FROM notes n LEFT JOIN reconciliation_expected e ON e.path=n.path WHERE e.path IS NULL
+       ), added AS MATERIALIZED (
+         SELECT e.path,e.content_id FROM reconciliation_expected e LEFT JOIN notes n ON n.path=e.path WHERE n.path IS NULL
+       ), old_ranked AS MATERIALIZED (
+         SELECT *,ROW_NUMBER() OVER(PARTITION BY content_id ORDER BY path COLLATE BINARY) AS rank FROM missing
+       ), new_ranked AS MATERIALIZED (
+         SELECT *,ROW_NUMBER() OVER(PARTITION BY content_id ORDER BY path COLLATE BINARY) AS rank FROM added
+       ), renames AS MATERIALIZED (
+         SELECT o.path,n.path AS target,o.content_id FROM old_ranked o JOIN new_ranked n
+           ON n.content_id=o.content_id AND n.rank=o.rank
+       ), upserts AS MATERIALIZED (
+         SELECT e.path,NULL AS target,e.content_id FROM reconciliation_expected e LEFT JOIN notes n ON n.path=e.path
+          WHERE (n.path IS NULL OR n.content_id<>e.content_id)
+            AND NOT EXISTS(SELECT 1 FROM renames r WHERE r.target=e.path)
+       ), deletes AS MATERIALIZED (
+         SELECT m.path,NULL AS target,m.content_id FROM missing m
+          WHERE NOT EXISTS(SELECT 1 FROM renames r WHERE r.path=m.path)
+       )
+       SELECT 'rename' AS kind,path,target,content_id AS contentId FROM renames
+       UNION ALL SELECT 'upsert',path,target,content_id FROM upserts
+       UNION ALL SELECT 'delete',path,target,content_id FROM deletes
+       ORDER BY kind COLLATE BINARY,path COLLATE BINARY`
+      )
+    );
     return {
-      renames: renames.sort((a, b) => a.from.localeCompare(b.from)),
-      upserts,
-      deletes,
-      state:
-        renames.length || upserts.length || deletes.length
-          ? this.markIncomplete()
-          : this.getState(),
+      renames: planned
+        .filter((r) => r.kind === "rename")
+        .map((r) => ({
+          from: String(r.path),
+          to: String(r.target),
+          contentId: String(r.contentId),
+        })),
+      upserts: planned
+        .filter((r) => r.kind === "upsert")
+        .map((r) => ({
+          path: String(r.path),
+          contentId: String(r.contentId),
+        })),
+      deletes: planned
+        .filter((r) => r.kind === "delete")
+        .map((r) => ({
+          path: String(r.path),
+          contentId: String(r.contentId),
+        })),
+      state: planned.length ? this.markIncomplete() : this.getState(),
     };
   }
   markIncomplete(): SqliteState {
@@ -296,10 +322,11 @@ export class MutableSqliteDatabase {
       let pk: number;
       if (old) {
         pk = Number(old.note_pk);
-        this.db.exec({
-          sql: "UPDATE notes SET content_id=? WHERE note_pk=?",
-          bind: [note.contentId, pk],
-        });
+        if (String(old.contentId) !== note.contentId)
+          this.db.exec({
+            sql: "UPDATE notes SET content_id=? WHERE note_pk=?",
+            bind: [note.contentId, pk],
+          });
       } else {
         this.db.exec({
           sql: "INSERT INTO notes(path,content_id) VALUES(?,?)",
@@ -309,37 +336,50 @@ export class MutableSqliteDatabase {
           rows(this.db, "SELECT note_pk FROM notes WHERE path=?", [note.path])[0].note_pk
         );
       }
-      const wanted = new Set(note.chunks.map((c) => c.id));
-      const current = rows(
-        this.db,
-        "SELECT chunk_pk,chunk_id,body,content_id FROM chunks WHERE note_pk=?",
-        [pk]
-      );
-      for (const row of current)
-        if (!wanted.has(String(row.chunk_id)))
-          this.db.exec({ sql: "DELETE FROM chunks WHERE chunk_pk=?", bind: [row.chunk_pk] });
+      this.db.exec({
+        sql: "DELETE FROM chunks WHERE note_pk=? AND chunk_id NOT IN (SELECT value FROM json_each(?))",
+        bind: [pk, JSON.stringify(note.chunks.map((c) => c.id))],
+      });
       const filename = note.path.slice(note.path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
       const insert =
         "INSERT INTO chunks(note_pk,content_id,chunk_id,ordinal,start_line,end_line,path_text,filename,body) VALUES(?,?,?,?,?,?,?,?,?)";
       for (const chunk of note.chunks) {
-        const prior = current.find((r) => String(r.chunk_id) === chunk.id);
+        const prior = rows(
+          this.db,
+          "SELECT chunk_pk,ordinal,start_line,end_line,path_text,filename,body,content_id FROM chunks WHERE note_pk=? AND chunk_id=?",
+          [pk, chunk.id]
+        )[0];
         if (prior) {
-          const same =
-            String(prior.body) === chunk.text && String(prior.content_id) === note.contentId;
-          this.db.exec({
-            sql: "UPDATE chunks SET content_id=?,ordinal=?,start_line=?,end_line=?,path_text=?,filename=?,body=? WHERE chunk_pk=?",
-            bind: [
-              note.contentId,
-              chunk.ordinal,
-              chunk.startLine,
-              chunk.endLine,
-              note.path,
-              filename,
-              chunk.text,
-              prior.chunk_pk,
-            ],
-          });
-          if (!same)
+          const bodyChanged = String(prior.body) !== chunk.text;
+          const identityChanged = String(prior.content_id) !== note.contentId;
+          const indexedChanged =
+            bodyChanged ||
+            String(prior.path_text) !== note.path ||
+            String(prior.filename) !== filename;
+          const locationChanged =
+            Number(prior.ordinal) !== chunk.ordinal ||
+            Number(prior.start_line) !== chunk.startLine ||
+            Number(prior.end_line) !== chunk.endLine;
+          if (indexedChanged)
+            this.db.exec({
+              sql: "UPDATE chunks SET content_id=?,ordinal=?,start_line=?,end_line=?,path_text=?,filename=?,body=? WHERE chunk_pk=?",
+              bind: [
+                note.contentId,
+                chunk.ordinal,
+                chunk.startLine,
+                chunk.endLine,
+                note.path,
+                filename,
+                chunk.text,
+                prior.chunk_pk,
+              ],
+            });
+          else if (identityChanged || locationChanged)
+            this.db.exec({
+              sql: "UPDATE chunks SET content_id=?,ordinal=?,start_line=?,end_line=? WHERE chunk_pk=?",
+              bind: [note.contentId, chunk.ordinal, chunk.startLine, chunk.endLine, prior.chunk_pk],
+            });
+          if (bodyChanged || identityChanged)
             this.db.exec({
               sql: "DELETE FROM chunk_vectors WHERE chunk_pk=?",
               bind: [prior.chunk_pk],
@@ -421,29 +461,31 @@ export class MutableSqliteDatabase {
   ): SqliteState {
     const current = this.getState();
     if (current.changeCounter !== observedChangeCounter) return current;
-    const expected = new Set(summaries.map((s) => s.path));
-    const actual = this.listNotes();
-    const extras = actual.filter((a) => !expected.has(a.path));
-    const remaining = actual.filter((a) => expected.has(a.path));
-    const same =
-      remaining.length === summaries.length &&
-      remaining.every((a) => {
-        const s = summaries.find((item) => item.path === a.path);
-        return (
-          !!s &&
-          s.contentId === a.contentId &&
-          (s.chunkCount === undefined || s.chunkCount === a.chunkCount)
+    transaction(this.db, () => {
+      withExpectedNotes(this.db, summaries, () => {
+        const mismatch = rows(
+          this.db,
+          `SELECT count(*) AS count FROM reconciliation_expected e LEFT JOIN notes n ON n.path=e.path
+          WHERE n.note_pk IS NULL OR n.content_id<>e.content_id OR
+                (e.chunk_count IS NOT NULL AND e.chunk_count<>(SELECT count(*) FROM chunks c WHERE c.note_pk=n.note_pk))`,
+          []
+        )[0];
+        if (Number(mismatch.count)) return;
+        const extras = Number(
+          rows(
+            this.db,
+            "SELECT count(*) AS count FROM notes n LEFT JOIN reconciliation_expected e ON e.path=n.path WHERE e.path IS NULL"
+          )[0].count
         );
-      });
-    if (same)
-      transaction(this.db, () => {
-        for (const old of extras)
-          this.db.exec({ sql: "DELETE FROM notes WHERE path=?", bind: [old.path] });
         this.db.exec({
-          sql: "UPDATE index_state SET incomplete=0,snapshot_loaded=0,reconciliation_summary=?,change_counter=change_counter+? WHERE id=1 AND change_counter=?",
-          bind: [JSON.stringify(summaries), extras.length ? 1 : 0, observedChangeCounter],
+          sql: "DELETE FROM notes WHERE NOT EXISTS(SELECT 1 FROM reconciliation_expected e WHERE e.path=notes.path)",
+        });
+        this.db.exec({
+          sql: "UPDATE index_state SET incomplete=0,snapshot_loaded=0,reconciliation_summary='',change_counter=change_counter+? WHERE id=1 AND change_counter=?",
+          bind: [extras ? 1 : 0, observedChangeCounter],
         });
       });
+    });
     return this.getState();
   }
 
@@ -470,42 +512,14 @@ export class MutableSqliteDatabase {
     embeddingFingerprint: string,
     observedChangeCounter: number
   ): { stored: number; skipped: number; state: SqliteState };
-  storeVectors(payload: {
-    readonly vectors: readonly StoredVectorInput[];
-    readonly embeddingFingerprint: string;
-    readonly observedChangeCounter: number;
-  }): { stored: number; skipped: number; state: SqliteState };
   storeVectors(
-    vectorsOrPayload:
-      | readonly StoredVectorInput[]
-      | {
-          readonly vectors: readonly StoredVectorInput[];
-          readonly embeddingFingerprint: string;
-          readonly observedChangeCounter: number;
-        },
-    embeddingFingerprint?: string,
-    observedChangeCounter?: number
+    vectors: readonly StoredVectorInput[],
+    embeddingFingerprint: string,
+    observedChangeCounter: number
   ): { stored: number; skipped: number; state: SqliteState } {
     this.ensureOpen();
-    let vectors: readonly StoredVectorInput[];
-    let fp: string;
-    let counter: number;
-    if (Array.isArray(vectorsOrPayload)) {
-      vectors = vectorsOrPayload as readonly StoredVectorInput[];
-      fp = embeddingFingerprint!;
-      counter = observedChangeCounter!;
-    } else {
-      const payload = vectorsOrPayload as {
-        readonly vectors: readonly StoredVectorInput[];
-        readonly embeddingFingerprint: string;
-        readonly observedChangeCounter: number;
-      };
-      vectors = payload.vectors;
-      fp = payload.embeddingFingerprint;
-      counter = payload.observedChangeCounter;
-    }
     const before = this.getState();
-    if (before.changeCounter !== counter)
+    if (before.changeCounter !== observedChangeCounter)
       return { stored: 0, skipped: vectors.length, state: before };
     let stored = 0;
     let skipped = 0;
@@ -524,7 +538,13 @@ export class MutableSqliteDatabase {
           skipped++;
           continue;
         }
-        this.putVector(item.chunkId, item.contentId, item.vector, fp, Number(item.chunkPk));
+        this.putVector(
+          item.chunkId,
+          item.contentId,
+          item.vector,
+          embeddingFingerprint,
+          Number(item.chunkPk)
+        );
         stored++;
       }
       if (stored) this.markMutation(false);
@@ -660,19 +680,21 @@ export class MutableSqliteDatabase {
   findRelated(path: string, vector: Float32Array | undefined, limit: number): readonly SqliteHit[] {
     let q = vector;
     if (!q) {
-      const rs = rows(
-        this.db,
-        "SELECT v.vector FROM chunk_vectors v JOIN chunks c ON c.chunk_pk=v.chunk_pk JOIN notes n ON n.note_pk=c.note_pk JOIN index_state s ON s.id=1 WHERE n.path=? AND v.embedding_fingerprint=s.embedding_fingerprint ORDER BY c.ordinal",
-        [path]
-      );
-      if (!rs.length) return [];
       const sum = new Float64Array(this.dimensions);
-      for (const r of rs) {
-        const x = vectorOf(r.vector);
-        if (x.length !== sum.length)
-          throw sqliteError("integrity_failed", "Stored vector dimensions mismatch");
-        for (let i = 0; i < x.length; i++) sum[i] += x[i];
-      }
+      let count = 0;
+      this.db.exec({
+        sql: "SELECT v.vector FROM chunk_vectors v JOIN chunks c ON c.chunk_pk=v.chunk_pk JOIN notes n ON n.note_pk=c.note_pk JOIN index_state s ON s.id=1 WHERE n.path=? AND v.embedding_fingerprint=s.embedding_fingerprint ORDER BY c.ordinal",
+        bind: [path],
+        rowMode: "object",
+        callback: (row) => {
+          const x = vectorOf(row.vector);
+          if (x.length !== sum.length)
+            throw sqliteError("integrity_failed", "Stored vector dimensions mismatch");
+          for (let i = 0; i < x.length; i++) sum[i] += x[i];
+          count++;
+        },
+      });
+      if (!count) return [];
       let norm = 0;
       for (const x of sum) norm += x * x;
       if (!(norm > 0)) return [];
@@ -726,37 +748,37 @@ export class MutableSqliteDatabase {
     } catch {
       throw sqliteError("integrity_failed", "SQLite FTS integrity check failed");
     }
-    const vectors = rows(
-      this.db,
-      "SELECT v.chunk_pk AS vectorChunkPk,v.content_id AS vectorContentId,v.chunk_id AS vectorChunkId,v.vector,c.chunk_pk AS chunkPk,c.content_id AS chunkContentId,c.chunk_id AS chunkId FROM chunk_vectors v LEFT JOIN chunks c ON c.chunk_pk=v.chunk_pk"
-    );
-    for (const row of vectors) {
-      if (
-        row.chunkPk == null ||
-        String(row.vectorContentId) !== String(row.chunkContentId) ||
-        String(row.vectorChunkId) !== String(row.chunkId)
-      )
-        throw sqliteError(
-          "integrity_failed",
-          "SQLite vector chunk/content identity does not match its chunk"
-        );
-      let vector: Float32Array;
-      try {
-        vector = vectorOf(row.vector);
-      } catch {
-        throw sqliteError("integrity_failed", "SQLite vector bytes are invalid");
-      }
-      if (vector.length !== dimensions || !vector.every(Number.isFinite))
-        throw sqliteError("integrity_failed", "SQLite vector dimensions or values are invalid");
-      let norm = 0;
-      for (const value of vector) norm += value * value;
-      if (
-        !Number.isFinite(norm) ||
-        !(norm > 0) ||
-        Math.abs(norm - 1) > SQLITE_VECTOR_NORMALIZATION_TOLERANCE
-      )
-        throw sqliteError("integrity_failed", "SQLite vector is not normalized");
-    }
+    this.db.exec({
+      sql: "SELECT v.content_id AS vectorContentId,v.chunk_id AS vectorChunkId,v.vector,c.chunk_pk AS chunkPk,c.content_id AS chunkContentId,c.chunk_id AS chunkId FROM chunk_vectors v LEFT JOIN chunks c ON c.chunk_pk=v.chunk_pk",
+      rowMode: "object",
+      callback: (row) => {
+        if (
+          row.chunkPk == null ||
+          String(row.vectorContentId) !== String(row.chunkContentId) ||
+          String(row.vectorChunkId) !== String(row.chunkId)
+        )
+          throw sqliteError(
+            "integrity_failed",
+            "SQLite vector chunk/content identity does not match its chunk"
+          );
+        let vector: Float32Array;
+        try {
+          vector = vectorOf(row.vector);
+        } catch {
+          throw sqliteError("integrity_failed", "SQLite vector bytes are invalid");
+        }
+        if (vector.length !== dimensions || !vector.every(Number.isFinite))
+          throw sqliteError("integrity_failed", "SQLite vector dimensions or values are invalid");
+        let norm = 0;
+        for (const value of vector) norm += value * value;
+        if (
+          !Number.isFinite(norm) ||
+          !(norm > 0) ||
+          Math.abs(norm - 1) > SQLITE_VECTOR_NORMALIZATION_TOLERANCE
+        )
+          throw sqliteError("integrity_failed", "SQLite vector is not normalized");
+      },
+    });
   }
   close(): void {
     if (this.closed) return;
@@ -866,10 +888,4 @@ export function literalTerms(query: string): readonly string[] {
 function compareCodeUnits(left: string, right: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
-}
-
-export function safeFtsQuery(query: string): string {
-  return [...new Set(literalTerms(query))]
-    .map((term) => `"${term.replace(/"/g, '""')}"`)
-    .join(" AND ");
 }

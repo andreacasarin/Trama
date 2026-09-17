@@ -215,7 +215,7 @@ export async function runTramaBenchmark(workload: Workload): Promise<TramaBenchm
     });
     const state = await index.getState();
     if (state && syncResult?.converged)
-      await publication.autoPublish({
+      await publication.publishAfterSuccessfulOperation({
         operation: "update",
         changed: syncResult.changed,
         converged: syncResult.converged,
@@ -231,7 +231,7 @@ export async function runTramaBenchmark(workload: Workload): Promise<TramaBenchm
   );
   durationMs.publicationAdopt = await elapsed(async () => {
     await restarted.load();
-    await restartedPublication.adoptOnStartup();
+    await restartedPublication.adoptCurrent();
   });
 
   let round = 0;

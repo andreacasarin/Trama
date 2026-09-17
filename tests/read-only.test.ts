@@ -8,6 +8,7 @@ import {
   VaultSearchTool,
 } from "@/tools/ToolRegistry";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
+import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 
 const signal = new AbortController().signal;
 const file = (path: string) => ({ path, name: path.split("/").pop(), extension: "md" });
@@ -245,7 +246,14 @@ describe("read-only vault and tools module", () => {
   });
   describe("VaultSearchTool", () => {
     it("advertises exact-term and conceptual passage search through its closed contract", () => {
-      const definition = new VaultSearchTool({ search: vi.fn() }).definition;
+      const definition = new VaultSearchTool({
+        vaultSearchState: () => ({
+          changeCounter: 1,
+          generationId: "test",
+          semantic: { state: "empty", activity: "idle", searchable: false },
+        }),
+        retrieveVaultCandidates: vi.fn(),
+      }).definition;
       expect(definition.name).toBe("vault_search");
       expect(definition.description).toContain("exact term, phrase, or natural-language concept");
       expect(definition.description).toContain("eligible notes in the committed index");
@@ -268,16 +276,61 @@ describe("read-only vault and tools module", () => {
 
     describe("execute()", () => {
       it("delegates with the hard result cap and returns provenance", async () => {
-        const search = vi.fn(async (_query: string, _signal: AbortSignal, limit: number) => [
-          { path: `result-${limit}.md` },
+        const search = vi.fn(async () => [
+          {
+            path: "result.md",
+            startLine: 1,
+            endLine: 2,
+            excerpt: "match",
+            chunkId: "c1",
+            ordinal: 0,
+            fusedScore: 1,
+          },
         ]);
         await expect(
-          new VaultSearchTool({ search }).execute({ query: "needle" }, signal)
+          new VaultSearchTool({
+            vaultSearchState: () => ({
+              changeCounter: 1,
+              generationId: "test",
+              semantic: { state: "empty", activity: "idle", searchable: false },
+            }),
+            retrieveVaultCandidates: search,
+          }).execute({ query: "needle" }, signal)
         ).resolves.toMatchObject({
-          data: { results: [{ path: "result-7.md" }] },
-          provenance: [{ path: "result-7.md" }],
+          data: { results: [{ path: "result.md" }] },
+          provenance: [{ path: "result.md" }],
         });
-        expect(search).toHaveBeenCalledWith("needle", signal, 7);
+        expect(search).toHaveBeenCalledWith("needle", "lexical", signal);
+      });
+
+      it("tries hybrid retrieval and falls back only when query embedding fails", async () => {
+        const hit = {
+          path: "result.md",
+          startLine: 1,
+          endLine: 2,
+          excerpt: "match",
+          chunkId: "c1",
+          ordinal: 0,
+          fusedScore: 1,
+        };
+        const search = vi
+          .fn()
+          .mockRejectedValueOnce(new QueryEmbeddingError())
+          .mockResolvedValueOnce([hit]);
+        const tool = new VaultSearchTool({
+          vaultSearchState: () => ({
+            changeCounter: 1,
+            generationId: "test",
+            semantic: { state: "ready", activity: "idle", searchable: true },
+          }),
+          retrieveVaultCandidates: search,
+        });
+        await expect(tool.execute({ query: "needle" }, signal)).resolves.toMatchObject({
+          ok: true,
+          provenance: [{ path: "result.md" }],
+        });
+        expect(search).toHaveBeenNthCalledWith(1, "needle", "hybrid", signal);
+        expect(search).toHaveBeenNthCalledWith(2, "needle", "lexical", signal);
       });
     });
   });

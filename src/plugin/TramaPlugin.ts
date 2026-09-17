@@ -423,7 +423,7 @@ export class TramaPlugin extends Plugin {
       .load({ emitDiagnostics: false })
       .then(async (loaded) => {
         if (loaded && this.index === manager) {
-          const adoption = await publication!.adoptOnStartup();
+          const adoption = await publication!.adoptCurrent();
           if (adoption.warning) this.handlePublicationWarning(adoption.warning);
         }
         return loaded;
@@ -681,7 +681,7 @@ export class TramaPlugin extends Plugin {
 
   /** Retries the last staged publication without rerunning local indexing. */
   async retryPublication(): Promise<void> {
-    const result = await this.publicationManager?.retryPublication();
+    const result = await this.publicationManager?.publish();
     if (result?.warning) this.handlePublicationWarning(result.warning);
     else if (result?.published) this.indexStatus?.setPublicationWarning(undefined);
   }
@@ -761,13 +761,7 @@ export class TramaPlugin extends Plugin {
 
   private updateIndexCapabilities(manager: IndexManager): void {
     if (this.index !== manager || !this.indexStatus) return;
-    const candidate = manager as unknown as {
-      capabilities?: () => ReturnType<IndexManager["getCapabilities"]>;
-      getCapabilities?: () => ReturnType<IndexManager["getCapabilities"]>;
-    };
-    const capabilities = candidate.capabilities?.() ?? candidate.getCapabilities?.();
-    if (!capabilities) return;
-    this.indexStatus.setCapabilities(capabilities);
+    this.indexStatus.setCapabilities(manager.capabilities());
   }
 
   private async publishAfterIndexOperation(
@@ -786,7 +780,7 @@ export class TramaPlugin extends Plugin {
     ) {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
-    if (this.index === manager) await publication.autoPublish(result);
+    if (this.index === manager) await publication.publishAfterSuccessfulOperation(result);
   }
 
   private handlePublicationWarning(warning: PublicationWarning): void {
