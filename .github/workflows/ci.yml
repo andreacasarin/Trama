@@ -31,6 +31,9 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Check derived versions
+        run: npm run version:check
+
       - name: Check formatting
         run: npm run format:check
 

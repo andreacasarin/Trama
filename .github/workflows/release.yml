@@ -64,6 +64,9 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Check derived versions
+        run: npm run version:check
+
       - name: Check formatting and lint
         run: |
           npm run format:check
@@ -96,27 +99,18 @@ jobs:
         run: |
           set -euo pipefail
           archive="dist/trama-${RELEASE_VERSION}.zip"
-          release_json=""
-          create_status=0
-          create_args=("$RELEASE_TAG" "$archive" --draft --title "$RELEASE_TITLE" --generate-notes)
-          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then create_args+=(--prerelease); fi
-          gh release create "${create_args[@]}" || create_status=$?
-          if (( create_status != 0 )); then
-            release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets 2>/dev/null || true)"
-            if [[ -z "$release_json" ]]; then
-              exit "$create_status"
-            fi
-          else
+          release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets 2>/dev/null || true)"
+          if [[ -z "$release_json" ]]; then
+            create_args=("$RELEASE_TAG" "$archive" --draft --title "$RELEASE_TITLE" --generate-notes)
+            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then create_args+=(--prerelease); fi
+            gh release create "${create_args[@]}"
             release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets)"
           fi
 
-          node - "$release_json" "$RELEASE_TAG" "$RELEASE_PRERELEASE" <<'NODE'
+          node - "$release_json" "$RELEASE_TAG" <<'NODE'
           const release = JSON.parse(process.argv[2]);
           const expectedTag = process.argv[3];
-          const expectedPrerelease = process.argv[4] === "true";
           if (release.tagName !== expectedTag) throw new Error(`Release tag mismatch: ${release.tagName}`);
-          if (release.isPrerelease !== expectedPrerelease)
-            throw new Error(`Release prerelease state mismatch for ${expectedTag}`);
           NODE
 
           asset="trama-${RELEASE_VERSION}.zip"

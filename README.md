@@ -142,6 +142,11 @@ inputs and the fingerprinted local build cache. The generated root assets
 they are build products, not source-controlled runtime copies. The cache is
 repository-local and ignored as well.
 
+`package.json` is the source for the release version. To bump it, run
+`npm version 0.4.0 --no-git-tag-version` (using the intended version). The npm
+version hook updates `manifest.json` and `package-lock.json`; commit all three
+files before tagging that commit. CI checks that the derived versions match.
+
 Build and install the plugin into a vault with one command:
 
 ```sh

@@ -8,6 +8,9 @@
   },
   "scripts": {
     "build": "node scripts/sqlite-wasm/build.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
+    "version": "node scripts/sync-version.mjs",
+    "version:sync": "node scripts/sync-version.mjs",
+    "version:check": "node scripts/sync-version.mjs --check",
     "verify:sqlite": "node scripts/sqlite-wasm/verify.mjs",
     "install:plugin": "npm run build && node scripts/install-plugin.mjs",
     "benchmark": "node scripts/benchmark/run.mjs",
