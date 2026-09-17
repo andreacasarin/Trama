@@ -17,6 +17,7 @@ const PRODUCTION_FILES = [
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "trama-release-"));
 const archive = join(temporaryDirectory, "trama.zip");
 const root = resolve(import.meta.dirname, "..");
+const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
 
 afterAll(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
 
@@ -24,7 +25,7 @@ describe("release package", () => {
   it("contains exactly the production plugin files", () => {
     execFileSync(
       process.execPath,
-      ["scripts/package-release.mjs", "--version", "0.1.0", "--archive", archive],
+      ["scripts/package-release.mjs", "--version", version, "--archive", archive],
       { cwd: root }
     );
 
@@ -33,7 +34,7 @@ describe("release package", () => {
 
     execFileSync(
       process.execPath,
-      ["scripts/package-release.mjs", "--verify", "--version", "0.1.0", "--archive", archive],
+      ["scripts/package-release.mjs", "--verify", "--version", version, "--archive", archive],
       { cwd: root }
     );
   });
