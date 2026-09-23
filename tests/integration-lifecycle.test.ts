@@ -159,6 +159,7 @@ function automaticSemanticHarness(delayMs: number, eligible = true) {
   const manager = {
     isComplete: () => true,
     isBuilding: () => false,
+    capabilities: () => ({ semantic: { searchable: eligible, activity: "idle" } }),
     disposeImmediately: vi.fn(),
     hasCompatibleSemanticVectors: () => eligible,
     prepareSemanticCacheBatch: vi.fn(async () => ({
@@ -167,6 +168,11 @@ function automaticSemanticHarness(delayMs: number, eligible = true) {
     })),
   };
   plugin.index = manager;
+  plugin.indexStatus = new IndexStatusController({} as any, {
+    index: async () => undefined,
+    reindex: async () => undefined,
+    cancel: () => undefined,
+  });
   plugin.indexReady = true;
   plugin.automaticSemanticEligible = eligible;
   return { plugin, manager };
@@ -308,6 +314,10 @@ describe("TramaPlugin lifecycle integration", () => {
       hasCompatibleSemanticVectors: () => false,
       capabilities: () => ({ semantic: { activity: "idle" } }),
       isComplete: () => true,
+      journalSnapshot: () => ({ changes: [], fullRecovery: true, revision: 1 }),
+      pendingChangeCount: () => 0,
+      clearJournalIfCurrent: vi.fn(),
+      hasPendingWork: () => false,
       synchronize: vi
         .fn()
         .mockResolvedValueOnce({ changed: false, converged: true })
@@ -413,7 +423,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
     await (plugin as any).indexLoad;
     const index = (plugin as any).index;
-    const queue = vi.spyOn(index, "queueChange");
+    const queue = vi.spyOn(index, "recordPathMutation");
     (index as any).hasUsableIndex = vi.fn(() => true);
     const modify = app.listeners.find((ref) => ref.event === "modify");
 
@@ -791,9 +801,7 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.index = manager;
     plugin.publicationManager = publication;
     plugin.indexReady = true;
-    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 4, eventRevision: 0 };
-    plugin.automaticPublicationRevision = 1;
-    plugin.latestPublicationChangeCounter = 4;
+    plugin.pendingAutomaticPublication = { eventRevision: 0 };
     const flush = plugin.publishOnQuit();
     expect(flush).toBeDefined();
     await flush;
@@ -801,9 +809,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(plugin.pendingAutomaticPublication).toBeUndefined();
     expect(manager.isComplete).toHaveBeenCalledOnce();
 
-    plugin.pendingAutomaticPublication = { revision: 2, changeCounter: 5, eventRevision: 0 };
-    plugin.automaticPublicationRevision = 2;
-    plugin.latestPublicationChangeCounter = 5;
+    plugin.pendingAutomaticPublication = { eventRevision: 0 };
     const reused = Promise.resolve({ published: true });
     plugin.activePublicationPromise = reused;
     await plugin.publishOnQuit();
@@ -826,9 +832,7 @@ describe("TramaPlugin lifecycle integration", () => {
       ...DEFAULT_SETTINGS,
       filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 0 },
     });
-    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 0, eventRevision: 0 };
-    plugin.automaticPublicationRevision = 1;
-    plugin.latestPublicationChangeCounter = 0;
+    plugin.pendingAutomaticPublication = { eventRevision: 0 };
     expect(plugin.publishOnQuit()).toBeUndefined();
     const enabled = plugin.settingsStore.stage({
       ...DEFAULT_SETTINGS,
@@ -861,11 +865,8 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.spyOn(index, "isComplete").mockReturnValue(true);
     const dispose = vi.spyOn(index, "disposeImmediately");
     plugin.pendingAutomaticPublication = {
-      revision: 1,
-      changeCounter: plugin.latestPublicationChangeCounter,
       eventRevision: plugin.vaultEventRevision,
     };
-    plugin.automaticPublicationRevision = 1;
     const completion = deferred<void>();
     vi.spyOn(plugin.publicationManager, "publish").mockReturnValue(
       completion.promise.then(() => ({
@@ -901,9 +902,7 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.indexReady = true;
     plugin.indexStatus = status;
     plugin.publicationManager = { publish: vi.fn(async () => ({ published: false, warning })) };
-    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 0, eventRevision: 0 };
-    plugin.automaticPublicationRevision = 1;
-    plugin.latestPublicationChangeCounter = 0;
+    plugin.pendingAutomaticPublication = { eventRevision: 0 };
 
     await plugin.publishOnQuit();
 
@@ -1402,7 +1401,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
-    const queue = vi.spyOn(index, "queueChange");
+    const queue = vi.spyOn(index, "recordPathMutation");
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -1719,7 +1718,7 @@ describe("TramaPlugin lifecycle integration", () => {
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    const queue = vi.spyOn(index, "queueChange");
+    const queue = vi.spyOn(index, "recordPathMutation");
     const ref = app.listeners.find((item) => item.event === "rename");
     ref?.callback({ path: "Renamed.md" }, "Old.md");
     expect(queue).toHaveBeenCalledTimes(1);
@@ -1738,7 +1737,7 @@ describe("TramaPlugin lifecycle integration", () => {
     )[0];
     command.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
-    const queue = vi.spyOn(index, "queueChange");
+    const queue = vi.spyOn(index, "recordPathMutation");
     const ref = app.listeners.find((item) => item.event === "rename");
 
     ref?.callback({ path: ".hidden.md" }, "Visible.md");

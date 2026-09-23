@@ -285,13 +285,9 @@ export function createSourceDigest(source: string): Promise<string> {
   return sha256Hex(domainInput("trama-source-v1", [normalizeMarkdownLineEndings(source)]));
 }
 
-export const sourceDigest = createSourceDigest;
-
 export function createInputDigest(input: string): Promise<string> {
   return sha256Hex(domainInput("trama-input-v1", [normalizeMarkdownLineEndings(input)]));
 }
-
-export const embeddingInputDigest = createInputDigest;
 
 export const EMBEDDING_PREPROCESSING_VERSION = "normalized-float32-v1" as const;
 export const EMBEDDING_ACTION_OPTIONS = Object.freeze({ inputVersion: 1 });

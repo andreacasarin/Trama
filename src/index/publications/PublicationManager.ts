@@ -1,5 +1,4 @@
 import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
-import type { IndexOperationResult, SemanticPrepareResult } from "@/index/IndexManager";
 import type {
   PublicationInspection,
   PublicationPrepared,
@@ -70,8 +69,6 @@ export interface PublicationManagerOptions {
   readonly debounceMs?: number;
 }
 
-type SuccessfulOperation = IndexOperationResult | SemanticPrepareResult;
-
 /**
  * Serializes publication and adoption around the IndexManager maintenance
  * seam. It intentionally has no merge, timestamp, hash, manifest, or ordering
@@ -92,7 +89,6 @@ export class PublicationManager {
   private disposed = false;
   private lastWarning?: PublicationWarning;
   private lastMetrics?: PublicationResourceMetrics;
-  private lastPublishedVisibilityGeneration?: string;
   private activeOperations = 0;
 
   readonly store: PublicationStore;
@@ -126,20 +122,6 @@ export class PublicationManager {
 
   get isBusy(): boolean {
     return this.activeOperations > 0;
-  }
-
-  /** Publish after a converged Build, Update, Rebuild, or semantic Prepare. */
-  async publishAfterSuccessfulOperation(result: SuccessfulOperation): Promise<PublicationResult> {
-    if (!isPublishableOperation(result) || !result.converged || !result.changed)
-      return { published: false };
-    const generation = visibleGeneration(result.state);
-    if (generation && generation === this.lastPublishedVisibilityGeneration)
-      return { published: false };
-    return this.serialize(async () => {
-      if (generation && generation === this.lastPublishedVisibilityGeneration)
-        return { published: false };
-      return this.publishSerialized();
-    });
   }
 
   async publish(): Promise<PublicationResult> {
@@ -229,7 +211,6 @@ export class PublicationManager {
       };
       this.lastWarning = undefined;
       this.lastMetrics = metrics;
-      this.lastPublishedVisibilityGeneration = visibleGeneration(prepared.state);
       try {
         this.onMetrics?.(metrics);
       } catch {
@@ -269,8 +250,7 @@ export class PublicationManager {
       return { adopted: false, ignored: "same-id", publicationId: current };
     try {
       const state = await this.index.adoptPublication(bytes, inspection.publicationId, inspection);
-      // An adopted candidate is authoritative as loaded data. Never call
-      // publishAfterSuccessfulOperation or reconcile here.
+      // An adopted candidate is authoritative as loaded data. Never publish or reconcile here.
       return { adopted: true, publicationId: inspection.publicationId, state };
     } catch (error) {
       return {
@@ -385,21 +365,6 @@ export class PublicationManager {
     );
     return next;
   }
-}
-
-function isPublishableOperation(result: SuccessfulOperation): boolean {
-  return (
-    result.operation === "build" ||
-    result.operation === "update" ||
-    result.operation === "rebuild" ||
-    result.operation === "prepare"
-  );
-}
-
-function visibleGeneration(state: SqliteState): string | undefined {
-  if (state.lexicalGeneration !== undefined && state.semanticGeneration !== undefined)
-    return `${state.lexicalGeneration}:${state.semanticGeneration}`;
-  return Number.isFinite(state.changeCounter) ? `change:${state.changeCounter}` : undefined;
 }
 
 function isRetryable(error: unknown): boolean {

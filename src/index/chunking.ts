@@ -8,15 +8,6 @@ export const CHUNK_ALGORITHM_VERSION = 3;
 export const CHUNK_SIZE = 384;
 export const CHUNK_OVERLAP = 64;
 
-export interface IndexChunk {
-  readonly text: string;
-  readonly startLine: number;
-  readonly endLine: number;
-  readonly embeddingInput?: string;
-  readonly kind?: MarkdownBlockKind;
-  readonly headingContext?: readonly string[];
-}
-
 export type MarkdownBlockKind =
   | "front-matter"
   | "heading"
@@ -253,64 +244,4 @@ export function chunkMarkdownBlocks(
   if (result.some((block) => block.embeddingInput.length > maxInput))
     throw new Error("Chunk splitter exceeded its serialized input bound");
   return result;
-}
-
-export function chunkMarkdown(
-  text: string,
-  size = CHUNK_SIZE,
-  overlap = CHUNK_OVERLAP,
-  signal?: AbortSignal
-): IndexChunk[] {
-  if (size <= 0 || overlap < 0 || overlap >= size) throw new Error("Invalid chunk parameters");
-  const sourceLines = normalizeLines(text);
-  const lineNumbers: number[] = [];
-  const lines = sourceLines.flatMap((line, sourceIndex) => {
-    if (signal?.aborted) throw new Error("Operation cancelled");
-    if (Array.from(line).length <= size) {
-      lineNumbers.push(sourceIndex + 1);
-      return [line];
-    }
-    const pieces: string[] = [];
-    const codePoints = Array.from(line);
-    for (let offset = 0; offset < codePoints.length; offset += size - overlap) {
-      if (signal?.aborted) throw new Error("Operation cancelled");
-      pieces.push(codePoints.slice(offset, offset + size).join(""));
-    }
-    lineNumbers.push(...pieces.map(() => sourceIndex + 1));
-    return pieces;
-  });
-  const chunks: IndexChunk[] = [];
-  let start = 0;
-  while (start < lines.length) {
-    if (signal?.aborted) throw new Error("Operation cancelled");
-    let end = start;
-    let length = 0;
-    while (
-      end < lines.length &&
-      (length === 0 || length + lines[end].length + (end > start ? 1 : 0) <= size)
-    ) {
-      length += lines[end].length + (end > start ? 1 : 0);
-      end++;
-    }
-    const value = lines.slice(start, end).join("\n");
-    if (value)
-      chunks.push({
-        text: value,
-        startLine: lineNumbers[start] ?? start + 1,
-        endLine: lineNumbers[end - 1] ?? end,
-      });
-    if (end === lines.length) break;
-    if (lineNumbers[end - 1] === lineNumbers[end]) {
-      start = end;
-      continue;
-    }
-    let carried = 0;
-    let next = end;
-    while (next > start && carried < overlap) {
-      next--;
-      carried += lines[next].length + 1;
-    }
-    start = Math.max(start + 1, next);
-  }
-  return chunks;
 }

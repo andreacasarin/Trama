@@ -185,9 +185,10 @@ describe("SQLite publication plugin maintenance", () => {
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
     await vi.advanceTimersByTimeAsync(5_000);
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2));
+    const newerIntent = plugin.pendingAutomaticPublication;
     finish({ published: true });
     await Promise.resolve();
-    expect(plugin.pendingAutomaticPublication).toMatchObject({ changeCounter: 2 });
+    expect(plugin.pendingAutomaticPublication).toBe(newerIntent);
     vi.useRealTimers();
   });
 

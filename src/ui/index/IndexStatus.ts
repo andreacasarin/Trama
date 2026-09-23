@@ -119,10 +119,6 @@ export class IndexOperationLease {
     if (!this.signal.aborted) this.controller.abort();
   }
 
-  attachRelease(handler: (lease: IndexOperationLease) => void): void {
-    this.releaseHandler = handler;
-  }
-
   release(): void {
     if (this.released) return;
     this.released = true;
@@ -130,10 +126,6 @@ export class IndexOperationLease {
     const handler = this.releaseHandler;
     this.releaseHandler = undefined;
     handler?.(this);
-  }
-
-  get isReleased(): boolean {
-    return this.released;
   }
 }
 
@@ -253,9 +245,6 @@ export class IndexStatusController {
   getStatus(): IndexStatus {
     return this.status;
   }
-  getActiveLease(): IndexOperationLease | undefined {
-    return this.activeLease;
-  }
   /** Acquires the single shared operation slot for automatic work. */
   acquireExternalLease(
     channel: IndexOperationChannel,
@@ -269,20 +258,6 @@ export class IndexStatusController {
     this.operationChannel = channel;
     this.set(channel === "semantic" ? "preparing" : "updating", this.status.hasLastGood, message);
     return lease;
-  }
-  /** Attaches an already-created automatic lease to this controller. */
-  attachExternalLease(lease: IndexOperationLease, message?: string): boolean {
-    if (this.activeLease || this.controller) return false;
-    lease.attachRelease((released) => this.releaseExternalLease(released));
-    this.activeLease = lease;
-    this.operationChannel = lease.channel;
-    this.set(
-      lease.channel === "semantic" ? "preparing" : "updating",
-      this.status.hasLastGood,
-      message ??
-        (lease.channel === "semantic" ? "Updating semantic index…" : "Updating lexical index…")
-    );
-    return true;
   }
   releaseExternalLease(lease: IndexOperationLease): void {
     if (this.activeLease !== lease) return;

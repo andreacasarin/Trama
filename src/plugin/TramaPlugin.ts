@@ -51,47 +51,6 @@ interface LenteSearchPort {
   search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
 }
 
-function coalescePathMutation(changes: IndexPathMutation[], mutation: IndexPathMutation): void {
-  const previous = changes[changes.length - 1];
-  if (mutation.type === "rename") {
-    if (previous?.type === "rename" && previous.to === mutation.from) {
-      changes[changes.length - 1] = { type: "rename", from: previous.from, to: mutation.to };
-      return;
-    }
-    if (previous?.type === "upsert" && previous.path === mutation.from) {
-      changes[changes.length - 1] = { type: "delete", path: mutation.from };
-      changes.push({ type: "upsert", path: mutation.to });
-      return;
-    }
-    if (previous?.type === "delete" && previous.path === mutation.from) {
-      changes.push({ type: "upsert", path: mutation.to });
-      return;
-    }
-    changes.push(mutation);
-    return;
-  }
-  const path = mutation.path;
-  if (mutation.type === "upsert") {
-    if (previous?.type === "upsert" && previous.path === path) return;
-    if (previous?.type === "delete" && previous.path === path) {
-      changes[changes.length - 1] = mutation;
-      return;
-    }
-    changes.push(mutation);
-    return;
-  }
-  if (previous?.type === "delete" && previous.path === path) return;
-  if (previous?.type === "rename" && previous.to === path) {
-    changes[changes.length - 1] = { type: "delete", path: previous.from };
-    return;
-  }
-  if (previous?.type === "upsert" && previous.path === path) {
-    changes[changes.length - 1] = mutation;
-    return;
-  }
-  changes.push(mutation);
-}
-
 function isRetryableError(error: unknown): boolean {
   if (projectDiagnosticError(error).retryable === true) return true;
   if (!error || typeof error !== "object") return false;
@@ -100,8 +59,6 @@ function isRetryableError(error: unknown): boolean {
 }
 
 interface AutomaticPublicationIntent {
-  readonly revision: number;
-  readonly changeCounter: number;
   readonly eventRevision: number;
 }
 
@@ -144,10 +101,7 @@ export class TramaPlugin extends Plugin {
   private indexReady = false;
   private combinedRebuildLexicalPhase = false;
   private compositionRevision = 0;
-  private readonly pendingVaultChanges: IndexPathMutation[] = [];
   private vaultEventRevision = 0;
-  /** Compatibility mirror used only by older injected manager doubles. */
-  private fullRecoveryPending = false;
   private startupRecoveryStarted = false;
   private automaticSemanticTimer?: ReturnType<typeof setTimeout>;
   private automaticSemanticRetryTimer?: ReturnType<typeof setTimeout>;
@@ -175,8 +129,6 @@ export class TramaPlugin extends Plugin {
   private automaticPublicationRetryTimer?: ReturnType<typeof setTimeout>;
   private automaticPublicationRetryAttempt = 0;
   private automaticPublicationRetryPaused = false;
-  private automaticPublicationRevision = 0;
-  private latestPublicationChangeCounter = 0;
   private pendingAutomaticPublication?: AutomaticPublicationIntent;
   private automaticPublicationPromise?: Promise<void>;
   private activePublicationPromise?: ReturnType<PublicationManager["publish"]>;
@@ -446,7 +398,7 @@ export class TramaPlugin extends Plugin {
         channel: "lexical",
         stage: "disabled",
         source: "explicit",
-        counts: { queued: this.index?.pendingChangeCount?.() ?? this.pendingVaultChanges.length },
+        counts: { queued: this.index?.pendingChangeCount() ?? 0 },
       });
     } else if (before.filo.automaticLexicalDelayMs !== saved.filo.automaticLexicalDelayMs)
       this.armAutomaticWork();
@@ -630,7 +582,6 @@ export class TramaPlugin extends Plugin {
       })
       .catch(() => false);
     this.indexLoad = loadPromise;
-    this.fullRecoveryPending = false;
     void loadPromise.then((loaded) => {
       if (this.index !== manager || compositionRevision !== this.compositionRevision) return;
       const available = manager.capabilities().availability !== "unavailable";
@@ -652,12 +603,9 @@ export class TramaPlugin extends Plugin {
       this.refreshOpenRelatedSuggestions(app);
       this.maybeScheduleStartupRecovery();
       this.automaticSemanticEligible = this.hasAutomaticSemanticWork(manager);
-      if (!(manager.hasPendingWork?.() ?? (this.fullRecoveryPending || this.queuedWork)))
-        this.scheduleAutomaticSemantic("startup");
+      if (!manager.hasPendingWork()) this.scheduleAutomaticSemantic("startup");
       if (this.queuedWork && this.getSettings().filo.automaticLexicalDelayMs > 0) {
-        this.scheduleReconcile(
-          manager.hasPendingWork?.() || this.fullRecoveryPending ? "startup" : "event"
-        );
+        this.scheduleReconcile(manager.hasPendingWork() ? "startup" : "event");
       } else if (this.queuedWork) {
         this.queuedWork = true;
         this.markQueuedWorkStale();
@@ -1210,11 +1158,8 @@ export class TramaPlugin extends Plugin {
     this.automaticPublicationRetryAttempt = 0;
     this.automaticPublicationRetryPaused = false;
     this.pendingAutomaticPublication = {
-      revision: ++this.automaticPublicationRevision,
-      changeCounter: result.state.changeCounter,
       eventRevision: this.vaultEventRevision,
     };
-    this.latestPublicationChangeCounter = result.state.changeCounter;
     this.emitSchedulerTransition({
       channel: "publication",
       stage: "pending",
@@ -1388,9 +1333,7 @@ export class TramaPlugin extends Plugin {
   private isCurrentPublicationIntent(pending: AutomaticPublicationIntent): boolean {
     return (
       this.pendingAutomaticPublication === pending &&
-      pending.revision === this.automaticPublicationRevision &&
-      pending.eventRevision === this.vaultEventRevision &&
-      pending.changeCounter === this.latestPublicationChangeCounter
+      pending.eventRevision === this.vaultEventRevision
     );
   }
 
@@ -1453,7 +1396,6 @@ export class TramaPlugin extends Plugin {
   }
 
   private clearPublicationIntentAfterAdoption(): void {
-    this.automaticPublicationRevision++;
     this.stopAutomaticPublication();
     this.refreshSchedulerMessage();
   }
@@ -1492,11 +1434,7 @@ export class TramaPlugin extends Plugin {
     )
       return;
     this.startupRecoveryStarted = true;
-    if (this.index.requestFullRecovery) this.index.requestFullRecovery();
-    else {
-      this.fullRecoveryPending = true;
-      this.index.queueChange();
-    }
+    this.index.requestFullRecovery();
     this.queuedWork = true;
     if (this.indexReady) this.scheduleReconcile("startup");
   }
@@ -1628,10 +1566,7 @@ export class TramaPlugin extends Plugin {
     )
       return Promise.resolve();
 
-    const acquireLease = this.indexStatus?.acquireExternalLease;
-    const lease = acquireLease
-      ? acquireLease.call(this.indexStatus, "semantic")
-      : new IndexOperationLease("semantic");
+    const lease = this.indexStatus?.acquireExternalLease("semantic");
     if (!lease) return Promise.resolve();
     this.automaticSemanticLease = lease;
     const controller = lease.controller;
@@ -1811,7 +1746,7 @@ export class TramaPlugin extends Plugin {
       stage: "delayed",
       source,
       delayMs: delay,
-      counts: { queued: this.index?.pendingChangeCount?.() ?? this.pendingVaultChanges.length },
+      counts: { queued: this.index?.pendingChangeCount() ?? 0 },
     });
     this.eventTimer = setTimeout(() => {
       this.eventTimer = undefined;
@@ -1835,7 +1770,7 @@ export class TramaPlugin extends Plugin {
         stage: "failed",
         source: "retry",
         retryAttempt: this.automaticRetryAttempt,
-        counts: { queued: this.index?.pendingChangeCount?.() ?? this.pendingVaultChanges.length },
+        counts: { queued: this.index?.pendingChangeCount() ?? 0 },
       });
       this.refreshSchedulerMessage();
       return;
@@ -1848,7 +1783,7 @@ export class TramaPlugin extends Plugin {
       source: "retry",
       delayMs: delay,
       retryAttempt: this.automaticRetryAttempt,
-      counts: { queued: this.index?.pendingChangeCount?.() ?? this.pendingVaultChanges.length },
+      counts: { queued: this.index?.pendingChangeCount() ?? 0 },
     });
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
@@ -1880,18 +1815,13 @@ export class TramaPlugin extends Plugin {
       return this.reconcilePromise;
     }
     const eventRevision = this.vaultEventRevision;
-    const journal = manager.journalSnapshot?.();
-    const changes = journal?.changes ?? this.pendingVaultChanges;
-    const queuedCount = manager.pendingChangeCount?.() ?? changes.length;
+    const journal = manager.journalSnapshot();
+    const changes = journal.changes;
+    const queuedCount = manager.pendingChangeCount();
     this.queuedWork = false;
     this.pauseAutomaticPublicationForIndexing();
-    const acquireLease = this.indexStatus?.acquireExternalLease;
     const automaticLease =
-      source === "automatic"
-        ? acquireLease
-          ? acquireLease.call(this.indexStatus, "lexical")
-          : new IndexOperationLease("lexical")
-        : undefined;
+      source === "automatic" ? this.indexStatus?.acquireExternalLease("lexical") : undefined;
     if (source === "automatic" && !automaticLease) {
       this.queuedWork = true;
       return;
@@ -1917,26 +1847,17 @@ export class TramaPlugin extends Plugin {
       });
     this.reconcilePromise = (async () => {
       try {
-        const fullRecovery =
-          this.fullRecoveryPending ||
-          journal?.fullRecovery === true ||
-          changes.length === 0 ||
-          !manager.isComplete();
+        const fullRecovery = journal.fullRecovery || changes.length === 0 || !manager.isComplete();
         const result = fullRecovery
           ? await manager.synchronize(operationSignal)
           : await manager.reconcileChanges(changes, operationSignal);
         if (operationSignal.aborted) throw new Error("Lexical indexing cancelled.");
-        if (journal) {
-          if (result.converged) manager.clearJournalIfCurrent?.(journal.revision);
-        } else {
-          this.pendingVaultChanges.length = 0;
-          this.fullRecoveryPending = false;
-        }
+        if (result.converged) manager.clearJournalIfCurrent(journal.revision);
         const current =
           result.converged &&
           manager.isComplete() &&
           eventRevision === this.vaultEventRevision &&
-          !(manager.hasPendingWork?.() ?? false);
+          !manager.hasPendingWork();
         if (current) {
           this.queuedWork = false;
           this.automaticRetryAttempt = 0;
@@ -1947,7 +1868,7 @@ export class TramaPlugin extends Plugin {
           !result.converged ||
           !manager.isComplete() ||
           eventRevision !== this.vaultEventRevision ||
-          (manager.hasPendingWork?.() ?? false)
+          manager.hasPendingWork()
         ) {
           this.queuedWork = true;
         }
@@ -2087,11 +2008,7 @@ export class TramaPlugin extends Plugin {
     this.automaticRetryPaused = false;
     this.automaticStopPaused = false;
     this.vaultEventRevision++;
-    if (this.index.recordPathMutation) this.index.recordPathMutation(mutation);
-    else {
-      this.index.queueChange();
-      coalescePathMutation(this.pendingVaultChanges, mutation);
-    }
+    this.index.recordPathMutation(mutation);
     this.emitSchedulerTransition({
       channel: "lexical",
       stage: "queued",
@@ -2099,7 +2016,7 @@ export class TramaPlugin extends Plugin {
       delayMs: this.getSettings().filo.automaticLexicalDelayMs,
       counts: {
         events: 1,
-        queued: this.index.pendingChangeCount?.() ?? this.pendingVaultChanges.length,
+        queued: this.index.pendingChangeCount(),
       },
     });
     this.queuedWork = true;
@@ -2126,11 +2043,7 @@ export class TramaPlugin extends Plugin {
     this.automaticRetryPaused = false;
     this.automaticStopPaused = false;
     this.vaultEventRevision++;
-    if (this.index.requestFullRecovery) this.index.requestFullRecovery();
-    else {
-      this.fullRecoveryPending = true;
-      this.index.queueChange();
-    }
+    this.index.requestFullRecovery();
     this.queuedWork = true;
     this.emitSchedulerTransition({
       channel: "lexical",
@@ -2139,7 +2052,7 @@ export class TramaPlugin extends Plugin {
       delayMs: this.getSettings().filo.automaticLexicalDelayMs,
       counts: {
         events: 1,
-        queued: this.index.pendingChangeCount?.() ?? this.pendingVaultChanges.length,
+        queued: this.index.pendingChangeCount(),
         fullRecovery: 1,
       },
     });

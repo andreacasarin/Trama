@@ -66,12 +66,6 @@ export interface IndexVaultPort {
   readMarkdown(path: string, signal: AbortSignal): Promise<IndexVaultDocument>;
   isIndexEligible?(path: string): boolean;
   isMarkdownAvailable?(path: string, signal: AbortSignal): Promise<boolean>;
-  estimateMarkdownTextCount?(
-    paths: readonly string[],
-    chunkSize: number,
-    overlap: number,
-    signal: AbortSignal
-  ): Promise<number | undefined>;
 }
 export interface IndexFingerprint {
   readonly embeddingBaseUrl: string;
@@ -271,7 +265,6 @@ export class IndexManager implements VaultRetrievalPort {
       readonly sqliteIdentity?: string | Promise<string>;
       readonly sqliteClient?: SqliteWorkerClient;
       readonly onSuccessfulOperation?: (result: IndexOperationResult) => void | Promise<void>;
-      readonly onOperationSuccess?: (result: IndexOperationResult) => void | Promise<void>;
     } = {},
     private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {
@@ -1075,7 +1068,7 @@ export class IndexManager implements VaultRetrievalPort {
     return state;
   }
 
-  queueChange(): void {
+  private markJournalDirty(): void {
     this.revision++;
     this.freshness = "unknown";
     this.fullRecoveryRequested = true;
@@ -1084,7 +1077,7 @@ export class IndexManager implements VaultRetrievalPort {
   /** Record one vault mutation in the manager-owned coalescing journal. */
   recordPathMutation(mutation: IndexPathMutation): void {
     const wasFullRecoveryRequested = this.fullRecoveryRequested;
-    this.queueChange();
+    this.markJournalDirty();
     this.fullRecoveryRequested = wasFullRecoveryRequested;
     if (mutation.type === "rename")
       coalescePathMutation(this.changeJournal, {
@@ -1101,7 +1094,7 @@ export class IndexManager implements VaultRetrievalPort {
 
   /** Mark the journal ambiguous; the next queued run must rediscover the vault. */
   requestFullRecovery(): void {
-    this.queueChange();
+    this.markJournalDirty();
     this.fullRecoveryRequested = true;
   }
 
@@ -1135,9 +1128,7 @@ export class IndexManager implements VaultRetrievalPort {
 
   private notifySuccessfulOperation(result: IndexOperationResult): void {
     try {
-      const pending = (this.options.onSuccessfulOperation ?? this.options.onOperationSuccess)?.(
-        result
-      );
+      const pending = this.options.onSuccessfulOperation?.(result);
       if (pending) void pending.catch(() => undefined);
     } catch {
       /* Publication is a follow-up concern and cannot invalidate a local commit. */
@@ -1164,12 +1155,7 @@ export class IndexManager implements VaultRetrievalPort {
 
   /** Enriches the lexical corpus in bounded, resumable batches. */
   async prepareSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.runSemanticPreparation(signal, false);
-  }
-
-  /** Runs one bounded semantic batch so automatic maintenance can yield to lexical work. */
-  async prepareSemanticBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.runSemanticPreparation(signal, false, 1, 16);
+    return this.runSemanticPreparation(signal);
   }
 
   /** True only while this manager has usable stored vectors for its current embedding identity. */
@@ -1213,7 +1199,6 @@ export class IndexManager implements VaultRetrievalPort {
   async prepareSemanticCacheBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
     return this.runSemanticPreparation(
       signal,
-      false,
       1,
       Math.min(16, this.options.prepareBatchSize ?? 16)
     );
@@ -1221,7 +1206,6 @@ export class IndexManager implements VaultRetrievalPort {
 
   private async runSemanticPreparation(
     signal: AbortSignal,
-    rebuild: boolean,
     maxBatches = Number.POSITIVE_INFINITY,
     batchSizeOverride?: number
   ): Promise<SemanticPrepareResult> {
@@ -1234,7 +1218,7 @@ export class IndexManager implements VaultRetrievalPort {
     let skipped = 0;
     let promoted = 0;
     let hasMore = true;
-    const operation = rebuild ? "full" : "incremental";
+    const operation = "incremental";
     const started = Date.now();
     const initialRevision = this.revision;
     try {
@@ -1366,7 +1350,7 @@ export class IndexManager implements VaultRetrievalPort {
       this.setState((await this.ensureClient().call("getState", {}, signal)) as SqliteState);
       const finalState = this.state!;
       const result: SemanticPrepareResult = {
-        operation: rebuild ? "rebuild" : "prepare",
+        operation: "prepare",
         changed: promoted > 0,
         converged: !hasMore && this.revision === initialRevision,
         state: finalState,

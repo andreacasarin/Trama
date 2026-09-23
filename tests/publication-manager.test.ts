@@ -91,19 +91,14 @@ function setup() {
 }
 
 describe("PublicationManager", () => {
-  it("publishes converged operations and validates the installed copy", async () => {
+  it("publishes and validates the installed copy", async () => {
     const fixture = setup();
     const metrics: unknown[] = [];
     const manager = new PublicationManager(fixture.index, fixture.adapter, {
       idFactory: () => "publication-1",
       onMetrics: (value) => metrics.push(value),
     });
-    const result = await manager.publishAfterSuccessfulOperation({
-      operation: "build",
-      changed: true,
-      converged: true,
-      state: state(),
-    });
+    const result = await manager.publish();
     expect(result).toMatchObject({ published: true, publicationId: "publication-1" });
     expect(metrics).toHaveLength(1);
     expect(fixture.publish).toHaveBeenCalledTimes(1);

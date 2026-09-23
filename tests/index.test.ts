@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { StructuredError, type IndexProgress } from "@/domain/contracts";
 import { projectDiagnosticError, type TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
-import { CHUNK_OVERLAP, CHUNK_SIZE, chunkMarkdown } from "@/index/chunking";
+import { CHUNK_OVERLAP, CHUNK_SIZE } from "@/index/chunking";
 import { IndexManager, createIndexFingerprint } from "@/index/IndexManager";
 import { LenteSearch } from "@/index/LenteSearch";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
@@ -51,14 +51,6 @@ function fixture(contents: Record<string, string>) {
     },
     isMarkdownAvailable: async (path: string) =>
       Object.prototype.hasOwnProperty.call(contents, path),
-    estimateMarkdownTextCount: async (paths: readonly string[], size: number, overlap: number) => {
-      const stride = Math.max(1, size - overlap);
-      return paths.reduce(
-        (total, path) =>
-          total + (contents[path] ? Math.max(1, Math.ceil(contents[path].length / stride)) : 0),
-        0
-      );
-    },
   };
 }
 
@@ -97,7 +89,7 @@ function racedManager(contents: Record<string, string>, repeat = false) {
     const result = await base.call(method, payload, requestSignal);
     if (armed && method === "finishLexicalRun" && (repeat || fired === 0)) {
       fired++;
-      target.queueChange();
+      target.requestFullRecovery();
     }
     return result;
   });
@@ -594,7 +586,7 @@ describe("semantic index module", () => {
     const preparation = index.prepareSemantic(signal);
     await vi.waitFor(() => expect(model.embed).toHaveBeenCalledOnce());
     contents["a.md"] = "alpha changed";
-    index.queueChange();
+    index.requestFullRecovery();
     await expect(index.synchronize(signal)).rejects.toMatchObject({ code: "busy" });
     await expect(index.build(signal)).rejects.toMatchObject({ code: "busy" });
     pending.resolve([[1, 0]]);
@@ -622,7 +614,7 @@ describe("semantic index module", () => {
     await setup.manager.prepareSemantic(signal);
 
     setup.contents["c.md"] = "gamma";
-    setup.manager.queueChange();
+    setup.manager.requestFullRecovery();
     expect(setup.manager.capabilities().freshness).toBe("unknown");
     await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
@@ -949,7 +941,7 @@ describe("semantic index module", () => {
     let armed = false;
     const client = new SqliteWorkerClient(undefined, async (method, payload, requestSignal) => {
       const result = await base.call(method, payload, requestSignal);
-      if (armed && method === "finishLexicalRun") target.queueChange();
+      if (armed && method === "finishLexicalRun") target.requestFullRecovery();
       return result;
     });
     const target = new IndexManager(
@@ -1164,7 +1156,6 @@ describe("semantic index module", () => {
     expect(createIndexFingerprint(" HTTP://127.0.0.1:1234/v1/ ", "m", 2)).toEqual(
       createIndexFingerprint("http://127.0.0.1:1234/v1", "m", 2)
     );
-    expect(chunkMarkdown("one\ntwo\nthree", 7, 2)).toEqual(chunkMarkdown("one\ntwo\nthree", 7, 2));
   });
 
   it("persists snapshot freshness through adoption and restart boundaries", async () => {
@@ -1396,7 +1387,7 @@ describe("semantic index module", () => {
       if (armed && !raced && method === "finishLexicalRun") {
         raced = true;
         contents["b.md"] = "gamma appeared during synchronization";
-        index.queueChange();
+        index.requestFullRecovery();
       }
       return result;
     });

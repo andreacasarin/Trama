@@ -89,20 +89,7 @@ describe("single-file SQLite publications", () => {
     const before = await index.search("alpha", new AbortController().signal, 5);
     const state = await index.getState();
     expect(state?.incomplete).toBe(false);
-    await expect(
-      publisher.publishAfterSuccessfulOperation({
-        operation: "update",
-        changed: true,
-        converged: false,
-        state: state!,
-      })
-    ).resolves.toMatchObject({ published: false });
-    const result = await publisher.publishAfterSuccessfulOperation({
-      operation: "update",
-      changed: true,
-      converged: true,
-      state: state!,
-    });
+    const result = await publisher.publish();
 
     expect(result).toMatchObject({ published: true, publicationId: "publication-1" });
     expect(result.metrics).toMatchObject({
@@ -118,24 +105,6 @@ describe("single-file SQLite publications", () => {
     const publishedBytes = await storage.readBinary("Trama/index/index.sqlite3");
     expect(publishedBytes.byteLength).toBe(result.metrics?.byteSize);
     expect(await index.search("alpha", new AbortController().signal, 5)).toEqual(before);
-  });
-
-  it("does not automatically publish a converged no-op update", async () => {
-    const storage = adapter();
-    const index = manager({});
-    const publisher = publication(index, storage, () => "no-op-publication");
-    await index.build(new AbortController().signal);
-    const state = await index.getState();
-
-    await expect(
-      publisher.publishAfterSuccessfulOperation({
-        operation: "update",
-        changed: false,
-        converged: true,
-        state: state!,
-      })
-    ).resolves.toEqual({ published: false });
-    expect(storage.files.has("Trama/index/index.sqlite3")).toBe(false);
   });
 
   it("can prepare semantic vectors after publication reopens the live database", async () => {

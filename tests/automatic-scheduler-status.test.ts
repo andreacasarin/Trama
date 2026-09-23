@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { IndexOperationLease, IndexStatusController } from "@/ui/index/IndexStatus";
 import { sqliteError } from "@/index/sqlite/protocol";
 
 describe("automatic scheduler status and diagnostics", () => {
@@ -84,7 +84,8 @@ describe("automatic scheduler status and diagnostics", () => {
     });
     plugin.index = {
       hasCompatibleSemanticVectors: () => false,
-      queueChange: vi.fn(),
+      recordPathMutation: vi.fn(),
+      pendingChangeCount: () => 1,
       isBuilding: () => false,
       capabilities: () => ({ semantic: { activity: "idle" } }),
     };
@@ -129,10 +130,17 @@ describe("automatic scheduler status and diagnostics", () => {
       filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: 1_000 },
     });
     plugin.indexReady = true;
+    plugin.indexStatus = {
+      acquireExternalLease: () => new IndexOperationLease("semantic"),
+      hasActiveOperation: () => false,
+      setCapabilities: vi.fn(),
+      setSchedulerMessage: vi.fn(),
+    };
     plugin.automaticSemanticEligible = true;
     plugin.index = {
       isComplete: () => true,
       isBuilding: () => false,
+      capabilities: () => ({ semantic: { searchable: false, activity: "idle" } }),
       prepareSemanticCacheBatch: vi.fn(async () => {
         throw sqliteError("storage_unavailable", "raw note content /private/vault/Secret.md", true);
       }),
@@ -178,6 +186,7 @@ describe("automatic scheduler status and diagnostics", () => {
       getStatus: () => ({}),
       hasActiveOperation: () => false,
       setCapabilities: vi.fn(),
+      acquireExternalLease: () => new IndexOperationLease("semantic"),
     };
     plugin.indexReady = true;
     plugin.automaticSemanticEligible = true;
