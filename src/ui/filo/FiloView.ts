@@ -129,7 +129,20 @@ export class FiloView extends ItemView {
     const path = this.currentPath();
     if (path !== this.activePath) this.expandedPaths.clear();
     this.activePath = path;
-    if (!path || !this.relatedSource || !this.semanticReady()) {
+    const transientStatus = [
+      "building",
+      "preparing",
+      "cancelling",
+      "updating",
+      "stale",
+      "error",
+      "cancelled",
+    ].includes(this.status.kind);
+    if (
+      !path ||
+      !this.relatedSource ||
+      (!this.semanticReady() && !(transientStatus && this.related))
+    ) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
       this.requestKey = undefined;
@@ -145,7 +158,8 @@ export class FiloView extends ItemView {
     }
     this.requestAbort?.abort();
     this.requestKey = key;
-    this.related = undefined;
+    // Keep the last settled rows visible while a new semantic head is being
+    // looked up; a successful result replaces them atomically.
     this.relatedError = false;
     this.render();
     const generation = ++this.requestGeneration;
@@ -172,7 +186,12 @@ export class FiloView extends ItemView {
   private acceptsResult(result: RelatedNotesResult): boolean {
     // A completed read remains usable after a mutable-index counter bump. The
     // next request observes the new snapshot key and refreshes the cache.
-    return result.currentPath === this.activePath;
+    if (result.currentPath !== this.activePath) return false;
+    const key = this.relatedSource?.snapshotKey?.(result.currentPath);
+    // RelatedNotes keys include the visible semantic head content hash. This
+    // rejects a late result from an older head without exposing paths in any
+    // diagnostic payload.
+    return !key || key.includes(`\0${result.contentHash}\0`);
   }
 
   private render(): void {
@@ -217,7 +236,7 @@ export class FiloView extends ItemView {
           cls: "setting-item-description trama-filo__message",
           text: status.message ?? "Updating lexical or semantic index…",
         });
-      if (status.canCancel) this.actionButton("Cancel", "cancel");
+      if (status.canCancel) this.actionButton("Stop indexing", "cancel");
       return;
     }
     if (status.kind === "stale") {
@@ -235,7 +254,10 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Lexical or semantic indexing failed.",
+        text:
+          status.channel === "semantic"
+            ? "Unable to update the semantic index."
+            : "Unable to build the lexical index.",
       });
       if (status.channel === "semantic") {
         if (status.canPrepare) this.semanticButtons();
@@ -248,7 +270,7 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Lexical or semantic indexing cancelled.",
+        text: `${status.channel === "semantic" ? "Semantic" : "Lexical"} indexing cancelled.`,
       });
       if (status.channel === "semantic") {
         if (status.canPrepare) this.semanticButtons();
@@ -451,10 +473,17 @@ export class FiloView extends ItemView {
   private actionButton(label: string, action: "index" | "reindex" | "cancel"): void {
     const button = this.root.createEl("button", {
       cls: `${action === "cancel" ? "clickable-icon " : ""}trama-filo__action`,
-      text: label,
+      // Obsidian's setIcon replaces this fallback text in the live view. It
+      // keeps simple render stubs and screen readers from losing the action
+      // before the icon is attached; aria-label and tooltip are authoritative.
+      text: action === "cancel" ? "Cancel" : label,
       attr: { type: "button", "aria-label": label },
     });
-    if (action === "cancel") setIcon(button, "square");
+    if (action === "cancel") {
+      setIcon(button, "square");
+      setTooltip(button, label);
+      button.setAttribute?.("aria-label", label);
+    }
     button.addEventListener("click", () => {
       if (action === "cancel") {
         if (this.cancelIndex) this.cancelIndex();

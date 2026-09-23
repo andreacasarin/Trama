@@ -6,6 +6,7 @@ import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { LenteSearch } from "@/index/LenteSearch";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 import { createTestSqliteClient } from "./sqlite-test-client";
+import { SQLITE_PROTOCOL_VERSION } from "@/index/sqlite/protocol";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -22,6 +23,7 @@ interface Listener {
 
 function projectedApp() {
   const listeners: Listener[] = [];
+  const layoutCallbacks: Array<() => void> = [];
   const files = [
     { path: "Note.md", name: "Note.md" },
     { path: "Other.md", name: "Other.md" },
@@ -90,14 +92,30 @@ function projectedApp() {
   };
   const workspace = {
     getActiveFile: () => files[0],
-    getLeavesOfType: () => [],
+    getLeavesOfType: (_type?: string) => [],
     getLeaf: () => ({ setViewState: vi.fn() }),
+    on: (event: string, callback: (...args: any[]) => void) => {
+      const ref = {
+        event,
+        callback,
+        active: true,
+        unsubscribe() {
+          this.active = false;
+        },
+      };
+      listeners.push(ref);
+      return ref;
+    },
+    onLayoutReady: (callback: () => void) => {
+      layoutCallbacks.push(callback);
+    },
   };
   return {
     vault,
     workspace,
     metadataCache: { getFirstLinkpathDest: () => null, getFileCache: () => ({ links: [] }) },
     listeners,
+    layoutCallbacks,
   };
 }
 
@@ -111,7 +129,15 @@ function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SE
   plugin.addCommand = vi.fn();
   plugin.addSettingTab = vi.fn();
   plugin.registerView = vi.fn();
-  plugin.registerEvent = vi.fn();
+  const registeredEvents: { unsubscribe?: () => void }[] = [];
+  plugin.registerEvent = vi.fn((ref: { unsubscribe?: () => void }) => {
+    registeredEvents.push(ref);
+  });
+  const onunload = plugin.onunload.bind(plugin);
+  plugin.onunload = () => {
+    for (const ref of registeredEvents) ref.unsubscribe?.();
+    onunload();
+  };
   return plugin as TramaPlugin & { app: typeof app };
 }
 
@@ -119,8 +145,31 @@ async function optInToAutomaticUpdates(plugin: TramaPlugin): Promise<void> {
   const current = plugin.getSettings();
   await plugin.saveSettings({
     ...current,
-    filo: { ...current.filo, automaticUpdates: true },
+    filo: { ...current.filo, automaticLexicalDelayMs: 750 },
   });
+}
+
+function automaticSemanticHarness(delayMs: number, eligible = true) {
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: delayMs },
+  };
+  const plugin = projectedPlugin(projectedApp(), settings) as any;
+  plugin.settingsStore.load({ ...settings, schemaVersion: 5 });
+  const manager = {
+    isComplete: () => true,
+    isBuilding: () => false,
+    disposeImmediately: vi.fn(),
+    hasCompatibleSemanticVectors: () => eligible,
+    prepareSemanticCacheBatch: vi.fn(async () => ({
+      converged: true,
+      state: { semanticReady: true },
+    })),
+  };
+  plugin.index = manager;
+  plugin.indexReady = true;
+  plugin.automaticSemanticEligible = eligible;
+  return { plugin, manager };
 }
 
 describe("TramaPlugin lifecycle integration", () => {
@@ -147,8 +196,10 @@ describe("TramaPlugin lifecycle integration", () => {
   it("resolves the Worker from the installed plugin resource path", () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app) as any;
-    expect(plugin.sqliteWorkerUrl(app)).toBe(
-      "app://local/.obsidian/plugins/trama/sqlite-worker.mjs"
+    expect(plugin.sqliteWorkerUrl(app)).toEqual(
+      expect.stringMatching(
+        /^app:\/\/local\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=8&nonce=.+$/
+      )
     );
   });
 
@@ -156,8 +207,10 @@ describe("TramaPlugin lifecycle integration", () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app) as any;
     plugin.manifest = { id: "trama" };
-    expect(plugin.sqliteWorkerUrl(app)).toBe(
-      "app://local/.obsidian/plugins/trama/sqlite-worker.mjs"
+    expect(plugin.sqliteWorkerUrl(app)).toEqual(
+      expect.stringMatching(
+        /^app:\/\/local\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=8&nonce=.+$/
+      )
     );
   });
 
@@ -184,10 +237,15 @@ describe("TramaPlugin lifecycle integration", () => {
       expect(await bootstrap!.text()).toContain(
         '"wasmUrl":"app://local/.obsidian/plugins/trama/sqlite3.wasm"'
       );
-      expect(await bootstrap!.text()).toContain(
-        'const __tramaWorkerUrl="app://local/.obsidian/plugins/trama/sqlite-worker.mjs"'
+      expect(await bootstrap!.text()).toEqual(
+        expect.stringContaining(
+          'const __tramaWorkerUrl="app://local/.obsidian/plugins/trama/sqlite-worker.mjs?v=8&nonce='
+        )
       );
       expect(await bootstrap!.text()).toContain("await import(__tramaWorkerUrl)");
+      expect(await bootstrap!.text()).toContain(
+        `v:${SQLITE_PROTOCOL_VERSION},id:Number.isSafeInteger`
+      );
       expect(await bootstrap!.text()).toContain('code:"storage_unavailable"');
       expect(await bootstrap!.text()).toContain("URL.revokeObjectURL(globalThis.location.href)");
       expect(URL.revokeObjectURL).not.toHaveBeenCalled();
@@ -196,6 +254,14 @@ describe("TramaPlugin lifecycle integration", () => {
       URL.createObjectURL = originalCreateObjectUrl;
       URL.revokeObjectURL = originalRevokeObjectUrl;
     }
+  });
+
+  it("cache-busts worker URLs across plugin instances", () => {
+    const app = projectedApp();
+    const first = projectedPlugin(app) as any;
+    const second = projectedPlugin(app) as any;
+    expect(first.sqliteWorkerUrl(app)).not.toBe(second.sqliteWorkerUrl(app));
+    expect(first.sqliteWorkerUrl(app)).toBe(first.sqliteWorkerUrl(app));
   });
 
   it("revokes the bootstrap blob when Worker construction fails", () => {
@@ -235,12 +301,14 @@ describe("TramaPlugin lifecycle integration", () => {
       setReady: vi.fn(),
       markStale: vi.fn(),
       setCapabilities: vi.fn(),
+      setSchedulerMessage: vi.fn(),
     };
     plugin.index = {
       isBuilding: () => false,
+      hasCompatibleSemanticVectors: () => false,
       capabilities: () => ({ semantic: { activity: "idle" } }),
       isComplete: () => true,
-      reconcileQueuedChanges: vi
+      synchronize: vi
         .fn()
         .mockResolvedValueOnce({ changed: false, converged: true })
         .mockResolvedValueOnce({ changed: true, converged: true }),
@@ -288,7 +356,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(10);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(12);
     expect(plugin.registerView).toHaveBeenCalledTimes(3);
     expect(plugin.registerView).toHaveBeenCalledWith("trama-voce", expect.any(Function));
     expect(plugin.registerView).toHaveBeenCalledWith("trama-filo", expect.any(Function));
@@ -303,6 +371,8 @@ describe("TramaPlugin lifecycle integration", () => {
       "prepare-semantic-index",
       "rebuild-semantic-index",
       "rebuild-both-indexes",
+      "force-update-indexes",
+      "publish-index-now",
       "cancel-filo-indexing",
       "open-voce",
       "open-filo",
@@ -327,18 +397,18 @@ describe("TramaPlugin lifecycle integration", () => {
       ["search-with-lente", "binoculars"],
     ]);
     expect(plugin.addSettingTab).toHaveBeenCalledTimes(1);
-    expect(app.listeners).toHaveLength(4);
+    expect(app.listeners).toHaveLength(6);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(debugSpy).not.toHaveBeenCalled();
     expect(plugin.saveData).not.toHaveBeenCalled();
   });
 
-  it("keeps default-off vault events queued and stale without scheduling or contacting LM Studio", async () => {
-    const load = vi
-      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
-      .mockResolvedValue(true);
+  it("keeps vault events queued and stale when lexical automation is Off", async () => {
     const app = projectedApp();
-    const plugin = projectedPlugin(app);
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
+    });
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     await plugin.onload();
     await (plugin as any).indexLoad;
@@ -356,7 +426,6 @@ describe("TramaPlugin lifecycle integration", () => {
       hasLastGood: true,
     });
     expect(fetchSpy).not.toHaveBeenCalled();
-    load.mockRestore();
   });
 
   it("rebinds only Lente when Lente settings change and applies the configured search options", async () => {
@@ -442,9 +511,9 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
 
     expect(plugin.isDesktopLoaded()).toBe(true);
-    expect(plugin.addCommand).toHaveBeenCalledTimes(10);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(12);
     expect(plugin.registerView).toHaveBeenCalledTimes(3);
-    expect(plugin.registerEvent).toHaveBeenCalledTimes(4);
+    expect(plugin.registerEvent).toHaveBeenCalledTimes(5);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -469,6 +538,389 @@ describe("TramaPlugin lifecycle integration", () => {
     command();
     await vi.waitFor(() => expect(order).toEqual(["lexical", "semantic"]));
     await vi.waitFor(() => expect(plugin.getIndexStatus()?.kind).toBe("ready"));
+  });
+
+  it("saves each open Markdown path before forcing lexical then semantic updates", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    const saving = deferred<void>();
+    const order: string[] = [];
+    const duplicate = {
+      file: { path: "Note.md" },
+      save: vi.fn(async () => {
+        order.push("save-note-start");
+        await saving.promise;
+        order.push("save-note-done");
+      }),
+    };
+    const other = {
+      file: { path: "Other.md" },
+      save: vi.fn(async () => {
+        order.push("save-other");
+      }),
+    };
+    (app.workspace as any).getLeavesOfType = (type: string) =>
+      type === "markdown" ? [{ view: duplicate }, { view: duplicate }, { view: other }] : [];
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    vi.spyOn(index, "synchronize").mockImplementation(async () => {
+      order.push("lexical");
+      return { changed: true, converged: true };
+    });
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    vi.spyOn(index, "prepareSemantic").mockImplementation(async () => {
+      order.push("semantic");
+      return {
+        operation: "prepare",
+        changed: true,
+        converged: true,
+        state: { incomplete: false },
+        stored: 1,
+        skipped: 0,
+      } as any;
+    });
+
+    const update = plugin.runForceUpdate(new AbortController().signal);
+    await vi.waitFor(() => expect(order).toContain("save-note-start"));
+    expect(order).toEqual(["save-note-start"]);
+    saving.resolve();
+    await update;
+
+    expect(order).toEqual([
+      "save-note-start",
+      "save-note-done",
+      "save-other",
+      "lexical",
+      "semantic",
+    ]);
+    expect(duplicate.save).toHaveBeenCalledOnce();
+    expect(other.save).toHaveBeenCalledOnce();
+    plugin.onunload();
+  });
+
+  it("forces lexical synchronization with no open views and does not require semantic automation", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: {
+        ...DEFAULT_SETTINGS.filo,
+        automaticLexicalDelayMs: 750,
+        automaticSemanticDelayMs: 0,
+      },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    const synchronize = vi.spyOn(index, "synchronize").mockResolvedValue({
+      changed: false,
+      converged: true,
+    });
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    const prepare = vi.spyOn(index, "prepareSemantic").mockResolvedValue({
+      operation: "prepare",
+      changed: false,
+      converged: true,
+      state: { incomplete: false },
+      stored: 0,
+      skipped: 0,
+    } as any);
+
+    await plugin.runForceUpdate(new AbortController().signal);
+
+    expect(app.workspace.getLeavesOfType("markdown")).toHaveLength(0);
+    expect(synchronize).toHaveBeenCalledOnce();
+    expect(prepare).toHaveBeenCalledOnce();
+    plugin.onunload();
+  });
+
+  it("keeps queued edits stale when they arrive during forced semantic preparation", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    vi.spyOn(index, "synchronize").mockResolvedValue({ changed: true, converged: true });
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    const semantic = deferred<any>();
+    vi.spyOn(index, "prepareSemantic").mockReturnValue(semantic.promise);
+    const update = plugin.runForceUpdate(new AbortController().signal);
+    await vi.waitFor(() => expect(index.prepareSemantic).toHaveBeenCalled());
+    plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
+    semantic.resolve({
+      operation: "prepare",
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+      stored: 1,
+      skipped: 0,
+    });
+    await update;
+
+    expect(plugin.queuedWork).toBe(true);
+    expect(plugin.getIndexStatus()).toMatchObject({ kind: "stale" });
+    plugin.onunload();
+  });
+
+  it("reconciles edits that arrive during forced lexical synchronization before semantic work", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    let syncCount = 0;
+    const synchronize = vi.spyOn(index, "synchronize").mockImplementation(async () => {
+      syncCount++;
+      if (syncCount === 1) plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
+      return { changed: true, converged: true };
+    });
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    vi.spyOn(index, "hasPendingWork").mockReturnValue(false);
+    const reconcile = vi
+      .spyOn(index, "reconcileChanges")
+      .mockResolvedValue({ changed: true, converged: true });
+    const prepare = vi.spyOn(index, "prepareSemantic").mockResolvedValue({
+      operation: "prepare",
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+      stored: 1,
+      skipped: 0,
+    } as any);
+
+    await plugin.runForceUpdate(new AbortController().signal);
+
+    expect(synchronize).toHaveBeenCalledOnce();
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(plugin.queuedWork).toBe(false);
+    plugin.onunload();
+  });
+
+  it("does not start forced semantic preparation after lexical failure or nonconvergence", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    const prepare = vi.spyOn(index, "prepareSemantic");
+    vi.spyOn(index, "synchronize").mockRejectedValueOnce(new Error("lexical failure"));
+    await expect(plugin.runForceUpdate(new AbortController().signal)).rejects.toThrow(
+      "lexical failure"
+    );
+    expect(prepare).not.toHaveBeenCalled();
+
+    vi.mocked(index.synchronize).mockResolvedValueOnce({ changed: true, converged: false });
+    vi.spyOn(index, "isComplete").mockReturnValue(false);
+    await expect(plugin.runForceUpdate(new AbortController().signal)).rejects.toThrow(
+      "Lexical index did not converge"
+    );
+    expect(prepare).not.toHaveBeenCalled();
+    plugin.onunload();
+  });
+
+  it("force update bypasses a scheduled lexical timer and leaves publication delayed", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: {
+        ...DEFAULT_SETTINGS.filo,
+        automaticLexicalDelayMs: 750,
+        automaticPublicationDelayMs: 30_000,
+      },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    plugin.indexReady = true;
+    plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
+    expect(plugin.eventTimer).toBeDefined();
+    const synchronize = vi.spyOn(index, "synchronize").mockResolvedValue({
+      changed: true,
+      converged: true,
+    });
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    vi.spyOn(index, "prepareSemantic").mockImplementation(async () => {
+      (index as any).options.onSuccessfulOperation({
+        operation: "prepare",
+        changed: true,
+        converged: true,
+        state: { incomplete: false, changeCounter: 1 },
+      });
+      return {
+        operation: "prepare",
+        changed: true,
+        converged: true,
+        state: { incomplete: false },
+        stored: 1,
+        skipped: 0,
+      } as any;
+    });
+    const publish = vi
+      .spyOn(plugin.publicationManager, "publish")
+      .mockResolvedValue({ published: true, publicationId: "local" } as any);
+
+    await plugin.runForceUpdate(new AbortController().signal);
+
+    expect(plugin.eventTimer).toBeUndefined();
+    expect(synchronize).toHaveBeenCalledOnce();
+    expect(plugin.automaticPublicationTimer).toBeDefined();
+    expect(publish).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(publish).toHaveBeenCalledOnce();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("flushes only converged pending publication on desktop quit and reuses an active publish", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 30_000 },
+    }) as any;
+    const manager = {
+      isComplete: vi.fn(() => true),
+      isBuilding: vi.fn(() => false),
+      isInMaintenance: vi.fn(() => false),
+      disposeImmediately: vi.fn(),
+    };
+    const publication = { isBusy: false, publish: vi.fn(async () => ({ published: true })) };
+    plugin.index = manager;
+    plugin.publicationManager = publication;
+    plugin.indexReady = true;
+    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 4, eventRevision: 0 };
+    plugin.automaticPublicationRevision = 1;
+    plugin.latestPublicationChangeCounter = 4;
+    const flush = plugin.publishOnQuit();
+    expect(flush).toBeDefined();
+    await flush;
+    expect(publication.publish).toHaveBeenCalledOnce();
+    expect(plugin.pendingAutomaticPublication).toBeUndefined();
+    expect(manager.isComplete).toHaveBeenCalledOnce();
+
+    plugin.pendingAutomaticPublication = { revision: 2, changeCounter: 5, eventRevision: 0 };
+    plugin.automaticPublicationRevision = 2;
+    plugin.latestPublicationChangeCounter = 5;
+    const reused = Promise.resolve({ published: true });
+    plugin.activePublicationPromise = reused;
+    await plugin.publishOnQuit();
+    expect(publication.publish).toHaveBeenCalledOnce();
+  });
+
+  it("leaves quit publication pending when disabled, absent, or lexical state is unsafe", () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    const manager = {
+      isComplete: vi.fn(() => true),
+      isBuilding: vi.fn(() => false),
+      isInMaintenance: vi.fn(() => false),
+      disposeImmediately: vi.fn(),
+    };
+    plugin.index = manager;
+    plugin.publicationManager = { publish: vi.fn() };
+    plugin.indexReady = true;
+    expect(plugin.publishOnQuit()).toBeUndefined();
+    plugin.settingsStore.commit({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 0 },
+    });
+    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 0, eventRevision: 0 };
+    plugin.automaticPublicationRevision = 1;
+    plugin.latestPublicationChangeCounter = 0;
+    expect(plugin.publishOnQuit()).toBeUndefined();
+    const enabled = plugin.settingsStore.stage({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 0 },
+    });
+    plugin.settingsStore.commit(enabled);
+    expect(plugin.publishOnQuit()).toBeUndefined();
+    plugin.settingsStore.commit({
+      ...enabled,
+      filo: { ...enabled.filo, automaticPublicationDelayMs: 30_000 },
+    });
+    plugin.queuedWork = true;
+    expect(plugin.publishOnQuit()).toBeUndefined();
+    plugin.queuedWork = false;
+    manager.isComplete.mockReturnValue(false);
+    expect(plugin.publishOnQuit()).toBeUndefined();
+    expect(plugin.pendingAutomaticPublication).toBeDefined();
+  });
+
+  it("keeps an accepted desktop quit task's Worker alive through unload", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 30_000 },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const index = plugin.index;
+    plugin.indexReady = true;
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
+    const dispose = vi.spyOn(index, "disposeImmediately");
+    plugin.pendingAutomaticPublication = {
+      revision: 1,
+      changeCounter: plugin.latestPublicationChangeCounter,
+      eventRevision: plugin.vaultEventRevision,
+    };
+    plugin.automaticPublicationRevision = 1;
+    const completion = deferred<void>();
+    vi.spyOn(plugin.publicationManager, "publish").mockReturnValue(
+      completion.promise.then(() => ({
+        published: false,
+        warning: { message: "offline", retryable: false },
+      })) as any
+    );
+    const tasks = { addPromise: vi.fn() };
+    app.listeners.find((listener) => listener.event === "quit")!.callback(tasks);
+    expect(tasks.addPromise).toHaveBeenCalledOnce();
+    const accepted = tasks.addPromise.mock.calls[0][0] as Promise<void>;
+    plugin.onunload();
+    expect(dispose).not.toHaveBeenCalled();
+    completion.resolve();
+    await accepted;
+    await Promise.resolve();
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+  });
+
+  it("preserves the publication warning when the quit flush fails", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 30_000 },
+    }) as any;
+    const manager = {
+      isComplete: () => true,
+      isBuilding: () => false,
+      isInMaintenance: () => false,
+    };
+    const warning = { message: "offline", retryable: false };
+    const status = { setPublicationWarning: vi.fn(), setSchedulerMessage: vi.fn() };
+    plugin.index = manager;
+    plugin.indexReady = true;
+    plugin.indexStatus = status;
+    plugin.publicationManager = { publish: vi.fn(async () => ({ published: false, warning })) };
+    plugin.pendingAutomaticPublication = { revision: 1, changeCounter: 0, eventRevision: 0 };
+    plugin.automaticPublicationRevision = 1;
+    plugin.latestPublicationChangeCounter = 0;
+
+    await plugin.publishOnQuit();
+
+    expect(status.setPublicationWarning).toHaveBeenCalledWith(
+      "Index saved locally, but publication failed: offline"
+    );
+    expect(plugin.index.synchronize).toBeUndefined();
+    expect(plugin.index.prepareSemantic).toBeUndefined();
+  });
+
+  it("does not register desktop quit behavior on mobile", async () => {
+    Platform.isDesktopApp = false;
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    expect(app.listeners.some((listener) => listener.event === "quit")).toBe(false);
+    plugin.onunload();
   });
 
   it("replaces chat and embedding composition on saved settings and invalidates the old index", async () => {
@@ -795,7 +1247,7 @@ describe("TramaPlugin lifecycle integration", () => {
       type === "trama-voce" ? [{ view: voceView }] : [];
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await plugin.onload();
     await (plugin as any).indexLoad;
@@ -808,8 +1260,9 @@ describe("TramaPlugin lifecycle integration", () => {
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
     await vi.waitFor(() => expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(1));
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
     const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
+      .spyOn(index, "reconcileChanges")
       .mockResolvedValue({ changed: true, converged: true });
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
@@ -818,7 +1271,7 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "Note.md" });
     await new Promise((resolve) => setTimeout(resolve, 1600));
     expect(reconcile).toHaveBeenCalled();
-    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(2);
+    expect(voceView.refreshRelatedSuggestions).toHaveBeenCalledTimes(3);
   });
 
   it("keeps a failed or cancelled explicit rebuild non-ready", async () => {
@@ -848,8 +1301,8 @@ describe("TramaPlugin lifecycle integration", () => {
     const buildGate = new Promise<void>((resolve) => (release = resolve));
     vi.spyOn(index, "build").mockImplementation(async () => buildGate);
     vi.spyOn(index, "isBuilding").mockImplementation(() => building);
-    const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
+    const synchronize = vi
+      .spyOn(index, "synchronize")
       .mockResolvedValue({ changed: true, converged: true });
     const rebuild = (plugin as any).addCommand.mock.calls.find(
       ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
@@ -864,7 +1317,7 @@ describe("TramaPlugin lifecycle integration", () => {
     });
     building = false;
     release();
-    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledWith(expect.any(AbortSignal)));
+    await vi.waitFor(() => expect(synchronize).toHaveBeenCalledWith(expect.any(AbortSignal)));
     expect((plugin as any).index).toBe(index);
     expect((plugin as any).indexReady).toBe(true);
   });
@@ -881,10 +1334,10 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.spyOn(index, "build")
       .mockImplementationOnce(async () => gate)
       .mockResolvedValue(undefined);
-    const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
+    const synchronize = vi
+      .spyOn(index, "synchronize")
       .mockRejectedValueOnce(new Error("v2 embedding failed"))
-      .mockResolvedValue(undefined);
+      .mockResolvedValue({ changed: false, converged: true });
     const rebuild = (plugin as any).addCommand.mock.calls.find(
       ([command]: [{ id: string }]) => command.id === "reindex-filo-vault"
     )[0].callback;
@@ -893,7 +1346,7 @@ describe("TramaPlugin lifecycle integration", () => {
     for (const ref of app.listeners.filter((item) => item.active && item.event === "modify"))
       ref.callback({ path: "Note.md" });
     release();
-    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(synchronize).toHaveBeenCalledTimes(1));
     expect((plugin as any).indexReady).toBe(true);
     expect((plugin as any).indexStatus.getStatus()).toMatchObject({
       kind: "stale",
@@ -902,7 +1355,7 @@ describe("TramaPlugin lifecycle integration", () => {
     rebuild();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
     expect((index as any).build).toHaveBeenCalledTimes(2);
-    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(synchronize).toHaveBeenCalledTimes(1);
   });
 
   it("ignores an old successful load after a replacement index loads unavailable", async () => {
@@ -961,73 +1414,193 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("rename", { path: "Renamed.md" }, "Old.md");
     expect(queue).toHaveBeenCalledTimes(2);
     expect((plugin as any).eventTimer).toBeDefined();
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(750);
     plugin.onunload();
     plugin.onunload();
     expect(app.listeners.every((ref) => !ref.active)).toBe(true);
     vi.useRealTimers();
   });
 
-  it("coalesces opted-in edits, does not retry a failed background pass, and retries on a later event", async () => {
+  it("rearms scoped work after quiet time and schedules another pass for events during a run", async () => {
     vi.useFakeTimers();
-    const load = vi
-      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
-      .mockResolvedValue(true);
     const app = projectedApp();
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    const status = (plugin as any).indexStatus;
+    await index.build(new AbortController().signal);
+    const pending = deferred<{ changed: boolean; converged: boolean }>();
+    const reconcile = vi
+      .spyOn(index, "reconcileChanges")
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue({ changed: true, converged: true });
+    const modify = app.listeners.find((ref) => ref.event === "modify");
+
+    modify?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(500);
+    modify?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(749);
+    expect(reconcile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
+    modify?.callback({ path: "Other.md" });
+    pending.resolve({ changed: true, converged: true });
+    await (plugin as any).reconcilePromise;
+    expect(status.getStatus().kind).toBe("stale");
+    await vi.advanceTimersByTimeAsync(750);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(vi.spyOn(index, "synchronize")).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(status.getStatus().kind).toBe("ready"));
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("rearms pending lexical work when the configured delay changes", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
+    const reconcile = vi
+      .spyOn(index, "reconcileChanges")
+      .mockResolvedValue({ changed: true, converged: true });
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(500);
+    await plugin.saveSettings((current) => ({
+      ...current,
+      filo: { ...current.filo, automaticLexicalDelayMs: 1_000 },
+    }));
+    await vi.advanceTimersByTimeAsync(999);
+    expect(reconcile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("caps lexical retries at 5, 15, and 60 seconds, then resets on a new event", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
+    const reconcile = vi.spyOn(index, "reconcileChanges").mockRejectedValue({ retryable: true });
+    const synchronize = vi.spyOn(index, "synchronize").mockRejectedValue({ retryable: true });
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(750);
+    await Promise.resolve();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconcile).toHaveBeenCalledTimes(4);
+    expect((plugin as any).automaticRetryAttempt).toBe(3);
+    expect((plugin as any).automaticRetryPaused).toBe(true);
+    expect((plugin as any).retryTimer).toBeUndefined();
+    await vi.waitFor(() =>
+      expect((plugin as any).indexStatus.getStatus().schedulerMessage).toContain("lexical failed")
+    );
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(reconcile).toHaveBeenCalledTimes(4);
+
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Other.md" });
+    expect((plugin as any).automaticRetryAttempt).toBe(0);
+    expect((plugin as any).automaticRetryPaused).toBe(false);
+    await vi.advanceTimersByTimeAsync(750);
+    expect(reconcile).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(reconcile).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconcile).toHaveBeenCalledTimes(6);
+    expect(synchronize).not.toHaveBeenCalled();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("coalesces opted-in edits, does not retry a failed background pass, and retries on a later event", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await plugin.onload();
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
     const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
+      .spyOn(index, "reconcileChanges")
       .mockRejectedValueOnce(new Error("embedding failed"))
-      .mockResolvedValue(undefined);
+      .mockResolvedValue({ changed: false, converged: false });
+    const synchronize = vi
+      .spyOn(index, "synchronize")
+      .mockResolvedValue({ changed: true, converged: true });
     const modify = app.listeners.find((ref) => ref.event === "modify");
 
     modify?.callback({ path: "Note.md" });
     modify?.callback({ path: "Note.md" });
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(750);
     await Promise.resolve();
     expect(reconcile).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(5000);
     expect(reconcile).toHaveBeenCalledTimes(1);
 
     modify?.callback({ path: "Other.md" });
-    await vi.advanceTimersByTimeAsync(1500);
-    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(2));
-    load.mockRestore();
+    await vi.advanceTimersByTimeAsync(750);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(synchronize).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
   it("opt-out clears the debounce, aborts automatic work, and preserves queued stale work", async () => {
     vi.useFakeTimers();
-    const load = vi
-      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
-      .mockResolvedValue(true);
     const app = projectedApp();
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await plugin.onload();
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
     const pending = deferred<{ changed: boolean; converged: boolean }>();
-    const reconcile = vi.spyOn(index, "reconcileQueuedChanges").mockReturnValue(pending.promise);
+    const reconcile = vi.spyOn(index, "reconcileChanges").mockReturnValue(pending.promise);
     const modify = app.listeners.find((ref) => ref.event === "modify");
     modify?.callback({ path: "Note.md" });
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(750);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
-    const signal = reconcile.mock.calls[0][0] as AbortSignal;
+    const signal = reconcile.mock.calls[0][1] as AbortSignal;
 
     await plugin.saveSettings({
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: false },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
     });
     expect(signal.aborted).toBe(true);
     expect((plugin as any).eventTimer).toBeUndefined();
@@ -1035,28 +1608,25 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).indexStatus.getStatus().kind).toBe("stale");
     pending.resolve({ changed: false, converged: false });
     await Promise.resolve();
-    load.mockRestore();
     vi.useRealTimers();
   });
 
   it("resumes queued automatic work after a slow cancelled pass and rapid re-opt-in", async () => {
     vi.useFakeTimers();
-    const load = vi
-      .spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load")
-      .mockResolvedValue(true);
     const app = projectedApp();
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await plugin.onload();
     await (plugin as any).indexLoad;
     await optInToAutomaticUpdates(plugin);
     const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
     const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
+      .spyOn(index, "reconcileChanges")
       .mockImplementationOnce(
-        (signal) =>
+        (_changes, signal) =>
           new Promise<void>((_resolve, reject) =>
             (signal as AbortSignal).addEventListener(
               "abort",
@@ -1068,24 +1638,24 @@ describe("TramaPlugin lifecycle integration", () => {
       .mockResolvedValue({ changed: true, converged: true });
     const modify = app.listeners.find((ref) => ref.event === "modify");
     modify?.callback({ path: "Note.md" });
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(750);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
 
     await plugin.saveSettings({
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: false },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
     });
     const optIn = plugin.saveSettings({
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await optIn;
     await vi.advanceTimersByTimeAsync(100);
     await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(750);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(2));
+    expect(vi.spyOn(index, "synchronize")).not.toHaveBeenCalled();
 
-    load.mockRestore();
     vi.useRealTimers();
   });
 
@@ -1094,7 +1664,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticUpdates: true },
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
     });
     await plugin.onload();
     await (plugin as any).indexLoad;
@@ -1113,9 +1683,10 @@ describe("TramaPlugin lifecycle integration", () => {
     indexCommand.callback();
     await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
     await vi.waitFor(() => expect(status.getStatus().kind).toBe("ready"));
+    vi.spyOn(index, "isComplete").mockReturnValue(true);
     const reconcile = vi
-      .spyOn(index, "reconcileQueuedChanges")
-      .mockResolvedValue({ changed: false, converged: false });
+      .spyOn(index, "reconcileChanges")
+      .mockResolvedValue({ changed: false, converged: true });
     const emit = (event: string, ...args: any[]) => {
       for (const ref of app.listeners.filter((item) => item.active && item.event === event))
         ref.callback(...args);
@@ -1123,11 +1694,12 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "Note.md" });
     emit("modify", { path: "Note.md" });
     expect(reconcile).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1499);
+    await vi.advanceTimersByTimeAsync(749);
     expect(reconcile).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
-    expect(status.getStatus().kind).toBe("stale");
+    await vi.waitFor(() => expect(status.getStatus().kind).toBe("ready"));
+    expect((plugin as any).queuedWork).toBe(false);
     expect(statuses.map((entry) => Number(entry.split(":")[1]))).toEqual(
       statuses.map((entry) => Number(entry.split(":")[1])).sort((a, b) => a - b)
     );
@@ -1174,6 +1746,254 @@ describe("TramaPlugin lifecycle integration", () => {
 
     expect(queue).toHaveBeenCalledTimes(2);
     plugin.onunload();
+  });
+
+  it("reconciles coalesced note paths and rename chains without retaining content", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
+    const reconcile = vi
+      .spyOn(index, "reconcileChanges")
+      .mockResolvedValue({ changed: true, converged: true });
+    const emit = (event: string, ...args: any[]) => {
+      for (const ref of app.listeners.filter((item) => item.active && item.event === event))
+        ref.callback(...args);
+    };
+
+    emit("create", { path: "Temp.md" });
+    emit("modify", { path: "Temp.md" });
+    emit("delete", { path: "Temp.md" });
+    emit("rename", { path: "Renamed.md" }, "Note.md");
+    emit("rename", { path: "Final.md" }, "Renamed.md");
+    emit("rename", { path: "Middle.md" }, "Other.md");
+    emit("modify", { path: "Middle.md" });
+    emit("rename", { path: "Last.md" }, "Middle.md");
+    emit("rename", { path: ".hidden.md" }, "Visible.md");
+    emit("rename", { path: "Back.md" }, ".hidden.md");
+    await vi.advanceTimersByTimeAsync(750);
+
+    expect(reconcile).toHaveBeenCalledWith(
+      [
+        { type: "delete", path: "Temp.md" },
+        { type: "rename", from: "Note.md", to: "Final.md" },
+        { type: "rename", from: "Other.md", to: "Middle.md" },
+        { type: "delete", path: "Middle.md" },
+        { type: "upsert", path: "Last.md" },
+        { type: "delete", path: "Visible.md" },
+        { type: "upsert", path: "Back.md" },
+      ],
+      expect.any(AbortSignal)
+    );
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("keeps an intervening renamed-note edit ordered and converges the final path content", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const files = app.vault.getMarkdownFiles() as Array<{ path: string }>;
+    const file = { path: "A.md" };
+    files.splice(0, files.length, file);
+    const contents = new Map<string, string>([["A.md", "alpha original"]]);
+    vi.spyOn(app.vault, "read").mockImplementation(
+      async (current) => contents.get(current.path) ?? ""
+    );
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.indexReady).toBe(true));
+    const index = plugin.index;
+    await index.build(new AbortController().signal);
+    const reconcile = vi.spyOn(index, "reconcileChanges");
+    const synchronize = vi.spyOn(index, "synchronize");
+    const emit = (event: string, ...args: any[]) => {
+      for (const ref of app.listeners.filter((item) => item.active && item.event === event))
+        ref.callback(...args);
+    };
+
+    file.path = "B.md";
+    contents.set("B.md", contents.get("A.md")!);
+    contents.delete("A.md");
+    emit("rename", file, "A.md");
+    contents.set("B.md", "beta modified while at B");
+    emit("modify", file);
+    file.path = "C.md";
+    contents.set("C.md", contents.get("B.md")!);
+    contents.delete("B.md");
+    emit("rename", file, "B.md");
+
+    await vi.advanceTimersByTimeAsync(750);
+    expect(synchronize).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalledOnce());
+    await (plugin as any).reconcilePromise;
+    await vi.waitFor(() => expect(index.isComplete()).toBe(true));
+
+    expect(reconcile).toHaveBeenCalledWith(
+      [
+        { type: "rename", from: "A.md", to: "B.md" },
+        { type: "delete", path: "B.md" },
+        { type: "upsert", path: "C.md" },
+      ],
+      expect.any(AbortSignal)
+    );
+    expect(
+      (await index.search("beta modified", new AbortController().signal, 5)).map(
+        (hit: any) => hit.path
+      )
+    ).toEqual(["C.md"]);
+    expect(
+      (await index.search("alpha original", new AbortController().signal, 5)).map(
+        (hit: any) => hit.path
+      )
+    ).toEqual([]);
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("retains dirty scoped work after scoped reconciliation fails or stays incomplete", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
+    const reconcile = vi
+      .spyOn(index, "reconcileChanges")
+      .mockRejectedValueOnce(new Error("race"))
+      .mockResolvedValueOnce({ changed: false, converged: false });
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(750);
+    await Promise.resolve();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(vi.spyOn(index, "synchronize")).not.toHaveBeenCalled();
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Other.md" });
+    await vi.advanceTimersByTimeAsync(750);
+    await Promise.resolve();
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(vi.spyOn(index, "synchronize")).not.toHaveBeenCalled();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("uses full recovery for folder events and leaves the publication target adoption-only", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexReady).toBe(true));
+    const index = (plugin as any).index;
+    await index.build(new AbortController().signal);
+    const scoped = vi.spyOn(index, "reconcileChanges");
+    const synchronize = vi
+      .spyOn(index, "synchronize")
+      .mockResolvedValue({ changed: false, converged: true });
+    app.listeners
+      .find((ref) => ref.event === "create")
+      ?.callback({
+        path: "Folder",
+        children: [],
+      });
+    await vi.advanceTimersByTimeAsync(750);
+    await Promise.resolve();
+    expect(synchronize).toHaveBeenCalledTimes(1);
+    expect(scoped).not.toHaveBeenCalled();
+
+    app.listeners
+      .find((ref) => ref.event === "modify")
+      ?.callback({
+        path: "Trama/index/index.sqlite3",
+      });
+    await vi.advanceTimersByTimeAsync(750);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("runs one loaded-first full startup recovery after layout readiness when enabled", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexLoaded).toBe(true));
+    expect((plugin as any).indexReady).toBe(true);
+    expect((plugin as any).indexReady).toBe(true);
+    const index = (plugin as any).index;
+    const synchronize = vi.spyOn(index, "synchronize");
+    expect(synchronize).not.toHaveBeenCalled();
+    app.layoutCallbacks[0]?.();
+    await vi.advanceTimersByTimeAsync(749);
+    expect(synchronize).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(synchronize).toHaveBeenCalledTimes(1));
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("does not scan on startup when lexical automation is Off", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexLoaded).toBe(true));
+    const synchronize = vi.spyOn((plugin as any).index, "synchronize");
+    app.layoutCallbacks[0]?.();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(synchronize).not.toHaveBeenCalled();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("merges events during startup into its single full recovery and cancels pending work on unload", async () => {
+    vi.useFakeTimers();
+    const app = projectedApp();
+    const plugin = projectedPlugin(app, {
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 750 },
+    });
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    await vi.waitFor(() => expect((plugin as any).indexLoaded).toBe(true));
+    const index = (plugin as any).index;
+    const synchronize = vi.spyOn(index, "synchronize");
+    const scoped = vi.spyOn(index, "reconcileChanges");
+    app.layoutCallbacks[0]?.();
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Note.md" });
+    await vi.advanceTimersByTimeAsync(750);
+    await vi.waitFor(() => expect(synchronize).toHaveBeenCalledTimes(1));
+    expect(scoped).not.toHaveBeenCalled();
+    app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Other.md" });
+    plugin.onunload();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
   });
 
   it("publishes incremental progress while the status is updating", () => {
@@ -1361,5 +2181,148 @@ describe("TramaPlugin lifecycle integration", () => {
       etaSeconds: 8,
       message: "Embedding semantic index chunks — 4 of about 20 texts · about 8 sec remaining",
     });
+  });
+
+  it("keeps automatic semantic work Off by default and respects the quiet delay", async () => {
+    vi.useFakeTimers();
+    const off = automaticSemanticHarness(0);
+    off.plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(off.manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+
+    const delayed = automaticSemanticHarness(1_000);
+    delayed.plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(delayed.manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delayed.manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    off.plugin.onunload();
+    delayed.plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("does not schedule automatic enrichment without prior compatible coverage", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(1_000, false);
+    plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("bootstraps automatic semantic work from pending lexical heads", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(1_000, false);
+    (manager as any).hasPendingSemanticWork = vi.fn(() => true);
+    expect(plugin.hasAutomaticSemanticWork(manager)).toBe(true);
+    plugin.automaticSemanticEligible = true;
+
+    plugin.scheduleAutomaticSemantic("startup");
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    expect(plugin.automaticSemanticEligible).toBe(false);
+    expect(plugin.automaticSemanticRetryTimer).toBeUndefined();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("keeps fresh semantic work network silent when automatic semantic delay is Off", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(0, false);
+    (manager as any).hasPendingSemanticWork = vi.fn(() => true);
+    plugin.automaticSemanticEligible = plugin.hasAutomaticSemanticWork(manager);
+
+    plugin.scheduleAutomaticSemantic("startup");
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("yields between semantic batches and stops when lexical work arrives", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(1_000);
+    const batch = deferred<any>();
+    manager.prepareSemanticCacheBatch.mockReturnValueOnce(batch.promise);
+    plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.queuedWork = true;
+    batch.resolve({ converged: false, state: { semanticReady: false } });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.queuedWork = false;
+    plugin.pauseAutomaticSemanticForLexicalWork();
+    manager.prepareSemanticCacheBatch.mockResolvedValueOnce({
+      converged: true,
+      state: { semanticReady: true },
+    });
+    plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(2);
+    plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("retries only retryable automatic semantic failures at the bounded intervals", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(1_000);
+    manager.prepareSemanticCacheBatch
+      .mockRejectedValueOnce({ retryable: true })
+      .mockRejectedValueOnce({ retryable: true })
+      .mockRejectedValueOnce({ retryable: true })
+      .mockRejectedValueOnce({ retryable: true });
+    plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(4);
+    expect(plugin.automaticSemanticRetryPaused).toBe(true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(4);
+
+    const permanent = automaticSemanticHarness(1_000);
+    permanent.manager.prepareSemanticCacheBatch.mockRejectedValueOnce({ retryable: false });
+    permanent.plugin.scheduleAutomaticSemantic();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(permanent.manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    expect(permanent.plugin.automaticSemanticRetryTimer).toBeUndefined();
+    plugin.onunload();
+    permanent.plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it("cancels automatic semantic timers and requests when its delay is set Off", async () => {
+    vi.useFakeTimers();
+    const { plugin, manager } = automaticSemanticHarness(1_000);
+    plugin.scheduleAutomaticSemantic();
+    await plugin.saveSettings({
+      ...plugin.getSettings(),
+      filo: { ...plugin.getSettings().filo, automaticSemanticDelayMs: 0 },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    expect(plugin.automaticSemanticTimer).toBeUndefined();
+    await plugin.saveSettings({
+      ...plugin.getSettings(),
+      filo: { ...plugin.getSettings().filo, automaticSemanticDelayMs: 2_000 },
+    });
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.onunload();
+    vi.useRealTimers();
   });
 });

@@ -48,6 +48,36 @@ describe("Filo semantic index display", () => {
     expect(rendered.some((item) => item.text === "Update semantic index")).toBe(false);
   });
 
+  it("keeps Stop indexing accessible when the square icon replaces button text", () => {
+    const status = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+    });
+    status.setReady();
+    const lease = status.acquireExternalLease("semantic");
+    const attrs: Record<string, string> = {};
+    const root = {
+      empty: () => undefined,
+      createEl: (_tag: string, options: { text?: string; attr?: Record<string, string> }) => {
+        Object.assign(attrs, options.attr);
+        return {
+          addEventListener: () => undefined,
+          setAttribute: (name: string, value: string) => (attrs[name] = value),
+        };
+      },
+      createDiv: () => root,
+    };
+    const view = new FiloView(new WorkspaceLeaf(), status, undefined);
+    (view as any).root = root;
+    (view as any).activePath = "one.md";
+    (view as any).status = status.getStatus();
+    (view as any).render();
+
+    expect(attrs["aria-label"]).toBe("Stop indexing");
+    lease!.release();
+  });
+
   it("offers semantic update and rebuild after a semantic failure", async () => {
     const status = new IndexStatusController({} as any, {
       index: async () => undefined,
@@ -78,6 +108,35 @@ describe("Filo semantic index display", () => {
     expect(labels).toContain("Update semantic index");
     expect(labels).toContain("Rebuild semantic index");
     expect(labels).not.toContain("Rebuild lexical index");
+  });
+
+  it("renders a friendly failure message instead of raw index details", () => {
+    const labels: string[] = [];
+    const root = {
+      empty: () => labels.splice(0),
+      createEl: (_tag: string, options: { text?: string }) => {
+        labels.push(options.text ?? "");
+        return { addEventListener: () => undefined };
+      },
+      createDiv: (options: { text?: string }) => labels.push(options.text ?? ""),
+    };
+    const view = new FiloView(new WorkspaceLeaf(), { getStatus: () => ({}) } as any, undefined);
+    (view as any).root = root;
+    (view as any).activePath = "one.md";
+    (view as any).status = {
+      kind: "error",
+      channel: "lexical",
+      hasLastGood: false,
+      message: "no such column: f while opening one.md",
+      canIndex: true,
+      canReindex: false,
+      canPrepare: false,
+      canCancel: false,
+    };
+    (view as any).render();
+    expect(labels).toContain("Unable to build the lexical index.");
+    expect(labels.join(" ")).not.toContain("no such column");
+    expect(labels.join(" ")).not.toContain("one.md");
   });
 
   it("offers separate incremental and full semantic actions for partial coverage", async () => {

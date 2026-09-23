@@ -29,11 +29,13 @@ export interface LenteSettings {
   readonly automaticSearchDelayMs: number;
 }
 export interface FiloSettings {
-  readonly automaticUpdates: boolean;
+  readonly automaticLexicalDelayMs: number;
+  readonly automaticSemanticDelayMs: number;
+  readonly automaticPublicationDelayMs: number;
   readonly excludedPaths: readonly string[];
 }
 export interface TramaSettings {
-  readonly schemaVersion: 4;
+  readonly schemaVersion: 5;
   readonly publicationDirectory: string;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
@@ -67,6 +69,17 @@ function isValidLenteAutomaticSearchDelay(value: unknown): value is number {
     value >= 0 &&
     value <= 1000 &&
     value % 50 === 0
+  );
+}
+
+function isValidAutomaticDelay(value: unknown, max: number, step: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= max &&
+    value % step === 0
   );
 }
 
@@ -126,7 +139,7 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
-  schemaVersion: 4,
+  schemaVersion: 5,
   publicationDirectory: DEFAULT_PUBLICATION_DIRECTORY,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
@@ -145,7 +158,9 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
     automaticSearchDelayMs: 0,
   }),
   filo: Object.freeze({
-    automaticUpdates: false,
+    automaticLexicalDelayMs: 750,
+    automaticSemanticDelayMs: 0,
+    automaticPublicationDelayMs: 30000,
     excludedPaths: Object.freeze([]),
   }),
   approvedOrigins: Object.freeze([]),
@@ -160,7 +175,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      ![2, 3, 4].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
+      ![2, 3, 4, 5].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -217,12 +232,38 @@ export class SettingsStore {
         ? rawLente.automaticSearchDelayMs
         : DEFAULT_SETTINGS.lente.automaticSearchDelayMs,
     };
+    const legacyFilo = input.schemaVersion !== 5;
     const filo = {
-      automaticUpdates: rawFilo.automaticUpdates === true,
+      automaticLexicalDelayMs: legacyFilo
+        ? rawFilo.automaticUpdates === true
+          ? 1500
+          : 0
+        : this.validatedAutomaticDelay(
+            rawFilo.automaticLexicalDelayMs,
+            10000,
+            250,
+            DEFAULT_SETTINGS.filo.automaticLexicalDelayMs
+          ),
+      automaticSemanticDelayMs: legacyFilo
+        ? DEFAULT_SETTINGS.filo.automaticSemanticDelayMs
+        : this.validatedAutomaticDelay(
+            rawFilo.automaticSemanticDelayMs,
+            60000,
+            1000,
+            DEFAULT_SETTINGS.filo.automaticSemanticDelayMs
+          ),
+      automaticPublicationDelayMs: legacyFilo
+        ? DEFAULT_SETTINGS.filo.automaticPublicationDelayMs
+        : this.validatedAutomaticDelay(
+            rawFilo.automaticPublicationDelayMs,
+            300000,
+            5000,
+            DEFAULT_SETTINGS.filo.automaticPublicationDelayMs
+          ),
       excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
     };
     this.value = {
-      schemaVersion: 4,
+      schemaVersion: 5,
       publicationDirectory,
       chat: Object.freeze(chat),
       embedding: Object.freeze(embedding),
@@ -247,6 +288,9 @@ export class SettingsStore {
   }
   private positiveInt(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+  }
+  private validatedAutomaticDelay(value: unknown, max: number, step: number, fallback: number) {
+    return isValidAutomaticDelay(value, max, step) ? value : fallback;
   }
   private optionalMaxOutputTokens(value: unknown): { maxOutputTokens?: number } {
     return isValidMaxOutputTokens(value) ? { maxOutputTokens: value } : {};
@@ -309,8 +353,9 @@ export class SettingsStore {
     const chatControls = this.validateChatControls(next.chat);
     const lente = this.validateLente(next.lente);
     const publicationDirectory = this.strictPublicationDirectory(next.publicationDirectory);
+    const filo = this.validateFilo(next.filo);
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       publicationDirectory,
       chat: Object.freeze({
         endpoint: chatEndpoint,
@@ -319,12 +364,24 @@ export class SettingsStore {
       }),
       embedding: Object.freeze({ ...next.embedding, endpoint: embeddingEndpoint }),
       lente: Object.freeze(lente),
-      filo: Object.freeze({
-        automaticUpdates: next.filo.automaticUpdates === true,
-        excludedPaths: Object.freeze(normalizeExcludedPaths(next.filo.excludedPaths)),
-      }),
+      filo: Object.freeze(filo),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
       detailedDebug: next.detailedDebug === true,
+    };
+  }
+  private validateFilo(filo: FiloSettings): FiloSettings {
+    const delays: Array<[number, number, number]> = [
+      [filo.automaticLexicalDelayMs, 10000, 250],
+      [filo.automaticSemanticDelayMs, 60000, 1000],
+      [filo.automaticPublicationDelayMs, 300000, 5000],
+    ];
+    if (delays.some(([value, max, step]) => !isValidAutomaticDelay(value, max, step)))
+      throw new Error("Automatic update delays must be aligned integer milliseconds within range.");
+    return {
+      automaticLexicalDelayMs: filo.automaticLexicalDelayMs,
+      automaticSemanticDelayMs: filo.automaticSemanticDelayMs,
+      automaticPublicationDelayMs: filo.automaticPublicationDelayMs,
+      excludedPaths: Object.freeze(normalizeExcludedPaths(filo.excludedPaths)),
     };
   }
   private strictPublicationDirectory(value: unknown): string {

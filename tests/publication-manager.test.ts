@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PublicationManager,
+  type AdoptionResult,
   type PublicationIndexPort,
 } from "@/index/publications/PublicationManager";
+import { StructuredError } from "@/domain/contracts";
 import { type PublicationDataAdapter } from "@/index/publications/PublicationStore";
 import type {
   PublicationInspection,
@@ -142,6 +144,91 @@ describe("PublicationManager", () => {
     expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
     expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
     expect(fixture.publish).not.toHaveBeenCalled();
+  });
+
+  it("keeps one pending event through a busy retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = setup();
+      const manager = new PublicationManager(fixture.index, fixture.adapter);
+      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
+      vi.mocked(fixture.index.inspectPublication)
+        .mockRejectedValueOnce(new StructuredError("busy", "busy", true))
+        .mockResolvedValueOnce({
+          valid: true,
+          publicationId: "remote",
+          state: state("remote"),
+          byteSize: fixture.bytes.byteLength,
+        });
+
+      manager.notifyFileEvent(manager.store.path);
+      await expect(manager.flushPendingEvents()).resolves.toMatchObject({
+        adopted: false,
+        warning: { retryable: true },
+      });
+      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(2);
+      expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs one follow-up adoption when the exact file changes during adoption", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = setup();
+      const adopted: AdoptionResult[] = [];
+      let entered!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const manager = new PublicationManager(fixture.index, fixture.adapter, {
+        onEventAdopted: (result) => {
+          adopted.push(result);
+        },
+      });
+      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
+      let inspections = 0;
+      vi.mocked(fixture.index.inspectPublication).mockImplementation(async () => {
+        inspections++;
+        if (inspections === 1) {
+          entered();
+          await gate;
+        }
+        return {
+          valid: true,
+          publicationId: inspections === 1 ? "remote-a" : "remote-b",
+          state: state(inspections === 1 ? "remote-a" : "remote-b"),
+          byteSize: fixture.bytes.byteLength,
+        };
+      });
+
+      manager.notifyFileEvent(manager.store.path);
+      const first = manager.flushPendingEvents();
+      await enteredPromise;
+      manager.notifyFileEvent(manager.store.path);
+      release();
+      await expect(first).resolves.toMatchObject({
+        adopted: true,
+        publicationId: "remote-a",
+      });
+      expect(await manager.flushPendingEvents()).toMatchObject({
+        adopted: true,
+        publicationId: "remote-b",
+      });
+      expect(inspections).toBe(2);
+      expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(2);
+      expect(adopted).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries a failed stage from the current local index", async () => {

@@ -2,6 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import {
   emitTramaDiagnostic,
   NOOP_TRAMA_DIAGNOSTICS,
+  projectDiagnosticError,
   startDiagnosticTimer,
   TramaDiagnostics,
   TramaDiagnosticRecord,
@@ -40,6 +41,8 @@ export interface IndexStatus {
   readonly freshness?: IndexFreshness;
   readonly publicationId?: string;
   readonly publicationWarning?: string;
+  /** Current automatic-work detail, independent of lexical readiness. */
+  readonly schedulerMessage?: string;
 }
 
 const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
@@ -76,9 +79,11 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
 interface StatusActions {
   index(signal: AbortSignal): Promise<void>;
   reindex(signal: AbortSignal): Promise<void>;
+  forceUpdate?(signal: AbortSignal): Promise<void>;
   prepare?(signal: AbortSignal): Promise<void>;
   rebuildSemantic?(signal: AbortSignal): Promise<void>;
   rebuildBoth?(signal: AbortSignal): Promise<void>;
+  publishNow?(): Promise<void>;
   cancel(): void;
 }
 interface StatusTiming {
@@ -87,13 +92,57 @@ interface StatusTiming {
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;
 }
 
-type IndexAction = "index" | "reindex" | "prepare" | "rebuild-semantic" | "rebuild-both";
+type IndexAction =
+  "index" | "reindex" | "force-update" | "prepare" | "rebuild-semantic" | "rebuild-both";
+
+export type IndexOperationChannel = "lexical" | "semantic";
+
+/** Shared ownership fence for one manual or automatic index operation. */
+export class IndexOperationLease {
+  readonly signal: AbortSignal;
+  readonly done: Promise<void>;
+  private resolveDone!: () => void;
+  private released = false;
+  private releaseHandler?: (lease: IndexOperationLease) => void;
+
+  constructor(
+    readonly channel: IndexOperationChannel,
+    readonly controller = new AbortController(),
+    releaseHandler?: (lease: IndexOperationLease) => void
+  ) {
+    this.signal = controller.signal;
+    this.releaseHandler = releaseHandler;
+    this.done = new Promise<void>((resolve) => (this.resolveDone = resolve));
+  }
+
+  abort(): void {
+    if (!this.signal.aborted) this.controller.abort();
+  }
+
+  attachRelease(handler: (lease: IndexOperationLease) => void): void {
+    this.releaseHandler = handler;
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    this.resolveDone();
+    const handler = this.releaseHandler;
+    this.releaseHandler = undefined;
+    handler?.(this);
+  }
+
+  get isReleased(): boolean {
+    return this.released;
+  }
+}
 
 /** Owns the observable index state and user-facing index actions. */
 export class IndexStatusController {
   private revision = 0;
   private controller?: AbortController;
-  private operationChannel?: "lexical" | "semantic";
+  private activeLease?: IndexOperationLease;
+  private operationChannel?: IndexOperationChannel;
   private readonly listeners = new Set<(status: IndexStatus) => void>();
   private progressTimer?: ReturnType<typeof setTimeout>;
   private pendingProgress?: IndexProgress;
@@ -169,6 +218,27 @@ export class IndexStatusController {
       },
     });
     this.plugin.addCommand({
+      id: "force-update-indexes",
+      name: "Update lexical and semantic indexes now",
+      callback: () => void this.run("force-update"),
+      checkCallback: (checking: boolean) => {
+        if ((!this.status.canReindex && !this.status.canIndex) || !this.actions.forceUpdate)
+          return false;
+        if (!checking) void this.run("force-update");
+        return true;
+      },
+    });
+    this.plugin.addCommand({
+      id: "publish-index-now",
+      name: "Publish index now",
+      callback: () => void this.actions.publishNow?.(),
+      checkCallback: (checking: boolean) => {
+        if (!this.actions.publishNow) return false;
+        if (!checking) void this.actions.publishNow();
+        return true;
+      },
+    });
+    this.plugin.addCommand({
       id: "cancel-filo-indexing",
       name: "Cancel lexical or semantic indexing",
       callback: () => this.cancel(),
@@ -182,6 +252,59 @@ export class IndexStatusController {
 
   getStatus(): IndexStatus {
     return this.status;
+  }
+  getActiveLease(): IndexOperationLease | undefined {
+    return this.activeLease;
+  }
+  /** Acquires the single shared operation slot for automatic work. */
+  acquireExternalLease(
+    channel: IndexOperationChannel,
+    message = channel === "semantic" ? "Updating semantic index…" : "Updating lexical index…"
+  ): IndexOperationLease | undefined {
+    if (this.activeLease || this.controller) return undefined;
+    const lease = new IndexOperationLease(channel, new AbortController(), (released) => {
+      this.releaseExternalLease(released);
+    });
+    this.activeLease = lease;
+    this.operationChannel = channel;
+    this.set(channel === "semantic" ? "preparing" : "updating", this.status.hasLastGood, message);
+    return lease;
+  }
+  /** Attaches an already-created automatic lease to this controller. */
+  attachExternalLease(lease: IndexOperationLease, message?: string): boolean {
+    if (this.activeLease || this.controller) return false;
+    lease.attachRelease((released) => this.releaseExternalLease(released));
+    this.activeLease = lease;
+    this.operationChannel = lease.channel;
+    this.set(
+      lease.channel === "semantic" ? "preparing" : "updating",
+      this.status.hasLastGood,
+      message ??
+        (lease.channel === "semantic" ? "Updating semantic index…" : "Updating lexical index…")
+    );
+    return true;
+  }
+  releaseExternalLease(lease: IndexOperationLease): void {
+    if (this.activeLease !== lease) return;
+    this.activeLease = undefined;
+    this.controller = undefined;
+    const channel = this.operationChannel;
+    this.operationChannel = undefined;
+    if (this.status.kind === "cancelling")
+      this.set(
+        "cancelled",
+        this.status.hasLastGood,
+        `${channel === "semantic" ? "Semantic" : "Lexical"} indexing cancelled.`
+      );
+    else if (
+      this.status.kind === "building" ||
+      this.status.kind === "updating" ||
+      this.status.kind === "preparing"
+    )
+      this.set("ready", true);
+  }
+  hasActiveOperation(channel?: IndexOperationChannel): boolean {
+    return Boolean(this.activeLease && (!channel || this.activeLease.channel === channel));
   }
   subscribe(listener: (status: IndexStatus) => void): () => void {
     this.listeners.add(listener);
@@ -218,6 +341,14 @@ export class IndexStatusController {
     };
     for (const listener of [...this.listeners]) listener(this.status);
   }
+  setSchedulerMessage(message?: string): void {
+    this.status = {
+      ...this.status,
+      schedulerMessage: message,
+      revision: ++this.revision,
+    };
+    for (const listener of [...this.listeners]) listener(this.status);
+  }
   setUpdating(): void {
     this.set("updating", true, "Updating lexical index…");
   }
@@ -227,11 +358,20 @@ export class IndexStatusController {
   ): void {
     this.set("stale", hasLastGood, message);
   }
-  markError(error: unknown): void {
+  markError(_error: unknown): void {
+    this.emitDiagnostic({
+      area: "index",
+      event: "index_operation",
+      operation: "status",
+      stage: "failed",
+      error: projectDiagnosticError(_error),
+    });
     this.set(
       "error",
       this.status.hasLastGood,
-      error instanceof Error ? error.message : String(error)
+      this.operationChannel === "semantic"
+        ? "Unable to update the semantic index."
+        : "Unable to build the lexical index."
     );
   }
 
@@ -316,12 +456,15 @@ export class IndexStatusController {
     for (const listener of [...this.listeners]) listener(this.status);
   }
 
-  cancel(): void {
-    if (!this.controller) return;
+  cancel(): Promise<void> {
+    const lease = this.activeLease;
+    if (!lease) return Promise.resolve();
     const channel = this.operationChannel ?? "lexical";
+    if (this.status.kind === "cancelling") return lease.done;
     this.set("cancelling", this.status.hasLastGood, `Cancelling ${channel} index…`);
-    this.controller.abort();
+    lease.abort();
     this.actions.cancel();
+    return lease.done;
   }
 
   /** Starts explicit semantic preparation through the same controller used by
@@ -334,6 +477,13 @@ export class IndexStatusController {
     if (this.controller) {
       this.operationChannel = "semantic";
       this.set("preparing", true, "Rebuilding semantic index…");
+    }
+  }
+
+  beginSemanticPreparation(): void {
+    if (this.controller) {
+      this.operationChannel = "semantic";
+      this.set("preparing", true, "Updating semantic index…");
     }
   }
 
@@ -354,6 +504,7 @@ export class IndexStatusController {
       hasLastGood,
       changeCounter: this.status.changeCounter,
       message,
+      schedulerMessage: this.status.schedulerMessage,
       canIndex:
         kind === "index-required" ||
         kind === "ready" ||
@@ -371,7 +522,7 @@ export class IndexStatusController {
         kind === "stale" ||
         (kind === "cancelled" && hasLastGood) ||
         (kind === "error" && hasLastGood),
-      canCancel: kind === "building" || kind === "preparing",
+      canCancel: kind === "building" || kind === "preparing" || kind === "updating",
       capabilities: this.status.capabilities,
       freshness: this.status.freshness,
       publicationId: this.status.publicationId,
@@ -403,14 +554,23 @@ export class IndexStatusController {
     emitTramaDiagnostic(this.diagnostics, record);
   }
   private async start(kind: IndexAction): Promise<void> {
-    if (this.controller) return;
+    if (this.activeLease || this.controller) return;
     if (kind === "prepare" && !this.actions.prepare) return;
     if (kind === "rebuild-semantic" && !this.actions.rebuildSemantic) return;
     if (kind === "rebuild-both" && !this.actions.rebuildBoth) return;
+    if (kind === "force-update" && !this.actions.forceUpdate) return;
     const elapsedMs = startDiagnosticTimer(() => this.timing.now());
-    this.controller = new AbortController();
     this.operationChannel =
       kind === "prepare" || kind === "rebuild-semantic" ? "semantic" : "lexical";
+    const lease = new IndexOperationLease(
+      this.operationChannel,
+      new AbortController(),
+      (released) => {
+        this.releaseExternalLease(released);
+      }
+    );
+    this.activeLease = lease;
+    this.controller = lease.controller;
     this.set(
       kind === "prepare" || kind === "rebuild-semantic" ? "preparing" : "building",
       this.status.hasLastGood,
@@ -418,43 +578,60 @@ export class IndexStatusController {
         ? "Updating semantic index…"
         : kind === "rebuild-semantic"
           ? "Rebuilding semantic index…"
-          : kind === "index"
-            ? "Updating lexical index…"
-            : "Rebuilding lexical index…"
+          : kind === "force-update"
+            ? "Updating lexical and semantic indexes…"
+            : kind === "index"
+              ? "Updating lexical index…"
+              : "Rebuilding lexical index…"
     );
     try {
       await (kind === "index"
-        ? this.actions.index(this.controller.signal)
+        ? this.actions.index(lease.signal)
         : kind === "reindex"
-          ? this.actions.reindex(this.controller.signal)
+          ? this.actions.reindex(lease.signal)
           : kind === "prepare"
-            ? this.actions.prepare!(this.controller.signal)
+            ? this.actions.prepare!(lease.signal)
             : kind === "rebuild-semantic"
-              ? this.actions.rebuildSemantic!(this.controller.signal)
-              : this.actions.rebuildBoth!(this.controller.signal));
-      if (this.status.kind === "building" || this.status.kind === "preparing")
-        this.set("ready", true);
+              ? this.actions.rebuildSemantic!(lease.signal)
+              : kind === "rebuild-both"
+                ? this.actions.rebuildBoth!(lease.signal)
+                : this.actions.forceUpdate!(lease.signal));
       this.emitDiagnostic({
         area: "index",
         event: "index_operation",
-        operation: kind === "index" || kind === "prepare" ? "incremental" : "full",
+        operation:
+          kind === "index" || kind === "prepare" || kind === "force-update"
+            ? "incremental"
+            : "full",
         stage: "user-completed",
         durationMs: elapsedMs(),
       });
     } catch (error) {
-      const cancelled = this.controller.signal.aborted;
+      const cancelled = lease.signal.aborted;
       const channel = this.operationChannel === "semantic" ? "Semantic" : "Lexical";
-      this.set(
-        cancelled ? "cancelled" : "error",
-        this.status.hasLastGood,
-        cancelled
-          ? `${channel} indexing cancelled.`
-          : `${channel} index: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const operation =
+        kind === "index" || kind === "prepare" || kind === "force-update" ? "incremental" : "full";
+      if (!cancelled)
+        this.emitDiagnostic({
+          area: "index",
+          event: "index_operation",
+          operation,
+          stage: "failed",
+          error: projectDiagnosticError(error),
+        });
+      const userMessage = cancelled
+        ? `${channel} indexing cancelled.`
+        : kind === "prepare"
+          ? "Unable to update the semantic index."
+          : kind === "rebuild-semantic"
+            ? "Unable to rebuild the semantic index."
+            : kind === "rebuild-both" || kind === "force-update"
+              ? "Unable to update the lexical and semantic indexes."
+              : "Unable to build the lexical index.";
+      this.set(cancelled ? "cancelled" : "error", this.status.hasLastGood, userMessage);
       if (!cancelled) new Notice(this.status.message ?? "Indexing failed.");
     } finally {
-      this.controller = undefined;
-      this.operationChannel = undefined;
+      lease.release();
     }
   }
 
@@ -465,6 +642,8 @@ export class IndexStatusController {
     if (kind === "prepare" && !this.status.canPrepare) return Promise.resolve();
     if (kind === "rebuild-semantic" && !this.status.canPrepare) return Promise.resolve();
     if (kind === "rebuild-both" && !this.status.canReindex && !this.status.canIndex)
+      return Promise.resolve();
+    if (kind === "force-update" && !this.status.canReindex && !this.status.canIndex)
       return Promise.resolve();
     return this.start(kind);
   }

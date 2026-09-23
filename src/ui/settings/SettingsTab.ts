@@ -27,6 +27,7 @@ export interface SettingsTabCallbacks {
   rebuildLexical?(): Promise<void>;
   rebuildSemantic?(): Promise<void>;
   rebuildBothIndexes?(): Promise<void>;
+  forceUpdateIndexes?(): Promise<void>;
   retryPublication?(): Promise<void>;
   checkPublication?(): Promise<void>;
   getIndexStatus?(): { publicationWarning?: string; capabilities?: IndexCapabilities } | undefined;
@@ -45,7 +46,9 @@ export interface SettingsDraft {
   lenteSearchMethod: LenteSearchMethod;
   lenteMaxResults: number;
   lenteAutomaticSearchDelayMs: number;
-  filoAutomaticUpdates?: boolean;
+  filoAutomaticLexicalDelayMs: number;
+  filoAutomaticSemanticDelayMs: number;
+  filoAutomaticPublicationDelayMs: number;
   filoExcludedPaths: readonly string[];
 }
 
@@ -99,10 +102,16 @@ export function projectSettingsWithDraft(
       automaticSearchDelayMs: draft.lenteAutomaticSearchDelayMs,
     },
     filo: {
-      automaticUpdates: draft.filoAutomaticUpdates ?? settings.filo.automaticUpdates,
+      automaticLexicalDelayMs: draft.filoAutomaticLexicalDelayMs,
+      automaticSemanticDelayMs: draft.filoAutomaticSemanticDelayMs,
+      automaticPublicationDelayMs: draft.filoAutomaticPublicationDelayMs,
       excludedPaths: normalizeExcludedPaths(draft.filoExcludedPaths),
     },
   };
+}
+
+export function formatAutomaticDelay(delayMs: number): string {
+  return delayMs === 0 ? "Off" : `${Number((delayMs / 1000).toFixed(3))} sec`;
 }
 
 /** Presents independent LM Studio configuration and explicit endpoint/model actions. */
@@ -135,7 +144,9 @@ export class TramaSettingsTab extends PluginSettingTab {
       lenteSearchMethod: settings.lente.searchMethod,
       lenteMaxResults: settings.lente.maxResults,
       lenteAutomaticSearchDelayMs: settings.lente.automaticSearchDelayMs,
-      filoAutomaticUpdates: settings.filo.automaticUpdates,
+      filoAutomaticLexicalDelayMs: settings.filo.automaticLexicalDelayMs,
+      filoAutomaticSemanticDelayMs: settings.filo.automaticSemanticDelayMs,
+      filoAutomaticPublicationDelayMs: settings.filo.automaticPublicationDelayMs,
       filoExcludedPaths: [...settings.filo.excludedPaths],
       publicationDirectory: settings.publicationDirectory,
     });
@@ -189,15 +200,20 @@ export class TramaSettingsTab extends PluginSettingTab {
       draft.embeddingEndpoint = value;
     });
     this.modelSelector("embedding", draft);
-    new Setting(this.containerEl)
-      .setName("Update lexical index automatically")
-      .setDesc("Reconcile Markdown changes after a short delay. This never contacts an AI service.")
-      .addToggle((toggle) => {
-        toggle.setValue(draft.filoAutomaticUpdates ?? false);
-        toggle.onChange((value) => {
-          draft.filoAutomaticUpdates = value;
-        });
+    const lexicalDelaySetting = new Setting(this.containerEl).setName(
+      "Automatic lexical update delay"
+    );
+    const lexicalDelayDescription = () =>
+      `Reconcile changed Markdown after editing. ${formatAutomaticDelay(draft.filoAutomaticLexicalDelayMs)}. This never contacts an AI service.`;
+    lexicalDelaySetting.setDesc(lexicalDelayDescription()).addSlider((slider) => {
+      slider.setLimits(0, 10000, 250);
+      slider.setValue(draft.filoAutomaticLexicalDelayMs);
+      slider.setDynamicTooltip();
+      slider.onChange((value) => {
+        draft.filoAutomaticLexicalDelayMs = value;
+        lexicalDelaySetting.setDesc(lexicalDelayDescription());
       });
+    });
     this.exclusions(draft);
 
     this.sectionHeading("Lexical & semantic indexes and sync");
@@ -212,6 +228,34 @@ export class TramaSettingsTab extends PluginSettingTab {
           draft.publicationDirectory = value;
         });
       });
+    const semanticDelaySetting = new Setting(this.containerEl).setName(
+      "Automatic semantic update delay"
+    );
+    const semanticDelayDescription = () =>
+      `Use the embedding service to update semantic vectors after lexical changes. ${formatAutomaticDelay(draft.filoAutomaticSemanticDelayMs)}.`;
+    semanticDelaySetting.setDesc(semanticDelayDescription()).addSlider((slider) => {
+      slider.setLimits(0, 60000, 1000);
+      slider.setValue(draft.filoAutomaticSemanticDelayMs);
+      slider.setDynamicTooltip();
+      slider.onChange((value) => {
+        draft.filoAutomaticSemanticDelayMs = value;
+        semanticDelaySetting.setDesc(semanticDelayDescription());
+      });
+    });
+    const publicationDelaySetting = new Setting(this.containerEl).setName(
+      "Automatic publication delay"
+    );
+    const publicationDelayDescription = () =>
+      `Publish the latest converged index state. Off disables automatic and quit publication. ${formatAutomaticDelay(draft.filoAutomaticPublicationDelayMs)}.`;
+    publicationDelaySetting.setDesc(publicationDelayDescription()).addSlider((slider) => {
+      slider.setLimits(0, 300000, 5000);
+      slider.setValue(draft.filoAutomaticPublicationDelayMs);
+      slider.setDynamicTooltip();
+      slider.onChange((value) => {
+        draft.filoAutomaticPublicationDelayMs = value;
+        publicationDelaySetting.setDesc(publicationDelayDescription());
+      });
+    });
     const status = this.controller.getIndexStatus?.();
     if (status?.capabilities) {
       for (const channel of ["lexical", "semantic"] as const) {
@@ -258,6 +302,14 @@ export class TramaSettingsTab extends PluginSettingTab {
           .onClick(() => void this.run(() => this.controller.rebuildBothIndexes?.()))
       );
     new Setting(this.containerEl)
+      .setName("Update both indexes now")
+      .setDesc("Save open Markdown notes, then update lexical and semantic indexes immediately.")
+      .addButton((button) =>
+        button
+          .setButtonText("Update lexical and semantic indexes now")
+          .onClick(() => void this.run(() => this.controller.forceUpdateIndexes?.()))
+      );
+    new Setting(this.containerEl)
       .setName("Index synchronization")
       .addButton((button) =>
         button
@@ -266,7 +318,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button
-          .setButtonText("Retry publication")
+          .setButtonText("Publish now")
           .onClick(() => void this.run(() => this.controller.retryPublication?.()))
       );
     if (status?.publicationWarning)

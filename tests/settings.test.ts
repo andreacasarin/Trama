@@ -21,7 +21,7 @@ describe("Settings module", () => {
         const store = new SettingsStore();
         const loaded = store.load({ schemaVersion: 2, chat: {}, embedding: {} });
 
-        expect(loaded.schemaVersion).toBe(4);
+        expect(loaded.schemaVersion).toBe(5);
         expect(loaded.publicationDirectory).toBe("Trama/index");
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
@@ -31,7 +31,12 @@ describe("Settings module", () => {
           maxResults: 20,
           automaticSearchDelayMs: 0,
         });
-        expect(loaded.filo).toEqual({ automaticUpdates: false, excludedPaths: [] });
+        expect(loaded.filo).toEqual({
+          automaticLexicalDelayMs: 0,
+          automaticSemanticDelayMs: 0,
+          automaticPublicationDelayMs: 30000,
+          excludedPaths: [],
+        });
         expect(loaded.detailedDebug).toBe(false);
       });
 
@@ -51,12 +56,81 @@ describe("Settings module", () => {
           automaticSearchDelayMs: 0,
         });
         expect(loaded.filo).toEqual({
-          automaticUpdates: true,
+          automaticLexicalDelayMs: 1500,
+          automaticSemanticDelayMs: 0,
+          automaticPublicationDelayMs: 30000,
           excludedPaths: ["Projects", "private/notes"],
         });
         expect(Object.isFrozen(DEFAULT_SETTINGS.lente)).toBe(true);
         expect(Object.isFrozen(DEFAULT_SETTINGS.filo)).toBe(true);
         expect(Object.isFrozen(DEFAULT_SETTINGS.filo.excludedPaths)).toBe(true);
+      });
+
+      it("migrates legacy automatic update flags for schemas 2, 3, and 4", () => {
+        for (const schemaVersion of [2, 3, 4]) {
+          expect(
+            new SettingsStore().load({ schemaVersion, filo: { automaticUpdates: true } }).filo
+              .automaticLexicalDelayMs
+          ).toBe(1500);
+          for (const automaticUpdates of [false, undefined, "yes"]) {
+            expect(
+              new SettingsStore().load({ schemaVersion, filo: { automaticUpdates } }).filo
+                .automaticLexicalDelayMs
+            ).toBe(0);
+          }
+          expect(
+            new SettingsStore().load({ schemaVersion, filo: { automaticUpdates: true } }).filo
+          ).toMatchObject({ automaticSemanticDelayMs: 0, automaticPublicationDelayMs: 30000 });
+        }
+      });
+
+      it("validates schema v5 delays independently and defaults malformed fields", () => {
+        const loaded = new SettingsStore().load({
+          schemaVersion: 5,
+          filo: {
+            automaticLexicalDelayMs: 1250,
+            automaticSemanticDelayMs: 2000,
+            automaticPublicationDelayMs: 25000,
+          },
+        });
+        expect(loaded.filo).toMatchObject({
+          automaticLexicalDelayMs: 1250,
+          automaticSemanticDelayMs: 2000,
+          automaticPublicationDelayMs: 25000,
+        });
+        const independent = new SettingsStore().load({
+          schemaVersion: 5,
+          filo: {
+            automaticLexicalDelayMs: 125,
+            automaticSemanticDelayMs: 60000,
+            automaticPublicationDelayMs: 5000,
+          },
+        });
+        expect(independent.filo).toMatchObject({
+          automaticLexicalDelayMs: 750,
+          automaticSemanticDelayMs: 60000,
+          automaticPublicationDelayMs: 5000,
+        });
+
+        const malformed = ["750", 1.5, Number.NaN, Number.POSITIVE_INFINITY, -250];
+        for (const automaticLexicalDelayMs of [...malformed, 10250]) {
+          expect(
+            new SettingsStore().load({ schemaVersion: 5, filo: { automaticLexicalDelayMs } }).filo
+              .automaticLexicalDelayMs
+          ).toBe(750);
+        }
+        for (const automaticSemanticDelayMs of [...malformed, 61000]) {
+          expect(
+            new SettingsStore().load({ schemaVersion: 5, filo: { automaticSemanticDelayMs } }).filo
+              .automaticSemanticDelayMs
+          ).toBe(0);
+        }
+        for (const automaticPublicationDelayMs of [...malformed, 305000]) {
+          expect(
+            new SettingsStore().load({ schemaVersion: 5, filo: { automaticPublicationDelayMs } })
+              .filo.automaticPublicationDelayMs
+          ).toBe(30000);
+        }
       });
 
       it("falls back independently for invalid Lente settings", () => {
@@ -176,10 +250,63 @@ describe("Settings module", () => {
           chat: { ...DEFAULT_SETTINGS.chat, endpoint: "http://127.0.0.1:1234" },
           embedding: { ...DEFAULT_SETTINGS.embedding, endpoint: "http://127.0.0.1:4321/v1" },
         });
-        expect(settings.schemaVersion).toBe(4);
+        expect(settings.schemaVersion).toBe(5);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
         expect(settings.detailedDebug).toBe(false);
+      });
+      it("validates and round-trips v5 delays without persisting the legacy flag", () => {
+        const store = new SettingsStore();
+        const values = [
+          [0, 0, 0],
+          [10000, 60000, 300000],
+          [750, 1000, 30000],
+        ] as const;
+        for (const [
+          automaticLexicalDelayMs,
+          automaticSemanticDelayMs,
+          automaticPublicationDelayMs,
+        ] of values) {
+          const saved = store.save({
+            ...DEFAULT_SETTINGS,
+            filo: {
+              ...DEFAULT_SETTINGS.filo,
+              automaticLexicalDelayMs,
+              automaticSemanticDelayMs,
+              automaticPublicationDelayMs,
+            },
+          });
+          expect(saved.schemaVersion).toBe(5);
+          expect(saved.filo).toMatchObject({
+            automaticLexicalDelayMs,
+            automaticSemanticDelayMs,
+            automaticPublicationDelayMs,
+          });
+          expect(saved.filo).not.toHaveProperty("automaticUpdates");
+          expect(new SettingsStore().load(JSON.parse(JSON.stringify(saved)))).toEqual(saved);
+        }
+      });
+      it("rejects invalid automatic delays without committing the candidate", () => {
+        const store = new SettingsStore();
+        const before = store.get();
+        const invalid = [
+          { automaticLexicalDelayMs: 1 },
+          { automaticLexicalDelayMs: 10250 },
+          { automaticSemanticDelayMs: 500 },
+          { automaticSemanticDelayMs: 61000 },
+          { automaticPublicationDelayMs: 1000 },
+          { automaticPublicationDelayMs: 305000 },
+          { automaticPublicationDelayMs: Number.NaN },
+        ];
+        for (const values of invalid) {
+          expect(() =>
+            store.stage({
+              ...DEFAULT_SETTINGS,
+              filo: { ...DEFAULT_SETTINGS.filo, ...values },
+            })
+          ).toThrow();
+          expect(store.get()).toBe(before);
+        }
       });
       it("rejects invalid staged chat controls without silently clearing them", () => {
         const store = new SettingsStore();

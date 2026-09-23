@@ -145,6 +145,42 @@ describe("RelatedNotes", () => {
     expect(current.search).toHaveBeenCalledOnce();
   });
 
+  it("retains exact rows while cache batches churn without changing the visible head", async () => {
+    const current = snapshot("current.md", "query", [{ path: "settled.md", score: 0.9 }]);
+    let activity: "idle" | "updating" = "idle";
+    const source = {
+      relatedState: vi.fn(() => ({
+        ...current.value,
+        semantic: { state: "ready" as const, activity, searchable: true },
+      })),
+      findRelated: current.search,
+    };
+    const service = new RelatedNotes(source);
+    const first = await service.find("current.md", signal);
+    activity = "updating";
+    const duringBatch = await service.find("current.md", signal);
+    expect(duringBatch.results).toEqual(first.results);
+    expect(current.search).toHaveBeenCalledOnce();
+  });
+
+  it("swaps cached rows once when the visible semantic head changes", async () => {
+    const first = snapshot("current.md", "query", [{ path: "old.md", score: 0.8 }], "head-1");
+    const second = snapshot("current.md", "query", [{ path: "new.md", score: 0.9 }], "head-2");
+    let current = first.value;
+    const service = new RelatedNotes({
+      relatedState: () => current,
+      findRelated: (path) =>
+        path === "current.md" && current === first.value ? first.search() : second.search(),
+    });
+    const settled = await service.find("current.md", signal);
+    current = second.value;
+    const refreshed = await service.find("current.md", signal);
+    expect(settled.results).toEqual([{ path: "old.md", score: 0.8 }]);
+    expect(refreshed.results).toEqual([{ path: "new.md", score: 0.9 }]);
+    expect(first.search).toHaveBeenCalledOnce();
+    expect(second.search).toHaveBeenCalledOnce();
+  });
+
   it("reports preparation and retrieval timings for the single shared computation", async () => {
     const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
     const records: TramaDiagnosticRecord[] = [];
@@ -160,6 +196,9 @@ describe("RelatedNotes", () => {
         .filter((record) => record.area === "filo" && record.event === "related_search")
         .map((record) => record.stage)
     ).toEqual(["started", "retrieve-completed", "completed"]);
+    expect(records.every((record) => !("path" in record))).toBe(true);
+    expect(JSON.stringify(records)).not.toContain("current.md");
+    expect(JSON.stringify(records)).not.toContain("a.md");
   });
 
   it("caches twenty candidates while preserving the default seven-result consumer cap", async () => {

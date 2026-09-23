@@ -11,10 +11,12 @@ import {
   validateRequest,
   type SqliteRequest,
   type SqliteReply,
+  type SqliteErrorShape,
+  type SqliteState,
   sqliteError,
 } from "./protocol";
-import { SQLITE_BUILD_IDENTITY } from "../../build/identity";
-import { hashMarkdown, upsertMarkdown } from "./markdown";
+import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
+import { applyLexicalMarkdownBatch, hashMarkdown, upsertLexicalMarkdown } from "./markdown";
 
 type SqliteModule = {
   oo1: { DB: new (name: string, mode: string) => SqliteConnection };
@@ -49,6 +51,75 @@ let bootConfig:
       dimensions: number;
     }
   | undefined;
+function diagnosticToken(value: unknown): string | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : undefined;
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(value)
+    ? value
+    : undefined;
+}
+
+export function storageFailureDetail(error: unknown): string {
+  if (!(error instanceof Error)) return "unknown failure";
+  if (typeof error.message === "string")
+    return error.message.replace(/[\\/][^\s]*/g, "<path>").slice(0, 160);
+
+  const name = diagnosticToken(error.name);
+  const source = error as Error & { code?: unknown; resultCode?: unknown };
+  const code = diagnosticToken(source.code) ?? diagnosticToken(source.resultCode);
+  const metadata = [name && `name=${name}`, code && `code=${code}`].filter(Boolean);
+  return metadata.length ? metadata.join(" ") : "unknown failure";
+}
+
+export function workerFailureLocation(error: unknown): string | undefined {
+  if (!(error instanceof Error) || typeof error.stack !== "string") return undefined;
+  const frame = error.stack
+    .split("\n")
+    .slice(1)
+    .map((line) => line.trim())
+    .find((line) => /:\d+(?::\d+)?\)?$/.test(line));
+  if (!frame) return undefined;
+  const match = frame.match(
+    /at\s+(?:(?:async\s+)?(?<name>[A-Za-z_$][\w$]*)\s+)?\(?[^()]*?(?<file>[^\\/:()\s]+):(?<line>\d+)/
+  );
+  return match?.groups?.file && match.groups.line
+    ? `${match.groups.name ?? "anonymous"}@${match.groups.file}:${match.groups.line}`
+    : undefined;
+}
+
+function safeRequestMethod(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9]{0,31}$/.test(value) ? value : undefined;
+}
+
+export function workerFailureReply(
+  error: unknown,
+  method: unknown,
+  phase: "validation" | "dispatch" | "open" | "execute"
+): SqliteErrorShape {
+  const structured =
+    error && typeof error === "object" && "error" in error
+      ? { ...((error as any).error as SqliteErrorShape) }
+      : {
+          code: "internal" as const,
+          message:
+            error instanceof Error && error.message
+              ? `SQLite request failed: ${error.message.slice(0, 240)}`
+              : "SQLite request failed",
+          retryable: false,
+        };
+  const requestMethod = safeRequestMethod(method);
+  const location = workerFailureLocation(error);
+  return {
+    ...structured,
+    ...(requestMethod ? { method: requestMethod } : {}),
+    phase: structured.phase ?? phase,
+    ...(location ? { debugLocation: location } : {}),
+  };
+}
+
+function storageFailure(context: string, error: unknown): never {
+  const detail = storageFailureDetail(error);
+  throw sqliteError("storage_unavailable", `SQLite ${context} failed: ${detail}`, true, "open");
+}
 
 async function initializeSqlite(): Promise<SqliteModule> {
   const assets = (
@@ -98,14 +169,31 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
   if (storage.database) return storage.database;
   databaseIdentity = identity;
   if (!sqliteModulePromise) sqliteModulePromise = initializeSqlite();
-  const sqlite = await sqliteModulePromise;
+  let sqlite: SqliteModule;
+  try {
+    sqlite = await sqliteModulePromise;
+  } catch (error) {
+    if (error && typeof error === "object" && "error" in error) {
+      const detail = (error as any).error;
+      throw sqliteError(detail.code, detail.message, detail.retryable, "open");
+    }
+    throw error;
+  }
   const namespace = identity.replace(/[^0-9a-f]/gi, "").slice(0, 32) || "default";
-  storage.opfsPool ??= await sqlite.installOpfsSAHPoolVfs({
-    name: `trama-sqlite-v1-${namespace}`,
-    directory: `trama-sqlite-v1-${namespace}`,
-    initialCapacity: 8,
-  });
-  storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
+  try {
+    storage.opfsPool ??= await sqlite.installOpfsSAHPoolVfs({
+      name: `trama-sqlite-v1-${namespace}`,
+      directory: `trama-sqlite-v1-${namespace}`,
+      initialCapacity: 8,
+    });
+  } catch (error) {
+    storageFailure("OPFS VFS installation", error);
+  }
+  try {
+    storage.connection = new storage.opfsPool!.OpfsSAHPoolDb("/index.sqlite3", "c");
+  } catch (error) {
+    storageFailure("database open", error);
+  }
   storage.database = new MutableSqliteDatabase(storage.connection);
   if (bootConfig) {
     try {
@@ -116,14 +204,46 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
         bootConfig.buildIdentity
       );
     } catch (error) {
+      // Local databases are disposable when their persisted format or vector
+      // dimensions no longer match this build. Publication candidates are
+      // validated separately and remain reject-only/non-destructive.
+      if ((error as any)?.error?.code === "incompatible_state") {
+        const replacement = resetIncompatibleLocalDatabase(bootConfig);
+        return replacement;
+      }
       closeConnection();
-      throw error;
+      if (error && typeof error === "object" && "error" in error) throw error;
+      storageFailure("database boot", error);
     }
   }
   return storage.database;
 }
 function closeConnection(): void {
   closeWorkerDatabase(storage);
+}
+function resetIncompatibleLocalDatabase(config: {
+  corpusFingerprint: string;
+  embeddingFingerprint: string;
+  buildIdentity: string;
+  dimensions: number;
+}): MutableSqliteDatabase {
+  try {
+    closeConnection();
+    if (!storage.opfsPool) throw new Error("OPFS pool is unavailable");
+    storage.opfsPool.unlink("/index.sqlite3");
+    storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
+    storage.database = new MutableSqliteDatabase(storage.connection);
+    storage.database.boot(
+      config.corpusFingerprint,
+      config.dimensions,
+      config.embeddingFingerprint,
+      config.buildIdentity
+    );
+    return storage.database;
+  } catch (error) {
+    if (error && typeof error === "object" && "error" in error) throw error;
+    storageFailure("incompatible database reset", error);
+  }
 }
 function liveBytes(): ArrayBuffer {
   if (!storage.opfsPool)
@@ -142,17 +262,57 @@ function config(db: MutableSqliteDatabase): {
   corpus: string;
   embedding: string;
   dimensions: number;
+  buildIdentity: string;
 } {
   const s = db.getState();
   return {
     corpus: s.corpusFingerprint,
     embedding: s.embeddingFingerprint,
     dimensions: s.dimensions,
+    buildIdentity: s.buildIdentity,
   };
+}
+
+function runtimeConfig(db: MutableSqliteDatabase): {
+  corpus: string;
+  embedding: string;
+  dimensions: number;
+  buildIdentity: string;
+} {
+  const persisted = config(db);
+  return bootConfig
+    ? {
+        corpus: bootConfig.corpusFingerprint,
+        embedding: bootConfig.embeddingFingerprint,
+        dimensions: bootConfig.dimensions,
+        buildIdentity: bootConfig.buildIdentity,
+      }
+    : persisted;
+}
+
+function rejectActiveLexicalRun(db: MutableSqliteDatabase): void {
+  if (db.hasActiveLexicalRuns()) throw sqliteError("busy", "A lexical run is still active", true);
+}
+
+function bootAndValidateCandidate(
+  candidate: MutableSqliteDatabase,
+  expected: ReturnType<typeof runtimeConfig>
+): SqliteState {
+  candidate.validateSnapshot(
+    expected.corpus,
+    expected.dimensions,
+    expected.embedding,
+    expected.buildIdentity
+  );
+  // validateSnapshot proves the persisted identity before boot(), which otherwise
+  // rewrites corpus and embedding fingerprints that differ from the runtime.
+  candidate.boot(expected.corpus, expected.dimensions, expected.embedding, expected.buildIdentity);
+  return candidate.getState();
 }
 
 async function preparePublication(publicationId: string): Promise<unknown> {
   const db = await openDatabase();
+  rejectActiveLexicalRun(db);
   const state = db.getState();
   db.validateSnapshot(state.corpusFingerprint, state.dimensions, state.embeddingFingerprint);
   const started = Date.now();
@@ -165,12 +325,13 @@ async function preparePublication(publicationId: string): Promise<unknown> {
   try {
     storage.opfsPool.importDb(name, original);
     candidate = openCandidate(name);
+    candidate.pruneForPublication();
+    candidate.setPublicationId(publicationId);
     candidate.validateSnapshot(
       state.corpusFingerprint,
       state.dimensions,
       state.embeddingFingerprint
     );
-    candidate.setPublicationId(publicationId);
     const bytes = exportOpfsDatabase(storage.opfsPool, name);
     if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)
       throw sqliteError("integrity_failed", "SQLite publication exceeds the safety limit");
@@ -192,7 +353,8 @@ async function inspectPublication(bytes: ArrayBuffer, payload: any): Promise<unk
   if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)
     throw sqliteError("invalid_request", "Publication exceeds the safety limit");
   const live = await openDatabase();
-  const expected = config(live);
+  rejectActiveLexicalRun(live);
+  const expected = runtimeConfig(live);
   if (payload.corpusFingerprint && payload.corpusFingerprint !== expected.corpus)
     throw sqliteError(
       "incompatible_state",
@@ -209,7 +371,8 @@ async function inspectPublication(bytes: ArrayBuffer, payload: any): Promise<unk
     candidate.validateSnapshot(
       payload.corpusFingerprint ?? expected.corpus,
       payload.dimensions ?? expected.dimensions,
-      payload.embeddingFingerprint ?? expected.embedding
+      payload.embeddingFingerprint ?? expected.embedding,
+      payload.buildIdentity ?? expected.buildIdentity
     );
     const state = candidate.getState();
     if (!state.publicationId) throw sqliteError("incompatible_state", "Publication ID is missing");
@@ -222,16 +385,8 @@ async function inspectPublication(bytes: ArrayBuffer, payload: any): Promise<unk
 }
 async function adoptPublication(bytes: ArrayBuffer, payload: any): Promise<unknown> {
   const live = await openDatabase();
-  const expected = config(live);
-  const inspection = await inspectPublication(bytes, {
-    ...payload,
-    corpusFingerprint: payload.corpusFingerprint ?? expected.corpus,
-    embeddingFingerprint: payload.embeddingFingerprint ?? expected.embedding,
-    dimensions: payload.dimensions ?? expected.dimensions,
-  });
-  const info = inspection as any;
-  if (payload.expectedPublicationId && payload.expectedPublicationId !== info.publicationId)
-    throw sqliteError("incompatible_state", "Publication ID changed during adoption");
+  rejectActiveLexicalRun(live);
+  const expected = runtimeConfig(live);
   if (!storage.opfsPool)
     throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
   const stampName = `/index.sqlite3.adopt-${Date.now()}`;
@@ -240,7 +395,14 @@ async function adoptPublication(bytes: ArrayBuffer, payload: any): Promise<unkno
   try {
     storage.opfsPool.importDb(stampName, bytes);
     stampedCandidate = openCandidate(stampName);
-    stampedCandidate.validateSnapshot(expected.corpus, expected.dimensions, expected.embedding);
+    const candidateState = bootAndValidateCandidate(stampedCandidate, expected);
+    if (!candidateState.publicationId)
+      throw sqliteError("incompatible_state", "Publication ID is missing");
+    if (
+      payload.expectedPublicationId &&
+      payload.expectedPublicationId !== candidateState.publicationId
+    )
+      throw sqliteError("incompatible_state", "Publication ID changed during adoption");
     stampedCandidate.markSnapshotLoaded();
     stampedBytes = exportOpfsDatabase(storage.opfsPool, stampName);
   } finally {
@@ -254,14 +416,24 @@ async function adoptPublication(bytes: ArrayBuffer, payload: any): Promise<unkno
   try {
     storage.opfsPool.importDb("/index.sqlite3", stampedBytes);
     const reopened = await openDatabase();
-    reopened.validateSnapshot(expected.corpus, expected.dimensions, expected.embedding);
+    reopened.validateSnapshot(
+      expected.corpus,
+      expected.dimensions,
+      expected.embedding,
+      expected.buildIdentity
+    );
     return reopened.getState();
   } catch (error) {
     closeConnection();
     try {
       storage.opfsPool.importDb("/index.sqlite3", backup);
       const restored = await openDatabase();
-      restored.validateSnapshot(expected.corpus, expected.dimensions, expected.embedding);
+      restored.validateSnapshot(
+        expected.corpus,
+        expected.dimensions,
+        expected.embedding,
+        expected.buildIdentity
+      );
     } catch {
       /* preserve original failure */
     }
@@ -277,14 +449,19 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       embeddingFingerprint: (p.embeddingFingerprint ?? "") as string,
       buildIdentity: (p.buildIdentity ?? SQLITE_BUILD_IDENTITY) as string,
     };
-    const state = (await openDatabase(p.identity ?? "default")).boot(
-      config.corpusFingerprint,
-      config.dimensions,
-      config.embeddingFingerprint,
-      config.buildIdentity
-    );
     bootConfig = config;
-    return state;
+    try {
+      return (await openDatabase(p.identity ?? "default")).boot(
+        config.corpusFingerprint,
+        config.dimensions,
+        config.embeddingFingerprint,
+        config.buildIdentity
+      );
+    } catch (error) {
+      if ((error as any)?.error?.code !== "incompatible_state") throw error;
+      const replacement = resetIncompatibleLocalDatabase(config);
+      return replacement.getState();
+    }
   }
   if (request.method === "shutdown") {
     scheduler.shutdown();
@@ -303,7 +480,12 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     if (request.method === "preparePublication") return preparePublication(p.publicationId);
     const db = await openDatabase();
     if (request.method === "finalizePublication") {
-      const result = db.finalizePublication(p.publicationId, p.expectedChangeCounter);
+      const result = db.finalizePublication(
+        p.publicationId,
+        p.expectedChangeCounter,
+        p.expectedLexicalGeneration,
+        p.expectedSemanticGeneration
+      );
       if (!result)
         throw sqliteError(
           "busy",
@@ -316,6 +498,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     if (request.method === "adoptPublication") return adoptPublication(p.bytes, p);
     throw sqliteError("unsupported", "Unknown maintenance method");
   }
+  if (request.method === "hashMarkdown")
+    return hashMarkdown(p.markdown, p.corpusFingerprint, signal);
   const db = await openDatabase();
   switch (request.method) {
     case "getState":
@@ -326,22 +510,56 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       return db.markIncomplete();
     case "beginRebuild":
       return db.beginRebuild();
-    case "clearVectors":
-      return db.clearVectors();
-    case "hashMarkdown":
-      return hashMarkdown(p.markdown, p.corpusFingerprint, signal);
-    case "upsertMarkdown":
-      return upsertMarkdown(db, p.path, p.markdown, p.expectedContentId, p.size, p.overlap, signal);
-    case "renameNote":
-      return db.renameNote(p.from, p.to, p.contentId);
-    case "deleteNote":
-      return db.deleteNote(p.path, p.contentId);
+    case "upsertLexicalRevision":
+      return upsertLexicalMarkdown(
+        db,
+        p.path,
+        p.markdown,
+        p.expectedRevisionDigest,
+        p.size,
+        signal
+      );
+    case "beginLexicalRun":
+      return db.beginLexicalRun({
+        runId: p.runId,
+        summaries: p.summaries ?? p.manifest,
+        expectedChangeCounter: p.expectedChangeCounter,
+        scope: p.scope,
+      });
+    case "applyLexicalBatch":
+      return applyLexicalMarkdownBatch(db, p.runId, p.notes ?? p.markdown ?? [], signal);
+    case "finishLexicalRun":
+      return db.finishLexicalRun(p.runId);
+    case "abortLexicalRun":
+      return db.abortLexicalRun(p.runId);
+    case "listLexicalSummaries":
+      return db.listLexicalSummaries();
+    case "prepareSemanticWork":
+      return db.prepareSemanticWork(
+        p.embeddingFingerprint,
+        p.preprocessing,
+        p.limit,
+        p.maxInputBytes,
+        p.promoteUnrestricted
+      );
+    case "commitSemanticResults":
+      return db.commitSemanticResults(p.results, p.embeddingFingerprint, p.preprocessing);
+    case "listMissingEmbeddingInputs":
+      return db.listMissingEmbeddingInputs(p.embeddingFingerprint, p.preprocessing, p.limit);
+    case "storeEmbeddingResults":
+      return db.storeEmbeddingResults(p.results, p.embeddingFingerprint, p.preprocessing);
+    case "promoteSemanticHeads":
+      return db.promoteSemanticHeads(p.embeddingFingerprint, p.preprocessing);
+    case "clearSemanticCache":
+      return db.clearSemanticCache();
+    case "renameLexicalNote":
+      return db.renameLexicalNote(p.from, p.to);
+    case "deleteLexicalNote":
+      return db.deleteLexicalNote(p.path);
     case "finishReconciliation":
       return db.finishReconciliation(p.summaries, p.observedChangeCounter);
-    case "listMissingVectors":
-      return db.listMissingVectors(p.embeddingFingerprint, p.limit, p.afterChunkPk);
-    case "storeVectors":
-      return db.storeVectors(p.vectors, p.embeddingFingerprint, p.observedChangeCounter);
+    case "finishScopedReconciliation":
+      return db.finishScopedReconciliation(p.observedChangeCounter, p.mayClearIncomplete);
     case "retrieve":
       return db.retrieve(p.query, p.vector, p.limit, p.currentPath, p);
     case "findRelated":
@@ -358,6 +576,10 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
 (self as unknown as { onmessage: (event: MessageEvent) => void }).onmessage = ({
   data,
 }: MessageEvent) => {
+  if (data?.type === "trama-runtime-handshake") {
+    post({ type: "trama-runtime-handshake", id: data.id, buildId: TRAMA_RUNTIME_BUILD_ID } as any);
+    return;
+  }
   let request: SqliteRequest;
   try {
     validateRequest(data);
@@ -365,8 +587,12 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
   } catch (error) {
     const safe =
       error instanceof Error && "error" in error
-        ? (error as any).error
-        : { code: "invalid_request", message: "Invalid request", retryable: false };
+        ? workerFailureReply(error, data?.method, "validation")
+        : workerFailureReply(
+            sqliteError("invalid_request", "Invalid request"),
+            data?.method,
+            "validation"
+          );
     post({ v: SQLITE_PROTOCOL_VERSION, id: Number(data?.id) || 0, ok: false, error: safe });
     return;
   }
@@ -411,10 +637,7 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
       },
       (error) => {
         if (isMaintenance) maintenance = false;
-        const safe =
-          error && typeof error === "object" && "error" in error
-            ? (error as any).error
-            : { code: "internal", message: "SQLite request failed", retryable: false };
+        const safe = workerFailureReply(error, request.method, "execute");
         post({ v: SQLITE_PROTOCOL_VERSION, id: request.id, ok: false, error: safe });
       }
     );

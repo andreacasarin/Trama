@@ -22,10 +22,23 @@ export const semanticIndex: IndexChannel = {
   status(state, available, updating) {
     const activity = updating ? "updating" : "idle";
     if (!available || !state) return { state: "unavailable", activity, searchable: false };
-    if (state.vectorCount === 0) return { state: "empty", activity, searchable: false };
-    if (state.compatibleVectorCount === 0)
+    if (state.semanticEligibleCount === undefined) {
+      if (state.vectorCount === 0) return { state: "empty", activity, searchable: false };
+      if (state.compatibleVectorCount === 0)
+        return { state: "incompatible", activity, searchable: false };
+      if (state.incomplete || state.vectorCoverage === "partial")
+        return { state: "partial", activity, searchable: true };
+      return state.semanticReady
+        ? { state: "ready", activity, searchable: true }
+        : { state: "partial", activity, searchable: false };
+    }
+    const eligible = state.semanticEligibleCount ?? state.noteCount;
+    const heads = state.semanticHeadCount ?? (state.semanticReady ? eligible : 0);
+    const missing = state.semanticMissingCount ?? 0;
+    if (eligible === 0) return { state: "empty", activity, searchable: false };
+    if (heads === 0 && (state.compatibleVectorCount === 0 || missing >= eligible))
       return { state: "incompatible", activity, searchable: false };
-    if (state.incomplete || state.vectorCoverage === "partial")
+    if (state.incomplete || state.semanticLagCount !== 0 || missing > 0 || heads < eligible)
       return { state: "partial", activity, searchable: true };
     return state.semanticReady
       ? { state: "ready", activity, searchable: true }

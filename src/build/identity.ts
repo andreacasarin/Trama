@@ -6,9 +6,11 @@
  * accidentally.
  */
 export const SQLITE_BUILD_IDENTITY =
-  "trama-sqlite-schema-5-protocol-4-fts5-vector-float32-cosine-opfs-sah-v1" as const;
+  "trama-sqlite-schema-8-protocol-8-heads-fts5-vector-float32-cosine-opfs-sah-v1" as const;
 
-export const SQLITE_SCHEMA_IDENTITY = "trama-sqlite-schema-5" as const;
+export const SQLITE_SCHEMA_IDENTITY = "trama-sqlite-schema-8" as const;
+
+export { TRAMA_RUNTIME_BUILD_ID } from "./runtime";
 
 export function sqliteBuildIdentity(): string {
   return SQLITE_BUILD_IDENTITY;

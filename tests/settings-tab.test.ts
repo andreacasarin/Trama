@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import {
+  formatAutomaticDelay,
   projectSettingsWithDraft,
   validateChatDraft,
   type SettingsDraft,
@@ -17,6 +18,9 @@ const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   lenteSearchMethod: "hybrid",
   lenteMaxResults: 20,
   lenteAutomaticSearchDelayMs: 0,
+  filoAutomaticLexicalDelayMs: DEFAULT_SETTINGS.filo.automaticLexicalDelayMs,
+  filoAutomaticSemanticDelayMs: DEFAULT_SETTINGS.filo.automaticSemanticDelayMs,
+  filoAutomaticPublicationDelayMs: DEFAULT_SETTINGS.filo.automaticPublicationDelayMs,
   filoExcludedPaths: [],
   ...overrides,
 });
@@ -32,6 +36,9 @@ describe("settings projection", () => {
         embeddingModelId: "embed-v2",
         lenteSearchMethod: "keyword",
         lenteMaxResults: 35,
+        filoAutomaticLexicalDelayMs: 1250,
+        filoAutomaticSemanticDelayMs: 2000,
+        filoAutomaticPublicationDelayMs: 25000,
         filoExcludedPaths: [" ./Projects\\Private/ "],
       })
     );
@@ -41,8 +48,20 @@ describe("settings projection", () => {
       chat: { endpoint: "http://127.0.0.1:5678/v1", modelId: "chat-v2" },
       embedding: { endpoint: "http://127.0.0.1:4321/v1", modelId: "embed-v2" },
       lente: { searchMethod: "keyword", maxResults: 35 },
-      filo: { automaticUpdates: false, excludedPaths: ["Projects/Private"] },
+      filo: {
+        automaticLexicalDelayMs: 1250,
+        automaticSemanticDelayMs: 2000,
+        automaticPublicationDelayMs: 25000,
+        excludedPaths: ["Projects/Private"],
+      },
     });
+  });
+
+  it("formats automatic delays as Off or readable seconds", () => {
+    expect(formatAutomaticDelay(0)).toBe("Off");
+    expect(formatAutomaticDelay(250)).toBe("0.25 sec");
+    expect(formatAutomaticDelay(1500)).toBe("1.5 sec");
+    expect(formatAutomaticDelay(2000)).toBe("2 sec");
   });
 
   it.each([

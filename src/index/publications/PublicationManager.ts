@@ -10,14 +10,21 @@ import { PublicationStore, type PublicationDataAdapter } from "./PublicationStor
 export interface PublicationIndexPort {
   publishPublication<T>(
     publicationId: string,
-    install: (prepared: PublicationPrepared) => Promise<T>,
+    install: (
+      prepared: PublicationPrepared,
+      inspect?: (bytes: ArrayBuffer, transferOwnership?: boolean) => Promise<PublicationInspection>
+    ) => Promise<T>,
     settle?: (committed: boolean) => Promise<void>
   ): Promise<{ prepared: PublicationPrepared; installed: T }>;
   inspectPublication(
     bytes: ArrayBuffer,
     transferOwnership?: boolean
   ): Promise<PublicationInspection>;
-  adoptPublication(bytes: ArrayBuffer, expectedPublicationId?: string): Promise<SqliteState>;
+  adoptPublication(
+    bytes: ArrayBuffer,
+    expectedPublicationId?: string,
+    inspection?: PublicationInspection
+  ): Promise<SqliteState>;
   getState?(): Promise<SqliteState | undefined>;
   capabilities?(): IndexCapabilities;
 }
@@ -59,6 +66,7 @@ export interface PublicationManagerOptions {
   readonly idFactory?: () => string;
   readonly onWarning?: (warning: PublicationWarning) => void;
   readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
+  readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
   readonly debounceMs?: number;
 }
 
@@ -73,13 +81,19 @@ export class PublicationManager {
   private readonly idFactory: () => string;
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
+  private readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
   private readonly debounceMs: number;
   private queue: Promise<unknown> = Promise.resolve();
   private eventPending = false;
   private eventTimer?: ReturnType<typeof setTimeout>;
   private eventPromise?: Promise<AdoptionResult>;
+  private eventRetryDelay?: number;
+  private inboundEventsStopped = false;
+  private disposed = false;
   private lastWarning?: PublicationWarning;
   private lastMetrics?: PublicationResourceMetrics;
+  private lastPublishedVisibilityGeneration?: string;
+  private activeOperations = 0;
 
   readonly store: PublicationStore;
 
@@ -98,6 +112,7 @@ export class PublicationManager {
     this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
+    this.onEventAdopted = options.onEventAdopted;
     this.debounceMs = Math.max(0, options.debounceMs ?? 0);
   }
 
@@ -109,10 +124,22 @@ export class PublicationManager {
     return this.lastMetrics;
   }
 
+  get isBusy(): boolean {
+    return this.activeOperations > 0;
+  }
+
   /** Publish after a converged Build, Update, Rebuild, or semantic Prepare. */
   async publishAfterSuccessfulOperation(result: SuccessfulOperation): Promise<PublicationResult> {
-    if (!isPublishableOperation(result) || !result.converged) return { published: false };
-    return this.publish();
+    if (!isPublishableOperation(result) || !result.converged || !result.changed)
+      return { published: false };
+    const generation = visibleGeneration(result.state);
+    if (generation && generation === this.lastPublishedVisibilityGeneration)
+      return { published: false };
+    return this.serialize(async () => {
+      if (generation && generation === this.lastPublishedVisibilityGeneration)
+        return { published: false };
+      return this.publishSerialized();
+    });
   }
 
   async publish(): Promise<PublicationResult> {
@@ -126,17 +153,9 @@ export class PublicationManager {
 
   /** Coalesce duplicate/out-of-order vault events for the exact target only. */
   notifyFileEvent(path = this.store.path): void {
-    if (path !== this.store.path) return;
+    if (this.disposed || this.inboundEventsStopped || path !== this.store.path) return;
     this.eventPending = true;
-    if (this.eventTimer) return;
-    this.eventTimer = setTimeout(() => {
-      this.eventTimer = undefined;
-      if (!this.eventPending) return;
-      this.eventPending = false;
-      this.eventPromise = this.adoptCurrent().finally(() => {
-        this.eventPromise = undefined;
-      });
-    }, this.debounceMs);
+    this.scheduleEventAttempt(this.debounceMs);
   }
 
   async flushPendingEvents(): Promise<AdoptionResult | undefined> {
@@ -144,13 +163,23 @@ export class PublicationManager {
       clearTimeout(this.eventTimer);
       this.eventTimer = undefined;
     }
-    if (this.eventPending) {
-      this.eventPending = false;
-      this.eventPromise = this.adoptCurrent().finally(() => {
-        this.eventPromise = undefined;
-      });
-    }
+    if (this.eventPending && !this.eventPromise) this.startEventAttempt();
     return this.eventPromise;
+  }
+
+  /** Stop accepting vault notifications while an accepted operation may finish. */
+  stopInboundEvents(): void {
+    this.inboundEventsStopped = true;
+    this.eventPending = false;
+    this.eventRetryDelay = undefined;
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+  }
+
+  /** Stop inbound notifications and prevent late event callbacks after disposal. */
+  dispose(): void {
+    this.stopInboundEvents();
+    this.disposed = true;
   }
 
   private async publishSerialized(): Promise<PublicationResult> {
@@ -161,14 +190,17 @@ export class PublicationManager {
     try {
       const { prepared, installed } = await this.index.publishPublication(
         id,
-        async (candidate) => {
+        async (candidate, inspect) => {
           phase = "stage";
           const stageStarted = Date.now();
           const staged = await this.store.stage(candidate.bytes, id);
           const stageDurationMs = Date.now() - stageStarted;
           try {
             phase = "inspect";
-            const inspection = await this.index.inspectPublication(staged.bytes, true);
+            const inspection = await (inspect ?? this.index.inspectPublication.bind(this.index))(
+              staged.bytes,
+              true
+            );
             if (inspection.publicationId !== id)
               throw new StructuredError("internal", "Publication ID changed in staged copy.", true);
             phase = "replace";
@@ -197,6 +229,7 @@ export class PublicationManager {
       };
       this.lastWarning = undefined;
       this.lastMetrics = metrics;
+      this.lastPublishedVisibilityGeneration = visibleGeneration(prepared.state);
       try {
         this.onMetrics?.(metrics);
       } catch {
@@ -235,7 +268,7 @@ export class PublicationManager {
     if (current === inspection.publicationId)
       return { adopted: false, ignored: "same-id", publicationId: current };
     try {
-      const state = await this.index.adoptPublication(bytes, inspection.publicationId);
+      const state = await this.index.adoptPublication(bytes, inspection.publicationId, inspection);
       // An adopted candidate is authoritative as loaded data. Never call
       // publishAfterSuccessfulOperation or reconcile here.
       return { adopted: true, publicationId: inspection.publicationId, state };
@@ -246,6 +279,67 @@ export class PublicationManager {
         warning: this.warn("adopt", error),
       };
     }
+  }
+
+  private scheduleEventAttempt(delayMs: number): void {
+    if (
+      this.disposed ||
+      this.inboundEventsStopped ||
+      !this.eventPending ||
+      this.eventTimer ||
+      this.eventPromise
+    )
+      return;
+    this.eventTimer = setTimeout(
+      () => {
+        this.eventTimer = undefined;
+        this.startEventAttempt();
+      },
+      Math.max(1, delayMs)
+    );
+  }
+
+  private startEventAttempt(): void {
+    if (this.disposed || this.inboundEventsStopped || !this.eventPending || this.eventPromise)
+      return;
+    // Keep inbound events out of an in-flight publication/adoption. A nonzero
+    // retry delay prevents a busy event from spinning the event loop.
+    if (this.activeOperations > 0) {
+      this.scheduleEventAttempt(EVENT_RETRY_MS);
+      return;
+    }
+    this.eventPending = false;
+    const attempt = this.adoptCurrent();
+    this.eventPromise = attempt
+      .then(async (result) => {
+        if (result.warning?.retryable && !this.disposed && !this.inboundEventsStopped) {
+          this.eventPending = true;
+          this.eventRetryDelay = EVENT_RETRY_MS;
+        } else if (result.adopted && !this.disposed) {
+          try {
+            await this.onEventAdopted?.(result);
+          } catch {
+            // UI refresh is observational and cannot change adoption semantics.
+          }
+        }
+        if (this.eventPending) this.scheduleEventAttempt(this.debounceMs);
+        return result;
+      })
+      .catch((error) => {
+        if (isRetryable(error) && !this.disposed && !this.inboundEventsStopped) {
+          this.eventPending = true;
+          this.eventRetryDelay = EVENT_RETRY_MS;
+        }
+        throw error;
+      })
+      .finally(() => {
+        this.eventPromise = undefined;
+        if (this.eventPending) {
+          const delay = this.eventRetryDelay ?? this.debounceMs;
+          this.eventRetryDelay = undefined;
+          this.scheduleEventAttempt(delay);
+        }
+      });
   }
 
   private async currentPublicationId(): Promise<string | undefined> {
@@ -276,7 +370,15 @@ export class PublicationManager {
   }
 
   private async serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(operation, operation);
+    const run = async () => {
+      this.activeOperations++;
+      try {
+        return await operation();
+      } finally {
+        this.activeOperations--;
+      }
+    };
+    const next = this.queue.then(run, run);
     this.queue = next.then(
       () => undefined,
       () => undefined
@@ -294,6 +396,12 @@ function isPublishableOperation(result: SuccessfulOperation): boolean {
   );
 }
 
+function visibleGeneration(state: SqliteState): string | undefined {
+  if (state.lexicalGeneration !== undefined && state.semanticGeneration !== undefined)
+    return `${state.lexicalGeneration}:${state.semanticGeneration}`;
+  return Number.isFinite(state.changeCounter) ? `change:${state.changeCounter}` : undefined;
+}
+
 function isRetryable(error: unknown): boolean {
   return typeof error === "object" && error !== null && "retryable" in error
     ? (error as { retryable?: unknown }).retryable !== false
@@ -307,3 +415,5 @@ function randomPublicationId(): string {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 }
+
+const EVENT_RETRY_MS = 25;

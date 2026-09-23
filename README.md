@@ -194,10 +194,13 @@ through the production chunker. Results are written to the ignored
 npm run benchmark
 ```
 
-The single 10,000-chunk Trama workload reports lexical rebuild, semantic preparation,
-unchanged-update time, mutation timings, search latency, process RSS delta, package
-bytes, deterministic feature-path results, and publication byte/copy metrics. Metrics
-unavailable to the in-memory Node
+The command defaults to the `trama-small` profile. Select the larger deterministic
+profiles with `TRAMA_BENCHMARK_PROFILE=trama-10k npm run benchmark` or
+`TRAMA_BENCHMARK_PROFILE=trama-large npm run benchmark`. Each profile reports lexical
+rebuild, semantic preparation, unchanged-update time, mutation timings, search latency,
+observed process RSS, package bytes, deterministic feature-path results, and publication
+byte/copy metrics. Complete evidence is written to
+`.artifacts/trama-benchmark/<profile>.json`. Metrics unavailable to the in-memory Node
 harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
 CI renders the metrics as a GitHub Actions job summary and retains the complete JSON
 report as a downloadable workflow artifact.

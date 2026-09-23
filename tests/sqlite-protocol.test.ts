@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { SQLITE_PROTOCOL_VERSION, validateRequest, sqliteError } from "@/index/sqlite/protocol";
+import {
+  SQLITE_MAX_MARKDOWN,
+  SQLITE_PROTOCOL_VERSION,
+  validateRequest,
+  sqliteError,
+} from "@/index/sqlite/protocol";
+import { deriveNoteContentId } from "@/index/Identity";
+import { createTestSqliteClient, malformedSchema7Snapshot } from "./sqlite-test-client";
 
 const hash = "a".repeat(64);
 
@@ -14,26 +21,39 @@ describe("SQLite protocol", () => {
     expect(() =>
       validateRequest(envelope("hashMarkdown", { markdown: "alpha", corpusFingerprint: hash }))
     ).not.toThrow();
-    expect(() => validateRequest(envelope("clearVectors", {}))).not.toThrow();
+    expect(() =>
+      validateRequest(envelope("boot", { corpusFingerprint: hash, dimensions: 2 }))
+    ).not.toThrow();
     expect(() =>
       validateRequest(
-        envelope("upsertMarkdown", {
+        envelope("boot", { corpusFingerprint: hash, dimensions: 2, identity: "c".repeat(64) })
+      )
+    ).not.toThrow();
+    for (const identity of [null, {}, "not-a-hash"])
+      expect(() =>
+        validateRequest(envelope("boot", { corpusFingerprint: hash, dimensions: 2, identity }))
+      ).toThrow();
+    expect(() => validateRequest(envelope("clearSemanticCache", {}))).not.toThrow();
+    expect(() =>
+      validateRequest(envelope("promoteSemanticHeads", { embeddingFingerprint: hash }))
+    ).not.toThrow();
+    expect(() =>
+      validateRequest(
+        envelope("upsertLexicalRevision", {
           path: "note.md",
           markdown: "alpha",
-          expectedContentId: hash,
+          expectedRevisionDigest: hash,
           size: 384,
-          overlap: 64,
         })
       )
     ).not.toThrow();
     expect(() =>
       validateRequest(
-        envelope("upsertMarkdown", {
+        envelope("upsertLexicalRevision", {
           path: "note.md",
           markdown: "alpha",
-          expectedContentId: hash,
-          size: 384,
-          overlap: 384,
+          expectedRevisionDigest: hash,
+          size: 2_000_001,
         })
       )
     ).toThrow();
@@ -45,7 +65,7 @@ describe("SQLite protocol", () => {
       validateRequest({
         v: SQLITE_PROTOCOL_VERSION,
         id: 1,
-        method: "deleteNote",
+        method: "deleteLexicalNote",
         payload: { path: "../secret.md" },
       })
     ).toThrow();
@@ -75,4 +95,137 @@ describe("SQLite protocol", () => {
       retryable: false,
     });
   });
+
+  it("boots a fresh Worker boundary and can immediately read status", async () => {
+    const client = createTestSqliteClient({ freshStatusBoundary: true });
+    await expect(
+      client.call("boot", {
+        corpusFingerprint: hash,
+        embeddingFingerprint: "b".repeat(64),
+        dimensions: 2,
+      })
+    ).resolves.toMatchObject({ schemaVersion: 8, protocolVersion: SQLITE_PROTOCOL_VERSION });
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      schemaVersion: 8,
+      protocolVersion: SQLITE_PROTOCOL_VERSION,
+    });
+  });
+
+  it("returns canonical hash output through the Worker client boundary", async () => {
+    const client = createTestSqliteClient({ hashBoundary: true });
+    const corpusFingerprint = hash;
+    const markdown = "---\ntitle: 😀\n---\n\nUnicode café";
+    const expected = await deriveNoteContentId(corpusFingerprint, markdown);
+    await expect(client.call("hashMarkdown", { markdown, corpusFingerprint })).resolves.toBe(
+      expected
+    );
+  });
+
+  it("returns cloneable state after an incompatible second boot", async () => {
+    const client = createTestSqliteClient({ secondBootBoundary: true });
+    await client.call("boot", { corpusFingerprint: hash, dimensions: 2 });
+    await expect(
+      client.call("boot", { corpusFingerprint: hash, dimensions: 3 })
+    ).resolves.toMatchObject({ schemaVersion: 8, dimensions: 3, noteCount: 0 });
+  });
+
+  it("rejects the bounded protocol Markdown size before Worker dispatch", () => {
+    expect(() =>
+      validateRequest({
+        v: SQLITE_PROTOCOL_VERSION,
+        id: 1,
+        method: "hashMarkdown",
+        payload: { markdown: "x".repeat(SQLITE_MAX_MARKDOWN + 1), corpusFingerprint: hash },
+      })
+    ).toThrow("Invalid Markdown hash payload");
+  });
+
+  for (const defect of ["missing-vector", "wrong-fts", "wrong-index"] as const)
+    it(`resets a schema-7 database with ${defect}`, async () => {
+      const client = createTestSqliteClient(
+        { schemaDefectBoundary: defect },
+        { snapshot: await malformedSchema7Snapshot(defect) }
+      );
+      await expect(
+        client.call("boot", {
+          corpusFingerprint: hash,
+          embeddingFingerprint: "b".repeat(64),
+          dimensions: 2,
+        })
+      ).resolves.toMatchObject({ schemaVersion: 8, noteCount: 0 });
+      await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 0 });
+    });
+
+  it("preserves valid V7 note/head/cache data on reopen", async () => {
+    const client = createTestSqliteClient({ validReopenBoundary: true });
+    const corpusFingerprint = hash;
+    const embeddingFingerprint = "b".repeat(64);
+    await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
+    const markdown = "sentinel";
+    const digest = await client.call("hashMarkdown", { markdown, corpusFingerprint });
+    await client.call("upsertLexicalRevision", {
+      path: "sentinel.md",
+      markdown,
+      expectedRevisionDigest: digest,
+      size: 100,
+    });
+    const request = (
+      await client.call("listMissingEmbeddingInputs", { embeddingFingerprint, limit: 4 })
+    )[0];
+    await client.call("storeEmbeddingResults", {
+      embeddingFingerprint,
+      results: [{ ...request, vector: new Float32Array([1, 0]) }],
+    });
+    await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      noteCount: 1,
+      semanticHeadCount: 1,
+    });
+  });
+
+  it("does not let inspection metadata authorize different adoption bytes", async () => {
+    const corpusFingerprint = hash;
+    const embeddingFingerprint = "b".repeat(64);
+    const prepare = async (identity: object, publicationId: string) => {
+      const client = createTestSqliteClient(identity);
+      await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
+      const markdown = "This publication contains enough text to create a valid lexical block.";
+      const digest = await client.call("hashMarkdown", { markdown, corpusFingerprint });
+      await client.call("upsertLexicalRevision", {
+        path: `${publicationId}.md`,
+        markdown,
+        expectedRevisionDigest: digest,
+        size: markdown.length,
+      });
+      return {
+        client,
+        prepared: (await client.call("preparePublication", { publicationId })) as {
+          bytes: ArrayBuffer;
+        },
+      };
+    };
+    const sourceA = await prepare({}, "publication-a");
+    const sourceB = await prepare({}, "publication-b");
+    const inspectionA = await sourceA.client.call("inspectPublication", {
+      bytes: sourceA.prepared.bytes,
+      corpusFingerprint,
+      embeddingFingerprint,
+      dimensions: 2,
+    });
+    const receiver = createTestSqliteClient({ receiver: true });
+    await receiver.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
+    const before = await receiver.call("getState", {});
+
+    await expect(
+      receiver.call("adoptPublication", {
+        bytes: sourceB.prepared.bytes,
+        expectedPublicationId: "publication-a",
+        inspection: inspectionA,
+        corpusFingerprint,
+        embeddingFingerprint,
+        dimensions: 2,
+      })
+    ).rejects.toMatchObject({ error: { code: "incompatible_state" } });
+    expect(await receiver.call("getState", {})).toEqual(before);
+  }, 30_000);
 });

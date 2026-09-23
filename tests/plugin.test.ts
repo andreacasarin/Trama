@@ -81,7 +81,9 @@ describe("TramaPlugin module", () => {
         try {
           expect(plugin.createSqliteWorker(app)).toBe(worker);
           expect(globalThis.Worker).toHaveBeenCalledWith(
-            "app://local/.obsidian/plugins/trama/sqlite-worker.mjs",
+            expect.stringMatching(
+              /^app:\/\/local\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=8&nonce=.+$/
+            ),
             { type: "module" }
           );
         } finally {

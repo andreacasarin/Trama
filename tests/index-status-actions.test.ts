@@ -3,10 +3,12 @@ import { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 describe("lexical and semantic index actions", () => {
-  it("exposes explicit palette commands for both rebuild channels", async () => {
-    const commands: { id: string; name: string }[] = [];
+  it("exposes explicit update, rebuild, and publication commands", async () => {
+    const commands: { id: string; name: string; callback?: () => void }[] = [];
     const rebuildSemantic = vi.fn(async () => undefined);
     const rebuildBoth = vi.fn(async () => undefined);
+    const forceUpdate = vi.fn(async () => undefined);
+    const publishNow = vi.fn(async () => undefined);
     const status = new IndexStatusController(
       { addCommand: (command: { id: string; name: string }) => commands.push(command) } as any,
       {
@@ -15,6 +17,8 @@ describe("lexical and semantic index actions", () => {
         prepare: async () => undefined,
         rebuildSemantic,
         rebuildBoth,
+        forceUpdate,
+        publishNow,
         cancel: () => undefined,
       }
     );
@@ -27,12 +31,18 @@ describe("lexical and semantic index actions", () => {
       "Update semantic index",
       "Rebuild semantic index",
       "Rebuild lexical and semantic indexes",
+      "Update lexical and semantic indexes now",
+      "Publish index now",
       "Cancel lexical or semantic indexing",
     ]);
     await status.run("rebuild-semantic");
     await status.run("rebuild-both");
+    await status.run("force-update");
+    commands.find(({ id }) => id === "publish-index-now")?.callback?.();
     expect(rebuildSemantic).toHaveBeenCalledOnce();
     expect(rebuildBoth).toHaveBeenCalledOnce();
+    expect(forceUpdate).toHaveBeenCalledOnce();
+    expect(publishNow).toHaveBeenCalledOnce();
   });
 
   it("retains lexical ETA when chunk and write progress alternate", () => {
@@ -123,5 +133,55 @@ describe("lexical and semantic index actions", () => {
       canIndex: true,
     });
     expect(events).toContainEqual(expect.objectContaining({ stage: "user-completed" }));
+  });
+
+  it("keeps technical failure details in diagnostics and out of the status UI", async () => {
+    const events: TramaDiagnosticRecord[] = [];
+    const status = new IndexStatusController(
+      {} as any,
+      {
+        index: async () => {
+          throw Object.assign(new Error("no such column: f while opening note.md"), {
+            code: "internal",
+            retryable: true,
+          });
+        },
+        reindex: async () => undefined,
+        cancel: () => undefined,
+      },
+      { emit: (event) => events.push(event) }
+    );
+    status.setReady();
+    await status.run("index");
+    expect(status.getStatus().message).toBe("Unable to build the lexical index.");
+    expect(status.getStatus().message).not.toContain("no such column");
+    const failure = events.find(
+      (event) =>
+        event.area === "index" && event.event === "index_operation" && event.stage === "failed"
+    );
+    expect(failure).toMatchObject({
+      operation: "incremental",
+      error: { code: "internal", message: "no such column: f while opening <note>" },
+    });
+  });
+
+  it("shares one external lease and settles cancelling only when it is released", async () => {
+    const cancel = vi.fn();
+    const status = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel,
+    });
+    status.setReady();
+    const lease = status.acquireExternalLease("lexical");
+
+    expect(lease).toBeDefined();
+    expect(status.getStatus()).toMatchObject({ kind: "updating", canCancel: true });
+    await expect(status.run("index")).resolves.toBeUndefined();
+    status.cancel();
+    expect(status.getStatus().kind).toBe("cancelling");
+    expect(cancel).toHaveBeenCalledOnce();
+    lease!.release();
+    expect(status.getStatus()).toMatchObject({ kind: "cancelled", canIndex: true });
   });
 });

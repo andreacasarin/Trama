@@ -18,23 +18,32 @@ import {
   compareCodeUnits,
   corpusIdentityInput,
   embeddingIdentityInput,
+  EMBEDDING_PREPROCESSING_VERSION,
+  deriveNoteContentId,
   indexIdentity,
   isPathExcluded,
   normalizeEmbeddingEndpoint,
   normalizeVaultPath,
   sha256Hex,
 } from "@/index/Identity";
-import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
+import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
 import { SqliteWorkerClient, type SqliteWorkerLike } from "@/index/sqlite/client";
 import {
   SQLITE_SNAPSHOT_MAX_BYTES,
+  SQLITE_PROTOCOL_VERSION,
+  SQLITE_MAX_SEMANTIC_BATCH_ITEMS,
+  SQLITE_MAX_SEMANTIC_INPUT_BYTES,
+  SQLITE_MAX_SEMANTIC_VECTOR_BYTES,
   sqliteError,
   type SqliteHit,
   type SqliteState,
   type SqliteNoteSummary,
   type SqliteReconciliationPlan,
+  type SqliteLexicalBatchNoteInput,
+  type SqliteLexicalRunResult,
   type SqliteMutationResult,
-  type MissingVector,
+  type SqliteSemanticWorkBatch,
+  type SqliteSemanticCommitResult,
   type PublicationInspection,
   type PublicationPrepared,
 } from "@/index/sqlite/protocol";
@@ -99,9 +108,17 @@ export interface RelatedIndexState {
   readonly freshness?: IndexFreshness;
   readonly publicationId?: string;
 }
-interface FullIndexPlan {
+interface IndexJournalSnapshot {
+  readonly changes: readonly IndexPathMutation[];
+  readonly fullRecovery: boolean;
+  readonly revision: number;
+}
+
+interface LexicalSnapshot {
   readonly paths: readonly string[];
-  readonly estimatedTexts?: number;
+  readonly summaries: readonly SqliteNoteSummary[];
+  readonly documents: ReadonlyMap<string, IndexVaultDocument>;
+  readonly revision: number;
 }
 export interface SnapshotDataAdapter {
   exists?(path: string): Promise<boolean>;
@@ -115,6 +132,10 @@ export interface IndexSyncResult {
   readonly changed: boolean;
   readonly converged: boolean;
 }
+export type IndexPathMutation =
+  | { readonly type: "upsert"; readonly path: string }
+  | { readonly type: "delete"; readonly path: string }
+  | { readonly type: "rename"; readonly from: string; readonly to: string };
 export type IndexOperationName = "build" | "update" | "rebuild" | "prepare";
 export interface IndexOperationResult {
   readonly operation: IndexOperationName;
@@ -126,6 +147,10 @@ export interface SemanticPrepareResult extends IndexOperationResult {
   readonly stored: number;
   readonly skipped: number;
 }
+export type PublicationInspector = (
+  bytes: ArrayBuffer,
+  transferOwnership?: boolean
+) => Promise<PublicationInspection>;
 
 export function createIndexFingerprint(
   embeddingBaseUrl: string,
@@ -165,20 +190,55 @@ export function createIndexFingerprint(
 function normalizePath(path: string): string {
   return normalizeVaultPath(path);
 }
+function coalescePathMutation(changes: IndexPathMutation[], mutation: IndexPathMutation): void {
+  const previous = changes[changes.length - 1];
+  if (mutation.type === "rename") {
+    if (previous?.type === "rename" && previous.to === mutation.from) {
+      changes[changes.length - 1] = { type: "rename", from: previous.from, to: mutation.to };
+      return;
+    }
+    if (previous?.type === "upsert" && previous.path === mutation.from) {
+      changes[changes.length - 1] = { type: "delete", path: mutation.from };
+      changes.push({ type: "upsert", path: mutation.to });
+      return;
+    }
+    if (previous?.type === "delete" && previous.path === mutation.from) {
+      changes.push({ type: "upsert", path: mutation.to });
+      return;
+    }
+    changes.push(mutation);
+    return;
+  }
+  const path = mutation.path;
+  if (mutation.type === "upsert") {
+    if (previous?.type === "upsert" && previous.path === path) return;
+    if (previous?.type === "delete" && previous.path === path) {
+      changes[changes.length - 1] = mutation;
+      return;
+    }
+    changes.push(mutation);
+    return;
+  }
+  if (previous?.type === "delete" && previous.path === path) return;
+  if (previous?.type === "rename" && previous.to === path) {
+    changes[changes.length - 1] = { type: "delete", path: previous.from };
+    return;
+  }
+  if (previous?.type === "upsert" && previous.path === path) {
+    changes[changes.length - 1] = mutation;
+    return;
+  }
+  changes.push(mutation);
+}
 function check(signal: AbortSignal): void {
   if (signal.aborted) throw new StructuredError("cancelled", "Index operation cancelled.", true);
-}
-function sameSummaries(a: readonly SqliteNoteSummary[], b: readonly SqliteNoteSummary[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let index = 0; index < a.length; index++)
-    if (a[index].path !== b[index].path || a[index].contentId !== b[index].contentId) return false;
-  return true;
 }
 export class IndexManager implements VaultRetrievalPort {
   private client?: SqliteWorkerClient;
   private state?: SqliteState;
   private loaded = false;
   private unavailable = false;
+  private loadError?: unknown;
   private building = false;
   private maintenance = false;
   private maintenanceFinished?: Promise<void>;
@@ -189,6 +249,8 @@ export class IndexManager implements VaultRetrievalPort {
   private buildPromise?: Promise<void>;
   private revision = 0;
   private reconciledRevision = 0;
+  private readonly changeJournal: IndexPathMutation[] = [];
+  private fullRecoveryRequested = false;
   private readonly onProgress?: (progress: IndexProgress) => void;
   private readonly workerFactory?: () => SqliteWorkerLike;
   private readonly worker?: SqliteWorkerLike;
@@ -346,6 +408,20 @@ export class IndexManager implements VaultRetrievalPort {
         phase: "boot",
       });
     try {
+      const actualBuildId = await this.ensureClient().handshake(TRAMA_RUNTIME_BUILD_ID);
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation: "startup",
+        stage: "completed",
+        phase: "handshake",
+        runtime: {
+          expectedBuildId: TRAMA_RUNTIME_BUILD_ID,
+          actualBuildId,
+          protocolVersion: SQLITE_PROTOCOL_VERSION,
+          schemaVersion: INDEX_SCHEMA_VERSION,
+        },
+      });
       const sqliteIdentity = await (this.options.sqliteIdentity ?? "default-vault");
       const state = (await this.ensureClient().call("boot", {
         corpusFingerprint: await this.corpusFingerprintId(),
@@ -361,6 +437,7 @@ export class IndexManager implements VaultRetrievalPort {
           ? "unknown"
           : "locally-reconciled";
       this.unavailable = false;
+      this.loadError = undefined;
       if (observable)
         this.emit({
           area: "index",
@@ -375,6 +452,7 @@ export class IndexManager implements VaultRetrievalPort {
       return true;
     } catch (error) {
       this.unavailable = true;
+      this.loadError = error;
       if (observable)
         this.emit({
           area: "index",
@@ -411,93 +489,15 @@ export class IndexManager implements VaultRetrievalPort {
     this.building = true;
     const started = Date.now();
     try {
-      if (!this.loaded) await this.load();
-      const plan = await this.planFullIndex(signal);
-      this.setState((await this.ensureClient().call("beginRebuild", {}, signal)) as SqliteState);
-      this.reportProgress({
-        operation: "full",
-        phase: "discover",
-        completed: plan.paths.length,
-        total: plan.paths.length,
-        unit: "paths",
-        determinate: true,
-      });
-      this.reportProgress({
-        operation: "full",
-        phase: "read",
-        completed: plan.paths.length,
-        total: plan.paths.length,
-        unit: "notes",
-        determinate: true,
-        estimated: true,
-      });
-      this.reportProgress({
-        operation: "full",
-        phase: "chunk",
-        completed: 0,
-        ...(plan.estimatedTexts === undefined ? {} : { total: plan.estimatedTexts }),
-        unit: "texts",
-        determinate: plan.estimatedTexts !== undefined,
-        estimated: plan.estimatedTexts !== undefined,
-      });
-      let encoded = 0;
-      let chunked = 0;
-      for await (const note of this.noteInputs(plan, signal)) {
-        check(signal);
-        const result = (await this.ensureClient().call(
-          "upsertMarkdown",
-          {
-            path: note.path,
-            markdown: note.markdown,
-            expectedContentId: note.contentId,
-            size: this.options.size ?? CHUNK_SIZE,
-            overlap: this.options.overlap ?? CHUNK_OVERLAP,
-          },
-          signal
-        )) as SqliteMutationResult & { chunkCount: number };
-        if (result.rescan) {
-          this.queueChange();
-          continue;
-        }
-        this.setState(result.state);
-        chunked += result.chunkCount;
-        this.reportProgress(
-          {
-            operation: "full",
-            phase: "chunk",
-            completed: chunked,
-            ...(plan.estimatedTexts === undefined || chunked > plan.estimatedTexts
-              ? { determinate: false as const }
-              : { total: plan.estimatedTexts, determinate: true as const, estimated: true }),
-            unit: "texts",
-          },
-          false
+      if (!this.loaded && !(await this.load()))
+        throw (
+          this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
         );
-        encoded++;
-        this.reportProgress(
-          {
-            operation: "full",
-            phase: "encode-write",
-            completed: encoded,
-            total: plan.paths.length,
-            unit: "notes",
-            determinate: true,
-            generationId: this.generationId(),
-          },
-          false
+      if (this.unavailable)
+        throw (
+          this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
         );
-      }
-      this.reportProgress({
-        operation: "full",
-        phase: "chunk",
-        completed: chunked,
-        total: chunked,
-        unit: "texts",
-        determinate: true,
-      });
-      const finalWatermark = this.revision;
-      const exact = await this.discoverEligible(signal);
-      await this.finishIfStable(exact, signal, finalWatermark);
+      const result = await this.runFullLexical(signal, "rebuild");
       this.reportProgress({
         operation: "full",
         phase: "validate",
@@ -511,8 +511,8 @@ export class IndexManager implements VaultRetrievalPort {
       if (finalState && !finalState.incomplete)
         this.notifySuccessfulOperation({
           operation: "rebuild",
-          changed: true,
-          converged: true,
+          changed: result.changed,
+          converged: result.converged,
           state: finalState,
         });
       this.emit({
@@ -542,36 +542,336 @@ export class IndexManager implements VaultRetrievalPort {
       this.building = false;
     }
   }
-  private async planFullIndex(signal: AbortSignal): Promise<FullIndexPlan> {
+
+  private async runFullLexical(
+    signal: AbortSignal,
+    operation: "rebuild" | "update" = "update"
+  ): Promise<IndexSyncResult> {
+    let snapshot = await this.readLexicalSnapshot(signal, operation);
+    let changed = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      check(signal);
+      if (this.fullRecoveryRequested && snapshot.revision !== this.revision) {
+        snapshot = await this.readLexicalSnapshot(signal, operation);
+      }
+      let runId: string | undefined;
+      try {
+        if (
+          operation !== "rebuild" &&
+          !this.fullRecoveryRequested &&
+          !this.state?.incomplete &&
+          !this.state?.snapshotLoaded &&
+          (await this.lexicalSnapshotMatchesState(snapshot, signal))
+        ) {
+          this.reconciledRevision = snapshot.revision;
+          this.changeJournal.length = 0;
+          this.fullRecoveryRequested = false;
+          this.freshness = this.state?.snapshotLoaded ? "snapshot-loaded" : "locally-reconciled";
+          return { changed, converged: true };
+        }
+        const before = this.state?.changeCounter ?? 0;
+        const started = (await this.ensureClient().call(
+          "beginLexicalRun",
+          { summaries: snapshot.summaries, expectedChangeCounter: before },
+          signal
+        )) as { runId: string; state: SqliteState };
+        runId = started.runId;
+        this.setState(started.state);
+        const applied = await this.applyLexicalSnapshot(runId, snapshot, signal, operation);
+        changed ||= applied;
+        if (snapshot.revision !== this.revision) {
+          await this.cleanupLexicalRun(runId, "full");
+          runId = undefined;
+          if (this.fullRecoveryRequested)
+            snapshot = await this.readLexicalSnapshot(signal, operation);
+          else snapshot = await this.refreshSnapshotForJournal(snapshot, signal);
+          continue;
+        }
+        let finished: SqliteLexicalRunResult;
+        do {
+          finished = (await this.ensureClient().call(
+            "finishLexicalRun",
+            { runId },
+            signal
+          )) as SqliteLexicalRunResult;
+          this.setState(finished.state);
+          changed ||= finished.receipt.changed;
+        } while (!finished.complete);
+        runId = undefined;
+        if (snapshot.revision !== this.revision) {
+          if (this.fullRecoveryRequested)
+            snapshot = await this.readLexicalSnapshot(signal, operation);
+          else snapshot = await this.refreshSnapshotForJournal(snapshot, signal);
+          continue;
+        }
+        this.reconciledRevision = snapshot.revision;
+        this.changeJournal.length = 0;
+        this.fullRecoveryRequested = false;
+        this.freshness = this.state?.snapshotLoaded ? "snapshot-loaded" : "locally-reconciled";
+        return { changed, converged: this.state?.incomplete === false };
+      } catch (error) {
+        if (runId) {
+          await this.cleanupLexicalRun(runId, "full");
+          runId = undefined;
+        }
+        if (signal.aborted) throw error;
+        if (attempt >= 7) {
+          await this.markIncomplete(new AbortController().signal).catch(() => undefined);
+          return { changed, converged: false };
+        }
+        throw error;
+      }
+    }
+    await this.markIncomplete(new AbortController().signal).catch(() => undefined);
+    return { changed, converged: false };
+  }
+
+  private async lexicalSnapshotMatchesState(
+    snapshot: LexicalSnapshot,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    const current = (await this.ensureClient().call(
+      "listLexicalSummaries",
+      {},
+      signal
+    )) as readonly { readonly path: string; readonly revisionDigest?: string }[];
+    if (current.length !== snapshot.summaries.length) return false;
+    const expected = [...snapshot.summaries].sort((a, b) => compareCodeUnits(a.path, b.path));
+    for (const [index, summary] of current.entries()) {
+      if (
+        summary.path !== expected[index].path ||
+        summary.revisionDigest !== expected[index].contentId
+      )
+        return false;
+    }
+    return true;
+  }
+
+  private async readLexicalSnapshot(
+    signal: AbortSignal,
+    operation: "full" | "incremental" | "rebuild" | "update" = "full"
+  ): Promise<LexicalSnapshot> {
     const paths = [...(await this.vault.listMarkdownPaths(signal))]
       .map(normalizePath)
       .filter((path) => this.isIndexEligible(path))
       .sort(compareCodeUnits);
-    const estimatedTexts = await this.vault.estimateMarkdownTextCount?.(
-      paths,
-      this.options.size ?? CHUNK_SIZE,
-      this.options.overlap ?? CHUNK_OVERLAP,
-      signal
-    );
-    return { paths, ...(estimatedTexts === undefined ? {} : { estimatedTexts }) };
-  }
-  private async *noteInputs(
-    plan: FullIndexPlan,
-    signal: AbortSignal
-  ): AsyncIterable<{ path: string; markdown: string; contentId: string }> {
     const fingerprint = await this.corpusFingerprintId();
-    for (const path of plan.paths) {
+    const documents = new Map<string, IndexVaultDocument>();
+    const summaries: SqliteNoteSummary[] = [];
+    this.reportProgress({
+      operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+      phase: "discover",
+      completed: paths.length,
+      total: paths.length,
+      unit: "paths",
+      determinate: true,
+    });
+    this.reportProgress({
+      operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+      phase: "read",
+      completed: 0,
+      total: paths.length,
+      unit: "notes",
+      determinate: true,
+    });
+    for (const [index, path] of paths.entries()) {
       check(signal);
       const doc = await this.readMarkdownIfAvailable(path, signal, "full");
-      if (!doc) continue;
+      if (doc) {
+        documents.set(path, doc);
+        summaries.push({
+          path,
+          contentId: await deriveNoteContentId(fingerprint, doc.content),
+        });
+      }
+      this.reportProgress(
+        {
+          operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+          phase: "read",
+          completed: index + 1,
+          total: paths.length,
+          unit: "notes",
+          determinate: true,
+        },
+        false
+      );
+    }
+    return { paths, summaries, documents, revision: this.revision };
+  }
+
+  private async refreshSnapshotForJournal(
+    snapshot: LexicalSnapshot,
+    signal: AbortSignal
+  ): Promise<LexicalSnapshot> {
+    const fingerprint = await this.corpusFingerprintId();
+    const documents = new Map(snapshot.documents);
+    const summaries = new Map(snapshot.summaries.map((summary) => [summary.path, summary]));
+    for (const change of this.changeJournal) {
       check(signal);
-      const contentId = await this.hashMarkdown(doc.content, fingerprint, signal);
-      const current = await this.readMarkdownIfAvailable(path, signal, "full");
-      if (!current) {
-        this.queueChange();
+      if (change.type === "delete") {
+        const path = normalizePath(change.path);
+        documents.delete(path);
+        summaries.delete(path);
         continue;
       }
-      yield { path, markdown: current.content, contentId };
+      if (change.type === "rename") {
+        const from = normalizePath(change.from);
+        const to = normalizePath(change.to);
+        const old = summaries.get(from);
+        const doc = documents.get(from);
+        summaries.delete(from);
+        documents.delete(from);
+        if (old && this.isIndexEligible(to)) {
+          summaries.set(to, { ...old, path: to });
+          if (doc) documents.set(to, { ...doc, path: to });
+          continue;
+        }
+        if (!this.isIndexEligible(to)) continue;
+        const current = await this.readMarkdownIfAvailable(to, signal, "incremental");
+        if (!current) continue;
+        documents.set(to, current);
+        summaries.set(to, {
+          path: to,
+          contentId: await deriveNoteContentId(fingerprint, current.content),
+        });
+        continue;
+      }
+      const path = normalizePath(change.path);
+      if (!this.isIndexEligible(path)) {
+        documents.delete(path);
+        summaries.delete(path);
+        continue;
+      }
+      const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
+      if (!doc) {
+        documents.delete(path);
+        summaries.delete(path);
+      } else {
+        documents.set(path, doc);
+        summaries.set(path, {
+          path,
+          contentId: await deriveNoteContentId(fingerprint, doc.content),
+        });
+      }
+    }
+    return {
+      paths: [...summaries.keys()].sort(compareCodeUnits),
+      summaries: [...summaries.values()].sort((a, b) => compareCodeUnits(a.path, b.path)),
+      documents,
+      revision: this.revision,
+    };
+  }
+
+  private async applyLexicalSnapshot(
+    runId: string,
+    snapshot: LexicalSnapshot,
+    signal: AbortSignal,
+    operation: "full" | "incremental" | "rebuild" | "update"
+  ): Promise<boolean> {
+    const notes = [...snapshot.documents.values()].sort((a, b) => compareCodeUnits(a.path, b.path));
+    const batches: IndexVaultDocument[][] = [];
+    let batch: IndexVaultDocument[] = [];
+    let bytes = 0;
+    for (const note of notes) {
+      const noteBytes = new TextEncoder().encode(note.content).byteLength;
+      if (batch.length && (batch.length >= 16 || bytes + noteBytes > 8 * 1024 * 1024)) {
+        batches.push(batch);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(note);
+      bytes += noteBytes;
+    }
+    if (batch.length) batches.push(batch);
+    const fingerprint = await this.corpusFingerprintId();
+    let changed = false;
+    this.reportProgress({
+      operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+      phase: "encode-write",
+      completed: 0,
+      total: notes.length,
+      unit: "notes",
+      determinate: true,
+    });
+    let completed = 0;
+    for (const group of batches) {
+      check(signal);
+      const result = (await this.ensureClient().call(
+        "applyLexicalBatch",
+        {
+          runId,
+          notes: await Promise.all(
+            group.map(async (note): Promise<SqliteLexicalBatchNoteInput> => ({
+              path: normalizePath(note.path),
+              markdown: note.content,
+              expectedRevisionDigest: await deriveNoteContentId(fingerprint, note.content),
+              size: this.options.size ?? CHUNK_SIZE,
+            }))
+          ),
+        },
+        signal
+      )) as {
+        changed: boolean;
+        applied: number;
+        skipped: number;
+        occurrences: number;
+        receipt: { generation?: unknown };
+      };
+      changed ||= result.changed;
+      completed += group.length;
+      const generation = result.receipt.generation as
+        { readonly changeCounter?: unknown } | undefined;
+      this.reportProgress(
+        {
+          operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+          phase: "encode-write",
+          completed,
+          total: notes.length,
+          unit: "notes",
+          determinate: true,
+          ...(typeof generation?.changeCounter === "number"
+            ? { generationId: indexIdentity(generation.changeCounter) }
+            : {}),
+        },
+        false
+      );
+      if (result.occurrences > 0)
+        this.reportProgress(
+          {
+            operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
+            phase: "chunk",
+            completed: result.occurrences,
+            total: result.occurrences,
+            unit: "texts",
+            determinate: true,
+          },
+          false
+        );
+    }
+    return changed;
+  }
+
+  private async abortLexicalRun(runId: string, signal: AbortSignal): Promise<void> {
+    const result = (await this.ensureClient().call(
+      "abortLexicalRun",
+      { runId },
+      signal
+    )) as SqliteLexicalRunResult;
+    this.setState(result.state);
+  }
+
+  private async cleanupLexicalRun(runId: string, operation: "full" | "incremental"): Promise<void> {
+    try {
+      await this.abortLexicalRun(runId, new AbortController().signal);
+    } catch (error) {
+      this.emit({
+        area: "index",
+        event: "index_operation",
+        operation,
+        stage: "cleanup-failed",
+        phase: "cleanup",
+        error: projectDiagnosticError(error),
+      });
     }
   }
 
@@ -589,6 +889,133 @@ export class IndexManager implements VaultRetrievalPort {
 
   async synchronize(signal: AbortSignal): Promise<IndexSyncResult> {
     return this.runSynchronization(signal);
+  }
+
+  async reconcileChanges(
+    changes: readonly IndexPathMutation[],
+    signal: AbortSignal
+  ): Promise<IndexSyncResult> {
+    await this.waitForMaintenance(signal);
+    if (this.building || this.preparing)
+      throw new StructuredError("busy", "Index maintenance is already running.", true);
+    check(signal);
+    if (!this.loaded && !(await this.load()))
+      throw (
+        this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
+      );
+    if (this.unavailable)
+      throw (
+        this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
+      );
+    this.building = true;
+    const revision = this.revision;
+    let runId: string | undefined;
+    try {
+      // The loaded state is the compact generation fence for a scoped run.
+      // Do not refresh global status or round-trip the complete lexical
+      // summary: only the journaled paths belong to this operation.
+      const before = this.state;
+      if (!before)
+        throw new StructuredError("unavailable", "SQLite index state is unavailable.", true);
+      const documents = new Map<string, IndexVaultDocument>();
+      const renames: { from: string; to: string }[] = [];
+      const deletes = new Set<string>();
+      for (const change of changes) {
+        check(signal);
+        if (change.type === "delete") {
+          deletes.add(normalizePath(change.path));
+          continue;
+        }
+        if (change.type === "rename") {
+          const from = normalizePath(change.from);
+          const to = normalizePath(change.to);
+          const fromEligible = this.isIndexEligible(from);
+          const toEligible = this.isIndexEligible(to);
+          if (fromEligible && toEligible) {
+            renames.push({ from, to });
+          } else if (fromEligible) {
+            deletes.add(from);
+          } else if (toEligible) {
+            const doc = await this.readMarkdownIfAvailable(to, signal, "incremental");
+            if (doc) documents.set(to, doc);
+          }
+          continue;
+        }
+        const path = normalizePath(change.path);
+        if (!this.isIndexEligible(path)) {
+          deletes.add(path);
+          continue;
+        }
+        const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
+        if (!doc) deletes.add(path);
+        else documents.set(path, doc);
+      }
+      if (revision !== this.revision) return { changed: false, converged: false };
+      const snapshot: LexicalSnapshot = {
+        paths: [...documents.keys()].sort(compareCodeUnits),
+        summaries: [],
+        documents,
+        revision,
+      };
+      const run = (await this.ensureClient().call(
+        "beginLexicalRun",
+        {
+          expectedChangeCounter: before.changeCounter,
+          scope: {
+            renames,
+            deletes: [...deletes].sort(compareCodeUnits),
+            mayClearIncomplete:
+              !before.incomplete &&
+              !before.snapshotLoaded &&
+              !this.fullRecoveryRequested &&
+              revision === this.revision,
+          },
+        },
+        signal
+      )) as { runId: string; state: SqliteState };
+      runId = run.runId;
+      this.setState(run.state);
+      let changed = await this.applyLexicalSnapshot(run.runId, snapshot, signal, "incremental");
+      if (revision !== this.revision) {
+        await this.cleanupLexicalRun(run.runId, "incremental");
+        runId = undefined;
+        return { changed, converged: false };
+      }
+      let finished: SqliteLexicalRunResult;
+      do {
+        finished = (await this.ensureClient().call(
+          "finishLexicalRun",
+          { runId: run.runId },
+          signal
+        )) as SqliteLexicalRunResult;
+        this.setState(finished.state);
+        changed ||= finished.receipt.changed;
+      } while (!finished.complete);
+      runId = undefined;
+      if (revision !== this.revision) {
+        await this.markIncomplete(new AbortController().signal);
+        return { changed, converged: false };
+      }
+      this.reconciledRevision = revision;
+      this.freshness = this.state?.snapshotLoaded ? "snapshot-loaded" : "locally-reconciled";
+      const result = { changed, converged: this.state?.incomplete === false };
+      if (result.converged)
+        this.notifySuccessfulOperation({ operation: "update", ...result, state: this.state! });
+      return result;
+    } catch (error) {
+      if (runId) {
+        await this.cleanupLexicalRun(runId, "incremental");
+        runId = undefined;
+      }
+      try {
+        await this.markIncomplete(new AbortController().signal);
+      } catch {
+        // The Worker may already be unavailable; retain the original operation error.
+      }
+      throw error;
+    } finally {
+      this.building = false;
+    }
   }
 
   private async runSynchronization(
@@ -628,33 +1055,18 @@ export class IndexManager implements VaultRetrievalPort {
       return { changed, converged: this.state?.incomplete === false };
     };
     try {
-      if (!this.loaded) await this.load();
-      let changed = false;
-      // A vault can change while this pass is hashing or embedding. Repeat after
-      // the final discovery until both the event watermark and exact summaries
-      // agree. The bounded guard is only defensive; an actively edited vault
-      // remains incomplete and is retried by the plugin.
-      for (let pass = 0; pass < 8; pass++) {
-        const watermark = this.revision;
-        const discovered = await this.discoverEligible(signal, "build-lexical");
-        changed ||= await this.reconcileDiscovered(discovered, signal);
-        const final = await this.discoverEligible(signal, "validate");
-        if (watermark !== this.revision || !sameSummaries(discovered, final)) continue;
-        const finished = await this.finishIfStable(final, signal, watermark);
-        if (finished && watermark === this.revision) {
-          this.reconciledRevision = Math.max(this.reconciledRevision, watermark);
-          const result = complete(changed);
-          if (result.converged)
-            this.notifySuccessfulOperation({
-              operation: "update",
-              changed: result.changed,
-              converged: result.converged,
-              state: this.state!,
-            });
-          return result;
-        }
-      }
-      return complete(changed);
+      if (!this.loaded && !(await this.load()))
+        throw (
+          this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
+        );
+      if (this.unavailable)
+        throw (
+          this.loadError ?? sqliteError("storage_unavailable", "SQLite index is unavailable.", true)
+        );
+      const result = await this.runFullLexical(signal, "update");
+      if (result.converged)
+        this.notifySuccessfulOperation({ operation: "update", ...result, state: this.state! });
+      return complete(result.changed);
     } catch (error) {
       this.emit({
         area: "index",
@@ -671,7 +1083,7 @@ export class IndexManager implements VaultRetrievalPort {
     }
   }
 
-  private async discoverEligible(
+  async discoverEligible(
     signal: AbortSignal,
     progressPhase?: "build-lexical" | "validate"
   ): Promise<readonly SqliteNoteSummary[]> {
@@ -715,7 +1127,7 @@ export class IndexManager implements VaultRetrievalPort {
     return summaries;
   }
 
-  private async reconcileDiscovered(
+  async reconcileDiscovered(
     discovered: readonly SqliteNoteSummary[],
     signal: AbortSignal
   ): Promise<boolean> {
@@ -742,7 +1154,7 @@ export class IndexManager implements VaultRetrievalPort {
       );
     for (const rename of plan.renames) {
       const result = (await this.ensureClient().call(
-        "renameNote",
+        "renameLexicalNote",
         rename,
         signal
       )) as SqliteMutationResult;
@@ -756,13 +1168,12 @@ export class IndexManager implements VaultRetrievalPort {
       const doc = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
       if (!doc) continue;
       const result = (await this.ensureClient().call(
-        "upsertMarkdown",
+        "upsertLexicalRevision",
         {
           path: summary.path,
           markdown: doc.content,
-          expectedContentId: summary.contentId,
+          expectedRevisionDigest: summary.contentId,
           size: this.options.size ?? CHUNK_SIZE,
-          overlap: this.options.overlap ?? CHUNK_OVERLAP,
         },
         signal
       )) as SqliteMutationResult;
@@ -777,7 +1188,7 @@ export class IndexManager implements VaultRetrievalPort {
 
     for (const note of plan.deletes) {
       const result = (await this.ensureClient().call(
-        "deleteNote",
+        "deleteLexicalNote",
         note,
         signal
       )) as SqliteMutationResult;
@@ -787,7 +1198,7 @@ export class IndexManager implements VaultRetrievalPort {
     }
     return changed;
   }
-  private async finishIfStable(
+  async finishIfStable(
     summaries: readonly SqliteNoteSummary[],
     signal: AbortSignal,
     expectedRevision = this.revision
@@ -822,6 +1233,59 @@ export class IndexManager implements VaultRetrievalPort {
   queueChange(): void {
     this.revision++;
     this.freshness = "unknown";
+    this.fullRecoveryRequested = true;
+  }
+
+  /** Record one vault mutation in the manager-owned coalescing journal. */
+  recordPathMutation(mutation: IndexPathMutation): void {
+    const wasFullRecoveryRequested = this.fullRecoveryRequested;
+    this.queueChange();
+    this.fullRecoveryRequested = wasFullRecoveryRequested;
+    if (mutation.type === "rename")
+      coalescePathMutation(this.changeJournal, {
+        type: "rename",
+        from: normalizePath(mutation.from),
+        to: normalizePath(mutation.to),
+      });
+    else
+      coalescePathMutation(this.changeJournal, {
+        type: mutation.type,
+        path: normalizePath(mutation.path),
+      });
+  }
+
+  /** Mark the journal ambiguous; the next queued run must rediscover the vault. */
+  requestFullRecovery(): void {
+    this.queueChange();
+    this.fullRecoveryRequested = true;
+  }
+
+  hasPendingWork(): boolean {
+    return Boolean(
+      this.fullRecoveryRequested ||
+      this.changeJournal.length ||
+      this.revision !== this.reconciledRevision ||
+      this.state?.incomplete
+    );
+  }
+
+  journalSnapshot(): IndexJournalSnapshot {
+    return {
+      changes: this.changeJournal.map((change) => ({ ...change })),
+      fullRecovery: this.fullRecoveryRequested,
+      revision: this.revision,
+    };
+  }
+
+  pendingChangeCount(): number {
+    return this.changeJournal.length;
+  }
+
+  clearJournalIfCurrent(revision: number): void {
+    if (revision !== this.revision) return;
+    this.changeJournal.length = 0;
+    this.fullRecoveryRequested = false;
+    this.reconciledRevision = revision;
   }
 
   private notifySuccessfulOperation(result: IndexOperationResult): void {
@@ -835,16 +1299,22 @@ export class IndexManager implements VaultRetrievalPort {
     }
   }
   async reconcileQueuedChanges(signal: AbortSignal): Promise<IndexSyncResult> {
-    if (this.revision === this.reconciledRevision) {
-      if (this.loaded && this.state?.incomplete) return this.runSynchronization(signal, "queued");
-      return { changed: false, converged: this.state?.incomplete === false };
+    const journal = this.journalSnapshot();
+    if (!journal.fullRecovery && journal.changes.length && this.isComplete()) {
+      const result = await this.reconcileChanges(journal.changes, signal);
+      if (result.converged) this.clearJournalIfCurrent(journal.revision);
+      return result;
     }
+    if (!this.hasPendingWork())
+      return { changed: false, converged: this.state?.incomplete === false };
     if (this.building) {
       await this.buildPromise;
       if (this.building)
         throw new StructuredError("busy", "Index update is already running.", true);
     }
-    return this.runSynchronization(signal, "queued");
+    const result = await this.runSynchronization(signal, "queued");
+    if (result.converged) this.clearJournalIfCurrent(journal.revision);
+    return result;
   }
 
   /** Enriches the lexical corpus in bounded, resumable batches. */
@@ -852,13 +1322,63 @@ export class IndexManager implements VaultRetrievalPort {
     return this.runSemanticPreparation(signal, false);
   }
 
+  /** Runs one bounded semantic batch so automatic maintenance can yield to lexical work. */
+  async prepareSemanticBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    return this.runSemanticPreparation(signal, false, 1, 16);
+  }
+
+  /** True only while this manager has usable stored vectors for its current embedding identity. */
+  hasCompatibleSemanticVectors(): boolean {
+    const state = this.state;
+    return Boolean(
+      this.loaded &&
+      state &&
+      (state.semanticHeadCount ?? state.compatibleVectorCount ?? 0) > 0 &&
+      (state.semanticMissingCount === undefined ||
+        state.semanticEligibleCount === undefined ||
+        state.semanticMissingCount < state.semanticEligibleCount)
+    );
+  }
+
+  /** True when the configured embedding provider has semantic work awaiting storage or promotion. */
+  hasPendingSemanticWork(): boolean {
+    const state = this.state;
+    if (!this.loaded || !state || !state.embeddingFingerprint || !this.modelId.trim()) return false;
+    if (state.semanticEligibleCount !== undefined) {
+      const missing = state.semanticMissingCount ?? 0;
+      const lagging =
+        state.semanticLagCount ??
+        Math.max(0, state.semanticEligibleCount - (state.semanticHeadCount ?? 0));
+      return missing > 0 || lagging > 0;
+    }
+    return false;
+  }
+
   async rebuildSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.runSemanticPreparation(signal, true);
+    await this.waitForMaintenance(signal);
+    if (!this.loaded) await this.load();
+    this.setState(
+      (await this.ensureClient().call("clearSemanticCache", {}, signal)) as SqliteState
+    );
+    const result = await this.prepareSemantic(signal);
+    return { ...result, operation: "rebuild" };
+  }
+
+  /** Fills the content-addressed semantic cache for active lexical heads. */
+  async prepareSemanticCacheBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    return this.runSemanticPreparation(
+      signal,
+      false,
+      1,
+      Math.min(16, this.options.prepareBatchSize ?? 16)
+    );
   }
 
   private async runSemanticPreparation(
     signal: AbortSignal,
-    rebuild: boolean
+    rebuild: boolean,
+    maxBatches = Number.POSITIVE_INFINITY,
+    batchSizeOverride?: number
   ): Promise<SemanticPrepareResult> {
     await this.waitForMaintenance(signal);
     if (this.building || this.preparing)
@@ -867,6 +1387,8 @@ export class IndexManager implements VaultRetrievalPort {
     this.preparing = true;
     let stored = 0;
     let skipped = 0;
+    let promoted = 0;
+    let hasMore = true;
     const operation = rebuild ? "full" : "incremental";
     const started = Date.now();
     const initialRevision = this.revision;
@@ -875,13 +1397,29 @@ export class IndexManager implements VaultRetrievalPort {
       if (this.unavailable || !this.state)
         throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
       const embeddingFingerprint = await this.embeddingFingerprintId();
-      const batchSize = Math.min(
-        512,
-        Math.max(1, Math.floor(this.options.prepareBatchSize ?? 128))
+      const providerLimits = this.embedding.batchLimits ?? {};
+      const maxInputBytes = Math.min(
+        SQLITE_MAX_SEMANTIC_INPUT_BYTES,
+        Math.max(1, Math.floor(providerLimits.maxInputBytes ?? SQLITE_MAX_SEMANTIC_INPUT_BYTES))
       );
-      if (rebuild)
-        this.setState((await this.ensureClient().call("clearVectors", {}, signal)) as SqliteState);
-      const totalMissing = this.state.chunkCount - this.state.compatibleVectorCount;
+      const maxVectorBytes = Math.min(
+        SQLITE_MAX_SEMANTIC_VECTOR_BYTES,
+        Math.max(
+          this.embedding.dimensions * Float32Array.BYTES_PER_ELEMENT,
+          Math.floor(providerLimits.maxVectorBytes ?? SQLITE_MAX_SEMANTIC_VECTOR_BYTES)
+        )
+      );
+      const requestedItems = Math.min(
+        SQLITE_MAX_SEMANTIC_BATCH_ITEMS,
+        Math.max(1, Math.floor(batchSizeOverride ?? this.options.prepareBatchSize ?? 128)),
+        Math.max(1, Math.floor(providerLimits.maxItems ?? SQLITE_MAX_SEMANTIC_BATCH_ITEMS)),
+        Math.max(1, Math.floor(maxVectorBytes / (this.embedding.dimensions * 4)))
+      );
+      const totalMissing = Math.max(
+        this.state.semanticMissingCount ?? 0,
+        this.state.semanticEligibleCount ?? 0,
+        this.state.chunkCount - this.state.compatibleVectorCount
+      );
       this.reportProgress({
         operation,
         phase: "build-vector",
@@ -890,20 +1428,32 @@ export class IndexManager implements VaultRetrievalPort {
         unit: "chunks",
         determinate: true,
       });
-      let afterChunkPk = 0;
+      let batches = 0;
+      // The unrestricted promotion pass is a run-level operation. Repeat it
+      // only after a lexical generation change can make another lagging head
+      // eligible; each result commit already promotes its affected notes.
+      let promotedLexicalGeneration: number | undefined;
       for (;;) {
+        if (batches >= maxBatches) break;
         check(signal);
-        // Vault edits queue a later lexical update; this run finishes vectors
-        // for the committed SQLite corpus without applying those edits mid-run.
-        const observedChangeCounter = this.changeCounter();
-        const missing = (await this.ensureClient().call(
-          "listMissingVectors",
-          { embeddingFingerprint, limit: batchSize, afterChunkPk },
+        const work = (await this.ensureClient().call(
+          "prepareSemanticWork",
+          {
+            embeddingFingerprint,
+            preprocessing: EMBEDDING_PREPROCESSING_VERSION,
+            limit: requestedItems,
+            maxInputBytes,
+            promoteUnrestricted: promotedLexicalGeneration === undefined,
+          },
           signal
-        )) as readonly MissingVector[];
-        if (!missing.length) break;
+        )) as SqliteSemanticWorkBatch;
+        promoted += work.promoted;
+        hasMore = work.hasMore;
+        promotedLexicalGeneration = work.generation.lexicalGeneration;
+        if (!work.requests.length) break;
+        const missing = work.requests;
         const vectors = await this.embedding.embed(
-          missing.map((item) => item.text),
+          missing.map((item) => item.serialization),
           signal,
           (progress) =>
             this.reportProgress(
@@ -918,6 +1468,7 @@ export class IndexManager implements VaultRetrievalPort {
               false
             )
         );
+        check(signal);
         if (
           vectors.length !== missing.length ||
           vectors.some((vector) => vector.length !== this.embedding.dimensions)
@@ -928,44 +1479,51 @@ export class IndexManager implements VaultRetrievalPort {
             false
           );
         const result = (await this.ensureClient().call(
-          "storeVectors",
+          "commitSemanticResults",
           {
             embeddingFingerprint,
-            observedChangeCounter,
-            vectors: missing.map((item, index) => ({
-              chunkPk: item.chunkPk,
-              chunkId: item.chunkId,
-              contentId: item.contentId,
+            preprocessing: EMBEDDING_PREPROCESSING_VERSION,
+            dimensions: this.embedding.dimensions,
+            expectedCount: missing.length,
+            results: missing.map((item, index) => ({
+              actionKey: item.actionKey,
+              inputId: item.inputId,
+              serialization: item.serialization,
               vector: new Float32Array(vectors[index]),
             })),
           },
           signal
-        )) as { stored: number; skipped: number; state: SqliteState };
-        this.setState(result.state);
+        )) as SqliteSemanticCommitResult;
         stored += result.stored;
         skipped += result.skipped;
+        promoted += result.promoted;
+        hasMore = result.hasMore;
+        if (result.generation.lexicalGeneration !== promotedLexicalGeneration)
+          promotedLexicalGeneration = undefined;
+        batches++;
         // A changed corpus invalidates the pagination fence. Restarting from
         // zero makes preparation resumable without ever attaching stale rows.
-        if (result.skipped && result.state.changeCounter !== observedChangeCounter)
-          afterChunkPk = 0;
-        else afterChunkPk = missing.at(-1)!.chunkPk;
         this.reportProgress(
           {
             operation,
             phase: "build-vector",
-            completed: stored,
-            total: Math.max(totalMissing, stored),
+            completed: hasMore ? stored : Math.max(1, result.stored),
+            total: hasMore ? Math.max(totalMissing, stored) : Math.max(1, result.stored),
             unit: "chunks",
             determinate: true,
           },
           false
         );
+        if (!hasMore) break;
       }
+      // Full state is intentionally refreshed only when this executor converges
+      // or yields its bounded slice. Cache-only commits therefore do not publish.
+      this.setState((await this.ensureClient().call("getState", {}, signal)) as SqliteState);
       const finalState = this.state!;
       const result: SemanticPrepareResult = {
         operation: rebuild ? "rebuild" : "prepare",
-        changed: stored > 0,
-        converged: finalState.semanticReady && this.revision === initialRevision,
+        changed: promoted > 0,
+        converged: !hasMore && this.revision === initialRevision,
         state: finalState,
         stored,
         skipped,
@@ -978,9 +1536,18 @@ export class IndexManager implements VaultRetrievalPort {
         stage: "completed",
         phase: "build-vector",
         durationMs: Date.now() - started,
-        counts: { stored, skipped },
+        counts: { stored, skipped, promoted },
       });
       return result;
+    } catch (error) {
+      // State is refreshed after failure/cancellation so callers retain the
+      // committed portion of a bounded operation.
+      try {
+        this.setState((await this.ensureClient().call("getState", {})) as SqliteState);
+      } catch {
+        /* Preserve the original operation error. */
+      }
+      throw error;
     } finally {
       this.preparing = false;
     }
@@ -989,7 +1556,7 @@ export class IndexManager implements VaultRetrievalPort {
   /** Keep local mutations and adoption out until the vault copy and live ID agree. */
   async publishPublication<T>(
     publicationId: string,
-    install: (prepared: PublicationPrepared) => Promise<T>,
+    install: (prepared: PublicationPrepared, inspect?: PublicationInspector) => Promise<T>,
     settle: (committed: boolean) => Promise<void> = async () => undefined
   ): Promise<{ prepared: PublicationPrepared; installed: T }> {
     if (this.building || this.preparing || this.maintenance)
@@ -1006,12 +1573,16 @@ export class IndexManager implements VaultRetrievalPort {
       const prepared = (await this.ensureClient().call("preparePublication", {
         publicationId,
       })) as PublicationPrepared;
-      const installed = await install(prepared);
+      const installed = await install(prepared, (bytes, transferOwnership) =>
+        this.inspectPublicationReserved(bytes, transferOwnership)
+      );
       let state: SqliteState | undefined;
       try {
         state = (await this.ensureClient().call("finalizePublication", {
           publicationId,
           expectedChangeCounter: prepared.state.changeCounter,
+          expectedLexicalGeneration: prepared.state.lexicalGeneration,
+          expectedSemanticGeneration: prepared.state.semanticGeneration,
         })) as SqliteState | undefined;
         if (!state) throw new StructuredError("busy", "Local changes prevented publication.", true);
       } catch (error) {
@@ -1036,6 +1607,20 @@ export class IndexManager implements VaultRetrievalPort {
       bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES
     )
       throw new StructuredError("invalid_request", "Publication bytes are invalid.", false);
+    if (this.building || this.preparing || this.maintenance)
+      throw new StructuredError("busy", "Index maintenance is already running.", true);
+    this.beginMaintenance();
+    try {
+      return await this.inspectPublicationReserved(bytes, transferOwnership);
+    } finally {
+      this.endMaintenance();
+    }
+  }
+
+  private async inspectPublicationReserved(
+    bytes: ArrayBuffer,
+    transferOwnership = false
+  ): Promise<PublicationInspection> {
     if (!this.loaded) await this.load();
     if (this.unavailable || !this.state)
       throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
@@ -1054,7 +1639,11 @@ export class IndexManager implements VaultRetrievalPort {
   }
 
   /** Adopt a validated publication directly; no Markdown reconciliation or republish follows. */
-  async adoptPublication(bytes: ArrayBuffer, expectedPublicationId?: string): Promise<SqliteState> {
+  async adoptPublication(
+    bytes: ArrayBuffer,
+    expectedPublicationId?: string,
+    inspection?: PublicationInspection
+  ): Promise<SqliteState> {
     if (this.building || this.preparing || this.maintenance)
       throw new StructuredError("busy", "Index maintenance is already running.", true);
     if (
@@ -1071,6 +1660,7 @@ export class IndexManager implements VaultRetrievalPort {
       const state = (await this.ensureClient().call("adoptPublication", {
         bytes,
         expectedPublicationId,
+        inspection,
         corpusFingerprint: await this.corpusFingerprintId(),
         embeddingFingerprint: await this.embeddingFingerprintId(),
         buildIdentity: SQLITE_BUILD_IDENTITY,
@@ -1240,11 +1830,12 @@ export class IndexManager implements VaultRetrievalPort {
       return null;
     const counter = this.changeCounter();
     const identity = indexIdentity(counter);
+    const visibleHead = this.state?.semanticHeadKey || identity;
     return {
       changeCounter: counter,
       generationId: identity,
       currentPath,
-      contentHash: identity,
+      contentHash: visibleHead,
       semantic: this.capabilities().semantic,
       freshness: this.freshness,
       ...(this.state?.publicationId ? { publicationId: this.state.publicationId } : {}),
