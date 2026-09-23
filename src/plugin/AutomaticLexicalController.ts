@@ -1,6 +1,6 @@
 import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
 import type { IndexPathMutation } from "@/index/IndexManager";
-import type { IndexOperationLease } from "@/ui/index/IndexStatus";
+import type { IndexOperationLease } from "@/ui/index/IndexOperationLease";
 import { isRetryableError, type SchedulerHost, type SchedulerSource } from "@/plugin/scheduler";
 
 export interface AutomaticLexicalHost extends SchedulerHost {

@@ -18,6 +18,11 @@ import {
   vectorBytes,
 } from "./core";
 import type { SqliteStateStore } from "./state";
+import {
+  SEMANTIC_AFFECTED_PROMOTION_SQL,
+  SEMANTIC_MISSING_INPUTS_SQL,
+  SEMANTIC_PROMOTION_SQL,
+} from "./hot-queries";
 
 function embeddingActionKey(
   inputDigest: string,
@@ -103,46 +108,13 @@ export class SqliteSemanticStore {
         "limit_exceeded",
         `Semantic input is ${firstInputBytes} bytes; maximum is ${boundedInputBytes} bytes.`
       );
-    const requests = rows(
-      this.context.db,
-      `WITH candidates AS MATERIALIZED (
-         SELECT ei.input_id AS inputId,ei.serialized_input AS serialization,ei.action_key AS inputDigest
-         FROM embedding_inputs ei
-         WHERE EXISTS (
-           SELECT 1
-           FROM chunk_occurrences o
-           JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
-           WHERE o.embedding_input_digest=ei.action_key
-         )
-           AND NOT EXISTS (
-             SELECT 1
-             FROM embedding_cache ec
-             WHERE ec.input_digest=ei.action_key
-               AND ec.embedding_fingerprint=?
-               AND ec.preprocessing=?
-           )
-         ORDER BY ei.input_id
-         LIMIT ?
-       ), bounded AS (
-         SELECT *,
-           sum(length(CAST(serialization AS BLOB))) OVER (
-             ORDER BY inputId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-           ) AS inputBytes,
-           row_number() OVER (ORDER BY inputId) AS itemNumber
-         FROM candidates
-       )
-       SELECT inputId,serialization,inputDigest
-       FROM bounded
-       WHERE itemNumber<=? AND inputBytes<=?
-       ORDER BY inputId`,
-      [
-        embeddingFingerprint,
-        preprocessing,
-        Math.max(0, limit),
-        Math.max(0, limit),
-        boundedInputBytes,
-      ]
-    ).map((row) => ({
+    const requests = rows(this.context.db, SEMANTIC_MISSING_INPUTS_SQL, [
+      embeddingFingerprint,
+      preprocessing,
+      Math.max(0, limit),
+      Math.max(0, limit),
+      boundedInputBytes,
+    ]).map((row) => ({
       actionKey: embeddingActionKey(String(row.inputDigest), embeddingFingerprint, preprocessing),
       inputId: Number(row.inputId),
       serialization: String(row.serialization),
@@ -270,27 +242,9 @@ export class SqliteSemanticStore {
     preprocessing: string,
     affectedTable?: string
   ): number {
-    const affected = affectedTable
-      ? `AND EXISTS (SELECT 1 FROM ${affectedTable} a WHERE a.note_id=n.note_id)`
-      : "";
+    const sql = affectedTable ? SEMANTIC_AFFECTED_PROMOTION_SQL : SEMANTIC_PROMOTION_SQL;
     this.context.db.exec({
-      sql: `UPDATE notes AS n
-            SET semantic_revision_id=n.lexical_revision_id
-            WHERE n.lexical_revision_id IS NOT NULL
-              AND n.semantic_revision_id IS NOT n.lexical_revision_id
-              ${affected}
-              AND NOT EXISTS (
-                SELECT 1
-                FROM chunk_occurrences o
-                JOIN embedding_inputs ei ON ei.action_key=o.embedding_input_digest
-                LEFT JOIN embedding_cache ec
-                  ON ec.input_digest=ei.action_key
-                 AND ec.embedding_fingerprint=?
-                 AND ec.preprocessing=?
-                WHERE o.note_id=n.note_id
-                  AND o.revision_id=n.lexical_revision_id
-                  AND ec.cache_id IS NULL
-              )`,
+      sql,
       bind: [embeddingFingerprint, preprocessing],
     });
     return Number(rows(this.context.db, "SELECT changes() AS count")[0]?.count ?? 0);

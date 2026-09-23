@@ -15,6 +15,7 @@ import {
   transaction,
 } from "./core";
 import type { LexicalRunRegistry } from "./lexical-context";
+import { LEXICAL_RENAME_LOOKUP_SQL } from "./hot-queries";
 
 export class SqliteLexicalBatchStore {
   constructor(
@@ -221,11 +222,7 @@ export class SqliteLexicalBatchStore {
     let semanticChanged = 0;
     try {
       for (const rename of renames) {
-        const row = rows(
-          this.context.db,
-          "SELECT note_id,semantic_revision_id FROM notes WHERE path=?",
-          [rename.from]
-        )[0];
+        const row = rows(this.context.db, LEXICAL_RENAME_LOOKUP_SQL, [rename.from])[0];
         if (!row || rows(this.context.db, "SELECT 1 FROM notes WHERE path=?", [rename.to]).length)
           continue;
         this.context.db.exec({

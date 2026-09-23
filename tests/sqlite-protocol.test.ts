@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { SQLITE_PROTOCOL_VERSION, validateRequest, sqliteError } from "@/index/sqlite/protocol";
+import { SQLITE_PROTOCOL_VERSION, sqliteError } from "@/index/sqlite/protocol";
+import { validateRequest } from "@/index/sqlite/request-validation";
 import {
   applyTestLexicalRun,
   createTestSqliteClient,

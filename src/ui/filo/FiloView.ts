@@ -1,6 +1,7 @@
 import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
-import { formatIndexProgress, IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
+import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { formatIndexProgress, type IndexStatus } from "@/ui/index/IndexStatusModel";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 

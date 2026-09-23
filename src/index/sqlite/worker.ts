@@ -1,22 +1,17 @@
 import { MutableSqliteDatabase, type SqliteConnection } from "./database";
 import { SqliteScheduler } from "./scheduler";
-import {
-  closeWorkerDatabase,
-  exportOpfsDatabase,
-  type WorkerStorageState,
-} from "./worker-lifecycle";
+import { closeWorkerDatabase, type WorkerStorageState } from "./worker-lifecycle";
 import {
   SQLITE_PROTOCOL_VERSION,
-  SQLITE_SNAPSHOT_MAX_BYTES,
-  validateRequest,
   type SqliteRequest,
   type SqliteReply,
   type SqliteErrorShape,
-  type SqliteState,
   sqliteError,
 } from "./protocol";
 import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
 import { applyLexicalMarkdownBatch } from "./markdown";
+import { validateRequest } from "./request-validation";
+import { WorkerPublicationOperations } from "./worker-publication";
 
 type SqliteModule = {
   oo1: { DB: new (name: string, mode: string) => SqliteConnection };
@@ -245,41 +240,8 @@ function resetIncompatibleLocalDatabase(config: {
     storageFailure("incompatible database reset", error);
   }
 }
-function liveBytes(): ArrayBuffer {
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  return exportOpfsDatabase(storage.opfsPool, "/index.sqlite3");
-}
-function candidateName(id: string): string {
-  return `/index.sqlite3.${id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80)}.candidate`;
-}
-function openCandidate(name: string): MutableSqliteDatabase {
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  return new MutableSqliteDatabase(new storage.opfsPool.OpfsSAHPoolDb(name, "c"));
-}
-function config(db: MutableSqliteDatabase): {
-  corpus: string;
-  embedding: string;
-  dimensions: number;
-  buildIdentity: string;
-} {
-  const s = db.getState();
-  return {
-    corpus: s.corpusFingerprint,
-    embedding: s.embeddingFingerprint,
-    dimensions: s.dimensions,
-    buildIdentity: s.buildIdentity,
-  };
-}
-
-function runtimeConfig(db: MutableSqliteDatabase): {
-  corpus: string;
-  embedding: string;
-  dimensions: number;
-  buildIdentity: string;
-} {
-  const persisted = config(db);
+function runtimeConfig(database: MutableSqliteDatabase) {
+  const state = database.getState();
   return bootConfig
     ? {
         corpus: bootConfig.corpusFingerprint,
@@ -287,159 +249,20 @@ function runtimeConfig(db: MutableSqliteDatabase): {
         dimensions: bootConfig.dimensions,
         buildIdentity: bootConfig.buildIdentity,
       }
-    : persisted;
+    : {
+        corpus: state.corpusFingerprint,
+        embedding: state.embeddingFingerprint,
+        dimensions: state.dimensions,
+        buildIdentity: state.buildIdentity,
+      };
 }
+const publication = new WorkerPublicationOperations({
+  storage,
+  openDatabase: () => openDatabase(),
+  closeConnection,
+  runtimeConfig,
+});
 
-function rejectActiveLexicalRun(db: MutableSqliteDatabase): void {
-  if (db.hasActiveLexicalRuns()) throw sqliteError("busy", "A lexical run is still active", true);
-}
-
-function bootAndValidateCandidate(
-  candidate: MutableSqliteDatabase,
-  expected: ReturnType<typeof runtimeConfig>
-): SqliteState {
-  candidate.validateSnapshot(
-    expected.corpus,
-    expected.dimensions,
-    expected.embedding,
-    expected.buildIdentity
-  );
-  // validateSnapshot proves the persisted identity before boot(), which otherwise
-  // rewrites corpus and embedding fingerprints that differ from the runtime.
-  candidate.boot(expected.corpus, expected.dimensions, expected.embedding, expected.buildIdentity);
-  return candidate.getState();
-}
-
-async function preparePublication(publicationId: string): Promise<unknown> {
-  const db = await openDatabase();
-  rejectActiveLexicalRun(db);
-  const state = db.getState();
-  db.validateSnapshot(state.corpusFingerprint, state.dimensions, state.embeddingFingerprint);
-  const started = Date.now();
-  const original = liveBytes();
-  closeConnection();
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  const name = candidateName(publicationId);
-  let candidate: MutableSqliteDatabase | undefined;
-  try {
-    storage.opfsPool.importDb(name, original);
-    candidate = openCandidate(name);
-    candidate.pruneForPublication();
-    candidate.setPublicationId(publicationId);
-    candidate.validateSnapshot(
-      state.corpusFingerprint,
-      state.dimensions,
-      state.embeddingFingerprint
-    );
-    const bytes = exportOpfsDatabase(storage.opfsPool, name);
-    if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)
-      throw sqliteError("integrity_failed", "SQLite publication exceeds the safety limit");
-    return {
-      publicationId,
-      state: candidate.getState(),
-      bytes,
-      byteSize: bytes.byteLength,
-      durationMs: Date.now() - started,
-      copyBytes: original.byteLength + bytes.byteLength,
-    };
-  } finally {
-    candidate?.close();
-    storage.opfsPool.unlink(name);
-    await openDatabase();
-  }
-}
-async function inspectPublication(bytes: ArrayBuffer, payload: any): Promise<unknown> {
-  if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)
-    throw sqliteError("invalid_request", "Publication exceeds the safety limit");
-  const live = await openDatabase();
-  rejectActiveLexicalRun(live);
-  const expected = runtimeConfig(live);
-  if (payload.corpusFingerprint && payload.corpusFingerprint !== expected.corpus)
-    throw sqliteError(
-      "incompatible_state",
-      "Publication corpus fingerprint does not match settings"
-    );
-  closeConnection();
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  const name = `/index.sqlite3.inspect-${Date.now()}`;
-  let candidate: MutableSqliteDatabase | undefined;
-  try {
-    storage.opfsPool.importDb(name, bytes);
-    candidate = openCandidate(name);
-    candidate.validateSnapshot(
-      payload.corpusFingerprint ?? expected.corpus,
-      payload.dimensions ?? expected.dimensions,
-      payload.embeddingFingerprint ?? expected.embedding,
-      payload.buildIdentity ?? expected.buildIdentity
-    );
-    const state = candidate.getState();
-    if (!state.publicationId) throw sqliteError("incompatible_state", "Publication ID is missing");
-    return { valid: true, publicationId: state.publicationId, state, byteSize: bytes.byteLength };
-  } finally {
-    candidate?.close();
-    storage.opfsPool.unlink(name);
-    await openDatabase();
-  }
-}
-async function adoptPublication(bytes: ArrayBuffer, payload: any): Promise<unknown> {
-  const live = await openDatabase();
-  rejectActiveLexicalRun(live);
-  const expected = runtimeConfig(live);
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  const stampName = `/index.sqlite3.adopt-${Date.now()}`;
-  let stampedCandidate: MutableSqliteDatabase | undefined;
-  let stampedBytes: ArrayBuffer;
-  try {
-    storage.opfsPool.importDb(stampName, bytes);
-    stampedCandidate = openCandidate(stampName);
-    const candidateState = bootAndValidateCandidate(stampedCandidate, expected);
-    if (!candidateState.publicationId)
-      throw sqliteError("incompatible_state", "Publication ID is missing");
-    if (
-      payload.expectedPublicationId &&
-      payload.expectedPublicationId !== candidateState.publicationId
-    )
-      throw sqliteError("incompatible_state", "Publication ID changed during adoption");
-    stampedCandidate.markSnapshotLoaded();
-    stampedBytes = exportOpfsDatabase(storage.opfsPool, stampName);
-  } finally {
-    stampedCandidate?.close();
-    storage.opfsPool.unlink(stampName);
-  }
-  const backup = liveBytes();
-  closeConnection();
-  if (!storage.opfsPool)
-    throw sqliteError("storage_unavailable", "SQLite OPFS pool is unavailable");
-  try {
-    storage.opfsPool.importDb("/index.sqlite3", stampedBytes);
-    const reopened = await openDatabase();
-    reopened.validateSnapshot(
-      expected.corpus,
-      expected.dimensions,
-      expected.embedding,
-      expected.buildIdentity
-    );
-    return reopened.getState();
-  } catch (error) {
-    closeConnection();
-    try {
-      storage.opfsPool.importDb("/index.sqlite3", backup);
-      const restored = await openDatabase();
-      restored.validateSnapshot(
-        expected.corpus,
-        expected.dimensions,
-        expected.embedding,
-        expected.buildIdentity
-      );
-    } catch {
-      /* preserve original failure */
-    }
-    throw error;
-  }
-}
 async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unknown> {
   const p: any = request.payload;
   if (request.method === "boot") {
@@ -469,35 +292,10 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     bootConfig = undefined;
     return { closed: true };
   }
-  if (
-    [
-      "preparePublication",
-      "finalizePublication",
-      "inspectPublication",
-      "adoptPublication",
-    ].includes(request.method)
-  ) {
-    if (request.method === "preparePublication") return preparePublication(p.publicationId);
-    const db = await openDatabase();
-    if (request.method === "finalizePublication") {
-      const result = db.finalizePublication(
-        p.publicationId,
-        p.expectedChangeCounter,
-        p.expectedLexicalGeneration,
-        p.expectedSemanticGeneration
-      );
-      if (!result)
-        throw sqliteError(
-          "busy",
-          "Publication is stale; local changes require a new publication.",
-          true
-        );
-      return result;
-    }
-    if (request.method === "inspectPublication") return inspectPublication(p.bytes, p);
-    if (request.method === "adoptPublication") return adoptPublication(p.bytes, p);
-    throw sqliteError("unsupported", "Unknown maintenance method");
-  }
+  if (request.method === "preparePublication") return publication.prepare(p.publicationId);
+  if (request.method === "finalizePublication") return publication.finalize(p);
+  if (request.method === "inspectPublication") return publication.inspect(p);
+  if (request.method === "adoptPublication") return publication.adopt(p);
   const db = await openDatabase();
   switch (request.method) {
     case "getState":

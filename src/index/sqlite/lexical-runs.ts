@@ -13,6 +13,7 @@ import type { LexicalRunRegistry } from "./lexical-context";
 import type { SqliteLexicalBatchStore } from "./lexical-batch";
 import type { SqliteLexicalStagingStore } from "./lexical-staging";
 import type { SqliteStateStore } from "./state";
+import { LEXICAL_BOUNDED_DELETE_SQL, LEXICAL_FINISH_EQUALITY_SQL } from "./hot-queries";
 
 function withExpectedNotes<T>(
   context: SqliteContext,
@@ -190,19 +191,7 @@ export class SqliteLexicalRunStore {
         const mismatch = withExpectedNotes(
           this.context,
           run.expected,
-          () =>
-            rows(
-              this.context.db,
-              `SELECT count(*) AS count
-             FROM reconciliation_expected e LEFT JOIN notes n ON n.path=e.path
-             LEFT JOIN note_revisions r ON r.revision_id=n.lexical_revision_id
-             WHERE n.note_pk IS NULL OR r.content_id<>e.content_id OR
-                   (e.chunk_count IS NOT NULL AND e.chunk_count<>(
-                     SELECT count(*) FROM chunk_occurrences c
-                     WHERE c.note_id=n.note_id AND c.revision_id=n.lexical_revision_id
-                   ))`,
-              []
-            )[0]
+          () => rows(this.context.db, LEXICAL_FINISH_EQUALITY_SQL, [])[0]
         );
         if (Number(mismatch.count))
           throw sqliteError("busy", "Lexical run has unapplied notes", true);
@@ -238,7 +227,7 @@ export class SqliteLexicalRunStore {
                     JOIN lexical_delete_paths d ON d.path=n.path`,
             });
             this.context.db.exec({
-              sql: "DELETE FROM notes WHERE path IN (SELECT path FROM lexical_delete_paths)",
+              sql: LEXICAL_BOUNDED_DELETE_SQL,
             });
           }
         } finally {

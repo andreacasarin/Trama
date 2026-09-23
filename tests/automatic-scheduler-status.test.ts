@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
-import { IndexOperationLease, IndexStatusController } from "@/ui/index/IndexStatus";
+import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { IndexOperationLease } from "@/ui/index/IndexOperationLease";
 import { sqliteError } from "@/index/sqlite/protocol";
 
 describe("automatic scheduler status and diagnostics", () => {

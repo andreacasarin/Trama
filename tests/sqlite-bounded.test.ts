@@ -4,8 +4,8 @@ import {
   SQLITE_MAX_LEXICAL_BATCH_MARKDOWN_BYTES,
   SQLITE_MAX_LEXICAL_BATCH_NOTES,
   SQLITE_PROTOCOL_VERSION,
-  validateRequest,
 } from "@/index/sqlite/protocol";
+import { validateRequest } from "@/index/sqlite/request-validation";
 import {
   applyTestLexicalRun,
   createTestSqliteClient,
