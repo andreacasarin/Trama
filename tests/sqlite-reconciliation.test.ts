@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createTestSqliteClient, inspectPersistedOccurrences } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  inspectPersistedOccurrences,
+} from "./sqlite-test-client";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -12,15 +16,7 @@ describe("revision reconciliation", () => {
       dimensions: 2,
     });
     const markdown = "# Heading\nalpha";
-    await client.call("upsertLexicalRevision", {
-      path: "note.md",
-      markdown,
-      expectedRevisionDigest: await client.call("hashMarkdown", {
-        markdown,
-        corpusFingerprint: digest("corpus"),
-      }),
-      size: 384,
-    });
+    await applyTestLexicalRun(client, [{ path: "note.md", markdown, size: 384 }]);
     const state = await client.call("getState", {});
     expect(state.semanticHeadCount).toBe(0);
     expect(state.semanticEligibleCount).toBe(1);
@@ -36,18 +32,9 @@ describe("revision reconciliation", () => {
       dimensions: 2,
     });
     const markdown = "# Parent\n\n### First\n\n### Second\n\nbody";
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
     await expect(
-      client.call("upsertLexicalRevision", {
-        path: "skipped.md",
-        markdown,
-        expectedRevisionDigest: revisionDigest,
-        size: 384,
-      })
-    ).resolves.toMatchObject({ changed: true });
+      applyTestLexicalRun(client, [{ path: "skipped.md", markdown, size: 384 }])
+    ).resolves.toMatchObject({ applied: { changed: true } });
     await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 1 });
     await expect(inspectPersistedOccurrences(identity)).resolves.toEqual(
       expect.arrayContaining([

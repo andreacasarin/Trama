@@ -16,7 +16,7 @@ import {
   sqliteError,
 } from "./protocol";
 import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
-import { applyLexicalMarkdownBatch, hashMarkdown, upsertLexicalMarkdown } from "./markdown";
+import { applyLexicalMarkdownBatch } from "./markdown";
 
 type SqliteModule = {
   oo1: { DB: new (name: string, mode: string) => SqliteConnection };
@@ -498,36 +498,21 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     if (request.method === "adoptPublication") return adoptPublication(p.bytes, p);
     throw sqliteError("unsupported", "Unknown maintenance method");
   }
-  if (request.method === "hashMarkdown")
-    return hashMarkdown(p.markdown, p.corpusFingerprint, signal);
   const db = await openDatabase();
   switch (request.method) {
     case "getState":
       return db.getState();
-    case "planReconciliation":
-      return db.planReconciliation(p.summaries);
     case "markIncomplete":
       return db.markIncomplete();
-    case "beginRebuild":
-      return db.beginRebuild();
-    case "upsertLexicalRevision":
-      return upsertLexicalMarkdown(
-        db,
-        p.path,
-        p.markdown,
-        p.expectedRevisionDigest,
-        p.size,
-        signal
-      );
     case "beginLexicalRun":
       return db.beginLexicalRun({
         runId: p.runId,
-        summaries: p.summaries ?? p.manifest,
+        summaries: p.summaries,
         expectedChangeCounter: p.expectedChangeCounter,
         scope: p.scope,
       });
     case "applyLexicalBatch":
-      return applyLexicalMarkdownBatch(db, p.runId, p.notes ?? p.markdown ?? [], signal);
+      return applyLexicalMarkdownBatch(db, p.runId, p.notes, signal);
     case "finishLexicalRun":
       return db.finishLexicalRun(p.runId);
     case "abortLexicalRun":
@@ -544,22 +529,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       );
     case "commitSemanticResults":
       return db.commitSemanticResults(p.results, p.embeddingFingerprint, p.preprocessing);
-    case "listMissingEmbeddingInputs":
-      return db.listMissingEmbeddingInputs(p.embeddingFingerprint, p.preprocessing, p.limit);
-    case "storeEmbeddingResults":
-      return db.storeEmbeddingResults(p.results, p.embeddingFingerprint, p.preprocessing);
-    case "promoteSemanticHeads":
-      return db.promoteSemanticHeads(p.embeddingFingerprint, p.preprocessing);
     case "clearSemanticCache":
       return db.clearSemanticCache();
-    case "renameLexicalNote":
-      return db.renameLexicalNote(p.from, p.to);
-    case "deleteLexicalNote":
-      return db.deleteLexicalNote(p.path);
-    case "finishReconciliation":
-      return db.finishReconciliation(p.summaries, p.observedChangeCounter);
-    case "finishScopedReconciliation":
-      return db.finishScopedReconciliation(p.observedChangeCounter, p.mayClearIncomplete);
     case "retrieve":
       return db.retrieve(p.query, p.vector, p.limit, p.currentPath, p);
     case "findRelated":

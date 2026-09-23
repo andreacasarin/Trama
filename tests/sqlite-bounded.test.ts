@@ -6,7 +6,12 @@ import {
   SQLITE_PROTOCOL_VERSION,
   validateRequest,
 } from "@/index/sqlite/protocol";
-import { createTestSqliteClient, inspectPersistedLexicalRevisionCount } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  hashTestMarkdown,
+  inspectPersistedLexicalRevisionCount,
+} from "./sqlite-test-client";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -124,13 +129,11 @@ describe("bounded lexical runs", () => {
     const client = createTestSqliteClient();
     const corpusFingerprint = digest("rename-corpus");
     await client.call("boot", { corpusFingerprint, dimensions: 2 });
-    const contentId = await client.call("hashMarkdown", { corpusFingerprint, markdown: "same" });
-    for (const path of ["one.md", "two.md"])
-      await client.call("upsertLexicalRevision", {
-        path,
-        markdown: "same",
-        expectedRevisionDigest: contentId,
-      });
+    const contentId = await hashTestMarkdown("same", corpusFingerprint);
+    await applyTestLexicalRun(client, [
+      { path: "one.md", markdown: "same" },
+      { path: "two.md", markdown: "same" },
+    ]);
     const before = await client.call("listLexicalSummaries", {});
     const run = await client.call("beginLexicalRun", {
       summaries: [
@@ -179,10 +182,7 @@ describe("bounded lexical runs", () => {
       summaries: [
         {
           path: "new.md",
-          contentId: await client.call("hashMarkdown", {
-            corpusFingerprint,
-            markdown: "fresh-word",
-          }),
+          contentId: await hashTestMarkdown("fresh-word", corpusFingerprint),
         },
       ],
     });
@@ -327,49 +327,15 @@ describe("bounded lexical runs", () => {
     await client.call("finishLexicalRun", { runId: replacementRun.runId });
   });
 
-  it("routes the compatibility upsert through bounded staging for oversized notes", async () => {
-    const client = createTestSqliteClient();
-    const corpusFingerprint = digest("legacy-oversized-note");
-    await client.call("boot", { corpusFingerprint, dimensions: 2 });
-    const markdown = Array.from({ length: 2_001 }, (_, index) => `# legacy-${index}`).join("\n");
-    const revisionDigest = await client.call("hashMarkdown", { corpusFingerprint, markdown });
-    const result = await client.call("upsertLexicalRevision", {
-      path: "legacy.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 64,
-    });
-    expect(result).toMatchObject({ changed: true, state: { lexicalGeneration: 1 } });
-    await expect(
-      client.call("retrieve", { query: "legacy-2000", limit: 10 })
-    ).resolves.toHaveLength(1);
-  });
-
-  it("keeps compatibility upsert revision counts aligned with active heads", async () => {
+  it("keeps staged revision counts aligned with active heads", async () => {
     const identity = {};
     const client = createTestSqliteClient(identity);
     const corpusFingerprint = digest("upsert-count");
     await client.call("boot", { corpusFingerprint, dimensions: 2 });
     const first = "first lexical revision";
-    const firstDigest = await client.call("hashMarkdown", {
-      corpusFingerprint,
-      markdown: first,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "counted.md",
-      markdown: first,
-      expectedRevisionDigest: firstDigest,
-    });
+    await applyTestLexicalRun(client, [{ path: "counted.md", markdown: first }]);
     const second = "second lexical revision";
-    const secondDigest = await client.call("hashMarkdown", {
-      corpusFingerprint,
-      markdown: second,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "counted.md",
-      markdown: second,
-      expectedRevisionDigest: secondDigest,
-    });
+    await applyTestLexicalRun(client, [{ path: "counted.md", markdown: second }]);
     await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 1 });
     await expect(inspectPersistedLexicalRevisionCount(identity)).resolves.toBe(1);
   });

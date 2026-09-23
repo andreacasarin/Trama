@@ -1,4 +1,5 @@
 import { ChatResponse, ToolCall } from "@/domain/contracts";
+import { isSqliteMethod } from "@/index/sqlite/protocol";
 import { ToolResult } from "@/tools/ToolRegistry";
 
 /** Explicit diagnostic area used to keep chat payloads separate from metadata-only index events. */
@@ -28,32 +29,6 @@ const SQLITE_ERROR_CODES = new Set([
   "unavailable",
   "limit_exceeded",
   "query_embedding_failed",
-]);
-const SQLITE_METHODS = new Set([
-  "boot",
-  "getState",
-  "planReconciliation",
-  "markIncomplete",
-  "beginRebuild",
-  "clearVectors",
-  "hashMarkdown",
-  "upsertMarkdown",
-  "upsertLexicalRevision",
-  "listLexicalSummaries",
-  "listMissingEmbeddingInputs",
-  "storeEmbeddingResults",
-  "renameNote",
-  "deleteNote",
-  "finishReconciliation",
-  "finishScopedReconciliation",
-  "retrieve",
-  "findRelated",
-  "preparePublication",
-  "finalizePublication",
-  "inspectPublication",
-  "adoptPublication",
-  "cancelQueued",
-  "shutdown",
 ]);
 const SQLITE_PHASES = new Set([
   "boot",
@@ -343,7 +318,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
           : "Error",
       ...(typeof code === "string" && SQLITE_ERROR_CODES.has(code) ? { code } : {}),
       ...(safeMessage ? { message: safeMessage } : {}),
-      ...(typeof method === "string" && SQLITE_METHODS.has(method) ? { method } : {}),
+      ...(isSqliteMethod(method) ? { method } : {}),
       ...(typeof phase === "string" && SQLITE_PHASES.has(phase) ? { phase } : {}),
       ...(debugLocation ? { debugLocation } : {}),
       ...(typeof code === "string" && SQLITE_ERROR_CODES.has(code) && typeof retryable === "boolean"

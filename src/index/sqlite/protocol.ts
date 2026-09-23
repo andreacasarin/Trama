@@ -9,7 +9,6 @@ export const SQLITE_MAX_MARKDOWN = 16 * 1024 * 1024;
 export const SQLITE_MAX_NOTES = 100_000;
 export const SQLITE_MAX_CHUNKS = 1_000_000;
 export const SQLITE_MAX_RESULTS = 256;
-export const SQLITE_MAX_VECTOR_BATCH = 512;
 /** Bounds for one set-based semantic executor slice. */
 export const SQLITE_MAX_SEMANTIC_BATCH_ITEMS = 128;
 export const SQLITE_MAX_SEMANTIC_INPUT_BYTES = 4 * 1024 * 1024;
@@ -23,11 +22,7 @@ export const SQLITE_MAX_LEXICAL_BATCH_OCCURRENCES = 2_000;
 export type SqliteMethod =
   | "boot"
   | "getState"
-  | "planReconciliation"
   | "markIncomplete"
-  | "beginRebuild"
-  | "hashMarkdown"
-  | "upsertLexicalRevision"
   | "beginLexicalRun"
   | "applyLexicalBatch"
   | "finishLexicalRun"
@@ -35,14 +30,7 @@ export type SqliteMethod =
   | "listLexicalSummaries"
   | "prepareSemanticWork"
   | "commitSemanticResults"
-  | "listMissingEmbeddingInputs"
-  | "storeEmbeddingResults"
-  | "promoteSemanticHeads"
   | "clearSemanticCache"
-  | "renameLexicalNote"
-  | "deleteLexicalNote"
-  | "finishReconciliation"
-  | "finishScopedReconciliation"
   | "retrieve"
   | "findRelated"
   | "preparePublication"
@@ -74,14 +62,6 @@ export interface SqliteLexicalBatchNoteInput {
   /** Optional caller-observed digest used to fence a stale read. */
   readonly expectedRevisionDigest?: string;
   readonly size?: number;
-}
-export interface SqliteLexicalRunReceipt {
-  readonly runId: string;
-  readonly generation: SqliteGenerationToken;
-  readonly changed?: boolean;
-  readonly skipped?: number;
-  readonly deleted?: number;
-  readonly renamed?: number;
 }
 export interface SqliteLexicalBatchResult {
   readonly runId: string;
@@ -193,22 +173,6 @@ export interface SqliteReconciliationPlan {
 }
 export type SqliteMutationStatus =
   "changed" | "unchanged" | "absent" | "alreadyApplied" | "state_changed";
-export interface SqliteMutationResult {
-  readonly changed: boolean;
-  readonly status: SqliteMutationStatus;
-  readonly rescan?: boolean;
-  readonly state: SqliteState;
-  readonly inputHashCount?: number;
-  readonly inputHashBytes?: number;
-  readonly receipt?: SqliteMutationReceipt;
-}
-export interface SqliteSemanticMutationResult {
-  readonly stored?: number;
-  readonly skipped?: number;
-  readonly promoted: number;
-  readonly state: SqliteState;
-  readonly receipt?: SqliteMutationReceipt;
-}
 export function sqliteGenerationToken(state: SqliteState): SqliteGenerationToken {
   return {
     changeCounter: state.changeCounter,
@@ -260,27 +224,16 @@ export interface SqliteRequestPayloads {
     readonly identity?: string;
   };
   getState: Record<string, never>;
-  planReconciliation: { readonly summaries: readonly SqliteNoteSummary[] };
   markIncomplete: Record<string, never>;
-  beginRebuild: Record<string, never>;
-  hashMarkdown: { readonly markdown: string; readonly corpusFingerprint: string };
-  upsertLexicalRevision: {
-    readonly path: string;
-    readonly markdown: string;
-    readonly expectedRevisionDigest: string;
-    readonly size?: number;
-  };
   beginLexicalRun: {
     readonly runId?: string;
     readonly summaries?: readonly SqliteNoteSummary[];
-    readonly manifest?: readonly SqliteNoteSummary[];
     readonly expectedChangeCounter?: number;
     readonly scope?: SqliteLexicalScope;
   };
   applyLexicalBatch: {
     readonly runId: string;
-    readonly notes?: readonly SqliteLexicalBatchNoteInput[];
-    readonly markdown?: readonly SqliteLexicalBatchNoteInput[];
+    readonly notes: readonly SqliteLexicalBatchNoteInput[];
   };
   finishLexicalRun: { readonly runId: string };
   abortLexicalRun: { readonly runId: string };
@@ -300,28 +253,7 @@ export interface SqliteRequestPayloads {
     readonly expectedCount: number;
     readonly results: readonly SqliteEmbeddingResult[];
   };
-  listMissingEmbeddingInputs: {
-    readonly embeddingFingerprint: string;
-    readonly preprocessing?: string;
-    readonly limit: number;
-  };
-  storeEmbeddingResults: {
-    readonly embeddingFingerprint: string;
-    readonly preprocessing?: string;
-    readonly results: readonly SqliteEmbeddingResult[];
-  };
-  promoteSemanticHeads: { readonly embeddingFingerprint: string; readonly preprocessing?: string };
   clearSemanticCache: Record<string, never>;
-  renameLexicalNote: { readonly from: string; readonly to: string };
-  deleteLexicalNote: { readonly path: string };
-  finishReconciliation: {
-    readonly observedChangeCounter: number;
-    readonly summaries: readonly SqliteNoteSummary[];
-  };
-  finishScopedReconciliation: {
-    readonly observedChangeCounter: number;
-    readonly mayClearIncomplete: boolean;
-  };
   retrieve: {
     readonly query?: string;
     readonly vector?: Float32Array;
@@ -422,11 +354,7 @@ export function sqliteError(
 const METHODS: readonly SqliteMethod[] = [
   "boot",
   "getState",
-  "planReconciliation",
   "markIncomplete",
-  "beginRebuild",
-  "hashMarkdown",
-  "upsertLexicalRevision",
   "beginLexicalRun",
   "applyLexicalBatch",
   "finishLexicalRun",
@@ -434,14 +362,7 @@ const METHODS: readonly SqliteMethod[] = [
   "listLexicalSummaries",
   "prepareSemanticWork",
   "commitSemanticResults",
-  "listMissingEmbeddingInputs",
-  "storeEmbeddingResults",
-  "promoteSemanticHeads",
   "clearSemanticCache",
-  "renameLexicalNote",
-  "deleteLexicalNote",
-  "finishReconciliation",
-  "finishScopedReconciliation",
   "retrieve",
   "findRelated",
   "preparePublication",
@@ -542,25 +463,8 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       (value.identity !== undefined && !validHash(value.identity))
     )
       throw sqliteError("invalid_request", "Invalid boot payload");
-  } else if (method === "hashMarkdown") {
-    if (
-      typeof value.markdown !== "string" ||
-      value.markdown.length > SQLITE_MAX_MARKDOWN ||
-      !validHash(value.corpusFingerprint)
-    )
-      throw sqliteError("invalid_request", "Invalid Markdown hash payload");
-  } else if (method === "upsertLexicalRevision") {
-    if (
-      !validPath(value.path) ||
-      typeof value.markdown !== "string" ||
-      value.markdown.length > SQLITE_MAX_MARKDOWN ||
-      !validHash(value.expectedRevisionDigest) ||
-      (value.size !== undefined &&
-        (!Number.isSafeInteger(value.size) || value.size < 1 || value.size > SQLITE_MAX_TEXT))
-    )
-      throw sqliteError("invalid_request", "Invalid lexical revision payload");
   } else if (method === "beginLexicalRun") {
-    const summaries = value.summaries ?? value.manifest;
+    const summaries = value.summaries;
     const scope = value.scope;
     if (
       (value.runId !== undefined && !validRunId(value.runId)) ||
@@ -591,7 +495,7 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
     )
       throw sqliteError("invalid_request", "Invalid lexical run payload");
   } else if (method === "applyLexicalBatch") {
-    const notes = value.notes ?? value.markdown;
+    const notes = value.notes;
     if (
       !validRunId(value.runId) ||
       !Array.isArray(notes) ||
@@ -658,47 +562,8 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       )
         throw sqliteError("invalid_request", "Semantic result batch exceeds supported bounds");
     }
-  } else if (method === "listMissingEmbeddingInputs") {
-    if (
-      !validHash(value.embeddingFingerprint) ||
-      !Number.isSafeInteger(value.limit) ||
-      value.limit < 0 ||
-      value.limit > SQLITE_MAX_VECTOR_BATCH
-    )
-      throw sqliteError("invalid_request", "Invalid embedding input request");
-  } else if (method === "storeEmbeddingResults") {
-    if (
-      !validHash(value.embeddingFingerprint) ||
-      !Array.isArray(value.results) ||
-      value.results.length > SQLITE_MAX_VECTOR_BATCH
-    )
-      throw sqliteError("invalid_request", "Invalid embedding result batch");
-  } else if (method === "promoteSemanticHeads") {
-    if (!validHash(value.embeddingFingerprint))
-      throw sqliteError("invalid_request", "Invalid semantic promotion payload");
   } else if (method === "clearSemanticCache") {
     // no payload fields
-  } else if (method === "renameLexicalNote") {
-    if (!validPath(value.from) || !validPath(value.to))
-      throw sqliteError("invalid_request", "Invalid rename payload");
-  } else if (method === "deleteLexicalNote") {
-    if (!validPath(value.path)) throw sqliteError("invalid_request", "Invalid delete payload");
-  } else if (method === "finishScopedReconciliation") {
-    if (
-      !Number.isSafeInteger(value.observedChangeCounter) ||
-      value.observedChangeCounter < 0 ||
-      typeof value.mayClearIncomplete !== "boolean"
-    )
-      throw sqliteError("invalid_request", "Invalid scoped reconciliation payload");
-  } else if (method === "planReconciliation" || method === "finishReconciliation") {
-    if (
-      (method === "finishReconciliation" &&
-        (!Number.isSafeInteger(value.observedChangeCounter) || value.observedChangeCounter < 0)) ||
-      !Array.isArray(value.summaries) ||
-      value.summaries.length > SQLITE_MAX_NOTES ||
-      !value.summaries.every(validSummary)
-    )
-      throw sqliteError("invalid_request", "Invalid reconciliation payload");
   } else if (method === "retrieve") {
     if (
       (value.query !== undefined &&

@@ -159,6 +159,18 @@ describe("diagnostic timing", () => {
     expect(unsafe.method).toBeUndefined();
     expect(unsafe.phase).toBeUndefined();
     expect(unsafe.debugLocation).toBeUndefined();
+    expect(
+      projectDiagnosticError({
+        name: "SqliteProtocolError",
+        error: { code: "internal", method: "applyLexicalBatch" },
+      }).method
+    ).toBe("applyLexicalBatch");
+    expect(
+      projectDiagnosticError({
+        name: "SqliteProtocolError",
+        error: { code: "internal", method: "hashMarkdown" },
+      }).method
+    ).toBeUndefined();
   });
 
   it("shows safe startup handshake build metadata in the collapsed log line", () => {

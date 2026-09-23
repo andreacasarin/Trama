@@ -163,13 +163,7 @@ export function instrumentSqliteClient(
     sampleMemory?.();
     counters.rpcCalls++;
     counters.rpcByMethod[method] = (counters.rpcByMethod[method] ?? 0) + 1;
-    if (method === "hashMarkdown") {
-      counters.contentHashCalls++;
-      counters.contentHashBytes += Buffer.byteLength(String(payload.markdown ?? ""), "utf8");
-    } else if (method === "upsertLexicalRevision") {
-      counters.contentHashCalls++;
-      counters.contentHashBytes += Buffer.byteLength(String(payload.markdown ?? ""), "utf8");
-    } else if (method === "applyLexicalBatch") {
+    if (method === "applyLexicalBatch") {
       // The Worker hashes every Markdown item before parsing, including items
       // that it later skips as unchanged.
       const notes = payload.notes ?? payload.markdown ?? [];
@@ -180,13 +174,7 @@ export function instrumentSqliteClient(
         0
       );
     }
-    if (
-      method === "getState" ||
-      method === "boot" ||
-      method === "finishReconciliation" ||
-      method === "finishScopedReconciliation"
-    )
-      counters.stateCalls++;
+    if (method === "getState" || method === "boot") counters.stateCalls++;
     if (method === "prepareSemanticWork") counters.semanticPrepareCalls++;
     if (method === "commitSemanticResults") counters.semanticCommitCalls++;
     const started = performance.now();
@@ -197,7 +185,7 @@ export function instrumentSqliteClient(
       (counters.rpcElapsedMs[method] ??= []).push(performance.now() - started);
       sampleMemory?.();
     }
-    if (method === "applyLexicalBatch" || method === "upsertLexicalRevision") {
+    if (method === "applyLexicalBatch") {
       const batch = result as { inputHashCount?: unknown; inputHashBytes?: unknown };
       counters.inputHashCount += Number(batch.inputHashCount ?? 0);
       counters.inputHashBytes += Number(batch.inputHashBytes ?? 0);

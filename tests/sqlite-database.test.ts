@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { createTestSqliteClient, inspectSnapshotTables } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  embedAllTestInputs,
+  inspectSnapshotTables,
+} from "./sqlite-test-client";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -18,24 +23,16 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = "alpha alpha";
-    const revisionDigest = await client.call("hashMarkdown", { markdown, corpusFingerprint });
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 384,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "two.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 384,
-    });
-    const requests = await client.call("listMissingEmbeddingInputs", {
+    await applyTestLexicalRun(client, [
+      { path: "one.md", markdown, size: 384 },
+      { path: "two.md", markdown, size: 384 },
+    ]);
+    const requests = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
       limit: 10,
+      maxInputBytes: 1024,
     });
-    expect(requests).toHaveLength(1);
+    expect(requests.requests).toHaveLength(1);
   });
 
   it("keeps lexical and old semantic heads while pruning pending publication material", async () => {
@@ -44,58 +41,21 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
 
-    const first = await client.call("hashMarkdown", {
-      markdown: "alpha",
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown: "alpha",
-      expectedRevisionDigest: first,
-      size: 100,
-    });
-    const firstRequest = (
-      await client.call("listMissingEmbeddingInputs", {
-        embeddingFingerprint,
-        limit: 10,
-      })
-    )[0];
-    await client.call("storeEmbeddingResults", {
-      embeddingFingerprint,
-      results: [
-        {
-          actionKey: firstRequest.actionKey,
-          inputId: firstRequest.inputId,
-          serialization: firstRequest.serialization,
-          vector: new Float32Array([1, 0]),
-        },
-      ],
-    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
+    await embedAllTestInputs(client, embeddingFingerprint, () => new Float32Array([1, 0]));
 
-    const shared = await client.call("hashMarkdown", {
-      markdown: "alpha",
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "two.md",
-      markdown: "alpha",
-      expectedRevisionDigest: shared,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "two.md", markdown: "alpha", size: 100 }]);
     expect(
-      await client.call("listMissingEmbeddingInputs", { embeddingFingerprint, limit: 10 })
+      (
+        await client.call("prepareSemanticWork", {
+          embeddingFingerprint,
+          limit: 10,
+          maxInputBytes: 1024,
+        })
+      ).requests
     ).toHaveLength(0);
 
-    const second = await client.call("hashMarkdown", {
-      markdown: "beta",
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown: "beta",
-      expectedRevisionDigest: second,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "beta", size: 100 }]);
     const prepared = await client.call("preparePublication", { publicationId: "heads-1" });
     expect(await inspectSnapshotTables(prepared.bytes)).toEqual({
       revisions: 3,
@@ -111,52 +71,38 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("generation-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = "alpha";
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
 
     const initial = await client.call("getState", {});
     expect(initial).toMatchObject({ lexicalGeneration: 0, semanticGeneration: 0 });
     expect(initial.semanticHeadKey).toBeUndefined();
 
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown, size: 100 }]);
     const lexical = await client.call("getState", {});
     expect(lexical).toMatchObject({ lexicalGeneration: 1, semanticGeneration: 0 });
 
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown, size: 100 }]);
     await expect(client.call("getState", {})).resolves.toMatchObject({
       lexicalGeneration: 1,
       semanticGeneration: 0,
     });
 
-    const request = (
-      await client.call("listMissingEmbeddingInputs", { embeddingFingerprint, limit: 4 })
-    )[0];
-    await client.call("storeEmbeddingResults", {
-      embeddingFingerprint,
-      results: [{ ...request, vector: new Float32Array([1, 0]) }],
-    });
+    await embedAllTestInputs(client, embeddingFingerprint, () => new Float32Array([1, 0]));
     const promoted = await client.call("getState", {});
     expect(promoted.semanticGeneration).toBe(1);
 
-    await client.call("renameLexicalNote", { from: "one.md", to: "renamed.md" });
+    await applyTestLexicalRun(client, [], {
+      renames: [{ from: "one.md", to: "renamed.md" }],
+      mayClearIncomplete: true,
+    });
     expect(await client.call("getState", {})).toMatchObject({
       lexicalGeneration: 2,
       semanticGeneration: 2,
     });
 
-    await client.call("deleteLexicalNote", { path: "renamed.md" });
+    await applyTestLexicalRun(client, [], {
+      deletes: ["renamed.md"],
+      mayClearIncomplete: true,
+    });
     expect(await client.call("getState", {})).toMatchObject({
       lexicalGeneration: 3,
       semanticGeneration: 3,
@@ -169,24 +115,19 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("cache-only-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = "alpha\n\nbeta";
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "two-blocks.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 100,
-    });
-    const requests = await client.call("listMissingEmbeddingInputs", {
+    await applyTestLexicalRun(client, [{ path: "two-blocks.md", markdown, size: 100 }]);
+    const prepared = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
       limit: 4,
+      maxInputBytes: 1024,
     });
+    const requests = prepared.requests;
     expect(requests.length).toBeGreaterThanOrEqual(2);
     const first = requests[0];
-    await client.call("storeEmbeddingResults", {
+    await client.call("commitSemanticResults", {
       embeddingFingerprint,
+      dimensions: 2,
+      expectedCount: 1,
       results: [{ ...first, vector: new Float32Array([1, 0]) }],
     });
     expect(await client.call("getState", {})).toMatchObject({
@@ -195,13 +136,16 @@ describe("revision cache database", () => {
     });
 
     const remaining = (
-      await client.call("listMissingEmbeddingInputs", {
+      await client.call("prepareSemanticWork", {
         embeddingFingerprint,
         limit: 4,
+        maxInputBytes: 1024,
       })
-    )[0];
-    await client.call("storeEmbeddingResults", {
+    ).requests[0];
+    await client.call("commitSemanticResults", {
       embeddingFingerprint,
+      dimensions: 2,
+      expectedCount: 1,
       results: [{ ...remaining, vector: new Float32Array([0, 1]) }],
     });
     expect(await client.call("getState", {})).toMatchObject({
@@ -216,16 +160,7 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("semantic-slices-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = "alpha\n\nbeta";
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "slice.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "slice.md", markdown, size: 100 }]);
     const prepared = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
       limit: 1,
@@ -261,16 +196,7 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("semantic-candidate-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = Array.from({ length: 129 }, (_, index) => `unique-${index}`).join("\n\n");
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "candidate-bound.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 80,
-    });
+    await applyTestLexicalRun(client, [{ path: "candidate-bound.md", markdown, size: 80 }]);
 
     const first = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
@@ -322,31 +248,13 @@ describe("revision cache database", () => {
     const embeddingFingerprint = digest("semantic-stale-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const first = "alpha";
-    const firstDigest = await client.call("hashMarkdown", {
-      markdown: first,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "stale.md",
-      markdown: first,
-      expectedRevisionDigest: firstDigest,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "stale.md", markdown: first, size: 100 }]);
     const prepared = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
       limit: 1,
     });
     const second = "beta";
-    const secondDigest = await client.call("hashMarkdown", {
-      markdown: second,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "stale.md",
-      markdown: second,
-      expectedRevisionDigest: secondDigest,
-      size: 100,
-    });
+    await applyTestLexicalRun(client, [{ path: "stale.md", markdown: second, size: 100 }]);
     await client.call("commitSemanticResults", {
       embeddingFingerprint,
       dimensions: 2,

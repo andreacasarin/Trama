@@ -155,10 +155,11 @@ describe("canonical embedding identity", () => {
     ).resolves.toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("changes action keys for exact input, fingerprint, preprocessing, or options", async () => {
+  it("changes action keys for exact input, fingerprint, preprocessing, or options", () => {
     const key = (input: string, fingerprint = "fp", preprocessing = "p", options = { x: 1 }) =>
       createEmbeddingActionKey(input, fingerprint, preprocessing, options);
-    const base = await key("input");
+    const base = key("input");
+    expect(key("input")).toBe(base);
     expect(key("changed")).not.toBe(base);
     expect(key("input", "changed")).not.toBe(base);
     expect(key("input", "fp", "changed")).not.toBe(base);

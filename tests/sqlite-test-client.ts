@@ -3,11 +3,8 @@ import { fileURLToPath } from "node:url";
 import { SqliteWorkerClient, type SqliteCallHandler } from "@/index/sqlite/client";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import { sqliteError } from "@/index/sqlite/protocol";
-import {
-  applyLexicalMarkdownBatch,
-  hashMarkdown,
-  upsertLexicalMarkdown,
-} from "@/index/sqlite/markdown";
+import { applyLexicalMarkdownBatch, hashMarkdown } from "@/index/sqlite/markdown";
+import type { SqliteLexicalScope } from "@/index/sqlite/protocol";
 import { schemaSql } from "@/index/sqlite/schema";
 
 interface TestStorage {
@@ -19,6 +16,54 @@ interface OpenDatabase {
   readonly database: MutableSqliteDatabase;
 }
 
+type TestSqliteClient = ReturnType<typeof createTestSqliteClient>;
+
+export async function applyTestLexicalRun(
+  client: TestSqliteClient,
+  notes: readonly { readonly path: string; readonly markdown: string; readonly size?: number }[],
+  scope: SqliteLexicalScope = { mayClearIncomplete: true }
+) {
+  const run = await client.call("beginLexicalRun", { scope });
+  const applied = await client.call("applyLexicalBatch", { runId: run.runId, notes });
+  let finished = await client.call("finishLexicalRun", { runId: run.runId });
+  while (!finished.complete) finished = await client.call("finishLexicalRun", { runId: run.runId });
+  return { applied, finished };
+}
+
+export async function embedAllTestInputs(
+  client: TestSqliteClient,
+  embeddingFingerprint: string,
+  vectorFor: (request: {
+    actionKey: string;
+    inputId: number;
+    serialization: string;
+  }) => Float32Array,
+  limit = 128
+) {
+  const requests = [];
+  for (;;) {
+    const prepared = await client.call("prepareSemanticWork", {
+      embeddingFingerprint,
+      limit,
+      maxInputBytes: 4 * 1024 * 1024,
+    });
+    requests.push(...prepared.requests);
+    if (prepared.requests.length === 0) return requests;
+    await client.call("commitSemanticResults", {
+      embeddingFingerprint,
+      dimensions: vectorFor(prepared.requests[0]).length,
+      expectedCount: prepared.requests.length,
+      results: prepared.requests.map(
+        (request: { actionKey: string; inputId: number; serialization: string }) => ({
+          ...request,
+          vector: vectorFor(request),
+        })
+      ),
+    });
+    if (!prepared.hasMore) return requests;
+  }
+}
+
 const storage = new WeakMap<object, TestStorage>();
 let runtimePromise: Promise<any> | undefined;
 
@@ -27,6 +72,9 @@ export async function snapshotFor(identity: object): Promise<Uint8Array> {
   if (!durable?.snapshot) throw new Error("SQLite test client has no persisted snapshot");
   return durable.snapshot.slice();
 }
+
+export const hashTestMarkdown = (markdown: string, corpusFingerprint: string) =>
+  hashMarkdown(markdown, corpusFingerprint);
 
 export async function loadTestSqlite(): Promise<any> {
   runtimePromise ??= (async () => {
@@ -245,30 +293,13 @@ export function createTestSqliteClient(
           break;
         case "getState":
           return opened.database.getState();
-        case "planReconciliation":
-          return opened.database.planReconciliation(value.summaries);
         case "markIncomplete":
           result = opened.database.markIncomplete();
-          break;
-        case "beginRebuild":
-          result = opened.database.beginRebuild();
-          break;
-        case "hashMarkdown":
-          return hashMarkdown(value.markdown, value.corpusFingerprint, signal);
-        case "upsertLexicalRevision":
-          result = await upsertLexicalMarkdown(
-            opened.database,
-            value.path,
-            value.markdown,
-            value.expectedRevisionDigest,
-            value.size,
-            signal
-          );
           break;
         case "beginLexicalRun":
           result = opened.database.beginLexicalRun({
             runId: value.runId,
-            summaries: value.summaries ?? value.manifest,
+            summaries: value.summaries,
             expectedChangeCounter: value.expectedChangeCounter,
             scope: value.scope,
           });
@@ -277,7 +308,7 @@ export function createTestSqliteClient(
           result = await applyLexicalMarkdownBatch(
             opened.database,
             value.runId,
-            value.notes ?? value.markdown ?? [],
+            value.notes,
             signal
           );
           break;
@@ -306,46 +337,8 @@ export function createTestSqliteClient(
             value.preprocessing
           );
           break;
-        case "listMissingEmbeddingInputs":
-          result = opened.database.listMissingEmbeddingInputs(
-            value.embeddingFingerprint,
-            value.preprocessing,
-            value.limit
-          );
-          break;
-        case "storeEmbeddingResults":
-          result = opened.database.storeEmbeddingResults(
-            value.results,
-            value.embeddingFingerprint,
-            value.preprocessing
-          );
-          break;
-        case "promoteSemanticHeads":
-          result = opened.database.promoteSemanticHeads(
-            value.embeddingFingerprint,
-            value.preprocessing
-          );
-          break;
         case "clearSemanticCache":
           result = opened.database.clearSemanticCache();
-          break;
-        case "renameLexicalNote":
-          result = opened.database.renameLexicalNote(value.from, value.to);
-          break;
-        case "deleteLexicalNote":
-          result = opened.database.deleteLexicalNote(value.path);
-          break;
-        case "finishReconciliation":
-          result = opened.database.finishReconciliation(
-            value.summaries,
-            value.observedChangeCounter
-          );
-          break;
-        case "finishScopedReconciliation":
-          result = opened.database.finishScopedReconciliation(
-            value.observedChangeCounter,
-            value.mayClearIncomplete
-          );
           break;
         case "retrieve":
           return opened.database.retrieve(

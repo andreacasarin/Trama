@@ -38,10 +38,8 @@ import {
   type SqliteHit,
   type SqliteState,
   type SqliteNoteSummary,
-  type SqliteReconciliationPlan,
   type SqliteLexicalBatchNoteInput,
   type SqliteLexicalRunResult,
-  type SqliteMutationResult,
   type SqliteSemanticWorkBatch,
   type SqliteSemanticCommitResult,
   type PublicationInspection,
@@ -875,18 +873,6 @@ export class IndexManager implements VaultRetrievalPort {
     }
   }
 
-  private async hashMarkdown(
-    markdown: string,
-    corpusFingerprint: string,
-    signal: AbortSignal
-  ): Promise<string> {
-    return (await this.ensureClient().call(
-      "hashMarkdown",
-      { markdown, corpusFingerprint },
-      signal
-    )) as string;
-  }
-
   async synchronize(signal: AbortSignal): Promise<IndexSyncResult> {
     return this.runSynchronization(signal);
   }
@@ -1081,147 +1067,6 @@ export class IndexManager implements VaultRetrievalPort {
     } finally {
       this.building = false;
     }
-  }
-
-  async discoverEligible(
-    signal: AbortSignal,
-    progressPhase?: "build-lexical" | "validate"
-  ): Promise<readonly SqliteNoteSummary[]> {
-    const paths = [...(await this.vault.listMarkdownPaths(signal))]
-      .map(normalizePath)
-      .filter((path) => this.isIndexEligible(path))
-      .sort(compareCodeUnits);
-    const fingerprint = await this.corpusFingerprintId();
-    const summaries: SqliteNoteSummary[] = [];
-    if (progressPhase)
-      this.reportProgress({
-        operation: "incremental",
-        phase: progressPhase,
-        completed: 0,
-        total: paths.length,
-        unit: "notes",
-        determinate: true,
-      });
-    for (const [index, path] of paths.entries()) {
-      const doc = await this.readMarkdownIfAvailable(path, signal, "incremental");
-      if (doc) {
-        check(signal);
-        summaries.push({
-          path,
-          contentId: await this.hashMarkdown(doc.content, fingerprint, signal),
-        });
-      }
-      if (progressPhase)
-        this.reportProgress(
-          {
-            operation: "incremental",
-            phase: progressPhase,
-            completed: index + 1,
-            total: paths.length,
-            unit: "notes",
-            determinate: true,
-          },
-          false
-        );
-    }
-    return summaries;
-  }
-
-  async reconcileDiscovered(
-    discovered: readonly SqliteNoteSummary[],
-    signal: AbortSignal
-  ): Promise<boolean> {
-    const plan = (await this.ensureClient().call(
-      "planReconciliation",
-      { summaries: discovered },
-      signal
-    )) as SqliteReconciliationPlan;
-    this.setState(plan.state);
-    let changed = false;
-    const total = plan.renames.length + plan.upserts.length + plan.deletes.length;
-    let completed = 0;
-    const reportWrite = () =>
-      this.reportProgress(
-        {
-          operation: "incremental",
-          phase: "encode-write",
-          completed: ++completed,
-          total,
-          unit: "notes",
-          determinate: true,
-        },
-        false
-      );
-    for (const rename of plan.renames) {
-      const result = (await this.ensureClient().call(
-        "renameLexicalNote",
-        rename,
-        signal
-      )) as SqliteMutationResult;
-      this.setState(result.state);
-      changed ||= result.changed;
-      reportWrite();
-    }
-
-    for (const summary of plan.upserts) {
-      check(signal);
-      const doc = await this.readMarkdownIfAvailable(summary.path, signal, "incremental");
-      if (!doc) continue;
-      const result = (await this.ensureClient().call(
-        "upsertLexicalRevision",
-        {
-          path: summary.path,
-          markdown: doc.content,
-          expectedRevisionDigest: summary.contentId,
-          size: this.options.size ?? CHUNK_SIZE,
-        },
-        signal
-      )) as SqliteMutationResult;
-      if (result.rescan) {
-        this.queueChange();
-        continue;
-      }
-      this.setState(result.state);
-      changed ||= result.changed;
-      reportWrite();
-    }
-
-    for (const note of plan.deletes) {
-      const result = (await this.ensureClient().call(
-        "deleteLexicalNote",
-        note,
-        signal
-      )) as SqliteMutationResult;
-      this.setState(result.state);
-      changed ||= result.changed;
-      reportWrite();
-    }
-    return changed;
-  }
-  async finishIfStable(
-    summaries: readonly SqliteNoteSummary[],
-    signal: AbortSignal,
-    expectedRevision = this.revision
-  ): Promise<boolean> {
-    const expected = [...summaries].sort((a, b) => compareCodeUnits(a.path, b.path));
-    if (expectedRevision !== this.revision) {
-      await this.markIncomplete(signal);
-      return false;
-    }
-    const before = this.state?.changeCounter ?? 0;
-    const state = (await this.ensureClient().call(
-      "finishReconciliation",
-      { summaries: expected, observedChangeCounter: before },
-      signal
-    )) as SqliteState;
-    if (expectedRevision !== this.revision) {
-      await this.markIncomplete(signal);
-      return false;
-    }
-    this.setState(state);
-    if (!state.incomplete)
-      this.freshness = state.snapshotLoaded ? "snapshot-loaded" : "locally-reconciled";
-    return !state.incomplete;
   }
 
   private async markIncomplete(signal: AbortSignal): Promise<SqliteState> {

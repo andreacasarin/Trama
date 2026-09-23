@@ -13,7 +13,6 @@ import {
   sqliteError,
   type SqliteLexicalBatchNoteInput,
   type SqliteLexicalBatchResult,
-  type SqliteMutationResult,
   type SqliteLexicalRevisionInput,
 } from "./protocol";
 import type { MutableSqliteDatabase } from "./database";
@@ -33,58 +32,6 @@ export async function hashMarkdown(
   }
   if (signal?.aborted) throw sqliteError("cancelled", "Request cancelled", true);
   return contentId;
-}
-
-/** Slice 3 API: parse Markdown blocks and activate an immutable lexical revision. */
-export async function upsertLexicalMarkdown(
-  database: MutableSqliteDatabase,
-  path: string,
-  markdown: string,
-  expectedRevisionDigest: string,
-  size = 384,
-  signal?: AbortSignal
-): Promise<SqliteMutationResult & { readonly blockCount: number }> {
-  const corpusFingerprint = database.getCorpusFingerprint();
-  const revisionDigest = await hashMarkdown(markdown, corpusFingerprint, signal);
-  if (revisionDigest !== expectedRevisionDigest)
-    return {
-      changed: false,
-      status: "state_changed",
-      rescan: true,
-      state: database.getState(),
-      blockCount: 0,
-    };
-  const blocks = chunkMarkdownBlocks(markdown, size, signal);
-  if (blocks.length > SQLITE_MAX_CHUNKS)
-    throw sqliteError("invalid_request", "Note has too many blocks");
-  let inputHashBytes = 0;
-  const input: SqliteLexicalRevisionInput = {
-    path,
-    revisionDigest,
-    blocks: await Promise.all(
-      blocks.map(async (block, ordinal) => {
-        inputHashBytes += utf8ByteLength(block.embeddingInput);
-        return {
-          ordinal,
-          kind: block.kind,
-          startLine: block.startLine,
-          endLine: block.endLine,
-          displayText: block.body,
-          headingContext: block.headingContext,
-          embeddingInput: block.embeddingInput,
-          embeddingInputDigest: await createInputDigest(block.embeddingInput),
-        };
-      })
-    ),
-  };
-  if (signal?.aborted) throw sqliteError("cancelled", "Request cancelled", true);
-  const result = database.upsertLexicalRevision(input);
-  return {
-    ...result,
-    blockCount: blocks.length,
-    inputHashCount: blocks.length,
-    inputHashBytes,
-  };
 }
 
 /**

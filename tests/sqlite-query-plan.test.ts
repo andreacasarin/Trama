@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { performance } from "node:perf_hooks";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { loadTestSqlite, createTestSqliteClient, snapshotFor } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  embedAllTestInputs,
+  loadTestSqlite,
+  snapshotFor,
+} from "./sqlite-test-client";
 
 type PlanRow = { id: number; parent: number; notused: number; detail: string };
 
@@ -150,40 +156,13 @@ describe("SQLite hot query plans", () => {
     const corpusFingerprint = digest("query-plan-corpus");
     const embeddingFingerprint = digest("query-plan-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
-    for (const [path, markdown] of [
-      ["one.md", "alpha alpha\n\nbeta"],
-      ["two.md", "alpha alpha\n\nbeta"],
-    ] as const) {
-      const revisionDigest = await client.call("hashMarkdown", {
-        markdown,
-        corpusFingerprint,
-      });
-      await client.call("upsertLexicalRevision", {
-        path,
-        markdown,
-        expectedRevisionDigest: revisionDigest,
-        size: 384,
-      });
-    }
-    const initial = await client.call("listMissingEmbeddingInputs", {
-      embeddingFingerprint,
-      limit: 20,
-    });
-    await client.call("storeEmbeddingResults", {
-      embeddingFingerprint,
-      results: initial.map((request: any) => ({ ...request, vector: new Float32Array([1, 0]) })),
-    });
+    await applyTestLexicalRun(client, [
+      { path: "one.md", markdown: "alpha alpha\n\nbeta", size: 384 },
+      { path: "two.md", markdown: "alpha alpha\n\nbeta", size: 384 },
+    ]);
+    await embedAllTestInputs(client, embeddingFingerprint, () => new Float32Array([1, 0]));
     const changedMarkdown = "gamma gamma\n\ndelta";
-    const changedDigest = await client.call("hashMarkdown", {
-      markdown: changedMarkdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "one.md",
-      markdown: changedMarkdown,
-      expectedRevisionDigest: changedDigest,
-      size: 384,
-    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: changedMarkdown, size: 384 }]);
     await client.call("shutdown", {});
     const snapshot = await snapshotFor(identity);
     const statements = [

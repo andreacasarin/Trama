@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { SQLITE_PROTOCOL_VERSION, validateRequest, sqliteError } from "@/index/sqlite/protocol";
 import {
-  SQLITE_MAX_MARKDOWN,
-  SQLITE_PROTOCOL_VERSION,
-  validateRequest,
-  sqliteError,
-} from "@/index/sqlite/protocol";
-import { deriveNoteContentId } from "@/index/Identity";
-import { createTestSqliteClient, malformedSchema7Snapshot } from "./sqlite-test-client";
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  embedAllTestInputs,
+  malformedSchema7Snapshot,
+} from "./sqlite-test-client";
 
 const hash = "a".repeat(64);
 
@@ -18,9 +17,6 @@ describe("SQLite protocol", () => {
       method,
       payload,
     });
-    expect(() =>
-      validateRequest(envelope("hashMarkdown", { markdown: "alpha", corpusFingerprint: hash }))
-    ).not.toThrow();
     expect(() =>
       validateRequest(envelope("boot", { corpusFingerprint: hash, dimensions: 2 }))
     ).not.toThrow();
@@ -35,25 +31,18 @@ describe("SQLite protocol", () => {
       ).toThrow();
     expect(() => validateRequest(envelope("clearSemanticCache", {}))).not.toThrow();
     expect(() =>
-      validateRequest(envelope("promoteSemanticHeads", { embeddingFingerprint: hash }))
-    ).not.toThrow();
-    expect(() =>
       validateRequest(
-        envelope("upsertLexicalRevision", {
-          path: "note.md",
-          markdown: "alpha",
-          expectedRevisionDigest: hash,
-          size: 384,
+        envelope("applyLexicalBatch", {
+          runId: "lexical-1",
+          notes: [{ path: "note.md", markdown: "alpha", size: 384 }],
         })
       )
     ).not.toThrow();
     expect(() =>
       validateRequest(
-        envelope("upsertLexicalRevision", {
-          path: "note.md",
-          markdown: "alpha",
-          expectedRevisionDigest: hash,
-          size: 2_000_001,
+        envelope("applyLexicalBatch", {
+          runId: "lexical-1",
+          notes: [{ path: "note.md", markdown: "alpha", size: 2_000_001 }],
         })
       )
     ).toThrow();
@@ -65,8 +54,8 @@ describe("SQLite protocol", () => {
       validateRequest({
         v: SQLITE_PROTOCOL_VERSION,
         id: 1,
-        method: "deleteLexicalNote",
-        payload: { path: "../secret.md" },
+        method: "beginLexicalRun",
+        payload: { scope: { deletes: ["../secret.md"], mayClearIncomplete: true } },
       })
     ).toThrow();
     expect(() =>
@@ -111,33 +100,12 @@ describe("SQLite protocol", () => {
     });
   });
 
-  it("returns canonical hash output through the Worker client boundary", async () => {
-    const client = createTestSqliteClient({ hashBoundary: true });
-    const corpusFingerprint = hash;
-    const markdown = "---\ntitle: 😀\n---\n\nUnicode café";
-    const expected = await deriveNoteContentId(corpusFingerprint, markdown);
-    await expect(client.call("hashMarkdown", { markdown, corpusFingerprint })).resolves.toBe(
-      expected
-    );
-  });
-
   it("returns cloneable state after an incompatible second boot", async () => {
     const client = createTestSqliteClient({ secondBootBoundary: true });
     await client.call("boot", { corpusFingerprint: hash, dimensions: 2 });
     await expect(
       client.call("boot", { corpusFingerprint: hash, dimensions: 3 })
     ).resolves.toMatchObject({ schemaVersion: 8, dimensions: 3, noteCount: 0 });
-  });
-
-  it("rejects the bounded protocol Markdown size before Worker dispatch", () => {
-    expect(() =>
-      validateRequest({
-        v: SQLITE_PROTOCOL_VERSION,
-        id: 1,
-        method: "hashMarkdown",
-        payload: { markdown: "x".repeat(SQLITE_MAX_MARKDOWN + 1), corpusFingerprint: hash },
-      })
-    ).toThrow("Invalid Markdown hash payload");
   });
 
   for (const defect of ["missing-vector", "wrong-fts", "wrong-index"] as const)
@@ -162,20 +130,8 @@ describe("SQLite protocol", () => {
     const embeddingFingerprint = "b".repeat(64);
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     const markdown = "sentinel";
-    const digest = await client.call("hashMarkdown", { markdown, corpusFingerprint });
-    await client.call("upsertLexicalRevision", {
-      path: "sentinel.md",
-      markdown,
-      expectedRevisionDigest: digest,
-      size: 100,
-    });
-    const request = (
-      await client.call("listMissingEmbeddingInputs", { embeddingFingerprint, limit: 4 })
-    )[0];
-    await client.call("storeEmbeddingResults", {
-      embeddingFingerprint,
-      results: [{ ...request, vector: new Float32Array([1, 0]) }],
-    });
+    await applyTestLexicalRun(client, [{ path: "sentinel.md", markdown, size: 100 }]);
+    await embedAllTestInputs(client, embeddingFingerprint, () => new Float32Array([1, 0]));
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
     await expect(client.call("getState", {})).resolves.toMatchObject({
       noteCount: 1,
@@ -190,13 +146,9 @@ describe("SQLite protocol", () => {
       const client = createTestSqliteClient(identity);
       await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
       const markdown = "This publication contains enough text to create a valid lexical block.";
-      const digest = await client.call("hashMarkdown", { markdown, corpusFingerprint });
-      await client.call("upsertLexicalRevision", {
-        path: `${publicationId}.md`,
-        markdown,
-        expectedRevisionDigest: digest,
-        size: markdown.length,
-      });
+      await applyTestLexicalRun(client, [
+        { path: `${publicationId}.md`, markdown, size: markdown.length },
+      ]);
       return {
         client,
         prepared: (await client.call("preparePublication", { publicationId })) as {

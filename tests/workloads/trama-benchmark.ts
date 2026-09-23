@@ -454,6 +454,7 @@ export async function runTramaBenchmark(
       ...(latestFilo?.results ?? []).flatMap((hit) => [hit.similarity, hit.score]),
       ...(latestVoce?.provenance ?? []).map((record) => record.score),
     ].filter((score): score is number => score !== undefined);
+    if (!semanticScores.length) throw new Error("Semantic benchmark produced no scores");
     if (semanticScores.some((score) => !Number.isFinite(score)))
       throw new Error("Semantic benchmark produced a non-finite score");
     durationMs.queries = performance.now() - queryStarted;
@@ -571,6 +572,7 @@ export async function runTramaBenchmark(
         semanticUncachedConverged: uncached?.converged === true,
         semanticCachedNoProviderWork: scenarios.semanticCached.providerTexts === 0,
         semanticPartialConverged: partial?.converged === true,
+        semanticResultsPresent: semanticScores.length > 0,
         semanticScoresFinite: semanticScores.every((score) => Number.isFinite(score)),
         finalCountsMatch:
           finalState?.noteCount === vault.notes.size && finalState.chunkCount === expectedChunks,

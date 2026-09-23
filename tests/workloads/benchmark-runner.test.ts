@@ -51,6 +51,7 @@ describe("benchmark lifecycle evidence", () => {
       "semanticCachedNoProviderWork",
       "semanticPartialConverged",
       "semanticScoresFinite",
+      "semanticResultsPresent",
       "finalCountsMatch",
       "allMutationsConverged",
       "publicationPublished",

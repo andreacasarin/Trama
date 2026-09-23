@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createTestSqliteClient } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  embedAllTestInputs,
+} from "./sqlite-test-client";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -10,30 +14,15 @@ async function semanticCorpus(
   const corpusFingerprint = digest("semantic-retrieval");
   const embeddingFingerprint = digest("semantic-model");
   await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
-  for (const note of notes) {
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown: note.markdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: note.path,
-      markdown: note.markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 100,
-    });
-  }
-  const requests = await client.call("listMissingEmbeddingInputs", {
-    embeddingFingerprint,
-    limit: 10,
-  });
-  await client.call("storeEmbeddingResults", {
-    embeddingFingerprint,
-    results: requests.map((request: { serialization: string }) => {
-      const body = (JSON.parse(request.serialization) as { body: string }).body;
-      const note = notes.find((candidate) => candidate.markdown === body);
-      if (!note) throw new Error(`Missing test vector for ${body}`);
-      return { ...request, vector: new Float32Array(note.vector) };
-    }),
+  await applyTestLexicalRun(
+    client,
+    notes.map(({ path, markdown }) => ({ path, markdown }))
+  );
+  await embedAllTestInputs(client, embeddingFingerprint, (request) => {
+    const body = (JSON.parse(request.serialization) as { body: string }).body;
+    const note = notes.find((candidate) => candidate.markdown === body);
+    if (!note) throw new Error(`Missing test vector for ${body}`);
+    return new Float32Array(note.vector);
   });
   return client;
 }
@@ -44,16 +33,7 @@ describe("revision retrieval", () => {
     const corpusFingerprint = digest("corpus-retrieval");
     await client.call("boot", { corpusFingerprint, dimensions: 2 });
     const markdown = "# Heading\nneedle alpha";
-    const revisionDigest = await client.call("hashMarkdown", {
-      markdown,
-      corpusFingerprint,
-    });
-    await client.call("upsertLexicalRevision", {
-      path: "note.md",
-      markdown,
-      expectedRevisionDigest: revisionDigest,
-      size: 384,
-    });
+    await applyTestLexicalRun(client, [{ path: "note.md", markdown, size: 384 }]);
     const hits = await client.call("retrieve", { query: "needle", limit: 5 });
     expect(hits[0]?.path).toBe("note.md");
     expect(hits[0]?.text).toContain("needle");

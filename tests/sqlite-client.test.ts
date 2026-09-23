@@ -118,18 +118,16 @@ describe("SqliteWorkerClient", () => {
     }
   });
 
-  it("sends lexical Markdown without requiring vector transferables", async () => {
+  it("sends lexical Markdown batches without requiring vector transferables", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);
 
-    await client.call("upsertLexicalRevision", {
-      path: "lexical.md",
-      markdown: "lexical only",
-      expectedRevisionDigest: "a".repeat(64),
-      size: 384,
+    await client.call("applyLexicalBatch", {
+      runId: "lexical-1",
+      notes: [{ path: "lexical.md", markdown: "lexical only", size: 384 }],
     });
 
-    expect(worker.messages[0].value.method).toBe("upsertLexicalRevision");
+    expect(worker.messages[0].value.method).toBe("applyLexicalBatch");
     expect(worker.messages[0].transfer).toEqual([]);
   });
 
@@ -138,12 +136,14 @@ describe("SqliteWorkerClient", () => {
     const client = new SqliteWorkerClient(worker);
     const vector = new Float32Array([1, 0]);
 
-    await client.call("storeEmbeddingResults", {
+    await client.call("commitSemanticResults", {
       embeddingFingerprint: "a".repeat(64),
+      dimensions: 2,
+      expectedCount: 1,
       results: [{ actionKey: "a".repeat(64), inputId: 1, serialization: "input", vector }],
     });
 
-    expect(worker.messages[0].value.method).toBe("storeEmbeddingResults");
+    expect(worker.messages[0].value.method).toBe("commitSemanticResults");
     expect(worker.messages[0].transfer).toEqual([vector.buffer]);
   });
 

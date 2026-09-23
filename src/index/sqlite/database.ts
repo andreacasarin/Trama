@@ -2,11 +2,9 @@ import {
   SQLITE_MAX_RESULTS,
   type SqliteHit,
   type SqliteState,
-  type SqliteMutationResult,
   type SqliteNoteSummary,
   type SqliteLexicalRevisionInput,
   type SqliteReconciliationPlan,
-  type SqliteSemanticMutationResult,
   type SqliteLexicalBatchResult,
   type SqliteLexicalRunResult,
   type SqliteLexicalScope,
@@ -554,7 +552,7 @@ export class MutableSqliteDatabase {
       );
     });
   }
-  planReconciliation(summaries: readonly SqliteNoteSummary[]): SqliteReconciliationPlan {
+  private planReconciliation(summaries: readonly SqliteNoteSummary[]): SqliteReconciliationPlan {
     this.ensureOpen();
     const planned = withExpectedNotes(this.db, summaries, () =>
       rows(
@@ -617,160 +615,6 @@ export class MutableSqliteDatabase {
       );
     return this.getState();
   }
-  /** Starts a full lexical pass without discarding chunks whose identities may survive. */
-  beginRebuild(): SqliteState {
-    this.ensureOpen();
-    transaction(this.db, () => {
-      this.markMutation();
-    });
-    return this.getState();
-  }
-
-  /** Activate one immutable Markdown revision and its lexical occurrences atomically. */
-  upsertLexicalRevision(input: SqliteLexicalRevisionInput): SqliteMutationResult {
-    this.ensureOpen();
-    if (input.blocks.length > SQLITE_MAX_LEXICAL_BATCH_OCCURRENCES) {
-      const runId = `legacy-${++this.lexicalRunSequence}`;
-      this.lexicalRuns.set(runId, {
-        runId,
-        expected: undefined,
-        renames: [],
-        deletes: [],
-        scoped: false,
-        mayClearIncomplete: true,
-        changeCounter: this.readChangeCounter(),
-        renamesApplied: true,
-      });
-      try {
-        const result = this.stageLexicalRevision(runId, input);
-        this.lexicalRuns.delete(runId);
-        const state = this.getState();
-        return {
-          changed: result.changed,
-          status: result.changed ? "changed" : "unchanged",
-          state,
-          receipt: result.receipt,
-        };
-      } catch (error) {
-        this.lexicalRuns.delete(runId);
-        throw error;
-      }
-    }
-    const note = rows(this.db, "SELECT note_id,lexical_revision_id FROM notes WHERE path=?", [
-      input.path,
-    ])[0];
-    if (note && note.lexical_revision_id != null) {
-      const current = rows(this.db, "SELECT content_id FROM note_revisions WHERE revision_id=?", [
-        note.lexical_revision_id,
-      ])[0];
-      if (current && String(current.content_id) === input.revisionDigest) {
-        const state = this.getState();
-        return {
-          changed: false,
-          status: "unchanged" as const,
-          state,
-          receipt: sqliteMutationReceipt(state, false, "unchanged"),
-        };
-      }
-    }
-    transaction(this.db, () => {
-      let noteId: number;
-      if (note) noteId = Number(note.note_id);
-      else {
-        this.db.exec({
-          sql: "INSERT INTO notes(note_id,path,content_id) SELECT COALESCE(MAX(note_id),0)+1,?,? FROM notes",
-          bind: [input.path, input.revisionDigest],
-        });
-        noteId = Number(
-          rows(this.db, "SELECT note_id FROM notes WHERE path=?", [input.path])[0].note_id
-        );
-      }
-      const prior =
-        note?.lexical_revision_id == null ? undefined : Number(note.lexical_revision_id);
-      let revisionId = Number(
-        rows(
-          this.db,
-          "SELECT revision_id FROM note_revisions WHERE note_id=? AND content_id=? AND extraction_version=? AND chunk_algorithm_version=?",
-          [noteId, input.revisionDigest, EXTRACTION_VERSION, CHUNK_ALGORITHM_VERSION]
-        )[0]?.revision_id ?? 0
-      );
-      if (!revisionId) {
-        this.db.exec({
-          sql: "INSERT INTO note_revisions(note_id,content_id,extraction_version,chunk_algorithm_version,created_change_counter) VALUES(?,?,?,?,(SELECT change_counter+1 FROM index_state WHERE id=1))",
-          bind: [noteId, input.revisionDigest, EXTRACTION_VERSION, CHUNK_ALGORITHM_VERSION],
-        });
-        revisionId = Number(rows(this.db, "SELECT last_insert_rowid() AS id")[0].id);
-        for (const block of input.blocks) {
-          this.db.exec({
-            sql: "INSERT INTO chunk_occurrences(revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,heading_context,embedding_input,embedding_input_digest,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            bind: [
-              revisionId,
-              noteId,
-              `${input.revisionDigest}:${block.ordinal}`,
-              block.ordinal,
-              block.kind,
-              block.startLine,
-              block.endLine,
-              block.displayText,
-              JSON.stringify(block.headingContext),
-              block.embeddingInput,
-              block.embeddingInputDigest,
-              block.displayText,
-            ],
-          });
-          this.db.exec({
-            sql: "INSERT INTO embedding_inputs(embedding_fingerprint,serialized_input,preprocessing,action_key) VALUES(?,?,?,?) ON CONFLICT(action_key) DO NOTHING",
-            bind: ["input-v1", block.embeddingInput, "serialized-v1", block.embeddingInputDigest],
-          });
-        }
-      }
-      if (prior && prior !== revisionId) {
-        for (const item of rows(
-          this.db,
-          "SELECT occurrence_id,body,path_text,filename FROM active_lexical WHERE note_id=?",
-          [noteId]
-        ))
-          this.db.exec({
-            sql: "INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename) VALUES('delete',?,?,?,?)",
-            bind: [item.occurrence_id, item.body, item.path_text, item.filename],
-          });
-        this.db.exec({
-          sql: "DELETE FROM active_lexical WHERE revision_id=? AND note_id=?",
-          bind: [prior, noteId],
-        });
-      }
-      const filename = input.path.slice(input.path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
-      this.db.exec({
-        sql: "INSERT INTO active_lexical(occurrence_id,note_id,revision_id,path_text,filename,body) SELECT occurrence_id,note_id,revision_id,?, ?,display_text FROM chunk_occurrences WHERE revision_id=? ON CONFLICT(occurrence_id) DO UPDATE SET path_text=excluded.path_text,filename=excluded.filename,body=excluded.body",
-        bind: [input.path, filename, revisionId],
-      });
-      for (const occurrence of rows(
-        this.db,
-        "SELECT occurrence_id,display_text FROM chunk_occurrences WHERE revision_id=?",
-        [revisionId]
-      )) {
-        this.db.exec({
-          sql: "INSERT INTO active_lexical_fts(rowid,body,path_text,filename) VALUES(?,?,?,?)",
-          bind: [occurrence.occurrence_id, occurrence.display_text, input.path, filename],
-        });
-      }
-      this.db.exec({
-        sql: "UPDATE notes SET lexical_revision_id=?,content_id=? WHERE note_id=?",
-        bind: [revisionId, input.revisionDigest, noteId],
-      });
-      this.db.exec(
-        "UPDATE index_state SET incomplete=1,lexical_generation=lexical_generation+1,lexical_revision_count=(SELECT count(*) FROM notes WHERE lexical_revision_id IS NOT NULL),embedding_input_count=(SELECT count(*) FROM embedding_inputs),change_counter=change_counter+1 WHERE id=1"
-      );
-    });
-    const state = this.getState();
-    return {
-      changed: true,
-      status: "changed",
-      state,
-      receipt: sqliteMutationReceipt(state, true, "changed"),
-    };
-  }
-
   /** Return the active digest without loading or parsing the Markdown body. */
   getLexicalRevisionDigest(path: string): string | undefined {
     this.ensureOpen();
@@ -799,7 +643,6 @@ export class MutableSqliteDatabase {
     readonly runId: string;
     readonly state: SqliteState;
     readonly receipt: SqliteMutationReceipt;
-    readonly plan?: SqliteReconciliationPlan;
   } {
     this.ensureOpen();
     const current = this.readChangeCounter();
@@ -841,7 +684,6 @@ export class MutableSqliteDatabase {
       runId,
       state,
       receipt: sqliteMutationReceipt(state, false, "unchanged"),
-      ...(plan ? { plan } : {}),
     };
   }
 
@@ -1824,119 +1666,6 @@ export class MutableSqliteDatabase {
     }));
   }
 
-  listMissingEmbeddingInputs(
-    embeddingFingerprint: string,
-    preprocessing = EMBEDDING_PREPROCESSING_VERSION,
-    limit = 128
-  ): readonly import("./protocol").SqliteEmbeddingRequest[] {
-    this.ensureOpen();
-    return rows(
-      this.db,
-      `SELECT ei.input_id AS inputId,ei.serialized_input AS serialization,ei.action_key AS inputDigest
-       FROM embedding_inputs ei
-       JOIN chunk_occurrences o ON o.embedding_input_digest=ei.action_key
-       JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
-       LEFT JOIN embedding_cache ec ON ec.input_digest=ei.action_key
-          AND ec.embedding_fingerprint=? AND ec.preprocessing=?
-       WHERE ec.cache_id IS NULL
-       GROUP BY ei.input_id,ei.serialized_input,ei.action_key
-       ORDER BY ei.input_id
-       LIMIT ?`,
-      [embeddingFingerprint, preprocessing, Math.max(0, limit)]
-    ).map((row) => ({
-      actionKey: embeddingActionKey(String(row.inputDigest), embeddingFingerprint, preprocessing),
-      inputId: Number(row.inputId),
-      serialization: String(row.serialization),
-    }));
-  }
-
-  storeEmbeddingResults(
-    results: readonly import("./protocol").SqliteEmbeddingResult[],
-    embeddingFingerprint: string,
-    preprocessing = EMBEDDING_PREPROCESSING_VERSION
-  ): SqliteSemanticMutationResult {
-    this.ensureOpen();
-    let stored = 0;
-    let skipped = 0;
-    let promoted = 0;
-    transaction(this.db, () => {
-      for (const result of results) {
-        const input = rows(
-          this.db,
-          "SELECT action_key,serialized_input FROM embedding_inputs WHERE input_id=?",
-          [result.inputId]
-        )[0];
-        const expected =
-          input &&
-          embeddingActionKey(String(input.action_key), embeddingFingerprint, preprocessing);
-        if (
-          !input ||
-          String(input.serialized_input) !== result.serialization ||
-          expected !== result.actionKey
-        ) {
-          skipped++;
-          continue;
-        }
-        let bytes: Uint8Array;
-        try {
-          bytes = vectorBytes(normalizedVector(result.vector, this.dimensions));
-        } catch (error) {
-          if (error instanceof Error && "error" in error) throw error;
-          skipped++;
-          continue;
-        }
-        this.db.exec({
-          sql: "INSERT INTO embedding_cache(input_digest,action_key,embedding_fingerprint,preprocessing,vector) VALUES(?,?,?,?,?) ON CONFLICT(action_key) DO UPDATE SET embedding_fingerprint=excluded.embedding_fingerprint,preprocessing=excluded.preprocessing,vector=excluded.vector",
-          bind: [
-            String(input.action_key),
-            result.actionKey,
-            embeddingFingerprint,
-            preprocessing,
-            bytes,
-          ],
-        });
-        stored++;
-      }
-      promoted = this.promoteSemanticHeadsInTransaction(embeddingFingerprint, preprocessing);
-      if (stored || promoted)
-        this.db.exec({
-          sql: "UPDATE index_state SET semantic_revision_count=semantic_revision_count+?,semantic_generation=semantic_generation+CASE WHEN ? > 0 THEN 1 ELSE 0 END,change_counter=change_counter+? WHERE id=1",
-          bind: [promoted, promoted, stored || promoted ? 1 : 0],
-        });
-    });
-    const state = this.getState();
-    const changed = stored > 0 || promoted > 0;
-    const status = changed ? "changed" : "unchanged";
-    return {
-      stored,
-      skipped,
-      promoted,
-      state,
-      receipt: sqliteMutationReceipt(state, changed, status),
-    };
-  }
-
-  promoteSemanticHeads(
-    embeddingFingerprint: string,
-    preprocessing = EMBEDDING_PREPROCESSING_VERSION
-  ): SqliteSemanticMutationResult {
-    this.ensureOpen();
-    let promoted = 0;
-    transaction(this.db, () => {
-      promoted = this.promoteSemanticHeadsInTransaction(embeddingFingerprint, preprocessing);
-      if (promoted)
-        this.db.exec({
-          sql: "UPDATE index_state SET semantic_revision_count=(SELECT count(*) FROM notes WHERE semantic_revision_id IS NOT NULL),semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
-        });
-    });
-    const state = this.getState();
-    return {
-      promoted,
-      state,
-      receipt: sqliteMutationReceipt(state, promoted > 0, promoted > 0 ? "changed" : "unchanged"),
-    };
-  }
-
   private promoteSemanticHeadsInTransaction(
     embeddingFingerprint: string,
     preprocessing: string,
@@ -1989,163 +1718,6 @@ export class MutableSqliteDatabase {
         sql: "UPDATE index_state SET semantic_revision_count=0,semantic_generation=semantic_generation+CASE WHEN ? THEN 1 ELSE 0 END,change_counter=change_counter+1 WHERE id=1",
         bind: [hadVisibleHeads ? 1 : 0],
       });
-    });
-    return this.getState();
-  }
-
-  renameLexicalNote(from: string, to: string): SqliteMutationResult {
-    this.ensureOpen();
-    if (from === to) {
-      const state = this.getState();
-      return {
-        changed: false,
-        status: "unchanged",
-        state,
-        receipt: sqliteMutationReceipt(state, false, "unchanged"),
-      };
-    }
-    const row = rows(this.db, "SELECT note_id,semantic_revision_id FROM notes WHERE path=?", [
-      from,
-    ])[0];
-    if (!row) {
-      const state = this.getState();
-      return {
-        changed: false,
-        status: "absent",
-        state,
-        receipt: sqliteMutationReceipt(state, false, "absent"),
-      };
-    }
-    if (rows(this.db, "SELECT 1 FROM notes WHERE path=?", [to]).length) {
-      const state = this.getState();
-      return {
-        changed: false,
-        status: "state_changed",
-        rescan: true,
-        state,
-        receipt: sqliteMutationReceipt(state, false, "state_changed"),
-      };
-    }
-    transaction(this.db, () => {
-      const oldFtsRows = rows(
-        this.db,
-        "SELECT occurrence_id,body,path_text,filename FROM active_lexical WHERE note_id=?",
-        [row.note_id]
-      );
-      for (const item of oldFtsRows)
-        this.db.exec({
-          sql: "INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename) VALUES('delete',?,?,?,?)",
-          bind: [item.occurrence_id, item.body, item.path_text, item.filename],
-        });
-      this.db.exec({ sql: "UPDATE notes SET path=? WHERE note_id=?", bind: [to, row.note_id] });
-      this.db.exec({
-        sql: "UPDATE active_lexical SET path_text=?,filename=? WHERE note_id=?",
-        bind: [to, to.slice(to.lastIndexOf("/") + 1).replace(/\.md$/i, ""), row.note_id],
-      });
-      this.db.exec({
-        sql: "UPDATE index_state SET lexical_generation=lexical_generation+1,semantic_generation=semantic_generation+CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END,change_counter=change_counter+1,incomplete=1 WHERE id=1",
-        bind: [row.semantic_revision_id ?? null],
-      });
-      for (const item of rows(
-        this.db,
-        "SELECT occurrence_id,body,filename FROM active_lexical WHERE note_id=?",
-        [row.note_id]
-      ))
-        this.db.exec({
-          sql: "INSERT INTO active_lexical_fts(rowid,body,path_text,filename) VALUES(?,?,?,?)",
-          bind: [item.occurrence_id, item.body, to, item.filename],
-        });
-    });
-    const state = this.getState();
-    return {
-      changed: true,
-      status: "changed",
-      state,
-      receipt: sqliteMutationReceipt(state, true, "changed"),
-    };
-  }
-
-  deleteLexicalNote(path: string): SqliteMutationResult {
-    this.ensureOpen();
-    const row = rows(this.db, "SELECT note_id,semantic_revision_id FROM notes WHERE path=?", [
-      path,
-    ])[0];
-    if (!row) {
-      const state = this.getState();
-      return {
-        changed: false,
-        status: "absent",
-        state,
-        receipt: sqliteMutationReceipt(state, false, "absent"),
-      };
-    }
-    transaction(this.db, () => {
-      for (const item of rows(
-        this.db,
-        "SELECT occurrence_id,body,path_text,filename FROM active_lexical WHERE note_id=?",
-        [row.note_id]
-      ))
-        this.db.exec({
-          sql: "INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename) VALUES('delete',?,?,?,?)",
-          bind: [item.occurrence_id, item.body, item.path_text, item.filename],
-        });
-      this.db.exec({ sql: "DELETE FROM notes WHERE note_id=?", bind: [row.note_id] });
-      this.db.exec({
-        sql: "UPDATE index_state SET lexical_generation=lexical_generation+1,semantic_generation=semantic_generation+CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END,change_counter=change_counter+1,incomplete=1 WHERE id=1",
-        bind: [row.semantic_revision_id ?? null],
-      });
-    });
-    const state = this.getState();
-    return {
-      changed: true,
-      status: "changed",
-      state,
-      receipt: sqliteMutationReceipt(state, true, "changed"),
-    };
-  }
-  finishReconciliation(
-    summaries: readonly SqliteNoteSummary[],
-    observedChangeCounter: number
-  ): SqliteState {
-    if (this.readChangeCounter() !== observedChangeCounter) return this.getState();
-    transaction(this.db, () => {
-      withExpectedNotes(this.db, summaries, () => {
-        const mismatch = rows(
-          this.db,
-          `SELECT count(*) AS count FROM reconciliation_expected e LEFT JOIN notes n ON n.path=e.path
-          WHERE n.note_pk IS NULL OR n.content_id<>e.content_id OR
-                (e.chunk_count IS NOT NULL AND e.chunk_count<>(SELECT count(*) FROM chunk_occurrences c JOIN notes nn ON nn.note_id=c.note_id AND nn.lexical_revision_id=c.revision_id WHERE nn.note_id=n.note_id))`,
-          []
-        )[0];
-        if (Number(mismatch.count)) return;
-        const extrasRow = rows(
-          this.db,
-          "SELECT count(*) AS count,sum(CASE WHEN semantic_revision_id IS NOT NULL THEN 1 ELSE 0 END) AS semanticCount FROM notes n LEFT JOIN reconciliation_expected e ON e.path=n.path WHERE e.path IS NULL"
-        )[0];
-        const extras = Number(extrasRow.count);
-        const semanticExtras = Number(extrasRow.semanticCount ?? 0);
-        this.db.exec({
-          sql: "DELETE FROM notes WHERE NOT EXISTS(SELECT 1 FROM reconciliation_expected e WHERE e.path=notes.path)",
-        });
-        this.db.exec({
-          sql: "UPDATE index_state SET incomplete=0,snapshot_loaded=0,reconciliation_summary='',lexical_generation=lexical_generation+?,semantic_generation=semantic_generation+CASE WHEN ? > 0 THEN 1 ELSE 0 END,change_counter=change_counter+? WHERE id=1 AND change_counter=?",
-          bind: [extras, semanticExtras, extras ? 1 : 0, observedChangeCounter],
-        });
-      });
-    });
-    return this.getState();
-  }
-
-  finishScopedReconciliation(
-    observedChangeCounter: number,
-    mayClearIncomplete: boolean
-  ): SqliteState {
-    this.ensureOpen();
-    if (this.readChangeCounter() !== observedChangeCounter || !mayClearIncomplete)
-      return this.getState();
-    this.db.exec({
-      sql: "UPDATE index_state SET incomplete=0,snapshot_loaded=0,reconciliation_summary='' WHERE id=1 AND change_counter=?",
-      bind: [observedChangeCounter],
     });
     return this.getState();
   }
@@ -2464,12 +2036,6 @@ export class MutableSqliteDatabase {
     this.ensureOpen();
     transaction(this.db, () => this.db.exec("UPDATE index_state SET snapshot_loaded=1 WHERE id=1"));
     return this.getState();
-  }
-  private markMutation(incomplete = true): void {
-    this.db.exec({
-      sql: "UPDATE index_state SET incomplete=CASE WHEN ? THEN 1 ELSE incomplete END,change_counter=change_counter+1 WHERE id=1",
-      bind: [incomplete ? 1 : 0],
-    });
   }
   private readChangeCounter(): number {
     const row = rows(this.db, "SELECT change_counter FROM index_state WHERE id=1")[0];

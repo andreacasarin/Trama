@@ -259,8 +259,6 @@ export class SqliteWorkerClient {
 function cloneRequest<M extends SqliteMethod>(
   request: SqliteRequest<M>
 ): { request: SqliteRequest<M>; transfer: ArrayBuffer[] } {
-  // These payloads contain only strings and numbers; postMessage performs the one required clone.
-  if (request.method === "hashMarkdown") return { request, transfer: [] };
   const cloned = structuredClone(request) as SqliteRequest<M>;
   const payload = cloned.payload as Record<string, unknown>;
   const transfer: ArrayBuffer[] = [];
