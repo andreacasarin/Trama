@@ -77,6 +77,35 @@ describe("SQLite protocol", () => {
     ).toThrow();
   });
 
+  it("rejects malformed retrieval options and publication generation fences", () => {
+    const request = (method: string, payload: object) => ({
+      v: SQLITE_PROTOCOL_VERSION,
+      id: 1,
+      method,
+      payload,
+    });
+    const retrievalOptions = [
+      { semanticCandidateLimit: -1 },
+      { semanticCandidateLimit: 257 },
+      { lexicalCandidateLimit: 1.5 },
+      { lexicalProfile: "unknown" },
+      { resultShape: "documents" },
+    ];
+    for (const option of retrievalOptions)
+      expect(() => validateRequest(request("retrieve", { limit: 10, ...option }))).toThrow();
+
+    for (const fence of [{ expectedLexicalGeneration: -1 }, { expectedSemanticGeneration: 1.5 }])
+      expect(() =>
+        validateRequest(
+          request("finalizePublication", {
+            publicationId: "publication-1",
+            expectedChangeCounter: 1,
+            ...fence,
+          })
+        )
+      ).toThrow();
+  });
+
   it("uses safe structured errors", () => {
     const error = sqliteError("invalid_request", "Invalid request");
     expect(error.error).toEqual({

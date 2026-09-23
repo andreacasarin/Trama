@@ -18,15 +18,39 @@ export interface AutomaticPublicationHost extends SchedulerHost {
 }
 
 export class AutomaticPublicationController {
-  timer?: ReturnType<typeof setTimeout>;
-  retryTimer?: ReturnType<typeof setTimeout>;
-  retryAttempt = 0;
-  retryPaused = false;
-  pending?: PublicationIntent;
-  promise?: Promise<void>;
-  activePromise?: ReturnType<PublicationManager["publish"]>;
+  private timer?: ReturnType<typeof setTimeout>;
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private retryAttempt = 0;
+  private retryPaused = false;
+  private pending?: PublicationIntent;
+  private promise?: Promise<void>;
+  private activePromise?: ReturnType<PublicationManager["publish"]>;
 
   constructor(private readonly host: AutomaticPublicationHost) {}
+
+  snapshot(): {
+    running: boolean;
+    retryScheduled: boolean;
+    retryAttempt: number;
+    retryPaused: boolean;
+    delayed: boolean;
+    pending: boolean;
+  } {
+    return {
+      running: Boolean(this.promise),
+      retryScheduled: Boolean(this.retryTimer),
+      retryAttempt: this.retryAttempt,
+      retryPaused: this.retryPaused,
+      delayed: Boolean(this.timer),
+      pending: Boolean(this.pending),
+    };
+  }
+
+  resetForSettings(): void {
+    this.clearRetry();
+    this.retryAttempt = 0;
+    this.retryPaused = false;
+  }
 
   recordIntent(publication: PublicationManager | undefined, result: IndexOperationResult): void {
     if (!publication || !result.converged || !result.changed || result.state.incomplete) return;
@@ -244,7 +268,7 @@ export class AutomaticPublicationController {
     return this.promise;
   }
 
-  publishOnce(publication: PublicationManager): ReturnType<PublicationManager["publish"]> {
+  private publishOnce(publication: PublicationManager): ReturnType<PublicationManager["publish"]> {
     if (this.activePromise) return this.activePromise;
     const wrapped = publication.publish().finally(() => {
       if (this.activePromise === wrapped) this.activePromise = undefined;
@@ -253,11 +277,11 @@ export class AutomaticPublicationController {
     return wrapped;
   }
 
-  isCurrent(pending: PublicationIntent): boolean {
+  private isCurrent(pending: PublicationIntent): boolean {
     return this.pending === pending && pending.eventRevision === this.host.getVaultEventRevision();
   }
 
-  scheduleRetry(
+  private scheduleRetry(
     pending: PublicationIntent | undefined,
     retryable: boolean,
     publication?: PublicationManager
@@ -293,12 +317,12 @@ export class AutomaticPublicationController {
     this.host.refreshSchedulerMessage();
   }
 
-  clearTimer(): void {
+  private clearTimer(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
   }
 
-  clearRetry(): void {
+  private clearRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
   }

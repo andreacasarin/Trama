@@ -162,6 +162,9 @@ function automaticSemanticHarness(delayMs: number, eligible = true) {
     capabilities: () => ({ semantic: { searchable: eligible, activity: "idle" } }),
     disposeImmediately: vi.fn(),
     hasCompatibleSemanticVectors: () => eligible,
+    hasPendingSemanticWork: () => eligible,
+    recordPathMutation: vi.fn(),
+    pendingChangeCount: () => 1,
     prepareSemanticCacheBatch: vi.fn(async () => ({
       converged: true,
       state: { semanticReady: true },
@@ -174,7 +177,7 @@ function automaticSemanticHarness(delayMs: number, eligible = true) {
     cancel: () => undefined,
   });
   plugin.indexReady = true;
-  plugin.semanticScheduler.eligible = eligible;
+  plugin.semanticScheduler.replaceEligibility(manager as any);
   return { plugin, manager };
 }
 
@@ -308,10 +311,12 @@ describe("TramaPlugin lifecycle integration", () => {
       markStale: vi.fn(),
       setCapabilities: vi.fn(),
       setSchedulerMessage: vi.fn(),
+      getStatus: () => ({}),
     };
     plugin.index = {
       isBuilding: () => false,
       hasCompatibleSemanticVectors: () => false,
+      hasPendingSemanticWork: () => false,
       capabilities: () => ({ semantic: { activity: "idle" } }),
       isComplete: () => true,
       journalSnapshot: () => ({ changes: [], fullRecovery: true, revision: 1 }),
@@ -325,7 +330,6 @@ describe("TramaPlugin lifecycle integration", () => {
     };
     await plugin.lexicalScheduler.reconcile();
     expect(refreshSubmitted).not.toHaveBeenCalled();
-    plugin.lexicalScheduler.queuedWork = true;
     await plugin.lexicalScheduler.reconcile();
     expect(refreshSubmitted).toHaveBeenCalledTimes(1);
   });
@@ -430,7 +434,7 @@ describe("TramaPlugin lifecycle integration", () => {
     modify?.callback({ path: "Note.md" });
 
     expect(queue).toHaveBeenCalledTimes(1);
-    expect((plugin as any).lexicalScheduler.eventTimer).toBeUndefined();
+    expect((plugin as any).lexicalScheduler.snapshot().delayed).toBe(false);
     expect((plugin as any).indexStatus.getStatus()).toMatchObject({
       kind: "stale",
       hasLastGood: true,
@@ -670,7 +674,7 @@ describe("TramaPlugin lifecycle integration", () => {
     });
     await update;
 
-    expect(plugin.lexicalScheduler.queuedWork).toBe(true);
+    expect(plugin.lexicalScheduler.snapshot().queued).toBe(true);
     expect(plugin.getIndexStatus()).toMatchObject({ kind: "stale" });
     plugin.onunload();
   });
@@ -706,7 +710,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(synchronize).toHaveBeenCalledOnce();
     expect(reconcile).toHaveBeenCalledOnce();
     expect(prepare).toHaveBeenCalledOnce();
-    expect(plugin.lexicalScheduler.queuedWork).toBe(false);
+    expect(plugin.lexicalScheduler.snapshot().queued).toBe(false);
     plugin.onunload();
   });
 
@@ -748,7 +752,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const index = plugin.index;
     plugin.indexReady = true;
     plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
-    expect(plugin.lexicalScheduler.eventTimer).toBeDefined();
+    expect(plugin.lexicalScheduler.snapshot().delayed).toBe(true);
     const synchronize = vi.spyOn(index, "synchronize").mockResolvedValue({
       changed: true,
       converged: true,
@@ -776,9 +780,9 @@ describe("TramaPlugin lifecycle integration", () => {
 
     await plugin.runForceUpdate(new AbortController().signal);
 
-    expect(plugin.lexicalScheduler.eventTimer).toBeUndefined();
+    expect(plugin.lexicalScheduler.snapshot().delayed).toBe(false);
     expect(synchronize).toHaveBeenCalledOnce();
-    expect(plugin.publicationScheduler.timer).toBeDefined();
+    expect(plugin.publicationScheduler.snapshot().delayed).toBe(true);
     expect(publish).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(publish).toHaveBeenCalledOnce();
@@ -796,24 +800,39 @@ describe("TramaPlugin lifecycle integration", () => {
       isBuilding: vi.fn(() => false),
       isInMaintenance: vi.fn(() => false),
       disposeImmediately: vi.fn(),
+      hasPendingSemanticWork: () => false,
+      recordPathMutation: vi.fn(),
+      pendingChangeCount: () => 1,
+      capabilities: () => ({ semantic: { activity: "idle" } }),
     };
     const publication = { isBusy: false, publish: vi.fn(async () => ({ published: true })) };
     plugin.index = manager;
     plugin.publicationManager = publication;
     plugin.indexReady = true;
-    plugin.publicationScheduler.pending = { eventRevision: 0 };
+    plugin.publicationScheduler.recordIntent(publication, {
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+    });
     const flush = plugin.publishOnQuit();
     expect(flush).toBeDefined();
     await flush;
     expect(publication.publish).toHaveBeenCalledOnce();
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
     expect(manager.isComplete).toHaveBeenCalledOnce();
 
-    plugin.publicationScheduler.pending = { eventRevision: 0 };
-    const reused = Promise.resolve({ published: true });
-    plugin.publicationScheduler.activePromise = reused;
-    await plugin.publishOnQuit();
-    expect(publication.publish).toHaveBeenCalledOnce();
+    plugin.publicationScheduler.recordIntent(publication, {
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+    });
+    const pendingPublish = deferred<{ published: boolean }>();
+    publication.publish.mockReturnValueOnce(pendingPublish.promise);
+    const explicit = plugin.publicationScheduler.retryExplicit(publication);
+    const quit = plugin.publishOnQuit();
+    pendingPublish.resolve({ published: true });
+    await Promise.all([explicit, quit]);
+    expect(publication.publish).toHaveBeenCalledTimes(2);
   });
 
   it("leaves quit publication pending when disabled, absent, or lexical state is unsafe", () => {
@@ -823,6 +842,10 @@ describe("TramaPlugin lifecycle integration", () => {
       isBuilding: vi.fn(() => false),
       isInMaintenance: vi.fn(() => false),
       disposeImmediately: vi.fn(),
+      hasPendingSemanticWork: () => false,
+      recordPathMutation: vi.fn(),
+      pendingChangeCount: () => 1,
+      capabilities: () => ({ semantic: { activity: "idle" } }),
     };
     plugin.index = manager;
     plugin.publicationManager = { publish: vi.fn() };
@@ -832,7 +855,6 @@ describe("TramaPlugin lifecycle integration", () => {
       ...DEFAULT_SETTINGS,
       filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 0 },
     });
-    plugin.publicationScheduler.pending = { eventRevision: 0 };
     expect(plugin.publishOnQuit()).toBeUndefined();
     const enabled = plugin.settingsStore.stage({
       ...DEFAULT_SETTINGS,
@@ -844,12 +866,17 @@ describe("TramaPlugin lifecycle integration", () => {
       ...enabled,
       filo: { ...enabled.filo, automaticPublicationDelayMs: 30_000 },
     });
-    plugin.lexicalScheduler.queuedWork = true;
+    plugin.publicationScheduler.recordIntent(plugin.publicationManager, {
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+    });
+    plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
     expect(plugin.publishOnQuit()).toBeUndefined();
-    plugin.lexicalScheduler.queuedWork = false;
+    plugin.lexicalScheduler.clearQueuedWork();
     manager.isComplete.mockReturnValue(false);
     expect(plugin.publishOnQuit()).toBeUndefined();
-    expect(plugin.publicationScheduler.pending).toBeDefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(true);
   });
 
   it("keeps an accepted desktop quit task's Worker alive through unload", async () => {
@@ -864,9 +891,11 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.indexReady = true;
     vi.spyOn(index, "isComplete").mockReturnValue(true);
     const dispose = vi.spyOn(index, "disposeImmediately");
-    plugin.publicationScheduler.pending = {
-      eventRevision: plugin.vaultEventRevision,
-    };
+    plugin.publicationScheduler.recordIntent(plugin.publicationManager, {
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+    });
     const completion = deferred<void>();
     vi.spyOn(plugin.publicationManager, "publish").mockReturnValue(
       completion.promise.then(() => ({
@@ -895,14 +924,23 @@ describe("TramaPlugin lifecycle integration", () => {
       isComplete: () => true,
       isBuilding: () => false,
       isInMaintenance: () => false,
+      capabilities: () => ({ semantic: { searchable: false } }),
     };
     const warning = { message: "offline", retryable: false };
-    const status = { setPublicationWarning: vi.fn(), setSchedulerMessage: vi.fn() };
+    const status = {
+      setPublicationWarning: vi.fn(),
+      setSchedulerMessage: vi.fn(),
+      getStatus: () => ({}),
+    };
     plugin.index = manager;
     plugin.indexReady = true;
     plugin.indexStatus = status;
     plugin.publicationManager = { publish: vi.fn(async () => ({ published: false, warning })) };
-    plugin.publicationScheduler.pending = { eventRevision: 0 };
+    plugin.publicationScheduler.recordIntent(plugin.publicationManager, {
+      changed: true,
+      converged: true,
+      state: { incomplete: false },
+    });
 
     await plugin.publishOnQuit();
 
@@ -1417,7 +1455,7 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: ".trama/index.md" });
     emit("rename", { path: "Renamed.md" }, "Old.md");
     expect(queue).toHaveBeenCalledTimes(2);
-    expect((plugin as any).lexicalScheduler.eventTimer).toBeDefined();
+    expect((plugin as any).lexicalScheduler.snapshot().delayed).toBe(true);
     await vi.advanceTimersByTimeAsync(750);
     plugin.onunload();
     plugin.onunload();
@@ -1454,7 +1492,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
     modify?.callback({ path: "Other.md" });
     pending.resolve({ changed: true, converged: true });
-    await (plugin as any).lexicalScheduler.reconcilePromise;
+    await (plugin as any).lexicalScheduler.activeReconciliation();
     expect(status.getStatus().kind).toBe("stale");
     await vi.advanceTimersByTimeAsync(750);
     expect(reconcile).toHaveBeenCalledTimes(2);
@@ -1523,9 +1561,9 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(reconcile).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(1);
     expect(reconcile).toHaveBeenCalledTimes(4);
-    expect((plugin as any).lexicalScheduler.retryAttempt).toBe(3);
-    expect((plugin as any).lexicalScheduler.retryPaused).toBe(true);
-    expect((plugin as any).lexicalScheduler.retryTimer).toBeUndefined();
+    expect((plugin as any).lexicalScheduler.snapshot().retryAttempt).toBe(3);
+    expect((plugin as any).lexicalScheduler.snapshot().retryPaused).toBe(true);
+    expect((plugin as any).lexicalScheduler.snapshot().retryScheduled).toBe(false);
     await vi.waitFor(() =>
       expect((plugin as any).indexStatus.getStatus().schedulerMessage).toContain("lexical failed")
     );
@@ -1533,8 +1571,8 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(reconcile).toHaveBeenCalledTimes(4);
 
     app.listeners.find((ref) => ref.event === "modify")?.callback({ path: "Other.md" });
-    expect((plugin as any).lexicalScheduler.retryAttempt).toBe(0);
-    expect((plugin as any).lexicalScheduler.retryPaused).toBe(false);
+    expect((plugin as any).lexicalScheduler.snapshot().retryAttempt).toBe(0);
+    expect((plugin as any).lexicalScheduler.snapshot().retryPaused).toBe(false);
     await vi.advanceTimersByTimeAsync(750);
     expect(reconcile).toHaveBeenCalledTimes(5);
     await vi.advanceTimersByTimeAsync(4_999);
@@ -1607,8 +1645,8 @@ describe("TramaPlugin lifecycle integration", () => {
       filo: { ...DEFAULT_SETTINGS.filo, automaticLexicalDelayMs: 0 },
     });
     expect(signal.aborted).toBe(true);
-    expect((plugin as any).lexicalScheduler.eventTimer).toBeUndefined();
-    expect((plugin as any).lexicalScheduler.queuedWork).toBe(true);
+    expect((plugin as any).lexicalScheduler.snapshot().delayed).toBe(false);
+    expect((plugin as any).lexicalScheduler.snapshot().queued).toBe(true);
     expect((plugin as any).indexStatus.getStatus().kind).toBe("stale");
     pending.resolve({ changed: false, converged: false });
     await Promise.resolve();
@@ -1703,7 +1741,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(status.getStatus().kind).toBe("ready"));
-    expect((plugin as any).lexicalScheduler.queuedWork).toBe(false);
+    expect((plugin as any).lexicalScheduler.snapshot().queued).toBe(false);
     expect(statuses.map((entry) => Number(entry.split(":")[1]))).toEqual(
       statuses.map((entry) => Number(entry.split(":")[1])).sort((a, b) => a - b)
     );
@@ -1840,7 +1878,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await vi.advanceTimersByTimeAsync(750);
     expect(synchronize).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(reconcile).toHaveBeenCalledOnce());
-    await (plugin as any).lexicalScheduler.reconcilePromise;
+    await (plugin as any).lexicalScheduler.activeReconciliation();
     await vi.waitFor(() => expect(index.isComplete()).toBe(true));
 
     expect(reconcile).toHaveBeenCalledWith(
@@ -2219,15 +2257,15 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.useFakeTimers();
     const { plugin, manager } = automaticSemanticHarness(1_000, false);
     (manager as any).hasPendingSemanticWork = vi.fn(() => true);
-    expect(plugin.hasAutomaticSemanticWork(manager)).toBe(true);
-    plugin.semanticScheduler.eligible = true;
+    expect(plugin.semanticScheduler.hasWork(manager)).toBe(true);
+    plugin.semanticScheduler.markEligibleIfPending(manager);
 
     plugin.scheduleAutomaticSemantic("startup");
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
-    expect(plugin.semanticScheduler.eligible).toBe(false);
-    expect(plugin.semanticScheduler.retryTimer).toBeUndefined();
+    expect(plugin.semanticScheduler.snapshot().eligible).toBe(false);
+    expect(plugin.semanticScheduler.snapshot().retryScheduled).toBe(false);
     plugin.onunload();
     vi.useRealTimers();
   });
@@ -2236,7 +2274,7 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.useFakeTimers();
     const { plugin, manager } = automaticSemanticHarness(0, false);
     (manager as any).hasPendingSemanticWork = vi.fn(() => true);
-    plugin.semanticScheduler.eligible = plugin.hasAutomaticSemanticWork(manager);
+    plugin.semanticScheduler.markEligibleIfPending(manager);
 
     plugin.scheduleAutomaticSemantic("startup");
     await vi.advanceTimersByTimeAsync(60_000);
@@ -2254,12 +2292,12 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.scheduleAutomaticSemantic();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
-    plugin.lexicalScheduler.queuedWork = true;
+    plugin.queueVaultMutation({ type: "upsert", path: "Note.md" });
     batch.resolve({ converged: false, state: { semanticReady: false } });
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(0);
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
-    plugin.lexicalScheduler.queuedWork = false;
+    plugin.lexicalScheduler.clearQueuedWork();
     plugin.semanticScheduler.pauseForLexicalWork();
     manager.prepareSemanticCacheBatch.mockResolvedValueOnce({
       converged: true,
@@ -2291,7 +2329,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(4);
-    expect(plugin.semanticScheduler.retryPaused).toBe(true);
+    expect(plugin.semanticScheduler.snapshot().retryPaused).toBe(true);
     await vi.advanceTimersByTimeAsync(120_000);
     expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(4);
 
@@ -2301,7 +2339,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.advanceTimersByTimeAsync(120_000);
     expect(permanent.manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
-    expect(permanent.plugin.semanticScheduler.retryTimer).toBeUndefined();
+    expect(permanent.plugin.semanticScheduler.snapshot().retryScheduled).toBe(false);
     plugin.onunload();
     permanent.plugin.onunload();
     vi.useRealTimers();
@@ -2317,7 +2355,7 @@ describe("TramaPlugin lifecycle integration", () => {
     });
     await vi.advanceTimersByTimeAsync(60_000);
     expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
-    expect(plugin.semanticScheduler.timer).toBeUndefined();
+    expect(plugin.semanticScheduler.snapshot().delayed).toBe(false);
     await plugin.saveSettings({
       ...plugin.getSettings(),
       filo: { ...plugin.getSettings().filo, automaticSemanticDelayMs: 2_000 },

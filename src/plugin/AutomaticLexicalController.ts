@@ -18,19 +18,63 @@ export interface AutomaticLexicalHost extends SchedulerHost {
 }
 
 export class AutomaticLexicalController {
-  abort?: AbortController;
-  lease?: IndexOperationLease;
-  reschedulePending = false;
-  startupRecoveryStarted = false;
-  eventTimer?: ReturnType<typeof setTimeout>;
-  retryTimer?: ReturnType<typeof setTimeout>;
-  retryAttempt = 0;
-  retryPaused = false;
-  stopPaused = false;
-  reconcilePromise?: Promise<void>;
-  queuedWork = false;
+  private abort?: AbortController;
+  private lease?: IndexOperationLease;
+  private reschedulePending = false;
+  private startupRecoveryStarted = false;
+  private eventTimer?: ReturnType<typeof setTimeout>;
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private retryAttempt = 0;
+  private retryPaused = false;
+  private stopPaused = false;
+  private reconcilePromise?: Promise<void>;
+  private queuedWork = false;
 
   constructor(private readonly host: AutomaticLexicalHost) {}
+
+  snapshot(): {
+    queued: boolean;
+    running: boolean;
+    retryPaused: boolean;
+    retryScheduled: boolean;
+    retryAttempt: number;
+    delayed: boolean;
+  } {
+    return {
+      queued: this.queuedWork,
+      running: Boolean(this.reconcilePromise),
+      retryPaused: this.retryPaused,
+      retryScheduled: Boolean(this.retryTimer),
+      retryAttempt: this.retryAttempt,
+      delayed: Boolean(this.eventTimer),
+    };
+  }
+
+  hasQueuedWork(): boolean {
+    return this.queuedWork;
+  }
+
+  hasActiveReconciliation(): boolean {
+    return Boolean(this.reconcilePromise);
+  }
+
+  activeReconciliation(): Promise<void> | undefined {
+    return this.reconcilePromise;
+  }
+
+  clearQueuedWork(): void {
+    this.queuedWork = false;
+  }
+
+  resetForManualOperation(): void {
+    this.retryAttempt = 0;
+    this.retryPaused = false;
+    this.stopPaused = false;
+  }
+
+  resetForRuntimeComposition(): void {
+    this.startupRecoveryStarted = false;
+  }
 
   arm(): void {
     if (this.host.getSettings().filo.automaticLexicalDelayMs <= 0) return;

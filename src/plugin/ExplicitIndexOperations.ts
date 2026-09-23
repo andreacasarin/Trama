@@ -16,7 +16,7 @@ interface ExplicitIndexHost {
   setSchedulerSource(source: SchedulerSource): void;
   getVisibleMarkdownCount(): number;
   isQueued(): boolean;
-  setQueued(queued: boolean): void;
+  clearQueued(): void;
   getLexicalPromise(): Promise<void> | undefined;
   getSemanticPromise(): Promise<void> | undefined;
   pausePublication(): void;
@@ -131,9 +131,9 @@ export class ExplicitIndexOperations {
     this.host.updateCapabilities(manager);
     this.host.refreshViews(result.changed);
     if (result.converged && eventRevision === this.host.getVaultEventRevision()) {
-      const journalRevision = manager.journalSnapshot?.().revision;
-      if (journalRevision !== undefined) manager.clearJournalIfCurrent?.(journalRevision);
-      this.host.setQueued(false);
+      const journalRevision = manager.journalSnapshot().revision;
+      manager.clearJournalIfCurrent(journalRevision);
+      this.host.clearQueued();
       this.host.markSemanticEligible();
       this.host.scheduleSemantic();
     }

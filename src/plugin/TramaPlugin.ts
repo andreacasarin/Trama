@@ -93,8 +93,8 @@ export class TramaPlugin extends Plugin {
     getIndexStatus: () => this.indexStatus,
     isIndexReady: () => this.indexReady,
     getVaultEventRevision: () => this.vaultEventRevision,
-    hasQueuedLexicalWork: () => this.lexicalScheduler.queuedWork,
-    hasActiveLexicalReconciliation: () => Boolean(this.lexicalScheduler.reconcilePromise),
+    hasQueuedLexicalWork: () => this.lexicalScheduler.hasQueuedWork(),
+    hasActiveLexicalReconciliation: () => this.lexicalScheduler.hasActiveReconciliation(),
     getSchedulerSource: () => this.currentSchedulerSource,
     setSchedulerSource: (source) => (this.currentSchedulerSource = source),
     emitSchedulerTransition: (transition) => this.emitSchedulerTransition(transition),
@@ -109,8 +109,8 @@ export class TramaPlugin extends Plugin {
     getPublicationManager: () => this.publicationManager,
     isIndexReady: () => this.indexReady,
     getVaultEventRevision: () => this.vaultEventRevision,
-    hasQueuedLexicalWork: () => this.lexicalScheduler.queuedWork,
-    hasActiveLexicalReconciliation: () => Boolean(this.lexicalScheduler.reconcilePromise),
+    hasQueuedLexicalWork: () => this.lexicalScheduler.hasQueuedWork(),
+    hasActiveLexicalReconciliation: () => this.lexicalScheduler.hasActiveReconciliation(),
     getSchedulerSource: () => this.currentSchedulerSource,
     setPublicationWarning: (warning) => {
       if (warning) this.handlePublicationWarning(warning);
@@ -137,9 +137,7 @@ export class TramaPlugin extends Plugin {
     },
     pausePublication: () => this.publicationScheduler.pauseForIndexing(),
     pauseSemantic: () => this.semanticScheduler.pauseForLexicalWork(),
-    markSemanticEligible: () => {
-      this.semanticScheduler.eligible ||= this.semanticScheduler.hasWork(this.index);
-    },
+    markSemanticEligible: () => this.semanticScheduler.markEligibleIfPending(this.index),
     scheduleSemantic: () => this.semanticScheduler.schedule(),
     refreshViews: (changed) => {
       const app = (this as unknown as { app?: any }).app;
@@ -172,23 +170,19 @@ export class TramaPlugin extends Plugin {
     getSchedulerSource: () => this.currentSchedulerSource,
     setSchedulerSource: (source) => (this.currentSchedulerSource = source),
     getVisibleMarkdownCount: () => this.visibleMarkdownCatalog().length,
-    isQueued: () => this.lexicalScheduler.queuedWork,
-    setQueued: (queued) => (this.lexicalScheduler.queuedWork = queued),
-    getLexicalPromise: () => this.lexicalScheduler.reconcilePromise,
-    getSemanticPromise: () => this.semanticScheduler.promise,
+    isQueued: () => this.lexicalScheduler.hasQueuedWork(),
+    clearQueued: () => this.lexicalScheduler.clearQueuedWork(),
+    getLexicalPromise: () => this.lexicalScheduler.activeReconciliation(),
+    getSemanticPromise: () => this.semanticScheduler.activeWork(),
     pausePublication: () => this.publicationScheduler.pauseForIndexing(),
     stopLexical: (markStale) => this.lexicalScheduler.stop(markStale),
     pauseSemantic: () => this.semanticScheduler.pauseForLexicalWork(),
     stopSemantic: () => this.semanticScheduler.stop(),
     resetManualSchedulerState: () => {
-      this.lexicalScheduler.retryAttempt = 0;
-      this.lexicalScheduler.retryPaused = false;
-      this.semanticScheduler.stopPaused = false;
-      this.lexicalScheduler.stopPaused = false;
+      this.lexicalScheduler.resetForManualOperation();
+      this.semanticScheduler.resetForManualOperation();
     },
-    markSemanticEligible: () => {
-      this.semanticScheduler.eligible ||= this.semanticScheduler.hasWork(this.index);
-    },
+    markSemanticEligible: () => this.semanticScheduler.markEligibleIfPending(this.index),
     scheduleSemantic: () => this.semanticScheduler.schedule(),
     scheduleLexical: () => this.lexicalScheduler.schedule(),
     reconcile: (signal) => this.lexicalScheduler.reconcile("explicit", signal),
@@ -247,7 +241,7 @@ export class TramaPlugin extends Plugin {
     this.composeRuntime(app, settings);
     const layoutReady = () => {
       this.layoutReady = true;
-      this.maybeScheduleStartupRecovery();
+      this.lexicalScheduler.maybeScheduleStartupRecovery();
     };
     if (typeof app.workspace.onLayoutReady === "function") app.workspace.onLayoutReady(layoutReady);
     else layoutReady();
@@ -359,7 +353,7 @@ export class TramaPlugin extends Plugin {
         counts: { queued: this.index?.pendingChangeCount() ?? 0 },
       });
     } else if (before.filo.automaticLexicalDelayMs !== saved.filo.automaticLexicalDelayMs)
-      this.armAutomaticWork();
+      this.lexicalScheduler.arm();
 
     if (indexDefinitionChanged || publicationDirectoryChanged) {
       this.stopAutomaticWork(false);
@@ -369,7 +363,7 @@ export class TramaPlugin extends Plugin {
       this.explicitIndex.semanticAbort?.abort();
       this.explicitIndex.semanticAbort = undefined;
       this.stopAutomaticSemanticWork();
-      this.semanticScheduler.eligible = false;
+      this.semanticScheduler.clearEligibility();
       this.relatedNotes?.cancel();
       this.indexStatus?.cancel();
       const oldIndex = this.index;
@@ -402,16 +396,13 @@ export class TramaPlugin extends Plugin {
           source: "explicit",
         });
       } else {
-        this.semanticScheduler.retryAttempt = 0;
-        this.semanticScheduler.retryPaused = false;
-        if (this.hasAutomaticSemanticWork(this.index)) this.semanticScheduler.eligible = true;
+        this.semanticScheduler.resetForSettings();
+        this.semanticScheduler.markEligibleIfPending(this.index);
         this.scheduleAutomaticSemantic("event");
       }
     }
     if (automaticPublicationDelayChanged) {
-      this.publicationScheduler.clearRetry();
-      this.publicationScheduler.retryAttempt = 0;
-      this.publicationScheduler.retryPaused = false;
+      this.publicationScheduler.resetForSettings();
       if (saved.filo.automaticPublicationDelayMs <= 0) {
         this.stopAutomaticPublication();
         this.emitSchedulerTransition({
@@ -452,7 +443,7 @@ export class TramaPlugin extends Plugin {
     const compositionRevision = ++this.compositionRevision;
     this.indexLoaded = false;
     this.indexReady = false;
-    this.lexicalScheduler.startupRecoveryStarted = false;
+    this.lexicalScheduler.resetForRuntimeComposition();
     const runtime = composePluginRuntime(
       {
         diagnostics: this.diagnostics,
@@ -514,22 +505,25 @@ export class TramaPlugin extends Plugin {
     this.indexLoaded = usable;
     this.indexReady = usable;
     this.updateIndexCapabilities(manager);
-    if (this.hasAutomaticSemanticWork(manager)) this.semanticScheduler.eligible = true;
+    this.semanticScheduler.markEligibleIfPending(manager);
     if (!usable || !manager.isComplete()) {
       if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
       else this.indexStatus?.setIndexRequired(true);
-      if (usable) this.maybeScheduleStartupRecovery();
+      if (usable) this.lexicalScheduler.maybeScheduleStartupRecovery();
       return;
     }
     if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
     else this.indexStatus?.setReady(true);
     this.modelRuntime.refreshOpenRelatedSuggestions(app);
-    this.maybeScheduleStartupRecovery();
-    this.semanticScheduler.eligible = this.hasAutomaticSemanticWork(manager);
+    this.lexicalScheduler.maybeScheduleStartupRecovery();
+    this.semanticScheduler.replaceEligibility(manager);
     if (!manager.hasPendingWork()) this.scheduleAutomaticSemantic("startup");
-    if (this.lexicalScheduler.queuedWork && this.getSettings().filo.automaticLexicalDelayMs > 0)
+    if (
+      this.lexicalScheduler.hasQueuedWork() &&
+      this.getSettings().filo.automaticLexicalDelayMs > 0
+    )
       this.scheduleReconcile(manager.hasPendingWork() ? "startup" : "event");
-    else if (this.lexicalScheduler.queuedWork) this.markQueuedWorkStale();
+    else if (this.lexicalScheduler.hasQueuedWork()) this.markQueuedWorkStale();
   }
 
   private resolveSqliteIdentity(
@@ -652,18 +646,6 @@ export class TramaPlugin extends Plugin {
     this.indexStatus.setCapabilities(manager.capabilities());
   }
 
-  private hasAutomaticSemanticWork(manager?: IndexManager): boolean {
-    if (!manager) return false;
-    const pending = (
-      manager as IndexManager & {
-        hasPendingSemanticWork?: () => boolean;
-      }
-    ).hasPendingSemanticWork;
-    return typeof pending === "function"
-      ? pending.call(manager)
-      : manager.hasCompatibleSemanticVectors();
-  }
-
   private emitSchedulerTransition(transition: SchedulerTransition): void {
     this.diagnostics.emit({
       area: "index",
@@ -688,41 +670,15 @@ export class TramaPlugin extends Plugin {
     if (!this.indexStatus) return;
     const message = schedulerStatusMessage({
       settings: this.getSettings().filo,
-      lexical: {
-        queued: this.lexicalScheduler.queuedWork,
-        running: Boolean(this.lexicalScheduler.reconcilePromise),
-        retryPaused: this.lexicalScheduler.retryPaused,
-        retryScheduled: Boolean(this.lexicalScheduler.retryTimer),
-        retryAttempt: this.lexicalScheduler.retryAttempt,
-        delayed: Boolean(this.lexicalScheduler.eventTimer),
-      },
+      lexical: this.lexicalScheduler.snapshot(),
       semantic: {
-        running: Boolean(this.semanticScheduler.promise),
-        retryScheduled: Boolean(this.semanticScheduler.retryTimer),
-        retryAttempt: this.semanticScheduler.retryAttempt,
-        delayed: Boolean(this.semanticScheduler.timer),
-        indexComplete: Boolean(
-          this.index && typeof this.index.isComplete === "function"
-            ? this.index.isComplete()
-            : false
-        ),
-        eligible: this.semanticScheduler.eligible,
-        searchable: Boolean(
-          this.index && typeof this.index.capabilities === "function"
-            ? this.index.capabilities().semantic?.searchable
-            : false
-        ),
+        ...this.semanticScheduler.snapshot(),
+        indexComplete: this.index?.isComplete() ?? false,
+        searchable: this.index?.capabilities().semantic.searchable ?? false,
       },
-      publication: {
-        running: Boolean(this.publicationScheduler.promise),
-        retryScheduled: Boolean(this.publicationScheduler.retryTimer),
-        retryAttempt: this.publicationScheduler.retryAttempt,
-        retryPaused: this.publicationScheduler.retryPaused,
-        delayed: Boolean(this.publicationScheduler.timer),
-        pending: Boolean(this.publicationScheduler.pending),
-      },
+      publication: this.publicationScheduler.snapshot(),
     });
-    if (this.indexStatus.getStatus?.().schedulerMessage !== message)
+    if (this.indexStatus.getStatus().schedulerMessage !== message)
       this.indexStatus.setSchedulerMessage(message);
   }
 
@@ -766,32 +722,6 @@ export class TramaPlugin extends Plugin {
     const manager = this.publicationManager;
     if (!manager || path !== manager.store.path) return;
     manager.notifyFileEvent(path);
-  }
-
-  private armAutomaticWork(): void {
-    if (this.getSettings().filo.automaticLexicalDelayMs <= 0) return;
-    if (this.lexicalScheduler.retryTimer) clearTimeout(this.lexicalScheduler.retryTimer);
-    this.lexicalScheduler.retryTimer = undefined;
-    this.lexicalScheduler.retryAttempt = 0;
-    this.lexicalScheduler.retryPaused = false;
-    this.lexicalScheduler.stopPaused = false;
-    this.maybeScheduleStartupRecovery();
-    if (this.lexicalScheduler.queuedWork && this.indexReady) this.scheduleReconcile();
-  }
-
-  private maybeScheduleStartupRecovery(): void {
-    if (
-      !this.layoutReady ||
-      !this.indexLoaded ||
-      !this.index ||
-      this.lexicalScheduler.startupRecoveryStarted ||
-      this.getSettings().filo.automaticLexicalDelayMs <= 0
-    )
-      return;
-    this.lexicalScheduler.startupRecoveryStarted = true;
-    this.index.requestFullRecovery();
-    this.lexicalScheduler.queuedWork = true;
-    if (this.indexReady) this.scheduleReconcile("startup");
   }
 
   private stopAutomaticSemanticWork(): void {

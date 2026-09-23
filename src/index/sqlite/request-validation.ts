@@ -95,160 +95,236 @@ function validPublicationId(value: unknown): value is string {
     typeof value === "string" && value.length > 0 && value.length <= 256 && !value.includes("\0")
   );
 }
+function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "string" && value.length <= maxLength && !value.includes("\0"))
+  );
+}
+function validOptionalGeneration(value: unknown): boolean {
+  return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
+}
+function validOptionalDimensions(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 4096)
+  );
+}
+function validOptionalResultLimit(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (Number.isSafeInteger(value) &&
+      (value as number) >= 0 &&
+      (value as number) <= SQLITE_MAX_RESULTS)
+  );
+}
+function validSnapshotExpectations(value: Record<string, any>): boolean {
+  return (
+    (value.corpusFingerprint === undefined || validHash(value.corpusFingerprint)) &&
+    (value.embeddingFingerprint === undefined || validHash(value.embeddingFingerprint)) &&
+    validOptionalText(value.buildIdentity, 256) &&
+    validOptionalDimensions(value.dimensions)
+  );
+}
+function assertNever(value: never): never {
+  throw sqliteError("invalid_request", `Unsupported SQLite method: ${String(value)}`);
+}
 function validatePayload(method: SqliteMethod, payload: unknown): void {
   if (!payload || typeof payload !== "object")
     throw sqliteError("invalid_request", "Invalid payload");
   const value = payload as Record<string, any>;
-  if (method === "boot") {
-    if (
-      !validHash(value.corpusFingerprint) ||
-      (value.embeddingFingerprint !== undefined && !validHash(value.embeddingFingerprint)) ||
-      !Number.isSafeInteger(value.dimensions) ||
-      value.dimensions < 1 ||
-      value.dimensions > 4096 ||
-      (value.identity !== undefined && !validHash(value.identity))
-    )
-      throw sqliteError("invalid_request", "Invalid boot payload");
-  } else if (method === "beginLexicalRun") {
-    const summaries = value.summaries;
-    const scope = value.scope;
-    if (
-      (value.runId !== undefined && !validRunId(value.runId)) ||
-      (value.expectedChangeCounter !== undefined &&
-        (!Number.isSafeInteger(value.expectedChangeCounter) || value.expectedChangeCounter < 0)) ||
-      (summaries !== undefined &&
-        (!Array.isArray(summaries) ||
-          summaries.length > SQLITE_MAX_NOTES ||
-          !summaries.every(validSummary))) ||
-      (scope !== undefined &&
-        (!scope ||
-          typeof scope !== "object" ||
-          typeof scope.mayClearIncomplete !== "boolean" ||
-          (scope.renames !== undefined &&
-            (!Array.isArray(scope.renames) ||
-              scope.renames.length > SQLITE_MAX_NOTES ||
-              !scope.renames.every(
-                (rename: unknown) =>
-                  !!rename &&
-                  typeof rename === "object" &&
-                  validPath((rename as { from?: unknown }).from) &&
-                  validPath((rename as { to?: unknown }).to)
-              ))) ||
-          (scope.deletes !== undefined &&
-            (!Array.isArray(scope.deletes) ||
-              scope.deletes.length > SQLITE_MAX_NOTES ||
-              !scope.deletes.every(validPath)))))
-    )
-      throw sqliteError("invalid_request", "Invalid lexical run payload");
-  } else if (method === "applyLexicalBatch") {
-    const notes = value.notes;
-    if (
-      !validRunId(value.runId) ||
-      !Array.isArray(notes) ||
-      notes.length > SQLITE_MAX_LEXICAL_BATCH_NOTES ||
-      !notes.every(validBatchNote)
-    )
-      throw sqliteError("invalid_request", "Invalid lexical batch payload");
-    let bytes = 0;
-    for (const note of notes as SqliteLexicalBatchNoteInput[]) {
-      // Keep this check byte based so multibyte Markdown cannot bypass the aggregate bound.
-      bytes += new TextEncoder().encode(note.markdown).byteLength;
-      const maxBytes =
-        (notes as SqliteLexicalBatchNoteInput[]).length === 1
-          ? MAX_MARKDOWN_UTF8_BYTES
-          : SQLITE_MAX_LEXICAL_BATCH_MARKDOWN_BYTES;
-      if (bytes > maxBytes)
-        throw sqliteError("invalid_request", "Lexical batch Markdown exceeds the supported size");
-    }
-  } else if (method === "finishLexicalRun" || method === "abortLexicalRun") {
-    if (!validRunId(value.runId)) throw sqliteError("invalid_request", "Invalid lexical run ID");
-  } else if (method === "listLexicalSummaries") {
-    // no payload fields
-  } else if (method === "prepareSemanticWork") {
-    if (
-      !validHash(value.embeddingFingerprint) ||
-      (value.preprocessing !== undefined &&
-        (typeof value.preprocessing !== "string" || value.preprocessing.length > 128)) ||
-      !Number.isSafeInteger(value.limit) ||
-      value.limit < 0 ||
-      value.limit > SQLITE_MAX_SEMANTIC_BATCH_ITEMS ||
-      (value.maxInputBytes !== undefined &&
-        (!Number.isSafeInteger(value.maxInputBytes) ||
-          value.maxInputBytes < 1 ||
-          value.maxInputBytes > SQLITE_MAX_SEMANTIC_INPUT_BYTES)) ||
-      (value.promoteUnrestricted !== undefined && typeof value.promoteUnrestricted !== "boolean")
-    )
-      throw sqliteError("invalid_request", "Invalid semantic work request");
-  } else if (method === "commitSemanticResults") {
-    if (
-      !validHash(value.embeddingFingerprint) ||
-      (value.preprocessing !== undefined &&
-        (typeof value.preprocessing !== "string" || value.preprocessing.length > 128)) ||
-      !Number.isSafeInteger(value.dimensions) ||
-      value.dimensions < 1 ||
-      value.dimensions > 4096 ||
-      !Number.isSafeInteger(value.expectedCount) ||
-      value.expectedCount < 0 ||
-      value.expectedCount > SQLITE_MAX_SEMANTIC_BATCH_ITEMS ||
-      !Array.isArray(value.results) ||
-      value.results.length !== value.expectedCount ||
-      value.results.length > SQLITE_MAX_SEMANTIC_BATCH_ITEMS
-    )
-      throw sqliteError("invalid_request", "Invalid semantic result batch");
-    let inputBytes = 0;
-    let vectorBytes = 0;
-    for (const result of value.results as SqliteEmbeddingResult[]) {
-      if (!validEmbeddingResult(result, value.dimensions, SQLITE_MAX_SEMANTIC_VECTOR_BYTES))
-        throw sqliteError("invalid_request", "Invalid semantic result");
-      inputBytes += new TextEncoder().encode(result.serialization).byteLength;
-      vectorBytes += result.vector.byteLength;
+  switch (method) {
+    case "boot":
       if (
-        inputBytes > SQLITE_MAX_SEMANTIC_INPUT_BYTES ||
-        vectorBytes > SQLITE_MAX_SEMANTIC_VECTOR_BYTES
+        !validHash(value.corpusFingerprint) ||
+        (value.embeddingFingerprint !== undefined && !validHash(value.embeddingFingerprint)) ||
+        !validOptionalText(value.buildIdentity, 256) ||
+        !validOptionalDimensions(value.dimensions) ||
+        value.dimensions === undefined ||
+        (value.identity !== undefined && !validHash(value.identity))
       )
-        throw sqliteError("invalid_request", "Semantic result batch exceeds supported bounds");
+        throw sqliteError("invalid_request", "Invalid boot payload");
+      return;
+    case "getState":
+    case "markIncomplete":
+    case "listLexicalSummaries":
+    case "clearSemanticCache":
+    case "shutdown":
+      return;
+    case "beginLexicalRun": {
+      const summaries = value.summaries;
+      const scope = value.scope;
+      if (
+        (value.runId !== undefined && !validRunId(value.runId)) ||
+        !validOptionalGeneration(value.expectedChangeCounter) ||
+        (summaries !== undefined &&
+          (!Array.isArray(summaries) ||
+            summaries.length > SQLITE_MAX_NOTES ||
+            !summaries.every(validSummary))) ||
+        (scope !== undefined &&
+          (!scope ||
+            typeof scope !== "object" ||
+            typeof scope.mayClearIncomplete !== "boolean" ||
+            (scope.renames !== undefined &&
+              (!Array.isArray(scope.renames) ||
+                scope.renames.length > SQLITE_MAX_NOTES ||
+                !scope.renames.every(
+                  (rename: unknown) =>
+                    !!rename &&
+                    typeof rename === "object" &&
+                    validPath((rename as { from?: unknown }).from) &&
+                    validPath((rename as { to?: unknown }).to)
+                ))) ||
+            (scope.deletes !== undefined &&
+              (!Array.isArray(scope.deletes) ||
+                scope.deletes.length > SQLITE_MAX_NOTES ||
+                !scope.deletes.every(validPath)))))
+      )
+        throw sqliteError("invalid_request", "Invalid lexical run payload");
+      return;
     }
-  } else if (method === "clearSemanticCache") {
-    // no payload fields
-  } else if (method === "retrieve") {
-    if (
-      (value.query !== undefined &&
-        (typeof value.query !== "string" || value.query.length > SQLITE_MAX_TEXT)) ||
-      (value.vector !== undefined && !validVector(value.vector)) ||
-      !Number.isSafeInteger(value.limit) ||
-      value.limit < 0 ||
-      value.limit > SQLITE_MAX_RESULTS ||
-      (value.currentPath !== undefined && !validPath(value.currentPath))
-    )
-      throw sqliteError("invalid_request", "Invalid retrieve payload");
-  } else if (method === "findRelated") {
-    if (
-      !validPath(value.path) ||
-      (value.vector !== undefined && !validVector(value.vector)) ||
-      !Number.isSafeInteger(value.limit) ||
-      value.limit < 0 ||
-      value.limit > SQLITE_MAX_RESULTS
-    )
-      throw sqliteError("invalid_request", "Invalid related payload");
-  } else if (method === "preparePublication") {
-    if (!validPublicationId(value.publicationId))
-      throw sqliteError("invalid_request", "Invalid publication ID");
-  } else if (method === "finalizePublication") {
-    if (
-      !validPublicationId(value.publicationId) ||
-      !Number.isSafeInteger(value.expectedChangeCounter) ||
-      value.expectedChangeCounter < 0
-    )
-      throw sqliteError("invalid_request", "Invalid publication finalization payload");
-  } else if (method === "inspectPublication" || method === "adoptPublication") {
-    if (
-      !(value.bytes instanceof ArrayBuffer) ||
-      value.bytes.byteLength === 0 ||
-      value.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES ||
-      (value.expectedPublicationId !== undefined &&
-        !validPublicationId(value.expectedPublicationId))
-    )
-      throw sqliteError("invalid_request", "Invalid publication bytes");
+    case "applyLexicalBatch": {
+      const notes = value.notes;
+      if (
+        !validRunId(value.runId) ||
+        !Array.isArray(notes) ||
+        notes.length > SQLITE_MAX_LEXICAL_BATCH_NOTES ||
+        !notes.every(validBatchNote)
+      )
+        throw sqliteError("invalid_request", "Invalid lexical batch payload");
+      let bytes = 0;
+      for (const note of notes as SqliteLexicalBatchNoteInput[]) {
+        bytes += new TextEncoder().encode(note.markdown).byteLength;
+        const maxBytes =
+          notes.length === 1 ? MAX_MARKDOWN_UTF8_BYTES : SQLITE_MAX_LEXICAL_BATCH_MARKDOWN_BYTES;
+        if (bytes > maxBytes)
+          throw sqliteError("invalid_request", "Lexical batch Markdown exceeds the supported size");
+      }
+      return;
+    }
+    case "finishLexicalRun":
+    case "abortLexicalRun":
+      if (!validRunId(value.runId)) throw sqliteError("invalid_request", "Invalid lexical run ID");
+      return;
+    case "prepareSemanticWork":
+      if (
+        !validHash(value.embeddingFingerprint) ||
+        !validOptionalText(value.preprocessing, 128) ||
+        !Number.isSafeInteger(value.limit) ||
+        value.limit < 0 ||
+        value.limit > SQLITE_MAX_SEMANTIC_BATCH_ITEMS ||
+        (value.maxInputBytes !== undefined &&
+          (!Number.isSafeInteger(value.maxInputBytes) ||
+            value.maxInputBytes < 1 ||
+            value.maxInputBytes > SQLITE_MAX_SEMANTIC_INPUT_BYTES)) ||
+        (value.promoteUnrestricted !== undefined && typeof value.promoteUnrestricted !== "boolean")
+      )
+        throw sqliteError("invalid_request", "Invalid semantic work request");
+      return;
+    case "commitSemanticResults": {
+      if (
+        !validHash(value.embeddingFingerprint) ||
+        !validOptionalText(value.preprocessing, 128) ||
+        !validOptionalDimensions(value.dimensions) ||
+        value.dimensions === undefined ||
+        !Number.isSafeInteger(value.expectedCount) ||
+        value.expectedCount < 0 ||
+        value.expectedCount > SQLITE_MAX_SEMANTIC_BATCH_ITEMS ||
+        !Array.isArray(value.results) ||
+        value.results.length !== value.expectedCount ||
+        value.results.length > SQLITE_MAX_SEMANTIC_BATCH_ITEMS
+      )
+        throw sqliteError("invalid_request", "Invalid semantic result batch");
+      let inputBytes = 0;
+      let vectorBytes = 0;
+      for (const result of value.results as SqliteEmbeddingResult[]) {
+        if (!validEmbeddingResult(result, value.dimensions, SQLITE_MAX_SEMANTIC_VECTOR_BYTES))
+          throw sqliteError("invalid_request", "Invalid semantic result");
+        inputBytes += new TextEncoder().encode(result.serialization).byteLength;
+        vectorBytes += result.vector.byteLength;
+        if (
+          inputBytes > SQLITE_MAX_SEMANTIC_INPUT_BYTES ||
+          vectorBytes > SQLITE_MAX_SEMANTIC_VECTOR_BYTES
+        )
+          throw sqliteError("invalid_request", "Semantic result batch exceeds supported bounds");
+      }
+      return;
+    }
+    case "retrieve":
+      if (
+        (value.query !== undefined &&
+          (typeof value.query !== "string" || value.query.length > SQLITE_MAX_TEXT)) ||
+        (value.vector !== undefined && !validVector(value.vector)) ||
+        !Number.isSafeInteger(value.limit) ||
+        value.limit < 0 ||
+        value.limit > SQLITE_MAX_RESULTS ||
+        (value.currentPath !== undefined && !validPath(value.currentPath)) ||
+        !validOptionalResultLimit(value.semanticCandidateLimit) ||
+        !validOptionalResultLimit(value.lexicalCandidateLimit) ||
+        (value.lexicalProfile !== undefined &&
+          value.lexicalProfile !== "voce" &&
+          value.lexicalProfile !== "lente") ||
+        (value.resultShape !== undefined &&
+          value.resultShape !== "chunks" &&
+          value.resultShape !== "notes")
+      )
+        throw sqliteError("invalid_request", "Invalid retrieve payload");
+      return;
+    case "findRelated":
+      if (
+        !validPath(value.path) ||
+        (value.vector !== undefined && !validVector(value.vector)) ||
+        !Number.isSafeInteger(value.limit) ||
+        value.limit < 0 ||
+        value.limit > SQLITE_MAX_RESULTS
+      )
+        throw sqliteError("invalid_request", "Invalid related payload");
+      return;
+    case "preparePublication":
+      if (!validPublicationId(value.publicationId))
+        throw sqliteError("invalid_request", "Invalid publication ID");
+      return;
+    case "finalizePublication":
+      if (
+        !validPublicationId(value.publicationId) ||
+        !Number.isSafeInteger(value.expectedChangeCounter) ||
+        value.expectedChangeCounter < 0 ||
+        !validOptionalGeneration(value.expectedLexicalGeneration) ||
+        !validOptionalGeneration(value.expectedSemanticGeneration)
+      )
+        throw sqliteError("invalid_request", "Invalid publication finalization payload");
+      return;
+    case "inspectPublication":
+    case "adoptPublication":
+      if (
+        !(value.bytes instanceof ArrayBuffer) ||
+        value.bytes.byteLength === 0 ||
+        value.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES ||
+        (value.expectedPublicationId !== undefined &&
+          !validPublicationId(value.expectedPublicationId)) ||
+        (value.inspection !== undefined &&
+          (!value.inspection ||
+            typeof value.inspection !== "object" ||
+            value.inspection.valid !== true ||
+            !validPublicationId(value.inspection.publicationId) ||
+            !value.inspection.state ||
+            typeof value.inspection.state !== "object" ||
+            !Number.isSafeInteger(value.inspection.byteSize) ||
+            value.inspection.byteSize < 1 ||
+            value.inspection.byteSize > SQLITE_SNAPSHOT_MAX_BYTES)) ||
+        !validSnapshotExpectations(value)
+      )
+        throw sqliteError("invalid_request", "Invalid publication bytes");
+      return;
+    case "cancelQueued":
+      if (
+        value.requestId !== undefined &&
+        (!Number.isSafeInteger(value.requestId) || value.requestId < 1)
+      )
+        throw sqliteError("invalid_request", "Invalid cancellation request ID");
+      return;
+    default:
+      return assertNever(method);
   }
 }
 export function validateRequest(value: unknown): asserts value is SqliteRequest {

@@ -25,9 +25,9 @@ function publicationHarness(delay = 5_000) {
     setPublicationWarning: vi.fn(),
     setSchedulerMessage: vi.fn(),
     setCapabilities: vi.fn(),
+    getStatus: () => ({}),
   };
   plugin.indexReady = true;
-  plugin.lexicalScheduler.queuedWork = false;
   plugin.vaultEventRevision = 0;
   const operation = (changeCounter: number, type: "update" | "prepare" = "update") => ({
     operation: type,
@@ -53,7 +53,10 @@ describe("SQLite publication plugin maintenance", () => {
         state: { publicationId: "remote-1" },
       }),
     };
-    plugin.index = { capabilities: () => ({}) };
+    plugin.index = {
+      isComplete: () => false,
+      capabilities: () => ({ semantic: { searchable: false } }),
+    };
     plugin.indexStatus = undefined;
 
     await expect(plugin.retryPublication()).resolves.toBeUndefined();
@@ -68,7 +71,10 @@ describe("SQLite publication plugin maintenance", () => {
       publish: vi.fn(),
       adoptCurrent: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
     };
-    plugin.index = { capabilities: () => ({}) };
+    plugin.index = {
+      isComplete: () => false,
+      capabilities: () => ({ semantic: { searchable: false } }),
+    };
     plugin.indexStatus = undefined;
 
     await plugin.checkPublication();
@@ -86,7 +92,7 @@ describe("SQLite publication plugin maintenance", () => {
     expect(publication.publish).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
     vi.useRealTimers();
   });
 
@@ -117,7 +123,7 @@ describe("SQLite publication plugin maintenance", () => {
       converged: false,
       state: { incomplete: true, changeCounter: 2 },
     });
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -141,7 +147,7 @@ describe("SQLite publication plugin maintenance", () => {
       ...plugin.getSettings(),
       filo: { ...plugin.getSettings().filo, automaticPublicationDelayMs: 0 },
     });
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -185,10 +191,10 @@ describe("SQLite publication plugin maintenance", () => {
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
     await vi.advanceTimersByTimeAsync(5_000);
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2));
-    const newerIntent = plugin.publicationScheduler.pending;
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(true);
     finish({ published: true });
     await Promise.resolve();
-    expect(plugin.publicationScheduler.pending).toBe(newerIntent);
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(true);
     vi.useRealTimers();
   });
 
@@ -210,7 +216,7 @@ describe("SQLite publication plugin maintenance", () => {
     expect(publication.publish).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(publication.publish).toHaveBeenCalledTimes(4);
-    expect(plugin.publicationScheduler.retryPaused).toBe(true);
+    expect(plugin.publicationScheduler.snapshot().retryPaused).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -225,7 +231,7 @@ describe("SQLite publication plugin maintenance", () => {
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
     await vi.advanceTimersByTimeAsync(5_000);
     expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationScheduler.retryPaused).toBe(true);
+    expect(plugin.publicationScheduler.snapshot().retryPaused).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -242,14 +248,18 @@ describe("SQLite publication plugin maintenance", () => {
       publish: vi.fn(),
       adoptCurrent: vi.fn().mockResolvedValue({ adopted: true, publicationId: "remote" }),
     };
-    plugin.index = { capabilities: () => ({}) };
+    plugin.index = {
+      isComplete: () => false,
+      capabilities: () => ({ semantic: { searchable: false } }),
+    };
     plugin.indexStatus = {
       setPublicationWarning: vi.fn(),
       setSchedulerMessage: vi.fn(),
       setCapabilities: vi.fn(),
+      getStatus: () => ({}),
     };
     await plugin.checkPublication();
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
     expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
   });
 
@@ -261,12 +271,12 @@ describe("SQLite publication plugin maintenance", () => {
       publicationId: "remote",
     }));
     plugin.recordAutomaticPublicationIntent(index, publication, operation(1));
-    expect(plugin.publicationScheduler.timer).toBeDefined();
+    expect(plugin.publicationScheduler.snapshot().delayed).toBe(true);
 
     await plugin.checkPublication();
 
-    expect(plugin.publicationScheduler.pending).toBeUndefined();
-    expect(plugin.publicationScheduler.timer).toBeUndefined();
+    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
+    expect(plugin.publicationScheduler.snapshot().delayed).toBe(false);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(publication.publish).not.toHaveBeenCalled();
 

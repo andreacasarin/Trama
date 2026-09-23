@@ -11,25 +11,63 @@ export interface AutomaticSemanticHost extends SchedulerHost {
 }
 
 export class AutomaticSemanticController {
-  timer?: ReturnType<typeof setTimeout>;
-  retryTimer?: ReturnType<typeof setTimeout>;
-  abort?: AbortController;
-  lease?: IndexOperationLease;
-  promise?: Promise<void>;
-  retryAttempt = 0;
-  retryPaused = false;
-  eligible = false;
-  stopPaused = false;
+  private timer?: ReturnType<typeof setTimeout>;
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private abort?: AbortController;
+  private lease?: IndexOperationLease;
+  private promise?: Promise<void>;
+  private retryAttempt = 0;
+  private retryPaused = false;
+  private eligible = false;
+  private stopPaused = false;
 
   constructor(private readonly host: AutomaticSemanticHost) {}
 
   hasWork(manager?: IndexManager): boolean {
-    if (!manager) return false;
-    const pending = (manager as IndexManager & { hasPendingSemanticWork?: () => boolean })
-      .hasPendingSemanticWork;
-    return typeof pending === "function"
-      ? pending.call(manager)
-      : manager.hasCompatibleSemanticVectors();
+    return manager?.hasPendingSemanticWork() ?? false;
+  }
+
+  snapshot(): {
+    running: boolean;
+    retryScheduled: boolean;
+    retryAttempt: number;
+    delayed: boolean;
+    eligible: boolean;
+    retryPaused: boolean;
+  } {
+    return {
+      running: Boolean(this.promise),
+      retryScheduled: Boolean(this.retryTimer),
+      retryAttempt: this.retryAttempt,
+      delayed: Boolean(this.timer),
+      eligible: this.eligible,
+      retryPaused: this.retryPaused,
+    };
+  }
+
+  activeWork(): Promise<void> | undefined {
+    return this.promise;
+  }
+
+  markEligibleIfPending(manager?: IndexManager): void {
+    this.eligible ||= this.hasWork(manager);
+  }
+
+  replaceEligibility(manager?: IndexManager): void {
+    this.eligible = this.hasWork(manager);
+  }
+
+  clearEligibility(): void {
+    this.eligible = false;
+  }
+
+  resetForManualOperation(): void {
+    this.stopPaused = false;
+  }
+
+  resetForSettings(): void {
+    this.retryAttempt = 0;
+    this.retryPaused = false;
   }
 
   stop(): void {
