@@ -39,8 +39,8 @@ describe("automatic scheduler status and diagnostics", () => {
     });
     const setSchedulerMessage = vi.fn();
     plugin.indexStatus = { setSchedulerMessage };
-    plugin.queuedWork = true;
-    plugin.automaticPublicationTimer = {};
+    plugin.lexicalScheduler.queuedWork = true;
+    plugin.publicationScheduler.timer = {};
 
     plugin.refreshSchedulerMessage();
 
@@ -62,10 +62,10 @@ describe("automatic scheduler status and diagnostics", () => {
     });
     const setSchedulerMessage = vi.fn();
     plugin.indexStatus = { setSchedulerMessage };
-    plugin.eventTimer = {};
-    plugin.automaticSemanticPromise = Promise.resolve();
-    plugin.automaticPublicationRetryTimer = {};
-    plugin.automaticPublicationRetryAttempt = 2;
+    plugin.lexicalScheduler.eventTimer = {};
+    plugin.semanticScheduler.promise = Promise.resolve();
+    plugin.publicationScheduler.retryTimer = {};
+    plugin.publicationScheduler.retryAttempt = 2;
 
     plugin.refreshSchedulerMessage();
 
@@ -118,7 +118,7 @@ describe("automatic scheduler status and diagnostics", () => {
       ])
     );
     expect(JSON.stringify(records)).not.toContain("Private/secret-note.md");
-    clearTimeout(plugin.eventTimer);
+    clearTimeout(plugin.lexicalScheduler.eventTimer);
     log.mockRestore();
   });
 
@@ -136,7 +136,7 @@ describe("automatic scheduler status and diagnostics", () => {
       setCapabilities: vi.fn(),
       setSchedulerMessage: vi.fn(),
     };
-    plugin.automaticSemanticEligible = true;
+    plugin.semanticScheduler.eligible = true;
     plugin.index = {
       isComplete: () => true,
       isBuilding: () => false,
@@ -147,7 +147,7 @@ describe("automatic scheduler status and diagnostics", () => {
     };
     const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
 
-    await plugin.runAutomaticSemanticBatch("event");
+    await plugin.semanticScheduler.runBatch("event");
 
     const records = log.mock.calls.map(([, record]) => record as Record<string, any>);
     expect(records).toEqual(
@@ -189,7 +189,7 @@ describe("automatic scheduler status and diagnostics", () => {
       acquireExternalLease: () => new IndexOperationLease("semantic"),
     };
     plugin.indexReady = true;
-    plugin.automaticSemanticEligible = true;
+    plugin.semanticScheduler.eligible = true;
     plugin.index = {
       isComplete: () => true,
       isBuilding: () => false,
@@ -199,12 +199,12 @@ describe("automatic scheduler status and diagnostics", () => {
       }),
     };
 
-    await plugin.runAutomaticSemanticBatch("event");
+    await plugin.semanticScheduler.runBatch("event");
 
     expect(markError).toHaveBeenCalledTimes(1);
-    expect(plugin.automaticSemanticRetryTimer).toBeUndefined();
-    expect(plugin.automaticSemanticRetryPaused).toBe(true);
-    expect(plugin.automaticSemanticEligible).toBe(false);
+    expect(plugin.semanticScheduler.retryTimer).toBeUndefined();
+    expect(plugin.semanticScheduler.retryPaused).toBe(true);
+    expect(plugin.semanticScheduler.eligible).toBe(false);
   });
 
   it("retries protocol failures on the lexical and semantic schedules", () => {
@@ -219,13 +219,13 @@ describe("automatic scheduler status and diagnostics", () => {
         automaticSemanticDelayMs: 1_000,
       },
     });
-    plugin.queuedWork = false;
+    plugin.lexicalScheduler.queuedWork = false;
     const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const failure = sqliteError("storage_unavailable", "worker unavailable", true);
 
     for (let attempt = 0; attempt < 4; attempt++) {
-      plugin.scheduleAutomaticRetry(failure);
-      plugin.scheduleAutomaticSemanticRetry(failure);
+      plugin.lexicalScheduler.scheduleRetry(failure);
+      plugin.semanticScheduler.scheduleRetry(failure);
     }
 
     const records = log.mock.calls.map(([, record]) => record as Record<string, any>);
@@ -239,8 +239,8 @@ describe("automatic scheduler status and diagnostics", () => {
         .filter((record) => record.stage === "retrying" && record.channel === "semantic")
         .map((record) => record.delayMs)
     ).toEqual([5_000, 15_000, 60_000]);
-    clearTimeout(plugin.retryTimer);
-    clearTimeout(plugin.automaticSemanticRetryTimer);
+    clearTimeout(plugin.lexicalScheduler.retryTimer);
+    clearTimeout(plugin.semanticScheduler.retryTimer);
     log.mockRestore();
 
     const legacyPlugin = new TramaPlugin(undefined as never, undefined as never) as any;
@@ -255,12 +255,12 @@ describe("automatic scheduler status and diagnostics", () => {
     });
     const legacyLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const legacyFailure = { retryable: true, message: "legacy retry" };
-    legacyPlugin.scheduleAutomaticRetry(legacyFailure);
-    legacyPlugin.scheduleAutomaticSemanticRetry(legacyFailure);
+    legacyPlugin.lexicalScheduler.scheduleRetry(legacyFailure);
+    legacyPlugin.semanticScheduler.scheduleRetry(legacyFailure);
     const legacyRecords = legacyLog.mock.calls.map(([, record]) => record as Record<string, any>);
     expect(legacyRecords.filter((record) => record.stage === "retrying")).toHaveLength(2);
-    clearTimeout(legacyPlugin.retryTimer);
-    clearTimeout(legacyPlugin.automaticSemanticRetryTimer);
+    clearTimeout(legacyPlugin.lexicalScheduler.retryTimer);
+    clearTimeout(legacyPlugin.semanticScheduler.retryTimer);
     legacyLog.mockRestore();
   });
 });

@@ -27,7 +27,7 @@ function publicationHarness(delay = 5_000) {
     setCapabilities: vi.fn(),
   };
   plugin.indexReady = true;
-  plugin.queuedWork = false;
+  plugin.lexicalScheduler.queuedWork = false;
   plugin.vaultEventRevision = 0;
   const operation = (changeCounter: number, type: "update" | "prepare" = "update") => ({
     operation: type,
@@ -86,7 +86,7 @@ describe("SQLite publication plugin maintenance", () => {
     expect(publication.publish).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.pendingAutomaticPublication).toBeUndefined();
+    expect(plugin.publicationScheduler.pending).toBeUndefined();
     vi.useRealTimers();
   });
 
@@ -117,7 +117,7 @@ describe("SQLite publication plugin maintenance", () => {
       converged: false,
       state: { incomplete: true, changeCounter: 2 },
     });
-    expect(plugin.pendingAutomaticPublication).toBeUndefined();
+    expect(plugin.publicationScheduler.pending).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -141,7 +141,7 @@ describe("SQLite publication plugin maintenance", () => {
       ...plugin.getSettings(),
       filo: { ...plugin.getSettings().filo, automaticPublicationDelayMs: 0 },
     });
-    expect(plugin.pendingAutomaticPublication).toBeUndefined();
+    expect(plugin.publicationScheduler.pending).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -185,10 +185,10 @@ describe("SQLite publication plugin maintenance", () => {
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
     await vi.advanceTimersByTimeAsync(5_000);
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2));
-    const newerIntent = plugin.pendingAutomaticPublication;
+    const newerIntent = plugin.publicationScheduler.pending;
     finish({ published: true });
     await Promise.resolve();
-    expect(plugin.pendingAutomaticPublication).toBe(newerIntent);
+    expect(plugin.publicationScheduler.pending).toBe(newerIntent);
     vi.useRealTimers();
   });
 
@@ -210,7 +210,7 @@ describe("SQLite publication plugin maintenance", () => {
     expect(publication.publish).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(publication.publish).toHaveBeenCalledTimes(4);
-    expect(plugin.automaticPublicationRetryPaused).toBe(true);
+    expect(plugin.publicationScheduler.retryPaused).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -225,7 +225,7 @@ describe("SQLite publication plugin maintenance", () => {
     plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
     await vi.advanceTimersByTimeAsync(5_000);
     expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.automaticPublicationRetryPaused).toBe(true);
+    expect(plugin.publicationScheduler.retryPaused).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
@@ -249,7 +249,7 @@ describe("SQLite publication plugin maintenance", () => {
       setCapabilities: vi.fn(),
     };
     await plugin.checkPublication();
-    expect(plugin.pendingAutomaticPublication).toBeUndefined();
+    expect(plugin.publicationScheduler.pending).toBeUndefined();
     expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
   });
 
@@ -261,12 +261,12 @@ describe("SQLite publication plugin maintenance", () => {
       publicationId: "remote",
     }));
     plugin.recordAutomaticPublicationIntent(index, publication, operation(1));
-    expect(plugin.automaticPublicationTimer).toBeDefined();
+    expect(plugin.publicationScheduler.timer).toBeDefined();
 
     await plugin.checkPublication();
 
-    expect(plugin.pendingAutomaticPublication).toBeUndefined();
-    expect(plugin.automaticPublicationTimer).toBeUndefined();
+    expect(plugin.publicationScheduler.pending).toBeUndefined();
+    expect(plugin.publicationScheduler.timer).toBeUndefined();
     await vi.advanceTimersByTimeAsync(5_000);
     expect(publication.publish).not.toHaveBeenCalled();
 
