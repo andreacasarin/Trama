@@ -204,6 +204,7 @@ export type TramaDiagnosticRecord =
       readonly channel?: "lexical" | "semantic" | "publication";
       readonly source?: "startup" | "event" | "explicit" | "retry" | "quit";
       readonly delayMs?: number;
+      readonly deferredReason?: string;
       readonly retryAttempt?: number;
       readonly publicationSizeBytes?: number;
       readonly phase?: string;

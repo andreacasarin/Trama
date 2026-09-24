@@ -1,4 +1,5 @@
 import type { IndexOperationResult } from "@/index/IndexManager";
+import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
 import {
   PublicationManager,
   type PublicationWarning,
@@ -115,6 +116,8 @@ export class AutomaticPublicationController {
           stage: "failed",
           source: "explicit",
           durationMs: Date.now() - startedAt,
+          phase: result.warning.phase,
+          error: projectDiagnosticError(result.warning.error),
         });
         this.scheduleRetry(pending, result.warning.retryable, publication);
       } else if (result.published) {
@@ -189,6 +192,8 @@ export class AutomaticPublicationController {
             stage: "failed",
             source: "quit",
             durationMs: Date.now() - startedAt,
+            phase: result.warning.phase,
+            error: projectDiagnosticError(result.warning.error),
           });
           this.scheduleRetry(pending, result.warning.retryable, publication);
         }
@@ -255,6 +260,8 @@ export class AutomaticPublicationController {
           stage: "failed",
           source,
           durationMs: Date.now() - startedAt,
+          phase: result.warning.phase,
+          error: projectDiagnosticError(result.warning.error),
         });
         this.scheduleRetry(pending, result.warning.retryable, publication);
       }

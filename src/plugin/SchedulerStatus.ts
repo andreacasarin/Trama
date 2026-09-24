@@ -18,6 +18,8 @@ export interface SchedulerStatusSnapshot {
     readonly indexComplete: boolean;
     readonly eligible: boolean;
     readonly searchable: boolean;
+    readonly pending?: boolean;
+    readonly deferred?: boolean;
   };
   readonly publication: {
     readonly running: boolean;
@@ -56,11 +58,15 @@ export function schedulerStatusMessage(snapshot: SchedulerStatusSnapshot): strin
           ? `retrying (attempt ${snapshot.semantic.retryAttempt})`
           : snapshot.semantic.delayed
             ? `scheduled (${settings.automaticSemanticDelayMs / 1000} sec)`
-            : snapshot.semantic.indexComplete && !snapshot.semantic.eligible
-              ? snapshot.semantic.searchable
-                ? "up to date"
-                : "incomplete"
-              : "idle";
+            : snapshot.semantic.deferred
+              ? "deferred"
+              : snapshot.semantic.pending
+                ? "pending"
+                : snapshot.semantic.indexComplete && !snapshot.semantic.eligible
+                  ? snapshot.semantic.searchable
+                    ? "up to date"
+                    : "incomplete"
+                  : "idle";
   const publication =
     settings.automaticPublicationDelayMs <= 0
       ? "Off"

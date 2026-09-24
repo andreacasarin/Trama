@@ -38,6 +38,7 @@ export class WorkerPublicationOperations {
     const database = await this.host.openDatabase();
     this.rejectActiveLexicalRun(database);
     const state = database.getState();
+    const expected = this.host.runtimeConfig(database);
     database.validateSnapshot(
       state.corpusFingerprint,
       state.dimensions,
@@ -52,12 +53,22 @@ export class WorkerPublicationOperations {
     try {
       pool.importDb(name, original);
       candidate = this.openCandidate(name);
+      // Boot the imported copy before pruning so cache cleanup uses the active
+      // embedding fingerprint and dimensions. The live database remains closed
+      // while the candidate is prepared and is reopened in finally below.
+      candidate.boot(
+        expected.corpus,
+        expected.dimensions,
+        expected.embedding,
+        expected.buildIdentity
+      );
       candidate.pruneForPublication();
       candidate.setPublicationId(publicationId);
       candidate.validateSnapshot(
-        state.corpusFingerprint,
-        state.dimensions,
-        state.embeddingFingerprint
+        expected.corpus,
+        expected.dimensions,
+        expected.embedding,
+        expected.buildIdentity
       );
       const bytes = exportOpfsDatabase(pool, name);
       if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)

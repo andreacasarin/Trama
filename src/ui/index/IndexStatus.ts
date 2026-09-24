@@ -21,6 +21,7 @@ interface StatusActions {
   rebuildBoth?(signal: AbortSignal): Promise<void>;
   publishNow?(): Promise<void>;
   cancel(): void;
+  onOperationReleased?(): void;
 }
 interface StatusTiming {
   now(): number;
@@ -179,6 +180,7 @@ export class IndexStatusController {
       this.status.kind === "preparing"
     )
       this.set("ready", true);
+    this.actions.onOperationReleased?.();
   }
   hasActiveOperation(channel?: IndexOperationChannel): boolean {
     return Boolean(this.activeLease && (!channel || this.activeLease.channel === channel));

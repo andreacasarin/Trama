@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
+import { MutableSqliteDatabase } from "@/index/sqlite/database";
+import { applyLexicalMarkdownBatch } from "@/index/sqlite/markdown";
+import { WorkerPublicationOperations } from "@/index/sqlite/worker-publication";
 import {
   PublicationManager,
   type PublicationIndexPort,
@@ -9,7 +13,7 @@ import {
   PublicationStore,
   type PublicationDataAdapter,
 } from "@/index/publications/PublicationStore";
-import { createTestSqliteClient } from "./sqlite-test-client";
+import { createTestSqliteClient, loadTestSqlite } from "./sqlite-test-client";
 
 const vault: IndexVaultPort = {
   listMarkdownPaths: async () => ["one.md"],
@@ -79,6 +83,96 @@ function publication(
 }
 
 describe("single-file SQLite publications", () => {
+  it("boots a publication candidate before pruning a lagging semantic cache", async () => {
+    const sqlite = await loadTestSqlite();
+    const files = new Map<string, Uint8Array>();
+    class PoolDatabase {
+      private readonly raw: any;
+
+      constructor(name: string) {
+        this.raw = new sqlite.oo1.DB(":memory:", "c");
+        const bytes = files.get(name);
+        if (!bytes) return;
+        const pointer = sqlite.wasm.allocFromTypedArray(bytes);
+        const flags =
+          sqlite.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite.capi.SQLITE_DESERIALIZE_RESIZEABLE;
+        if (
+          sqlite.capi.sqlite3_deserialize(
+            this.raw.pointer,
+            "main",
+            pointer,
+            bytes.byteLength,
+            bytes.byteLength,
+            flags
+          ) !== 0
+        )
+          throw new Error("failed to deserialize test publication");
+      }
+
+      exec(options: any): void {
+        this.raw.exec(options);
+      }
+
+      close(): void {
+        this.raw.close();
+      }
+    }
+    const pool = {
+      OpfsSAHPoolDb: PoolDatabase,
+      exportFile: (name: string) => files.get(name)!,
+      importDb: (name: string, bytes: Uint8Array | ArrayBuffer) => {
+        files.set(name, new Uint8Array(bytes));
+        return 0;
+      },
+      unlink: (name: string) => files.delete(name),
+    };
+    const config = {
+      corpus: "a".repeat(64),
+      embedding: "b".repeat(64),
+      dimensions: 2,
+      buildIdentity: SQLITE_BUILD_IDENTITY,
+    };
+    const liveRaw = new sqlite.oo1.DB(":memory:", "c");
+    let live: MutableSqliteDatabase | undefined = new MutableSqliteDatabase(liveRaw);
+    live.boot(config.corpus, config.dimensions, config.embedding, config.buildIdentity);
+    const firstRun = live.beginLexicalRun({ scope: { mayClearIncomplete: true } });
+    await applyLexicalMarkdownBatch(live, firstRun.runId, [{ path: "one.md", markdown: "alpha" }]);
+    live.finishLexicalRun(firstRun.runId);
+    const work = live.prepareSemanticWork(config.embedding, undefined, 128, 4 * 1024 * 1024);
+    live.commitSemanticResults(
+      work.requests.map((request) => ({
+        ...request,
+        vector: new Float32Array([1, 0]),
+      })),
+      config.embedding
+    );
+    const secondRun = live.beginLexicalRun({ scope: { mayClearIncomplete: true } });
+    await applyLexicalMarkdownBatch(live, secondRun.runId, [{ path: "one.md", markdown: "beta" }]);
+    live.finishLexicalRun(secondRun.runId);
+    const lagging = live.getState();
+    expect(lagging.semanticLagCount).toBe(1);
+    files.set("/index.sqlite3", new Uint8Array(sqlite.capi.sqlite3_js_db_export(liveRaw.pointer)));
+    const storage = { opfsPool: pool };
+    const operations = new WorkerPublicationOperations({
+      storage: storage as any,
+      openDatabase: async () => {
+        if (!live) live = new MutableSqliteDatabase(new PoolDatabase("/index.sqlite3"));
+        return live;
+      },
+      closeConnection: () => {
+        live?.close();
+        live = undefined;
+      },
+      runtimeConfig: () => config,
+    });
+    const prepared = await operations.prepare("lagging-publication");
+    expect(prepared.state).toMatchObject({
+      semanticLagCount: 1,
+      compatibleVectorCount: 1,
+      semanticReady: false,
+    });
+  });
+
   it("publishes one validated file with an opaque ID and resource metrics", async () => {
     const storage = adapter();
     const index = manager({});

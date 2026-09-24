@@ -945,10 +945,37 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.publishOnQuit();
 
     expect(status.setPublicationWarning).toHaveBeenCalledWith(
-      "Index saved locally, but publication failed: offline"
+      "Index saved locally, but publication failed."
     );
     expect(plugin.index.synchronize).toBeUndefined();
     expect(plugin.index.prepareSemantic).toBeUndefined();
+  });
+
+  it("wakes semantic scheduling after failed publication and same-id inspection settles", async () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const notify = vi.spyOn(plugin.semanticScheduler, "notifyBlockerCleared");
+    const index = plugin.index;
+    const publication = plugin.publicationManager;
+
+    vi.spyOn(index, "publishPublication").mockRejectedValue(new Error("offline"));
+    await expect(publication.publish()).resolves.toMatchObject({
+      published: false,
+      warning: { phase: "prepare" },
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    notify.mockClear();
+    vi.spyOn(publication.store, "read").mockResolvedValue(new ArrayBuffer(1));
+    vi.spyOn(index, "inspectPublication").mockResolvedValue({ publicationId: "same" } as any);
+    vi.spyOn(index, "getState").mockResolvedValue({ publicationId: "same" } as any);
+    await expect(publication.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      ignored: "same-id",
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+    plugin.onunload();
   });
 
   it("does not register desktop quit behavior on mobile", async () => {

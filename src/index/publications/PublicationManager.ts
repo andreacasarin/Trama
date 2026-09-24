@@ -1,8 +1,9 @@
 import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
-import type {
-  PublicationInspection,
-  PublicationPrepared,
-  SqliteState,
+import {
+  SqliteProtocolError,
+  type PublicationInspection,
+  type PublicationPrepared,
+  type SqliteState,
 } from "@/index/sqlite/protocol";
 import { PublicationStore, type PublicationDataAdapter } from "./PublicationStore";
 
@@ -65,6 +66,8 @@ export interface PublicationManagerOptions {
   readonly idFactory?: () => string;
   readonly onWarning?: (warning: PublicationWarning) => void;
   readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
+  /** Called after the serialized operation and IndexManager maintenance settle. */
+  readonly onOperationSettled?: () => void;
   readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
   readonly debounceMs?: number;
 }
@@ -78,6 +81,7 @@ export class PublicationManager {
   private readonly idFactory: () => string;
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
+  private readonly onOperationSettled?: () => void;
   private readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
   private readonly debounceMs: number;
   private queue: Promise<unknown> = Promise.resolve();
@@ -108,6 +112,7 @@ export class PublicationManager {
     this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
+    this.onOperationSettled = options.onOperationSettled;
     this.onEventAdopted = options.onEventAdopted;
     this.debounceMs = Math.max(0, options.debounceMs ?? 0);
   }
@@ -356,6 +361,11 @@ export class PublicationManager {
         return await operation();
       } finally {
         this.activeOperations--;
+        try {
+          this.onOperationSettled?.();
+        } catch {
+          // Scheduler wakeups are observational and cannot change publication semantics.
+        }
       }
     };
     const next = this.queue.then(run, run);
@@ -368,9 +378,56 @@ export class PublicationManager {
 }
 
 function isRetryable(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "retryable" in error
-    ? (error as { retryable?: unknown }).retryable !== false
-    : true;
+  const details = publicationErrorDetails(error);
+  if (details.code && PERMANENT_PUBLICATION_CODES.has(details.code)) return false;
+  if (details.retryable !== undefined) return details.retryable;
+  if (details.code === "busy") return true;
+  return true;
+}
+
+interface PublicationErrorDetails {
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly phase?: string;
+}
+
+const PERMANENT_PUBLICATION_CODES = new Set([
+  "integrity_failed",
+  "invalid_request",
+  "incompatible_state",
+  "limit_exceeded",
+]);
+
+/** Reads direct and nested RPC errors without assuming a same-realm Error instance. */
+function publicationErrorDetails(error: unknown): PublicationErrorDetails {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  let result: PublicationErrorDetails = {};
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const value = current as {
+      code?: unknown;
+      retryable?: unknown;
+      phase?: unknown;
+      error?: unknown;
+    };
+    const code = typeof value.code === "string" ? value.code : undefined;
+    const retryable = typeof value.retryable === "boolean" ? value.retryable : undefined;
+    const phase = typeof value.phase === "string" ? value.phase : undefined;
+    if (code !== undefined || retryable !== undefined || phase !== undefined) {
+      result = {
+        code: code ?? result.code,
+        retryable: retryable ?? result.retryable,
+        phase: phase ?? result.phase,
+      };
+    }
+    if (current instanceof SqliteProtocolError || value.error !== undefined) {
+      current = value.error;
+      continue;
+    }
+    break;
+  }
+  return result;
 }
 
 function randomPublicationId(): string {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
+import { sqliteError } from "@/index/sqlite/protocol";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 
 function publicationHarness(delay = 5_000) {
@@ -219,6 +220,42 @@ describe("SQLite publication plugin maintenance", () => {
     expect(plugin.publicationScheduler.snapshot().retryPaused).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
+  });
+
+  it("emits sanitized publication and RPC phases for automatic failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const { plugin, publication, operation } = publicationHarness(5_000);
+      const emitted: unknown[] = [];
+      plugin.diagnostics = { emit: (record: unknown) => emitted.push(record) };
+      publication.publish.mockResolvedValue({
+        published: false,
+        warning: {
+          phase: "inspect",
+          retryable: false,
+          message: "unsafe /Users/me/Private Note.md",
+          error: sqliteError("integrity_failed", "bad /Users/me/Private Note.md", false, "execute"),
+        },
+      } as any);
+      plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(emitted).toContainEqual(
+        expect.objectContaining({
+          event: "index_operation",
+          phase: "inspect",
+          error: expect.objectContaining({
+            code: "integrity_failed",
+            phase: "execute",
+            retryable: false,
+          }),
+        })
+      );
+      expect((plugin.indexStatus.setPublicationWarning as any).mock.calls[0][0]).toBe(
+        "Index saved locally, but publication failed."
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not automatically retry a nonretryable publication failure", async () => {

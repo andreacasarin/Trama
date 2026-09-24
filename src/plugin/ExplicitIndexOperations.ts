@@ -25,6 +25,7 @@ interface ExplicitIndexHost {
   stopSemantic(): void;
   resetManualSchedulerState(): void;
   markSemanticEligible(): void;
+  clearSemanticEligibility(): void;
   scheduleSemantic(): void;
   scheduleLexical(): void;
   reconcile(signal: AbortSignal): Promise<void>;
@@ -152,6 +153,9 @@ export class ExplicitIndexOperations {
     if (!manager) throw new Error("Index is not initialized.");
     const eventRevision = this.host.getVaultEventRevision();
     this.host.pausePublication();
+    // An explicit semantic action owns the current request. Automatic work
+    // may be armed again by a later lexical event or settings change.
+    this.host.clearSemanticEligibility();
     this.host.stopSemantic();
     const startedAt = Date.now();
     const previousSource = this.host.getSchedulerSource();
@@ -161,6 +165,12 @@ export class ExplicitIndexOperations {
       if (rebuild) await manager.rebuildSemantic(signal);
       else await manager.prepareSemantic(signal);
       this.host.setIndexReady(true);
+      if (
+        !this.host.isQueued() &&
+        eventRevision === this.host.getVaultEventRevision() &&
+        !manager.hasPendingSemanticWork()
+      )
+        this.host.clearSemanticEligibility();
       this.host.updateCapabilities(manager);
       this.host.emit({
         channel: "semantic",

@@ -15,6 +15,10 @@ export interface SchedulerTransition {
   readonly durationMs?: number;
   readonly counts?: Readonly<Record<string, number>>;
   readonly publicationSizeBytes?: number;
+  /** Publication phase; error.phase retains the Worker RPC phase. */
+  readonly phase?: string;
+  /** Metadata for a deferred automatic request; never shown as user content. */
+  readonly deferredReason?: string;
   readonly error?: ReturnType<typeof projectDiagnosticError>;
 }
 

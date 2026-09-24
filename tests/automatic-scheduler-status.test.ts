@@ -300,4 +300,190 @@ describe("automatic scheduler status and diagnostics", () => {
     legacyPlugin.semanticScheduler.stop();
     legacyLog.mockRestore();
   });
+
+  it("hands a semantic intent across a released lexical lease", async () => {
+    vi.useFakeTimers();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.settingsStore.load({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: 1_000 },
+    });
+    const manager = {
+      hasPendingSemanticWork: () => true,
+      isComplete: () => true,
+      isBuilding: () => false,
+      isInMaintenance: () => false,
+      capabilities: () => ({ semantic: { searchable: false, activity: "idle" } }),
+      prepareSemanticCacheBatch: vi.fn(async () => ({ converged: true })),
+    };
+    plugin.index = manager;
+    plugin.indexReady = true;
+    plugin.indexStatus = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+      onOperationReleased: () =>
+        void Promise.resolve().then(() => plugin.semanticScheduler.notifyBlockerCleared("event")),
+    });
+    plugin.semanticScheduler.markEligibleIfPending(manager);
+
+    const lexicalLease = plugin.indexStatus.acquireExternalLease("lexical");
+    plugin.scheduleAutomaticSemantic("event");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    expect(plugin.semanticScheduler.snapshot()).toMatchObject({ pending: true, deferred: true });
+
+    lexicalLease.release();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.semanticScheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("defers maintenance without polling and resumes from the composition wakeup", async () => {
+    vi.useFakeTimers();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.settingsStore.load({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: 1_000 },
+    });
+    let maintenance = true;
+    const manager = {
+      hasPendingSemanticWork: () => true,
+      isComplete: () => true,
+      isBuilding: () => false,
+      isInMaintenance: () => maintenance,
+      capabilities: () => ({ semantic: { searchable: false, activity: "idle" } }),
+      prepareSemanticCacheBatch: vi.fn(async () => ({ converged: true })),
+    };
+    plugin.index = manager;
+    plugin.indexReady = true;
+    plugin.indexStatus = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+    });
+    plugin.semanticScheduler.markEligibleIfPending(manager);
+    plugin.scheduleAutomaticSemantic("startup");
+
+    expect(plugin.semanticScheduler.snapshot()).toMatchObject({ pending: true, deferred: true });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+
+    maintenance = false;
+    plugin.semanticScheduler.notifyBlockerCleared("startup");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(manager.prepareSemanticCacheBatch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.semanticScheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("coalesces capability and publication wakeups during a nonconverged batch", async () => {
+    vi.useFakeTimers();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.settingsStore.load({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: 1_000 },
+    });
+    let resolveBatch!: (result: { converged: boolean; stored: number; skipped: number }) => void;
+    let batches = 0;
+    const manager = {
+      hasPendingSemanticWork: () => true,
+      isComplete: () => true,
+      isBuilding: () => false,
+      isInMaintenance: () => false,
+      capabilities: () => ({ semantic: { searchable: false, activity: "idle" } }),
+      prepareSemanticCacheBatch: vi.fn(() => {
+        batches++;
+        if (batches === 1)
+          return new Promise<{ converged: boolean; stored: number; skipped: number }>(
+            (resolve) => (resolveBatch = resolve)
+          );
+        return Promise.resolve({ converged: true, stored: 0, skipped: 0 });
+      }),
+    };
+    plugin.index = manager;
+    plugin.indexReady = true;
+    plugin.indexStatus = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+    });
+    const runBatch = vi.spyOn(plugin.semanticScheduler, "runBatch");
+    plugin.semanticScheduler.markEligibleIfPending(manager);
+    plugin.scheduleAutomaticSemantic("event");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runBatch).toHaveBeenCalledTimes(1);
+    expect(plugin.semanticScheduler.activeWork()).toBeDefined();
+
+    // onMetrics and the following publication-settled wake arrive while the
+    // quiet period has elapsed but the active batch still owns the request.
+    plugin.updateIndexCapabilities(manager);
+    plugin.semanticScheduler.notifyBlockerCleared("event");
+    expect(runBatch).toHaveBeenCalledTimes(1);
+
+    const running = plugin.semanticScheduler.activeWork()!;
+    resolveBatch({ converged: false, stored: 0, skipped: 0 });
+    await running;
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    expect(runBatch).toHaveBeenCalledTimes(1);
+
+    plugin.semanticScheduler.notifyBlockerCleared("event");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(2);
+    expect(runBatch).toHaveBeenCalledTimes(2);
+    plugin.semanticScheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("keeps Stop from restarting work when the semantic lease releases", async () => {
+    vi.useFakeTimers();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.settingsStore.load({
+      ...DEFAULT_SETTINGS,
+      filo: { ...DEFAULT_SETTINGS.filo, automaticSemanticDelayMs: 1_000 },
+    });
+    let resolveBatch!: (result: { converged: boolean }) => void;
+    const manager = {
+      hasPendingSemanticWork: () => true,
+      isComplete: () => true,
+      isBuilding: () => false,
+      isInMaintenance: () => false,
+      capabilities: () => ({ semantic: { searchable: false, activity: "idle" } }),
+      prepareSemanticCacheBatch: vi.fn(
+        () => new Promise<{ converged: boolean }>((resolve) => (resolveBatch = resolve))
+      ),
+    };
+    plugin.index = manager;
+    plugin.indexReady = true;
+    plugin.indexStatus = new IndexStatusController({} as any, {
+      index: async () => undefined,
+      reindex: async () => undefined,
+      cancel: () => undefined,
+      onOperationReleased: () =>
+        void Promise.resolve().then(() => plugin.semanticScheduler.notifyBlockerCleared("event")),
+    });
+    plugin.semanticScheduler.markEligibleIfPending(manager);
+    plugin.scheduleAutomaticSemantic("event");
+    await vi.advanceTimersByTimeAsync(1_000);
+    const running = plugin.semanticScheduler.activeWork();
+    expect(running).toBeDefined();
+
+    plugin.semanticScheduler.cancelActive();
+    resolveBatch({ converged: true });
+    await running;
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager.prepareSemanticCacheBatch).toHaveBeenCalledTimes(1);
+    plugin.semanticScheduler.stop();
+    vi.useRealTimers();
+  });
 });

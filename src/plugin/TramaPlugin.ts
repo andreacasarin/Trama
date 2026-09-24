@@ -183,6 +183,7 @@ export class TramaPlugin extends Plugin {
       this.semanticScheduler.resetForManualOperation();
     },
     markSemanticEligible: () => this.semanticScheduler.markEligibleIfPending(this.index),
+    clearSemanticEligibility: () => this.semanticScheduler.clearEligibility(),
     scheduleSemantic: () => this.semanticScheduler.schedule(),
     scheduleLexical: () => this.lexicalScheduler.schedule(),
     reconcile: (signal) => this.lexicalScheduler.reconcile("explicit", signal),
@@ -256,6 +257,11 @@ export class TramaPlugin extends Plugin {
         forceUpdate: (signal) => this.runForceUpdate(signal),
         publishNow: () => this.retryPublication(),
         cancel: () => this.cancelActiveIndexOperation(),
+        onOperationReleased: () => {
+          // Let the operation and its shared lease settle before handing the
+          // sticky semantic request back to the automatic scheduler.
+          void Promise.resolve().then(() => this.semanticScheduler.notifyBlockerCleared("event"));
+        },
       },
       this.diagnostics
     );
@@ -468,6 +474,9 @@ export class TramaPlugin extends Plugin {
           if (this.index === manager) this.handlePublicationWarning(warning);
         },
         onPublicationMetrics: (manager) => this.updateIndexCapabilities(manager),
+        onPublicationSettled: (manager) => {
+          if (this.index === manager) this.semanticScheduler.notifyBlockerCleared("event");
+        },
         onPublicationAdopted: (manager, publication, adopted) => {
           if (adopted && this.publicationManager === publication)
             this.applyPublicationAdoption(manager);
@@ -644,6 +653,7 @@ export class TramaPlugin extends Plugin {
   private updateIndexCapabilities(manager: IndexManager): void {
     if (this.index !== manager || !this.indexStatus) return;
     this.indexStatus.setCapabilities(manager.capabilities());
+    this.semanticScheduler.notifyBlockerCleared("event");
   }
 
   private emitSchedulerTransition(transition: SchedulerTransition): void {
@@ -661,6 +671,10 @@ export class TramaPlugin extends Plugin {
       ...(transition.publicationSizeBytes === undefined
         ? {}
         : { publicationSizeBytes: transition.publicationSizeBytes }),
+      ...(transition.phase === undefined ? {} : { phase: transition.phase }),
+      ...(transition.deferredReason === undefined
+        ? {}
+        : { deferredReason: transition.deferredReason }),
       ...(transition.error === undefined ? {} : { error: transition.error }),
     });
     this.refreshSchedulerMessage();
@@ -711,11 +725,9 @@ export class TramaPlugin extends Plugin {
     this.refreshSchedulerMessage();
   }
 
-  private handlePublicationWarning(warning: PublicationWarning): void {
+  private handlePublicationWarning(_warning: PublicationWarning): void {
     if (this.indexStatus)
-      this.indexStatus.setPublicationWarning(
-        `Index saved locally, but publication failed: ${warning.message}`
-      );
+      this.indexStatus.setPublicationWarning("Index saved locally, but publication failed.");
   }
 
   private notifyPublicationFileEvent(path: string): void {

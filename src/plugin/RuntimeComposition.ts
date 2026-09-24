@@ -38,6 +38,7 @@ interface RuntimeCompositionHost {
   ): void;
   onPublicationWarning(manager: IndexManager, warning: any): void;
   onPublicationMetrics(manager: IndexManager): void;
+  onPublicationSettled(manager: IndexManager): void;
   onPublicationAdopted(
     manager: IndexManager,
     publication: PublicationManager,
@@ -99,6 +100,7 @@ export function composeRuntime(
     {
       onWarning: (warning) => host.onPublicationWarning(manager, warning),
       onMetrics: () => host.onPublicationMetrics(manager),
+      onOperationSettled: () => host.onPublicationSettled(manager),
       onEventAdopted: (result): void => {
         host.onPublicationAdopted(manager, publication, result.adopted);
       },
