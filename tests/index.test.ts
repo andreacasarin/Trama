@@ -7,7 +7,6 @@ import { LenteSearch } from "@/index/LenteSearch";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
 import { SQLITE_PROTOCOL_VERSION, sqliteError } from "@/index/sqlite/protocol";
 import { createTestSqliteClient } from "./sqlite-test-client";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
 
 const signal = new AbortController().signal;
@@ -500,6 +499,29 @@ describe("semantic index module", () => {
     expect((await index.getState())?.semanticHeadCount).toBe(committed);
   });
 
+  it("yields semantic preparation after a committed batch when requested", async () => {
+    const model = embeddings();
+    const index = new IndexManager(
+      fixture({ "a.md": "alpha", "b.md": "beta", "c.md": "beta gamma" }),
+      model,
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      { prepareBatchSize: 1, sqliteClient: createTestSqliteClient({}) }
+    );
+    await index.build(signal);
+
+    await expect(index.prepareSemantic(signal, () => true)).resolves.toMatchObject({
+      converged: false,
+      stored: 1,
+    });
+    expect(model.embed).toHaveBeenCalledOnce();
+    expect(index.capabilities().semantic).toMatchObject({ state: "partial", searchable: true });
+    await expect(index.prepareSemantic(signal)).resolves.toMatchObject({
+      converged: true,
+      stored: 2,
+    });
+  });
+
   it("automatically prepares only chunks invalidated by a lexical update", async () => {
     const contents = { "a.md": "alpha stable", "b.md": "beta stable" };
     const setup = manager(contents);
@@ -568,6 +590,40 @@ describe("semantic index module", () => {
       converged: true,
     });
     expect((await setup.manager.getState())?.changeCounter).toBeGreaterThan(before!.changeCounter);
+  });
+
+  it("resumes an interrupted semantic rebuild without clearing committed batches again", async () => {
+    const model = embeddings();
+    const index = new IndexManager(
+      fixture({ "a.md": "alpha", "b.md": "beta", "c.md": "alpha gamma" }),
+      model,
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      { prepareBatchSize: 1, sqliteClient: createTestSqliteClient({}) }
+    );
+    await index.build(signal);
+
+    await expect(index.rebuildSemantic(signal, () => true)).resolves.toMatchObject({
+      operation: "rebuild",
+      converged: false,
+      stored: 1,
+    });
+    expect((await index.getState())?.semanticHeadCount).toBe(1);
+
+    await expect(index.prepareSemantic(signal)).resolves.toMatchObject({
+      operation: "prepare",
+      converged: true,
+      stored: 2,
+    });
+    expect(model.embed).toHaveBeenCalledTimes(3);
+    expect((await index.getState())?.semanticHeadCount).toBe(3);
+
+    await expect(index.rebuildSemantic(signal)).resolves.toMatchObject({
+      operation: "rebuild",
+      converged: true,
+      stored: 3,
+    });
+    expect(model.embed).toHaveBeenCalledTimes(6);
   });
 
   it("finishes semantic preparation for its indexed corpus despite queued note edits", async () => {
@@ -1271,29 +1327,19 @@ describe("semantic index module", () => {
 
   it("keeps full-build progress lexical-only after chunking", async () => {
     const model = embeddings();
-    const target: { value?: IndexManager } = {};
-    const status = new IndexStatusController({} as any, {
-      index: async () => undefined,
-      reindex: (requestSignal) => target.value!.build(requestSignal),
-      cancel: () => undefined,
-    });
     const observed: string[] = [];
-    status.subscribe((value) => {
-      if (value.progress) observed.push(`${value.progress.phase}:${value.progress.completed}`);
-    });
-    target.value = new IndexManager(
+    const target = new IndexManager(
       fixture({ "a.md": "alpha" }),
       model,
       "http://127.0.0.1:1234/v1",
       "embed",
       {
-        onProgress: (progress) => status.reportProgress(progress),
+        onProgress: (progress) => observed.push(`${progress.phase}:${progress.completed}`),
         sqliteClient: createTestSqliteClient({}),
       }
     );
 
-    status.setReady();
-    await status.run("reindex");
+    await target.build(signal);
 
     const chunkIndex = observed.findIndex((entry) => entry.startsWith("chunk:"));
     expect(chunkIndex).toBeGreaterThanOrEqual(0);

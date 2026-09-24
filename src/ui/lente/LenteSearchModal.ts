@@ -34,7 +34,7 @@ type ModalState =
 
 /** Explicit-submit native suggestion modal for vault search. */
 export class LenteSearchModal extends SuggestModal<LenteResult> {
-  private readonly automaticSearchDelayMs: number;
+  private readonly automaticSearches: boolean;
   private searchRevision = 0;
   private searchAbort?: AbortController;
   private automaticSearchTimer?: ReturnType<typeof setTimeout>;
@@ -59,10 +59,10 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
   constructor(
     app: App,
     private readonly searchSource: LenteSearchPort,
-    automaticSearchDelayMs = 0
+    automaticSearches = false
   ) {
     super(app);
-    this.automaticSearchDelayMs = automaticSearchDelayMs;
+    this.automaticSearches = automaticSearches;
     this.setPlaceholder("Search your vault");
     this.setInstructions([{ command: "Enter", purpose: "Search" }]);
     this.statusEl = this.contentEl.createDiv({
@@ -280,13 +280,13 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
     this.state = { kind: "idle", query };
     this.updateStatus();
     this.refreshSuggestions();
-    if (schedule && query.trim() && this.automaticSearchDelayMs > 0)
+    if (schedule && query.trim() && this.automaticSearches)
       this.automaticSearchTimer = setTimeout(() => {
         this.automaticSearchTimer = undefined;
         if (!this.modalOpen || this.composing) return;
         const latestQuery = this.inputEl.value.trim();
         if (latestQuery) void this.submit(latestQuery);
-      }, this.automaticSearchDelayMs);
+      }, 500);
   }
 
   private cancelAutomaticSearch(): void {

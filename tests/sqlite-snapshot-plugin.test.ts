@@ -1,325 +1,137 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
-import { sqliteError } from "@/index/sqlite/protocol";
-import { DEFAULT_SETTINGS } from "@/settings/Settings";
-
-function publicationHarness(delay = 5_000) {
-  const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-  const settings = {
-    ...DEFAULT_SETTINGS,
-    filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: delay },
-  };
-  plugin.settingsStore.load(settings);
-  const index = {
-    isComplete: () => true,
-    isBuilding: () => false,
-    isInMaintenance: () => false,
-    capabilities: () => ({ semantic: { activity: "idle" } }),
-  };
-  const publication = {
-    isBusy: false,
-    publish: vi.fn(async () => ({ published: true, publicationId: "local" })),
-  };
-  plugin.index = index;
-  plugin.publicationManager = publication;
-  plugin.indexStatus = {
-    setPublicationWarning: vi.fn(),
-    setSchedulerMessage: vi.fn(),
-    setCapabilities: vi.fn(),
-    getStatus: () => ({}),
-  };
-  plugin.indexReady = true;
-  plugin.vaultEventRevision = 0;
-  const operation = (changeCounter: number, type: "update" | "prepare" = "update") => ({
-    operation: type,
-    changed: true,
-    converged: true,
-    state: { incomplete: false, changeCounter },
-  });
-  return { plugin, index, publication, operation };
-}
 
 describe("SQLite publication plugin maintenance", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("delegates publication retry and synchronized-file adoption", async () => {
+  it("delegates synchronized-file adoption to the maintenance controller", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.publicationManager = {
-      publish: vi.fn().mockResolvedValue({ published: true, publicationId: "local-1" }),
-      adoptCurrent: vi.fn().mockResolvedValue({
+    plugin.maintenance = {
+      checkPublication: vi.fn().mockResolvedValue({
         adopted: true,
         publicationId: "remote-1",
         state: { publicationId: "remote-1" },
       }),
     };
-    plugin.index = {
-      isComplete: () => false,
-      capabilities: () => ({ semantic: { searchable: false } }),
-    };
+    plugin.index = { capabilities: () => ({}), isComplete: () => true, hasUsableIndex: () => true };
     plugin.indexStatus = undefined;
 
-    await expect(plugin.retryPublication()).resolves.toBeUndefined();
     await expect(plugin.checkPublication()).resolves.toBeUndefined();
-    expect(plugin.publicationManager.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
+    expect(plugin.maintenance.checkPublication).toHaveBeenCalledTimes(1);
   });
 
   it("does not adopt or publish when the synchronized file is absent", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.publicationManager = {
-      publish: vi.fn(),
-      adoptCurrent: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
+    plugin.maintenance = {
+      checkPublication: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
     };
-    plugin.index = {
-      isComplete: () => false,
-      capabilities: () => ({ semantic: { searchable: false } }),
-    };
+    plugin.index = { capabilities: () => ({}) };
     plugin.indexStatus = undefined;
 
     await plugin.checkPublication();
-    expect(plugin.publicationManager.adoptCurrent).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
+    expect(plugin.maintenance.checkPublication).toHaveBeenCalledTimes(1);
   });
 
-  it("coalesces converged lexical operations and semantic completion restarts the quiet timer", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(4_000);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2, "prepare"));
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(publication.publish).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
-    vi.useRealTimers();
-  });
-
-  it("publishes with partial semantic coverage when lexical state converged", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication } = publicationHarness(5_000);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, {
-      operation: "prepare",
-      changed: true,
-      converged: true,
-      state: { incomplete: false, semanticReady: false, changeCounter: 8 },
-    });
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
-  });
-
-  it("does not create automatic intent for disabled publication or nonconverged lexical state", async () => {
-    vi.useFakeTimers();
-    const { plugin, index, publication, operation } = publicationHarness(0);
-    plugin.recordAutomaticPublicationIntent(index, publication, operation(1));
-    plugin.getSettings = () => ({
-      ...DEFAULT_SETTINGS,
-      filo: { ...DEFAULT_SETTINGS.filo, automaticPublicationDelayMs: 5_000 },
-    });
-    plugin.recordAutomaticPublicationIntent(index, publication, {
-      ...operation(2),
-      converged: false,
-      state: { incomplete: true, changeCounter: 2 },
-    });
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
-    vi.useRealTimers();
-  });
-
-  it("reconfigures an existing publication quiet timer and clears intent when switched off", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(2_000);
-    await plugin.performSave({
-      ...plugin.getSettings(),
-      filo: { ...plugin.getSettings().filo, automaticPublicationDelayMs: 10_000 },
-    });
-    await vi.advanceTimersByTimeAsync(9_999);
-    expect(publication.publish).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2));
-    await plugin.performSave({
-      ...plugin.getSettings(),
-      filo: { ...plugin.getSettings().filo, automaticPublicationDelayMs: 0 },
-    });
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
-    vi.useRealTimers();
-  });
-
-  it("postpones while indexing is active without zero-delay polling", async () => {
-    vi.useFakeTimers();
-    const { plugin, index, publication, operation } = publicationHarness(5_000);
-    let building = true;
-    index.isBuilding = () => building;
-    plugin.recordAutomaticPublicationIntent(index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(1);
-    building = false;
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
-  });
-
-  it("postpones while publication or adoption is active", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    publication.isBusy = true;
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(1);
-    publication.isBusy = false;
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
-  });
-
-  it("drops stale automatic intent when a newer operation revision arrives during publication", async () => {
-    vi.useFakeTimers();
-    let finish!: (value: { published: boolean }) => void;
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    publication.publish.mockImplementationOnce(
-      () => new Promise((resolve) => (finish = resolve)) as any
-    );
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(5_000);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(2));
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(true);
-    finish({ published: true });
-    await Promise.resolve();
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(true);
-    vi.useRealTimers();
-  });
-
-  it("retries retryable publication failures at 5, 15, and 60 seconds, then pauses", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    publication.publish.mockResolvedValue({
-      published: false,
-      warning: { retryable: true, message: "offline" },
-    } as any);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(publication.publish).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(15_000);
-    expect(publication.publish).toHaveBeenCalledTimes(3);
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(publication.publish).toHaveBeenCalledTimes(4);
-    expect(plugin.publicationScheduler.snapshot().retryPaused).toBe(true);
-    expect(vi.getTimerCount()).toBe(0);
-    vi.useRealTimers();
-  });
-
-  it("emits sanitized publication and RPC phases for automatic failures", async () => {
-    vi.useFakeTimers();
-    try {
-      const { plugin, publication, operation } = publicationHarness(5_000);
-      const emitted: unknown[] = [];
-      plugin.diagnostics = { emit: (record: unknown) => emitted.push(record) };
-      publication.publish.mockResolvedValue({
-        published: false,
-        warning: {
-          phase: "inspect",
-          retryable: false,
-          message: "unsafe /Users/me/Private Note.md",
-          error: sqliteError("integrity_failed", "bad /Users/me/Private Note.md", false, "execute"),
-        },
-      } as any);
-      plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-      await vi.advanceTimersByTimeAsync(5_000);
-      expect(emitted).toContainEqual(
-        expect.objectContaining({
-          event: "index_operation",
-          phase: "inspect",
-          error: expect.objectContaining({
-            code: "integrity_failed",
-            phase: "execute",
-            retryable: false,
-          }),
-        })
-      );
-      expect((plugin.indexStatus.setPublicationWarning as any).mock.calls[0][0]).toBe(
-        "Index saved locally, but publication failed."
-      );
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not automatically retry a nonretryable publication failure", async () => {
-    vi.useFakeTimers();
-    const { plugin, publication, operation } = publicationHarness(5_000);
-    publication.publish.mockResolvedValue({
-      published: false,
-      warning: { retryable: false, message: "incompatible" },
-    } as any);
-    plugin.recordAutomaticPublicationIntent(plugin.index, publication, operation(1));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    expect(plugin.publicationScheduler.snapshot().retryPaused).toBe(true);
-    expect(vi.getTimerCount()).toBe(0);
-    vi.useRealTimers();
-  });
-
-  it("keeps explicit publication immediate when automatic publication is off", async () => {
-    const { plugin, publication } = publicationHarness(0);
-    await plugin.retryPublication();
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-  });
-
-  it("adoption does not create automatic publication intent", async () => {
+  it("uses operation provenance for publication and Check warning wording", () => {
+    const setPublicationWarning = vi.fn();
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.publicationManager = {
-      publish: vi.fn(),
-      adoptCurrent: vi.fn().mockResolvedValue({ adopted: true, publicationId: "remote" }),
-    };
-    plugin.index = {
-      isComplete: () => false,
-      capabilities: () => ({ semantic: { searchable: false } }),
-    };
-    plugin.indexStatus = {
-      setPublicationWarning: vi.fn(),
-      setSchedulerMessage: vi.fn(),
-      setCapabilities: vi.fn(),
-      getStatus: () => ({}),
-    };
-    await plugin.checkPublication();
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
-    expect(plugin.publicationManager.publish).not.toHaveBeenCalled();
+    plugin.indexStatus = { setPublicationWarning };
+
+    plugin.handlePublicationWarning(
+      {
+        phase: "inspect",
+        message: "invalid SQLite file",
+        error: new Error("invalid SQLite file"),
+        retryable: false,
+      },
+      "check"
+    );
+    expect(setPublicationWarning).toHaveBeenLastCalledWith(
+      "Synchronized index check failed: invalid SQLite file"
+    );
+    plugin.handlePublicationWarning(
+      {
+        phase: "adopt",
+        message: "replace failed",
+        error: new Error("replace failed"),
+        retryable: true,
+      },
+      "check"
+    );
+    expect(setPublicationWarning).toHaveBeenLastCalledWith(
+      "Synchronized index adoption failed: replace failed"
+    );
+    plugin.handlePublicationWarning(
+      {
+        phase: "inspect",
+        message: "readback failed",
+        error: new Error("readback failed"),
+        retryable: true,
+      },
+      "publication"
+    );
+    expect(setPublicationWarning).toHaveBeenLastCalledWith(
+      "Synchronized index adoption failed: replace failed"
+    );
+    plugin.clearPublicationWarning("check");
+    expect(setPublicationWarning).toHaveBeenLastCalledWith(
+      "Index saved locally, but publication failed: readback failed"
+    );
   });
 
-  it("cancels pending publication after adoption but schedules a later local operation", async () => {
-    vi.useFakeTimers();
-    const { plugin, index, publication, operation } = publicationHarness(5_000);
-    (publication as any).adoptCurrent = vi.fn(async () => ({
-      adopted: true,
-      publicationId: "remote",
-    }));
-    plugin.recordAutomaticPublicationIntent(index, publication, operation(1));
-    expect(plugin.publicationScheduler.snapshot().delayed).toBe(true);
+  it.each(["same-id", "missing"] as const)(
+    "clears an adoption warning after a successful %s Check",
+    async (ignored) => {
+      const setPublicationWarning = vi.fn();
+      const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+      const warning = {
+        phase: "adopt",
+        message: "replace failed",
+        error: new Error("replace failed"),
+        retryable: true,
+      };
+      plugin.indexStatus = { setPublicationWarning };
+      plugin.index = {};
+      plugin.maintenance = {
+        checkPublication: vi
+          .fn()
+          .mockResolvedValueOnce({ warning })
+          .mockResolvedValueOnce({ adopted: false, ignored }),
+      };
+
+      await plugin.checkPublication();
+      await plugin.checkPublication();
+
+      expect(setPublicationWarning).toHaveBeenNthCalledWith(
+        1,
+        "Synchronized index adoption failed: replace failed"
+      );
+      expect(setPublicationWarning).toHaveBeenNthCalledWith(2, undefined);
+    }
+  );
+
+  it("keeps a publication warning after a successful Check", async () => {
+    const setPublicationWarning = vi.fn();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.indexStatus = { setPublicationWarning };
+    plugin.index = {};
+    plugin.maintenance = {
+      checkPublication: vi.fn().mockResolvedValue({ adopted: false, ignored: "same-id" }),
+    };
+    plugin.handlePublicationWarning(
+      {
+        phase: "inspect",
+        message: "readback failed",
+        error: new Error("readback failed"),
+        retryable: true,
+      },
+      "publication"
+    );
 
     await plugin.checkPublication();
 
-    expect(plugin.publicationScheduler.snapshot().pending).toBe(false);
-    expect(plugin.publicationScheduler.snapshot().delayed).toBe(false);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).not.toHaveBeenCalled();
-
-    plugin.recordAutomaticPublicationIntent(index, publication, operation(2));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publication.publish).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
+    expect(setPublicationWarning).toHaveBeenNthCalledWith(
+      1,
+      "Index saved locally, but publication failed: readback failed"
+    );
+    expect(setPublicationWarning).toHaveBeenCalledTimes(1);
   });
 });

@@ -2,47 +2,30 @@ import { describe, expect, it, vi } from "vitest";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
-describe("lexical and semantic index actions", () => {
-  it("exposes explicit update, rebuild, and publication commands", async () => {
-    const commands: { id: string; name: string; callback?: () => void }[] = [];
-    const rebuildSemantic = vi.fn(async () => undefined);
-    const rebuildBoth = vi.fn(async () => undefined);
-    const forceUpdate = vi.fn(async () => undefined);
-    const publishNow = vi.fn(async () => undefined);
+describe("index maintenance actions", () => {
+  it("exposes only Update, Rebuild, and Stop commands", async () => {
+    const commands: { id: string; name: string }[] = [];
+    const update = vi.fn(async () => undefined);
+    const rebuild = vi.fn(async () => undefined);
     const status = new IndexStatusController(
       { addCommand: (command: { id: string; name: string }) => commands.push(command) } as any,
       {
-        index: async () => undefined,
-        reindex: async () => undefined,
-        prepare: async () => undefined,
-        rebuildSemantic,
-        rebuildBoth,
-        forceUpdate,
-        publishNow,
-        cancel: () => undefined,
+        update,
+        rebuild,
+        stop: () => undefined,
       }
     );
     status.setReady();
     status.register();
 
     expect(commands.map(({ name }) => name)).toEqual([
-      "Update lexical index",
-      "Rebuild lexical index",
-      "Update semantic index",
-      "Rebuild semantic index",
-      "Rebuild lexical and semantic indexes",
-      "Update lexical and semantic indexes now",
-      "Publish index now",
-      "Cancel lexical or semantic indexing",
+      "Update index",
+      "Rebuild index",
+      "Stop index maintenance",
     ]);
-    await status.run("rebuild-semantic");
-    await status.run("rebuild-both");
-    await status.run("force-update");
-    commands.find(({ id }) => id === "publish-index-now")?.callback?.();
-    expect(rebuildSemantic).toHaveBeenCalledOnce();
-    expect(rebuildBoth).toHaveBeenCalledOnce();
-    expect(forceUpdate).toHaveBeenCalledOnce();
-    expect(publishNow).toHaveBeenCalledOnce();
+    await status.run("reindex");
+    expect(rebuild).toHaveBeenCalledOnce();
+    expect(commands.map(({ id }) => id)).not.toContain("prepare-semantic-index");
   });
 
   it("retains lexical ETA when chunk and write progress alternate", () => {
@@ -50,9 +33,9 @@ describe("lexical and semantic index actions", () => {
     const status = new IndexStatusController(
       {} as any,
       {
-        index: async () => undefined,
-        reindex: async () => undefined,
-        cancel: () => undefined,
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        stop: () => undefined,
       },
       undefined,
       {
@@ -62,7 +45,7 @@ describe("lexical and semantic index actions", () => {
       }
     );
     status.setReady();
-    status.setUpdating();
+    status.setMaintenance({ lane: "update", phase: "lexical", pending: false, suspended: false });
     status.reportProgress({
       operation: "full",
       phase: "chunk",
@@ -106,82 +89,144 @@ describe("lexical and semantic index actions", () => {
     );
   });
 
-  it("reports a completed semantic run as completed even when newer notes are stale", async () => {
-    let finish!: () => void;
+  it("keeps stale status during a manual update", async () => {
     const events: TramaDiagnosticRecord[] = [];
+    const update = vi.fn(async () => undefined);
     const status = new IndexStatusController(
       {} as any,
       {
-        index: async () => undefined,
-        reindex: async () => undefined,
-        prepare: () =>
-          new Promise<void>((resolve) => {
-            finish = resolve;
-          }),
-        cancel: () => undefined,
+        update,
+        rebuild: async () => undefined,
+        stop: () => undefined,
       },
       { emit: (event) => events.push(event) }
     );
     status.setReady();
-    const run = status.prepare();
-    status.markStale(true, "Notes changed during semantic preparation.");
-    finish();
+    const run = status.run("index");
+    status.markStale(true, "Notes changed during manual update.");
     await run;
     expect(status.getStatus()).toMatchObject({
       kind: "stale",
-      message: "Notes changed during semantic preparation.",
+      message: "Notes changed during manual update.",
       canIndex: true,
     });
-    expect(events).toContainEqual(expect.objectContaining({ stage: "user-completed" }));
+    expect(events).toContainEqual(
+      expect.objectContaining({ event: "index_status", status: "stale" })
+    );
   });
 
-  it("keeps technical failure details in diagnostics and out of the status UI", async () => {
-    const events: TramaDiagnosticRecord[] = [];
-    const status = new IndexStatusController(
-      {} as any,
-      {
-        index: async () => {
-          throw Object.assign(new Error("no such column: f while opening note.md"), {
-            code: "internal",
-            retryable: true,
-          });
-        },
-        reindex: async () => undefined,
-        cancel: () => undefined,
-      },
-      { emit: (event) => events.push(event) }
-    );
-    status.setReady();
-    await status.run("index");
-    expect(status.getStatus().message).toBe("Unable to build the lexical index.");
-    expect(status.getStatus().message).not.toContain("no such column");
-    const failure = events.find(
-      (event) =>
-        event.area === "index" && event.event === "index_operation" && event.stage === "failed"
-    );
-    expect(failure).toMatchObject({
-      operation: "incremental",
-      error: { code: "internal", message: "no such column: f while opening <note>" },
-    });
-  });
-
-  it("shares one external lease and settles cancelling only when it is released", async () => {
-    const cancel = vi.fn();
+  it("projects idle pending work as stale even when automatic maintenance is enabled", () => {
     const status = new IndexStatusController({} as any, {
-      index: async () => undefined,
-      reindex: async () => undefined,
-      cancel,
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
     });
     status.setReady();
-    const lease = status.acquireExternalLease("lexical");
-
-    expect(lease).toBeDefined();
-    expect(status.getStatus()).toMatchObject({ kind: "updating", canCancel: true });
-    await expect(status.run("index")).resolves.toBeUndefined();
-    status.cancel();
-    expect(status.getStatus().kind).toBe("cancelling");
-    expect(cancel).toHaveBeenCalledOnce();
-    lease!.release();
-    expect(status.getStatus()).toMatchObject({ kind: "cancelled", canIndex: true });
+    status.setMaintenance({ lane: "idle", pending: true, suspended: false });
+    expect(status.getStatus()).toMatchObject({ kind: "stale", canIndex: true });
   });
+
+  it("prioritizes an idle maintenance error over pending changes", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    status.setMaintenance({ lane: "update", pending: true, suspended: false });
+    status.setMaintenance({
+      lane: "idle",
+      pending: true,
+      suspended: true,
+      error: new Error("disk failure"),
+    });
+    expect(status.getStatus()).toMatchObject({
+      kind: "error",
+      message: "disk failure",
+      canIndex: true,
+    });
+    status.setMaintenance({
+      lane: "idle",
+      pending: true,
+      suspended: false,
+      error: new Error("disk failure"),
+    });
+    expect(status.getStatus()).toMatchObject({
+      kind: "error",
+      message: "disk failure",
+      canIndex: true,
+    });
+  });
+
+  it("shows Stop suspension before pending stale state", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    status.setMaintenance({ lane: "update", pending: true, suspended: false });
+    status.setMaintenance({ lane: "idle", pending: true, suspended: true });
+    expect(status.getStatus()).toMatchObject({
+      kind: "cancelled",
+      message: "Index maintenance stopped.",
+      canIndex: true,
+    });
+  });
+
+  it("shows Stop when edits are only waiting for the automatic quiet period", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    status.setMaintenance({ lane: "idle", pending: true, suspended: true });
+    expect(status.getStatus()).toMatchObject({
+      kind: "cancelled",
+      message: "Index maintenance stopped.",
+    });
+  });
+
+  it("shows Check activity and projects an empty lexical index on completion", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setCapabilities({
+      availability: "available",
+      lexical: { state: "empty", activity: "idle", searchable: false },
+      semantic: { state: "empty", activity: "idle", searchable: false },
+      freshness: "locally-reconciled",
+    });
+    status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
+    expect(status.getStatus()).toMatchObject({
+      kind: "preparing",
+      message: "Checking synchronized index…",
+    });
+    status.setMaintenance({ lane: "idle", pending: false, suspended: false });
+    expect(status.getStatus()).toMatchObject({ kind: "empty", canIndex: true });
+  });
+
+  it.each(["missing", "same-id"] as const)(
+    "restores the capability status after an ignored synchronized index check (%s)",
+    () => {
+      const status = new IndexStatusController({} as any, {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        stop: () => undefined,
+      });
+      status.setCapabilities({
+        availability: "available",
+        lexical: { state: "ready", activity: "idle", searchable: true },
+        semantic: { state: "empty", activity: "idle", searchable: false },
+        freshness: "locally-reconciled",
+      });
+      status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
+      expect(status.getStatus().message).toBe("Checking synchronized index…");
+      status.setMaintenance({ lane: "idle", pending: false, suspended: false });
+      expect(status.getStatus()).toMatchObject({ kind: "ready", message: undefined });
+    }
+  );
 });

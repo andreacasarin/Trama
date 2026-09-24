@@ -46,7 +46,7 @@ export class IndexRuntime {
   preparing = false;
   freshness: IndexFreshness = "unknown";
   loadPromise?: Promise<boolean>;
-  buildPromise?: Promise<void>;
+  buildPromise?: Promise<unknown>;
 
   private maintenance = false;
   private maintenanceFinished?: Promise<void>;

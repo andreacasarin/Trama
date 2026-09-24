@@ -1,6 +1,11 @@
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
-import { PublicationManager } from "@/index/publications/PublicationManager";
+import { MaintenanceScheduler, type MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
+import {
+  PublicationManager,
+  type AdoptionResult,
+  type PublicationWarning,
+} from "@/index/publications/PublicationManager";
 import { PublicationStore } from "@/index/publications/PublicationStore";
 import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
 import { RelatedNotes } from "@/index/RelatedNotes";
@@ -27,23 +32,19 @@ interface RuntimeCompositionHost {
   createWorker(app: any): SqliteWorkerLike;
   resolveIdentity(adapter: any): Promise<string>;
   createClient(storage: object): SqliteWorkerClient | undefined;
+  isCurrent(manager: IndexManager): boolean;
   getIndexStatus(): IndexStatusController | undefined;
-  getVisibleMarkdownCount(): number;
-  suppressRebuildPublication(): boolean;
   onComposed(runtime: Omit<ComposedRuntime, "load">): void;
-  onSuccessfulOperation(
+  onIndexOperation(manager: IndexManager, changed: boolean): void;
+  onMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void;
+  onPublicationWarning(
     manager: IndexManager,
-    publication: PublicationManager | undefined,
-    result: any
+    warning: PublicationWarning,
+    origin: "publication" | "check"
   ): void;
-  onPublicationWarning(manager: IndexManager, warning: any): void;
   onPublicationMetrics(manager: IndexManager): void;
-  onPublicationSettled(manager: IndexManager): void;
-  onPublicationAdopted(
-    manager: IndexManager,
-    publication: PublicationManager,
-    adopted: boolean
-  ): void;
+  onPublicationSuccess(manager: IndexManager): void;
+  onAdoptionResult(manager: IndexManager, result: AdoptionResult): void;
   onInitialState(manager: IndexManager, loaded: boolean): void;
   onLoadSettled(manager: IndexManager, loaded: boolean, app: any): void;
 }
@@ -51,6 +52,7 @@ interface RuntimeCompositionHost {
 export interface ComposedRuntime {
   readonly manager: IndexManager;
   readonly publication: PublicationManager;
+  readonly scheduler: MaintenanceScheduler;
   readonly relatedNotes: RelatedNotes;
   readonly embedding: LmStudioEmbeddingModel;
   readonly load: Promise<boolean>;
@@ -86,28 +88,69 @@ export function composeRuntime(
       workerFactory: () => host.createWorker(app),
       sqliteIdentity: host.resolveIdentity(app.vault.adapter),
       sqliteClient: host.createClient(app.vault),
-      onSuccessfulOperation: (result) => {
-        if (host.suppressRebuildPublication() && result.operation === "rebuild") return;
-        host.onSuccessfulOperation(manager, publication, result);
-      },
       onProgress: (progress) => host.getIndexStatus()?.reportProgress(progress),
     },
     host.diagnostics
   );
-  const publication: PublicationManager = new PublicationManager(
+
+  let warningOrigin: "publication" | "check" = "publication";
+  const publication = new PublicationManager(
     manager,
     new PublicationStore(app.vault.adapter, { directory: settings.publicationDirectory }),
     {
-      onWarning: (warning) => host.onPublicationWarning(manager, warning),
+      onWarning: (warning) => host.onPublicationWarning(manager, warning, warningOrigin),
       onMetrics: () => host.onPublicationMetrics(manager),
-      onOperationSettled: () => host.onPublicationSettled(manager),
-      onEventAdopted: (result): void => {
-        host.onPublicationAdopted(manager, publication, result.adopted);
-      },
     }
   );
+
+  const scheduler = new MaintenanceScheduler(
+    {
+      semanticConfigured: settings.embedding.modelId.trim().length > 0,
+      synchronize: async (signal) => {
+        const result = await manager.reconcileQueuedChanges(signal);
+        host.onIndexOperation(manager, result.changed);
+        return result;
+      },
+      rebuild: async (signal) => {
+        const revision = manager.journalSnapshot().revision;
+        const result = await manager.build(signal);
+        if (result.converged) manager.clearJournalIfCurrent(revision);
+        host.onIndexOperation(manager, result.changed);
+        return result;
+      },
+      prepareSemantic: async (signal, shouldYield) => {
+        const result = await manager.prepareSemantic(signal, shouldYield);
+        host.onIndexOperation(manager, result.changed);
+        return result;
+      },
+      rebuildSemantic: async (signal, shouldYield) => {
+        const result = await manager.rebuildSemantic(signal, shouldYield);
+        host.onIndexOperation(manager, result.changed);
+        return result;
+      },
+      publish: async () => {
+        warningOrigin = "publication";
+        const result = await publication.publish();
+        if (result.published && !result.warning) host.onPublicationSuccess(manager);
+        return result;
+      },
+      adoptCurrent: async () => {
+        warningOrigin = "check";
+        try {
+          return await publication.adoptCurrent();
+        } finally {
+          warningOrigin = "publication";
+        }
+      },
+    },
+    {
+      onChange: (snapshot) => host.onMaintenanceSnapshot(manager, snapshot),
+    }
+  );
+
   const relatedNotes = new RelatedNotes(manager, host.diagnostics);
-  host.onComposed({ manager, publication, relatedNotes, embedding });
+  host.onComposed({ manager, publication, scheduler, relatedNotes, embedding });
+  scheduler.setAutomaticEnabled(settings.automaticMaintenance);
   host.modelRuntime.lenteSearch = host.modelRuntime.createLenteSearch(manager, app, settings);
   const registry = new ToolRegistry([
     new ReadNoteTool(readonlyVault),
@@ -116,20 +159,20 @@ export function composeRuntime(
     new VaultSearchTool(manager),
   ]);
   host.modelRuntime.composeChatSession(app, settings, readonlyVault, registry, transport);
-  const currentPublication = publication;
+
   const load = manager
     .load({ emitDiagnostics: false })
     .then(async (loaded) => {
+      if (!host.isCurrent(manager)) return loaded;
       host.onInitialState(manager, loaded);
       const usable = loaded && manager.capabilities().availability !== "unavailable";
-      if (usable) {
-        const adoption = await currentPublication.adoptCurrent();
-        if (adoption.warning) host.onPublicationWarning(manager, adoption.warning);
-        else if (adoption.adopted) host.onPublicationAdopted(manager, currentPublication, true);
+      if (usable && host.isCurrent(manager)) {
+        const result = await scheduler.checkPublication();
+        if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
       }
       return loaded;
     })
     .catch(() => false);
   void load.then((loaded) => host.onLoadSettled(manager, loaded, app));
-  return { manager, publication, relatedNotes, embedding, load };
+  return { manager, publication, scheduler, relatedNotes, embedding, load };
 }

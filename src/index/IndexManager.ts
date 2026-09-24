@@ -19,6 +19,7 @@ import type {
   IndexFingerprint,
   IndexJournalSnapshot,
   IndexManagerOptions,
+  IndexOperationResult,
   IndexPathMutation,
   IndexSyncResult,
   IndexVaultPort,
@@ -142,7 +143,7 @@ export class IndexManager implements VaultRetrievalPort {
   load(options: { readonly emitDiagnostics?: boolean } = {}): Promise<boolean> {
     return this.runtime.load(options.emitDiagnostics === true);
   }
-  build(signal: AbortSignal): Promise<void> {
+  build(signal: AbortSignal): Promise<IndexOperationResult> {
     return this.lexical.build(signal);
   }
   waitForBuild(): Promise<void> {
@@ -180,8 +181,11 @@ export class IndexManager implements VaultRetrievalPort {
   reconcileQueuedChanges(signal: AbortSignal): Promise<IndexSyncResult> {
     return this.lexical.reconcileQueuedChanges(signal);
   }
-  prepareSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.semantic.prepareSemantic(signal);
+  prepareSemantic(
+    signal: AbortSignal,
+    shouldYield?: () => boolean
+  ): Promise<SemanticPrepareResult> {
+    return this.semantic.prepareSemantic(signal, shouldYield);
   }
   hasCompatibleSemanticVectors(): boolean {
     return this.semantic.hasCompatibleSemanticVectors();
@@ -189,8 +193,11 @@ export class IndexManager implements VaultRetrievalPort {
   hasPendingSemanticWork(): boolean {
     return this.semantic.hasPendingSemanticWork();
   }
-  rebuildSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.semantic.rebuildSemantic(signal);
+  rebuildSemantic(
+    signal: AbortSignal,
+    shouldYield?: () => boolean
+  ): Promise<SemanticPrepareResult> {
+    return this.semantic.rebuildSemantic(signal, shouldYield);
   }
   prepareSemanticCacheBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
     return this.semantic.prepareSemanticCacheBatch(signal);

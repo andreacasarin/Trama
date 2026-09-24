@@ -13,14 +13,26 @@ import { IndexJournal } from "./journal";
 import { check, IndexRuntime } from "./runtime";
 
 export class SemanticCoordinator {
+  private semanticRebuildInProgress = false;
+
   constructor(
     private readonly runtime: IndexRuntime,
     private readonly journal: IndexJournal,
     private readonly embedding: EmbeddingModel
   ) {}
   /** Enriches the lexical corpus in bounded, resumable batches. */
-  async prepareSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    return this.runSemanticPreparation(signal);
+  async prepareSemantic(
+    signal: AbortSignal,
+    shouldYield?: () => boolean
+  ): Promise<SemanticPrepareResult> {
+    const result = await this.runSemanticPreparation(
+      signal,
+      Number.POSITIVE_INFINITY,
+      undefined,
+      shouldYield
+    );
+    if (result.converged) this.semanticRebuildInProgress = false;
+    return result;
   }
 
   /** True only while this manager has usable stored vectors for its current embedding identity. */
@@ -56,13 +68,19 @@ export class SemanticCoordinator {
     return false;
   }
 
-  async rebuildSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
-    await this.runtime.waitForMaintenance(signal);
-    if (!this.runtime.loaded) await this.runtime.load();
-    this.runtime.setState(
-      (await this.runtime.ensureClient().call("clearSemanticCache", {}, signal)) as SqliteState
-    );
-    const result = await this.prepareSemantic(signal);
+  async rebuildSemantic(
+    signal: AbortSignal,
+    shouldYield?: () => boolean
+  ): Promise<SemanticPrepareResult> {
+    if (!this.semanticRebuildInProgress) {
+      await this.runtime.waitForMaintenance(signal);
+      if (!this.runtime.loaded) await this.runtime.load();
+      this.runtime.setState(
+        (await this.runtime.ensureClient().call("clearSemanticCache", {}, signal)) as SqliteState
+      );
+      this.semanticRebuildInProgress = true;
+    }
+    const result = await this.prepareSemantic(signal, shouldYield);
     return { ...result, operation: "rebuild" };
   }
 
@@ -78,7 +96,8 @@ export class SemanticCoordinator {
   private async runSemanticPreparation(
     signal: AbortSignal,
     maxBatches = Number.POSITIVE_INFINITY,
-    batchSizeOverride?: number
+    batchSizeOverride?: number,
+    shouldYield?: () => boolean
   ): Promise<SemanticPrepareResult> {
     await this.runtime.waitForMaintenance(signal);
     if (this.runtime.building || this.runtime.preparing)
@@ -214,6 +233,7 @@ export class SemanticCoordinator {
           },
           false
         );
+        if (shouldYield?.()) break;
         if (!hasMore) break;
       }
       // Full state is intentionally refreshed only when this executor converges

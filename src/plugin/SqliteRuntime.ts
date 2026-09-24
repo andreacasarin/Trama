@@ -1,7 +1,7 @@
 import { Platform } from "obsidian";
 import { bytesToHex } from "@/index/Identity";
 import type { SnapshotDataAdapter } from "@/index/IndexManager";
-import type { SqliteWorkerLike } from "@/index/sqlite/client";
+import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
 import { SQLITE_PROTOCOL_VERSION } from "@/index/sqlite/protocol";
 
 interface PluginManifest {
@@ -83,6 +83,11 @@ export class SqliteRuntime {
       URL.revokeObjectURL(bootstrapUrl);
       throw error;
     }
+  }
+
+  /** Optional in-process backend supplied by non-Worker hosts. */
+  createClient(_storage: object): SqliteWorkerClient | undefined {
+    return undefined;
   }
 
   private assetUrl(app: any, fileName: string): string {

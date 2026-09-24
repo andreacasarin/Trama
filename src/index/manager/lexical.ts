@@ -6,7 +6,12 @@ import {
   type SqliteState,
 } from "@/index/sqlite/protocol";
 import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
-import type { IndexPathMutation, IndexSyncResult, IndexVaultDocument } from "./contracts";
+import type {
+  IndexOperationResult,
+  IndexPathMutation,
+  IndexSyncResult,
+  IndexVaultDocument,
+} from "./contracts";
 import { IndexJournal } from "./journal";
 import { LexicalSnapshotService, type LexicalSnapshot } from "./lexical-snapshot";
 import { check, IndexRuntime } from "./runtime";
@@ -17,7 +22,7 @@ export class LexicalCoordinator {
     private readonly journal: IndexJournal,
     private readonly snapshots: LexicalSnapshotService
   ) {}
-  async build(signal: AbortSignal): Promise<void> {
+  async build(signal: AbortSignal): Promise<IndexOperationResult> {
     await this.runtime.waitForMaintenance(signal);
     if (this.runtime.building)
       throw new StructuredError("busy", "Index rebuild is already running.", true);
@@ -26,7 +31,7 @@ export class LexicalCoordinator {
     const run = this.buildInternal(signal);
     this.runtime.buildPromise = run;
     try {
-      await run;
+      return await run;
     } finally {
       if (this.runtime.buildPromise === run) this.runtime.buildPromise = undefined;
     }
@@ -34,7 +39,7 @@ export class LexicalCoordinator {
   async waitForBuild(): Promise<void> {
     await this.runtime.buildPromise;
   }
-  private async buildInternal(signal: AbortSignal): Promise<void> {
+  private async buildInternal(signal: AbortSignal): Promise<IndexOperationResult> {
     check(signal);
     this.runtime.building = true;
     const started = Date.now();
@@ -60,13 +65,15 @@ export class LexicalCoordinator {
         generationId: this.runtime.generationId(),
       });
       const finalState = this.runtime.state;
-      if (finalState && !finalState.incomplete)
-        this.runtime.notifySuccessfulOperation({
-          operation: "rebuild",
-          changed: result.changed,
-          converged: result.converged,
-          state: finalState,
-        });
+      if (!finalState)
+        throw new StructuredError("unavailable", "SQLite index state is unavailable.", true);
+      const operationResult: IndexOperationResult = {
+        operation: "rebuild",
+        changed: result.changed,
+        converged: result.converged,
+        state: finalState,
+      };
+      if (!finalState.incomplete) this.runtime.notifySuccessfulOperation(operationResult);
       this.runtime.emit({
         area: "index",
         event: "index_operation",
@@ -80,6 +87,7 @@ export class LexicalCoordinator {
           incomplete: finalState?.incomplete ? 1 : 0,
         },
       });
+      return operationResult;
     } catch (error) {
       this.runtime.emit({
         area: "index",

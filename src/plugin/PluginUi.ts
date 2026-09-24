@@ -24,10 +24,15 @@ interface PluginUiDependencies {
   readonly contextNoteSuggestions: () => readonly string[];
   readonly getLenteSearch: () => LenteSearchPort | undefined;
   readonly getSettings: () => TramaSettings;
+  readonly stopMaintenance: () => void;
 }
 
 export function registerPluginUi(
-  plugin: Plugin,
+  plugin: Plugin & {
+    updateIndex(): Promise<void>;
+    rebuildIndex(): Promise<void>;
+    stopIndex(): Promise<void>;
+  },
   app: any,
   ui: Awaited<ReturnType<typeof loadPluginUi>>,
   dependencies: PluginUiDependencies
@@ -53,7 +58,7 @@ export function registerPluginUi(
         dependencies.status,
         dependencies.relatedNotes,
         (kind) => dependencies.status.run(kind),
-        () => dependencies.status.cancel()
+        dependencies.stopMaintenance
       )
   );
   plugin.registerView(
@@ -93,7 +98,7 @@ export function registerPluginUi(
       new LenteSearchModal(
         app,
         searchSource,
-        dependencies.getSettings().lente.automaticSearchDelayMs
+        dependencies.getSettings().lente.automaticSearches
       ).open();
     },
   });

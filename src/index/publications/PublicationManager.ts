@@ -66,34 +66,17 @@ export interface PublicationManagerOptions {
   readonly idFactory?: () => string;
   readonly onWarning?: (warning: PublicationWarning) => void;
   readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
-  /** Called after the serialized operation and IndexManager maintenance settle. */
-  readonly onOperationSettled?: () => void;
-  readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
-  readonly debounceMs?: number;
 }
 
 /**
- * Serializes publication and adoption around the IndexManager maintenance
- * seam. It intentionally has no merge, timestamp, hash, manifest, or ordering
- * policy: the synchronized provider chooses which valid single file arrives.
+ * Executes publication and adoption transactions. Timing and serialization are
+ * owned by MaintenanceScheduler; the index port fences mutations once started.
  */
 export class PublicationManager {
   private readonly idFactory: () => string;
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
-  private readonly onOperationSettled?: () => void;
-  private readonly onEventAdopted?: (result: AdoptionResult) => void | Promise<void>;
-  private readonly debounceMs: number;
-  private queue: Promise<unknown> = Promise.resolve();
-  private eventPending = false;
-  private eventTimer?: ReturnType<typeof setTimeout>;
-  private eventPromise?: Promise<AdoptionResult>;
-  private eventRetryDelay?: number;
-  private inboundEventsStopped = false;
-  private disposed = false;
-  private lastWarning?: PublicationWarning;
   private lastMetrics?: PublicationResourceMetrics;
-  private activeOperations = 0;
 
   readonly store: PublicationStore;
 
@@ -112,61 +95,19 @@ export class PublicationManager {
     this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
-    this.onOperationSettled = options.onOperationSettled;
-    this.onEventAdopted = options.onEventAdopted;
-    this.debounceMs = Math.max(0, options.debounceMs ?? 0);
-  }
-
-  get warning(): PublicationWarning | undefined {
-    return this.lastWarning;
   }
 
   get metrics(): PublicationResourceMetrics | undefined {
     return this.lastMetrics;
   }
 
-  get isBusy(): boolean {
-    return this.activeOperations > 0;
-  }
-
   async publish(): Promise<PublicationResult> {
-    return this.serialize(() => this.publishSerialized());
+    return this.publishSerialized();
   }
 
   /** Inspect and adopt the exact configured file. Adoption never publishes. */
   async adoptCurrent(): Promise<AdoptionResult> {
-    return this.serialize(() => this.adoptSerialized());
-  }
-
-  /** Coalesce duplicate/out-of-order vault events for the exact target only. */
-  notifyFileEvent(path = this.store.path): void {
-    if (this.disposed || this.inboundEventsStopped || path !== this.store.path) return;
-    this.eventPending = true;
-    this.scheduleEventAttempt(this.debounceMs);
-  }
-
-  async flushPendingEvents(): Promise<AdoptionResult | undefined> {
-    if (this.eventTimer) {
-      clearTimeout(this.eventTimer);
-      this.eventTimer = undefined;
-    }
-    if (this.eventPending && !this.eventPromise) this.startEventAttempt();
-    return this.eventPromise;
-  }
-
-  /** Stop accepting vault notifications while an accepted operation may finish. */
-  stopInboundEvents(): void {
-    this.inboundEventsStopped = true;
-    this.eventPending = false;
-    this.eventRetryDelay = undefined;
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.eventTimer = undefined;
-  }
-
-  /** Stop inbound notifications and prevent late event callbacks after disposal. */
-  dispose(): void {
-    this.stopInboundEvents();
-    this.disposed = true;
+    return this.adoptSerialized();
   }
 
   private async publishSerialized(): Promise<PublicationResult> {
@@ -214,7 +155,6 @@ export class PublicationManager {
         stageDurationMs: installed.stageDurationMs,
         replaceDurationMs: installed.replaceDurationMs,
       };
-      this.lastWarning = undefined;
       this.lastMetrics = metrics;
       try {
         this.onMetrics?.(metrics);
@@ -266,67 +206,6 @@ export class PublicationManager {
     }
   }
 
-  private scheduleEventAttempt(delayMs: number): void {
-    if (
-      this.disposed ||
-      this.inboundEventsStopped ||
-      !this.eventPending ||
-      this.eventTimer ||
-      this.eventPromise
-    )
-      return;
-    this.eventTimer = setTimeout(
-      () => {
-        this.eventTimer = undefined;
-        this.startEventAttempt();
-      },
-      Math.max(1, delayMs)
-    );
-  }
-
-  private startEventAttempt(): void {
-    if (this.disposed || this.inboundEventsStopped || !this.eventPending || this.eventPromise)
-      return;
-    // Keep inbound events out of an in-flight publication/adoption. A nonzero
-    // retry delay prevents a busy event from spinning the event loop.
-    if (this.activeOperations > 0) {
-      this.scheduleEventAttempt(EVENT_RETRY_MS);
-      return;
-    }
-    this.eventPending = false;
-    const attempt = this.adoptCurrent();
-    this.eventPromise = attempt
-      .then(async (result) => {
-        if (result.warning?.retryable && !this.disposed && !this.inboundEventsStopped) {
-          this.eventPending = true;
-          this.eventRetryDelay = EVENT_RETRY_MS;
-        } else if (result.adopted && !this.disposed) {
-          try {
-            await this.onEventAdopted?.(result);
-          } catch {
-            // UI refresh is observational and cannot change adoption semantics.
-          }
-        }
-        if (this.eventPending) this.scheduleEventAttempt(this.debounceMs);
-        return result;
-      })
-      .catch((error) => {
-        if (isRetryable(error) && !this.disposed && !this.inboundEventsStopped) {
-          this.eventPending = true;
-          this.eventRetryDelay = EVENT_RETRY_MS;
-        }
-        throw error;
-      })
-      .finally(() => {
-        this.eventPromise = undefined;
-        if (this.eventPending) {
-          const delay = this.eventRetryDelay ?? this.debounceMs;
-          this.eventRetryDelay = undefined;
-          this.scheduleEventAttempt(delay);
-        }
-      });
-  }
-
   private async currentPublicationId(): Promise<string | undefined> {
     const state = await this.index.getState?.();
     if (state?.publicationId) return state.publicationId;
@@ -345,35 +224,12 @@ export class PublicationManager {
       message: error instanceof Error ? error.message : String(error),
       retryable: isRetryable(error),
     };
-    this.lastWarning = warning;
     try {
       this.onWarning?.(warning);
     } catch {
       // A view/diagnostic warning sink cannot change publication semantics.
     }
     return warning;
-  }
-
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const run = async () => {
-      this.activeOperations++;
-      try {
-        return await operation();
-      } finally {
-        this.activeOperations--;
-        try {
-          this.onOperationSettled?.();
-        } catch {
-          // Scheduler wakeups are observational and cannot change publication semantics.
-        }
-      }
-    };
-    const next = this.queue.then(run, run);
-    this.queue = next.then(
-      () => undefined,
-      () => undefined
-    );
-    return next;
   }
 }
 
@@ -437,5 +293,3 @@ function randomPublicationId(): string {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 }
-
-const EVENT_RETRY_MS = 25;

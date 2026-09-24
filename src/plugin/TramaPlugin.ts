@@ -1,34 +1,26 @@
-import { Platform, Plugin } from "obsidian";
-import { composeRuntime as composePluginRuntime } from "@/plugin/RuntimeComposition";
+import { Plugin } from "obsidian";
 import { formatDiagnosticLogLine, TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
-import {
-  IndexManager,
-  type IndexPathMutation,
-  type IndexOperationResult,
-} from "@/index/IndexManager";
 import { compareCodeUnits } from "@/index/Identity";
+import { IndexManager, type IndexPathMutation } from "@/index/IndexManager";
+import type { MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
+import type { AdoptionResult, PublicationWarning } from "@/index/publications/PublicationManager";
+import { PublicationManager } from "@/index/publications/PublicationManager";
+import { RelatedNotes } from "@/index/RelatedNotes";
+import type { SqliteWorkerLike } from "@/index/sqlite/client";
+import { ModelRuntime } from "@/plugin/ModelRuntime";
+import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
+import {
+  composeRuntime as composePluginRuntime,
+  type ComposedRuntime,
+} from "@/plugin/RuntimeComposition";
+import { SqliteRuntime } from "@/plugin/SqliteRuntime";
+import { VaultEventRouter } from "@/plugin/VaultEventRouter";
 import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
 import { DEFAULT_SETTINGS, SettingsStore, TramaSettings } from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
-import { RelatedNotes } from "@/index/RelatedNotes";
-import { ModelRuntime } from "@/plugin/ModelRuntime";
-import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
-import { ExplicitIndexOperations } from "@/plugin/ExplicitIndexOperations";
-import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
-import {
-  PublicationManager,
-  type PublicationWarning,
-} from "@/index/publications/PublicationManager";
-import { AutomaticLexicalController } from "@/plugin/AutomaticLexicalController";
-import { AutomaticPublicationController } from "@/plugin/AutomaticPublicationController";
-import { AutomaticSemanticController } from "@/plugin/AutomaticSemanticController";
-import type { SchedulerSource, SchedulerTransition } from "@/plugin/scheduler";
-import { VaultEventRouter } from "@/plugin/VaultEventRouter";
-import { SqliteRuntime } from "@/plugin/SqliteRuntime";
-import { schedulerStatusMessage } from "@/plugin/SchedulerStatus";
 
-/** Composes the shared assistant and owns its lifecycle and vault event boundary. */
+/** Composes the shared assistant and owns its lifecycle and vault-event boundary. */
 export class TramaPlugin extends Plugin {
   private runtimeLoaded = false;
   private readonly settingsStore = new SettingsStore();
@@ -36,48 +28,44 @@ export class TramaPlugin extends Plugin {
   private index?: IndexManager;
   private indexStatus?: IndexStatusController;
   private relatedNotes?: RelatedNotes;
-  private lifecycleAbort?: AbortController;
   private indexLoad?: Promise<boolean>;
-  private indexLoaded = false;
-  private indexReady = false;
-  private compositionRevision = 0;
-  private vaultEventRevision = 0;
-  private layoutReady = false;
-  private saveQueue: Promise<void> = Promise.resolve();
+  private maintenance?: ComposedRuntime["scheduler"];
   private publicationManager?: PublicationManager;
-  private quitPublicationPromise?: Promise<void>;
-  private currentSchedulerSource: SchedulerSource = "explicit";
-  /** Test-only explicit backend injection; production composition leaves this unset. */
-  sqliteClientFactory?: (storage: object) => SqliteWorkerClient;
+  private compositionRevision = 0;
+  private compositionReplacement = false;
+  private compositionDirty = false;
+  private saveQueue: Promise<void> = Promise.resolve();
+  private readonly publicationWarnings: Partial<Record<"publication" | "check", string>> = {};
+  private projectedPublicationWarning?: string;
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
+
   private readonly diagnostics: TramaDiagnostics = {
     emit: (record) => {
-      if (this.settingsStore.get().detailedDebug) {
-        // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
-        try {
-          const operation =
-            record.event === "index_operation"
-              ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
-              : "";
-          const stage = "stage" in record ? ` ${record.stage}` : "";
-          const duration =
-            "durationMs" in record && typeof record.durationMs === "number"
-              ? ` ${Math.round(record.durationMs)} ms`
-              : "";
-          // eslint-disable-next-line no-console
-          console.info(
-            formatDiagnosticLogLine(record) ??
-              `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
-            record
-          );
-        } catch {
-          // Console instrumentation is observational and must not break chat or indexing.
-        }
+      if (!this.settingsStore.get().detailedDebug) return;
+      try {
+        const operation =
+          record.event === "index_operation"
+            ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
+            : "";
+        const stage = "stage" in record ? ` ${record.stage}` : "";
+        const duration =
+          "durationMs" in record && typeof record.durationMs === "number"
+            ? ` ${Math.round(record.durationMs)} ms`
+            : "";
+        // eslint-disable-next-line no-console
+        console.info(
+          formatDiagnosticLogLine(record) ??
+            `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
+          record
+        );
+      } catch {
+        // Console diagnostics are observational.
       }
     },
   };
+
   private readonly sqliteRuntime = new SqliteRuntime(() => this.manifest);
   private readonly modelRuntime = new ModelRuntime({
     diagnostics: this.diagnostics,
@@ -85,68 +73,6 @@ export class TramaPlugin extends Plugin {
     getIndex: () => this.index,
     getIndexStatus: () => this.indexStatus,
     getRelatedNotes: () => this.relatedNotes,
-  });
-  private readonly semanticScheduler = new AutomaticSemanticController({
-    diagnostics: this.diagnostics,
-    getSettings: () => this.getSettings(),
-    getIndex: () => this.index,
-    getIndexStatus: () => this.indexStatus,
-    isIndexReady: () => this.indexReady,
-    getVaultEventRevision: () => this.vaultEventRevision,
-    hasQueuedLexicalWork: () => this.lexicalScheduler.hasQueuedWork(),
-    hasActiveLexicalReconciliation: () => this.lexicalScheduler.hasActiveReconciliation(),
-    getSchedulerSource: () => this.currentSchedulerSource,
-    setSchedulerSource: (source) => (this.currentSchedulerSource = source),
-    emitSchedulerTransition: (transition) => this.emitSchedulerTransition(transition),
-    refreshSchedulerMessage: () => this.refreshSchedulerMessage(),
-    updateIndexCapabilities: (manager) => this.updateIndexCapabilities(manager),
-  });
-  private readonly publicationScheduler = new AutomaticPublicationController({
-    diagnostics: this.diagnostics,
-    getSettings: () => this.getSettings(),
-    getIndex: () => this.index,
-    getIndexStatus: () => this.indexStatus,
-    getPublicationManager: () => this.publicationManager,
-    isIndexReady: () => this.indexReady,
-    getVaultEventRevision: () => this.vaultEventRevision,
-    hasQueuedLexicalWork: () => this.lexicalScheduler.hasQueuedWork(),
-    hasActiveLexicalReconciliation: () => this.lexicalScheduler.hasActiveReconciliation(),
-    getSchedulerSource: () => this.currentSchedulerSource,
-    setPublicationWarning: (warning) => {
-      if (warning) this.handlePublicationWarning(warning);
-      else this.indexStatus?.setPublicationWarning(undefined);
-    },
-    emitSchedulerTransition: (transition) => this.emitSchedulerTransition(transition),
-    refreshSchedulerMessage: () => this.refreshSchedulerMessage(),
-    updateIndexCapabilities: (manager) => this.updateIndexCapabilities(manager),
-  });
-  private readonly lexicalScheduler = new AutomaticLexicalController({
-    diagnostics: this.diagnostics,
-    getSettings: () => this.getSettings(),
-    getIndex: () => this.index,
-    getIndexStatus: () => this.indexStatus,
-    isIndexReady: () => this.indexReady,
-    getIndexLoaded: () => this.indexLoaded,
-    getLayoutReady: () => this.layoutReady,
-    getLifecycleSignal: () => this.lifecycleAbort?.signal,
-    getVaultEventRevision: () => this.vaultEventRevision,
-    getSchedulerSource: () => this.currentSchedulerSource,
-    setSchedulerSource: (source) => (this.currentSchedulerSource = source),
-    incrementVaultEventRevision: () => {
-      this.vaultEventRevision++;
-    },
-    pausePublication: () => this.publicationScheduler.pauseForIndexing(),
-    pauseSemantic: () => this.semanticScheduler.pauseForLexicalWork(),
-    markSemanticEligible: () => this.semanticScheduler.markEligibleIfPending(this.index),
-    scheduleSemantic: () => this.semanticScheduler.schedule(),
-    refreshViews: (changed) => {
-      const app = (this as unknown as { app?: any }).app;
-      if (app?.workspace) this.modelRuntime.refreshOpenRelatedSuggestions(app);
-      if (changed && app?.workspace) this.modelRuntime.refreshOpenLente(app);
-    },
-    emitSchedulerTransition: (transition) => this.emitSchedulerTransition(transition),
-    refreshSchedulerMessage: () => this.refreshSchedulerMessage(),
-    updateIndexCapabilities: (manager) => this.updateIndexCapabilities(manager),
   });
   private readonly vaultEvents = new VaultEventRouter({
     getSettings: () => this.getSettings(),
@@ -158,43 +84,6 @@ export class TramaPlugin extends Plugin {
     queueMutation: (mutation) => this.queueVaultMutation(mutation),
     requestFullRecovery: (path) => this.requestFullRecovery(path),
   });
-  private readonly explicitIndex = new ExplicitIndexOperations({
-    getApp: () => (this as unknown as { app?: any }).app,
-    getSettings: () => this.getSettings(),
-    getIndex: () => this.index,
-    getIndexStatus: () => this.indexStatus,
-    getIndexLoad: () => this.indexLoad,
-    isIndexReady: () => this.indexReady,
-    setIndexReady: (ready) => (this.indexReady = ready),
-    getVaultEventRevision: () => this.vaultEventRevision,
-    getSchedulerSource: () => this.currentSchedulerSource,
-    setSchedulerSource: (source) => (this.currentSchedulerSource = source),
-    getVisibleMarkdownCount: () => this.visibleMarkdownCatalog().length,
-    isQueued: () => this.lexicalScheduler.hasQueuedWork(),
-    clearQueued: () => this.lexicalScheduler.clearQueuedWork(),
-    getLexicalPromise: () => this.lexicalScheduler.activeReconciliation(),
-    getSemanticPromise: () => this.semanticScheduler.activeWork(),
-    pausePublication: () => this.publicationScheduler.pauseForIndexing(),
-    stopLexical: (markStale) => this.lexicalScheduler.stop(markStale),
-    pauseSemantic: () => this.semanticScheduler.pauseForLexicalWork(),
-    stopSemantic: () => this.semanticScheduler.stop(),
-    resetManualSchedulerState: () => {
-      this.lexicalScheduler.resetForManualOperation();
-      this.semanticScheduler.resetForManualOperation();
-    },
-    markSemanticEligible: () => this.semanticScheduler.markEligibleIfPending(this.index),
-    clearSemanticEligibility: () => this.semanticScheduler.clearEligibility(),
-    scheduleSemantic: () => this.semanticScheduler.schedule(),
-    scheduleLexical: () => this.lexicalScheduler.schedule(),
-    reconcile: (signal) => this.lexicalScheduler.reconcile("explicit", signal),
-    updateCapabilities: (manager) => this.updateIndexCapabilities(manager),
-    refreshViews: (changed) => {
-      const app = (this as unknown as { app?: any }).app;
-      if (app?.workspace) this.modelRuntime.refreshOpenRelatedSuggestions(app);
-      if (changed && app?.workspace) this.modelRuntime.refreshOpenLente(app);
-    },
-    emit: (transition) => this.emitSchedulerTransition(transition),
-  });
 
   override async onload(): Promise<void> {
     this.runtimeLoaded = true;
@@ -202,26 +91,12 @@ export class TramaPlugin extends Plugin {
       try {
         this.settingsStore.load(await this.loadData());
       } catch {
-        // A settings read failure must not prevent the offline shell from loading.
         this.settingsStore.load(undefined);
       }
     }
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
-    if (Platform.isDesktopApp) {
-      const quitRef = app.workspace.on?.(
-        "quit",
-        (tasks: { addPromise(promise: Promise<any>): void }) => {
-          this.publicationManager?.stopInboundEvents();
-          const task = this.publishOnQuit();
-          if (task) {
-            this.quitPublicationPromise = task;
-            tasks.addPromise(task);
-          }
-        }
-      );
-      if (quitRef) this.registerEvent(quitRef);
-    }
+
     this.visibleMarkdownCatalog = () =>
       app.vault
         .getMarkdownFiles()
@@ -236,32 +111,15 @@ export class TramaPlugin extends Plugin {
       this.lastActiveMarkdownPath ? [this.lastActiveMarkdownPath] : [];
     const fileOpenRef = app.workspace.on?.("file-open", rememberActiveMarkdown);
     if (fileOpenRef) this.registerEvent(fileOpenRef);
+
     const ui = await loadPluginUi();
-    this.lifecycleAbort = new AbortController();
-    const settings = this.settingsStore.get();
-    this.composeRuntime(app, settings);
-    const layoutReady = () => {
-      this.layoutReady = true;
-      this.lexicalScheduler.maybeScheduleStartupRecovery();
-    };
-    if (typeof app.workspace.onLayoutReady === "function") app.workspace.onLayoutReady(layoutReady);
-    else layoutReady();
+    this.composeRuntime(app, this.settingsStore.get());
     this.indexStatus = new IndexStatusController(
       this,
       {
-        index: (signal) => this.runIndex(signal, false),
-        reindex: (signal) => this.runFullIndex(signal),
-        prepare: (signal) => this.runSemanticPreparation(signal),
-        rebuildSemantic: (signal) => this.runSemanticPreparation(signal, true),
-        rebuildBoth: (signal) => this.runBothIndexes(signal),
-        forceUpdate: (signal) => this.runForceUpdate(signal),
-        publishNow: () => this.retryPublication(),
-        cancel: () => this.cancelActiveIndexOperation(),
-        onOperationReleased: () => {
-          // Let the operation and its shared lease settle before handing the
-          // sticky semantic request back to the automatic scheduler.
-          void Promise.resolve().then(() => this.semanticScheduler.notifyBlockerCleared("event"));
-        },
+        update: () => this.updateIndex(),
+        rebuild: () => this.rebuildIndex(),
+        stop: () => this.maintenance?.stop(),
       },
       this.diagnostics
     );
@@ -274,34 +132,40 @@ export class TramaPlugin extends Plugin {
       contextNoteSuggestions: this.contextNoteSuggestions,
       getLenteSearch: () => this.modelRuntime.lenteSearch,
       getSettings: () => this.getSettings(),
+      stopMaintenance: () => this.maintenance?.stop(),
     });
     this.registerVaultEvents(app.vault);
   }
 
   override onunload(): void {
-    this.indexReady = false;
-    this.stopAutomaticSemanticWork();
-    this.stopAutomaticPublication();
-    this.explicitIndex.semanticAbort?.abort();
-    this.explicitIndex.semanticAbort = undefined;
-    this.publicationManager?.dispose();
+    const maintenance = this.maintenance;
     const index = this.index;
-    if (index && this.quitPublicationPromise) {
-      void this.quitPublicationPromise.finally(() => index.disposeImmediately());
-    } else {
-      index?.disposeImmediately();
-    }
+    const load = this.indexLoad;
+    this.compositionRevision++;
+    this.compositionReplacement = false;
+    this.compositionDirty = false;
+    this.vaultEvents.dispose();
+    this.maintenance = undefined;
+    this.indexLoad = undefined;
     this.index = undefined;
-    this.indexStatus?.cancel();
-    this.lifecycleAbort?.abort();
-    this.stopAutomaticWork(false);
+    this.publicationManager = undefined;
+    this.indexStatus = undefined;
+    delete this.publicationWarnings.publication;
+    delete this.publicationWarnings.check;
+    this.projectedPublicationWarning = undefined;
     this.relatedNotes?.cancel();
     this.relatedNotes = undefined;
     this.modelRuntime.session?.cancel();
-    this.vaultEvents.dispose();
-    this.publicationManager = undefined;
+    this.modelRuntime.session = undefined;
+    this.modelRuntime.lenteSearch = undefined;
+    this.embeddingModel = undefined;
     this.runtimeLoaded = false;
+    const disposal = maintenance?.dispose() ?? Promise.resolve();
+    void Promise.all([load ?? Promise.resolve(), disposal])
+      .catch(() => undefined)
+      .finally(() => index?.disposeImmediately());
   }
+
   isDesktopLoaded(): boolean {
     return this.runtimeLoaded;
   }
@@ -311,21 +175,25 @@ export class TramaPlugin extends Plugin {
   getSettings(): TramaSettings {
     return this.settingsStore.get() ?? DEFAULT_SETTINGS;
   }
+
   saveSettings(
     settings: TramaSettings | ((current: TramaSettings) => TramaSettings)
   ): Promise<void> {
     return this.enqueueSettingsUpdate(typeof settings === "function" ? settings : () => settings);
   }
+
   private enqueueSettingsUpdate(update: (current: TramaSettings) => TramaSettings): Promise<void> {
     const operation = this.saveQueue.then(() => this.performSave(update(this.settingsStore.get())));
     this.saveQueue = operation.catch(() => undefined);
     return operation;
   }
+
   private async performSave(settings: TramaSettings): Promise<void> {
     const before = this.settingsStore.get();
     const saved = this.settingsStore.stage(settings);
     if (typeof this.saveData === "function") await this.saveData(saved);
     this.settingsStore.commit(saved);
+
     const chatChanged =
       before.chat.endpoint !== saved.chat.endpoint ||
       before.chat.modelId !== saved.chat.modelId ||
@@ -342,84 +210,57 @@ export class TramaPlugin extends Plugin {
     const exclusionsChanged =
       before.filo.excludedPaths.length !== saved.filo.excludedPaths.length ||
       before.filo.excludedPaths.some((path, index) => path !== saved.filo.excludedPaths[index]);
-    const indexDefinitionChanged = embeddingChanged || exclusionsChanged;
-    const publicationDirectoryChanged = before.publicationDirectory !== saved.publicationDirectory;
-    const automaticSemanticDelayChanged =
-      before.filo.automaticSemanticDelayMs !== saved.filo.automaticSemanticDelayMs;
-    const automaticPublicationDelayChanged =
-      before.filo.automaticPublicationDelayMs !== saved.filo.automaticPublicationDelayMs;
+    const definitionChanged =
+      embeddingChanged ||
+      exclusionsChanged ||
+      before.publicationDirectory !== saved.publicationDirectory;
     const app = (this as unknown as { app?: any }).app;
 
-    if (!saved.filo.automaticLexicalDelayMs) {
-      this.stopAutomaticWork(true, before.filo.automaticLexicalDelayMs > 0);
-      this.emitSchedulerTransition({
-        channel: "lexical",
-        stage: "disabled",
-        source: "explicit",
-        counts: { queued: this.index?.pendingChangeCount() ?? 0 },
-      });
-    } else if (before.filo.automaticLexicalDelayMs !== saved.filo.automaticLexicalDelayMs)
-      this.lexicalScheduler.arm();
+    if (!definitionChanged && before.automaticMaintenance !== saved.automaticMaintenance)
+      this.maintenance?.setAutomaticEnabled(saved.automaticMaintenance);
 
-    if (indexDefinitionChanged || publicationDirectoryChanged) {
-      this.stopAutomaticWork(false);
-      this.stopAutomaticPublication();
-      this.publicationManager?.dispose();
-      this.modelRuntime.session?.cancel();
-      this.explicitIndex.semanticAbort?.abort();
-      this.explicitIndex.semanticAbort = undefined;
-      this.stopAutomaticSemanticWork();
-      this.semanticScheduler.clearEligibility();
-      this.relatedNotes?.cancel();
-      this.indexStatus?.cancel();
+    if (definitionChanged) {
+      const oldMaintenance = this.maintenance;
       const oldIndex = this.index;
-      oldIndex?.invalidate();
-      this.lifecycleAbort?.abort();
-      try {
-        await oldIndex?.waitForBuild();
-      } catch {
-        // The old build is intentionally cancelled before composing its replacement.
-      }
-      await oldIndex?.dispose();
-      this.lifecycleAbort = new AbortController();
-      this.indexStatus?.markStale(false);
-    }
-    if (app?.vault && app.workspace && app.metadataCache && this.modelRuntime.session) {
-      if (chatChanged && !indexDefinitionChanged && !publicationDirectoryChanged)
-        this.modelRuntime.replaceChatModel(saved);
-      else if (indexDefinitionChanged || publicationDirectoryChanged)
-        this.composeRuntime(app, saved);
-    }
+      const oldLoad = this.indexLoad;
+      this.compositionReplacement = true;
+      this.compositionDirty ||= Boolean(
+        oldMaintenance?.snapshot.pending || oldIndex?.hasPendingWork()
+      );
 
-    if (lenteChanged && !indexDefinitionChanged && this.index)
-      this.modelRuntime.replaceLenteSearch(app);
-    if (automaticSemanticDelayChanged) {
-      if (saved.filo.automaticSemanticDelayMs <= 0) {
-        this.stopAutomaticSemanticWork();
-        this.emitSchedulerTransition({
-          channel: "semantic",
-          stage: "disabled",
-          source: "explicit",
-        });
-      } else {
-        this.semanticScheduler.resetForSettings();
-        this.semanticScheduler.markEligibleIfPending(this.index);
-        this.scheduleAutomaticSemantic("event");
+      // Detach callbacks before awaiting any old asynchronous work.
+      this.compositionRevision++;
+      this.maintenance = undefined;
+      this.index = undefined;
+      this.indexLoad = undefined;
+      this.publicationManager = undefined;
+      this.clearPublicationWarnings();
+      this.relatedNotes?.cancel();
+      this.relatedNotes = undefined;
+      this.modelRuntime.session?.cancel();
+
+      const maintenanceDisposal = oldMaintenance?.dispose() ?? Promise.resolve();
+      await oldLoad?.catch(() => false);
+      await maintenanceDisposal;
+      oldIndex?.invalidate();
+      await oldIndex?.dispose();
+      this.indexStatus?.markStale(false);
+
+      if (app?.vault && app.workspace && app.metadataCache) {
+        try {
+          this.composeRuntime(app, saved);
+          this.compositionReplacement = false;
+        } catch (error) {
+          this.compositionDirty = true;
+          throw error;
+        }
       }
+    } else {
+      if (chatChanged) this.modelRuntime.replaceChatModel(saved);
+      if (lenteChanged && this.index) this.modelRuntime.replaceLenteSearch(app);
     }
-    if (automaticPublicationDelayChanged) {
-      this.publicationScheduler.resetForSettings();
-      if (saved.filo.automaticPublicationDelayMs <= 0) {
-        this.stopAutomaticPublication();
-        this.emitSchedulerTransition({
-          channel: "publication",
-          stage: "disabled",
-          source: "explicit",
-        });
-      } else this.scheduleAutomaticPublication();
-    }
-    this.refreshSchedulerMessage();
   }
+
   updateChatEndpoint(value: string): Promise<void> {
     return this.enqueueSettingsUpdate((current) => ({
       ...current,
@@ -447,9 +288,6 @@ export class TramaPlugin extends Plugin {
 
   private composeRuntime(app: any, settings: TramaSettings): void {
     const compositionRevision = ++this.compositionRevision;
-    this.indexLoaded = false;
-    this.indexReady = false;
-    this.lexicalScheduler.resetForRuntimeComposition();
     const runtime = composePluginRuntime(
       {
         diagnostics: this.diagnostics,
@@ -457,42 +295,36 @@ export class TramaPlugin extends Plugin {
         isVisibleMarkdown: (path) => this.isVisibleMarkdown(path),
         createWorker: (currentApp) => this.createSqliteWorker(currentApp),
         resolveIdentity: (adapter) => this.resolveSqliteIdentity(adapter),
-        createClient: (storage) => this.sqliteClientFactory?.(storage),
+        createClient: (storage) => this.sqliteRuntime.createClient(storage),
+        isCurrent: (manager) => this.index === manager,
         getIndexStatus: () => this.indexStatus,
-        getVisibleMarkdownCount: () => this.visibleMarkdownCatalog().length,
-        suppressRebuildPublication: () => this.explicitIndex.combinedRebuildLexicalPhase,
-        onComposed: ({ manager, publication, relatedNotes, embedding }) => {
+        onComposed: ({ manager, publication, scheduler, relatedNotes, embedding }) => {
           this.index = manager;
           this.publicationManager = publication;
-          this.relatedNotes?.cancel();
+          this.maintenance = scheduler;
           this.relatedNotes = relatedNotes;
           this.embeddingModel = embedding;
+          if (this.compositionReplacement && this.compositionDirty) {
+            manager.requestFullRecovery();
+            scheduler.invalidate();
+            this.compositionDirty = false;
+          }
         },
-        onSuccessfulOperation: (manager, publication, result) =>
-          this.recordAutomaticPublicationIntent(manager, publication, result),
-        onPublicationWarning: (manager, warning) => {
-          if (this.index === manager) this.handlePublicationWarning(warning);
+        onIndexOperation: (manager, changed) => this.afterIndexOperation(manager, changed),
+        onMaintenanceSnapshot: (manager, snapshot) =>
+          this.applyMaintenanceSnapshot(manager, snapshot),
+        onPublicationWarning: (manager, warning, origin) => {
+          if (this.index === manager) this.handlePublicationWarning(warning, origin);
         },
         onPublicationMetrics: (manager) => this.updateIndexCapabilities(manager),
-        onPublicationSettled: (manager) => {
-          if (this.index === manager) this.semanticScheduler.notifyBlockerCleared("event");
+        onPublicationSuccess: (manager) => {
+          if (this.index === manager) this.clearPublicationWarning("publication");
         },
-        onPublicationAdopted: (manager, publication, adopted) => {
-          if (adopted && this.publicationManager === publication)
-            this.applyPublicationAdoption(manager);
-        },
+        onAdoptionResult: (manager, result) => this.applyAdoptionResult(manager, result),
         onInitialState: (manager, loaded) => {
-          const usable = loaded && manager.capabilities().availability !== "unavailable";
-          if (!usable || this.index !== manager || compositionRevision !== this.compositionRevision)
+          if (this.index !== manager || compositionRevision !== this.compositionRevision || !loaded)
             return;
-          this.indexLoaded = true;
-          this.indexReady = true;
           this.updateIndexCapabilities(manager);
-          if (manager.isComplete()) {
-            if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
-            else this.indexStatus?.setReady(true);
-          } else if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
-          else this.indexStatus?.setIndexRequired(true);
         },
         onLoadSettled: (manager, loaded, currentApp) =>
           this.finishRuntimeLoad(manager, loaded, currentApp, compositionRevision),
@@ -507,42 +339,24 @@ export class TramaPlugin extends Plugin {
     manager: IndexManager,
     loaded: boolean,
     app: any,
-    compositionRevision: number
+    revision: number
   ): void {
-    if (this.index !== manager || compositionRevision !== this.compositionRevision) return;
-    const usable = loaded && manager.capabilities().availability !== "unavailable";
-    this.indexLoaded = usable;
-    this.indexReady = usable;
+    if (this.index !== manager || revision !== this.compositionRevision) return;
     this.updateIndexCapabilities(manager);
-    this.semanticScheduler.markEligibleIfPending(manager);
-    if (!usable || !manager.isComplete()) {
+    const maintenance = this.maintenance?.snapshot;
+    if (maintenance && (maintenance.pending || maintenance.lane !== "idle")) {
+      if (maintenance.lane === "idle" && manager.hasUsableIndex())
+        this.indexStatus?.markStale(true);
+      return;
+    }
+    if (!loaded || !manager.isComplete()) {
       if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
       else this.indexStatus?.setIndexRequired(true);
-      if (usable) this.lexicalScheduler.maybeScheduleStartupRecovery();
       return;
     }
     if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
     else this.indexStatus?.setReady(true);
     this.modelRuntime.refreshOpenRelatedSuggestions(app);
-    this.lexicalScheduler.maybeScheduleStartupRecovery();
-    this.semanticScheduler.replaceEligibility(manager);
-    if (!manager.hasPendingWork()) this.scheduleAutomaticSemantic("startup");
-    if (
-      this.lexicalScheduler.hasQueuedWork() &&
-      this.getSettings().filo.automaticLexicalDelayMs > 0
-    )
-      this.scheduleReconcile(manager.hasPendingWork() ? "startup" : "event");
-    else if (this.lexicalScheduler.hasQueuedWork()) this.markQueuedWorkStale();
-  }
-
-  private resolveSqliteIdentity(
-    adapter: import("@/index/IndexManager").SnapshotDataAdapter
-  ): Promise<string> {
-    return this.sqliteRuntime.resolveIdentity(adapter);
-  }
-
-  private createSqliteWorker(app: any): SqliteWorkerLike {
-    return this.sqliteRuntime.createWorker(app);
   }
 
   async addApprovedOrigin(endpoint: string): Promise<void> {
@@ -558,6 +372,7 @@ export class TramaPlugin extends Plugin {
       return { ...current, approvedOrigins: [...approvals, approval] };
     });
   }
+
   async removeApprovedOrigin(origin: {
     scheme: "http" | "https";
     host: string;
@@ -571,6 +386,7 @@ export class TramaPlugin extends Plugin {
       ),
     }));
   }
+
   async discoverModels(target: "chat" | "embedding"): Promise<readonly string[]> {
     const signal = new AbortController().signal;
     if (target === "chat") {
@@ -581,200 +397,102 @@ export class TramaPlugin extends Plugin {
     return this.embeddingModel.discoverModels(signal);
   }
 
-  /** Retries the last staged publication without rerunning local indexing. */
-  async retryPublication(): Promise<void> {
-    await this.publicationScheduler.retryExplicit(this.publicationManager);
+  async updateIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.update();
   }
-
-  async prepareSemantic(): Promise<void> {
-    await this.explicitIndex.prepareSemantic();
+  async rebuildIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.rebuild();
   }
-
-  async updateLexical(): Promise<void> {
-    await this.indexStatus?.run("index");
-  }
-
-  async rebuildLexical(): Promise<void> {
-    await this.indexStatus?.run("reindex");
-  }
-
-  async rebuildSemantic(): Promise<void> {
-    await this.indexStatus?.run("rebuild-semantic");
-  }
-
-  async rebuildBothIndexes(): Promise<void> {
-    await this.indexStatus?.run("rebuild-both");
-  }
-
-  async forceUpdateIndexes(): Promise<void> {
-    await this.indexStatus?.run("force-update");
-  }
-
-  private runForceUpdate(signal: AbortSignal): Promise<void> {
-    return this.explicitIndex.forceUpdate(signal);
-  }
-
-  private runSemanticPreparation(signal: AbortSignal, rebuild = false): Promise<void> {
-    return this.explicitIndex.runSemanticPreparation(signal, rebuild);
+  async stopIndex(): Promise<void> {
+    this.maintenance?.stop();
   }
 
   getIndexStatus(): ReturnType<IndexStatusController["getStatus"]> | undefined {
     return this.indexStatus?.getStatus();
   }
-
   getPublicationMetrics(): { byteSize: number; durationMs: number } | undefined {
     const metrics = this.publicationManager?.metrics;
     return metrics ? { byteSize: metrics.byteSize, durationMs: metrics.durationMs } : undefined;
   }
 
-  /** Checks the exact configured synchronized file and adopts it when its ID differs. */
   async checkPublication(): Promise<void> {
-    const manager = this.publicationManager;
-    const result = await manager?.adoptCurrent();
-    if (result?.warning) this.handlePublicationWarning(result.warning);
-    else if (result?.adopted && manager && this.index) this.applyPublicationAdoption(this.index);
+    const scheduler = this.maintenance;
+    const manager = this.index;
+    const result = await scheduler?.checkPublication();
+    if (!scheduler || scheduler !== this.maintenance || manager !== this.index || !result) return;
+    this.applyAdoptionResult(manager!, result);
   }
 
-  private applyPublicationAdoption(manager: IndexManager): void {
+  private applyAdoptionResult(manager: IndexManager, result: AdoptionResult): void {
     if (this.index !== manager) return;
-    this.clearPublicationIntentAfterAdoption();
+    if (result.warning) {
+      this.handlePublicationWarning(result.warning, "check");
+      return;
+    }
+    this.clearPublicationWarning("check");
+    if (!result.adopted) return;
     this.updateIndexCapabilities(manager);
-    this.indexReady = true;
-    this.indexStatus?.setPublicationWarning(undefined);
+    const snapshot = this.maintenance?.snapshot;
+    if (snapshot?.pending || snapshot?.lane !== "idle") return;
+    if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
+    else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
+    else this.indexStatus?.setReady(true);
     const app = (this as unknown as { app?: any }).app;
     this.modelRuntime.refreshOpenRelatedSuggestions(app);
     this.modelRuntime.refreshOpenLente(app);
   }
 
-  getRelatedNotes(): RelatedNotes | undefined {
-    return this.relatedNotes;
-  }
-
   private updateIndexCapabilities(manager: IndexManager): void {
-    if (this.index !== manager || !this.indexStatus) return;
-    this.indexStatus.setCapabilities(manager.capabilities());
-    this.semanticScheduler.notifyBlockerCleared("event");
+    if (this.index === manager) this.indexStatus?.setCapabilities(manager.capabilities());
   }
 
-  private emitSchedulerTransition(transition: SchedulerTransition): void {
-    this.diagnostics.emit({
-      area: "index",
-      event: "index_operation",
-      operation: transition.channel === "publication" ? "publication" : "status",
-      stage: transition.stage,
-      channel: transition.channel,
-      source: transition.source,
-      ...(transition.delayMs === undefined ? {} : { delayMs: transition.delayMs }),
-      ...(transition.retryAttempt === undefined ? {} : { retryAttempt: transition.retryAttempt }),
-      ...(transition.durationMs === undefined ? {} : { durationMs: transition.durationMs }),
-      ...(transition.counts === undefined ? {} : { counts: transition.counts }),
-      ...(transition.publicationSizeBytes === undefined
-        ? {}
-        : { publicationSizeBytes: transition.publicationSizeBytes }),
-      ...(transition.phase === undefined ? {} : { phase: transition.phase }),
-      ...(transition.deferredReason === undefined
-        ? {}
-        : { deferredReason: transition.deferredReason }),
-      ...(transition.error === undefined ? {} : { error: transition.error }),
-    });
-    this.refreshSchedulerMessage();
+  private afterIndexOperation(manager: IndexManager, changed: boolean): void {
+    if (this.index !== manager) return;
+    this.updateIndexCapabilities(manager);
+    const app = (this as unknown as { app?: any }).app;
+    this.modelRuntime.refreshOpenRelatedSuggestions(app);
+    if (changed) this.modelRuntime.refreshOpenLente(app);
   }
 
-  private refreshSchedulerMessage(): void {
-    if (!this.indexStatus) return;
-    const message = schedulerStatusMessage({
-      settings: this.getSettings().filo,
-      lexical: this.lexicalScheduler.snapshot(),
-      semantic: {
-        ...this.semanticScheduler.snapshot(),
-        indexComplete: this.index?.isComplete() ?? false,
-        searchable: this.index?.capabilities().semantic.searchable ?? false,
-      },
-      publication: this.publicationScheduler.snapshot(),
-    });
-    if (this.indexStatus.getStatus().schedulerMessage !== message)
-      this.indexStatus.setSchedulerMessage(message);
+  private applyMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void {
+    if (this.index !== manager) return;
+    this.indexStatus?.setMaintenance(snapshot);
   }
 
-  private recordAutomaticPublicationIntent(
-    manager: IndexManager,
-    publication: PublicationManager | undefined,
-    result: IndexOperationResult
+  private clearPublicationWarning(origin: "publication" | "check"): void {
+    delete this.publicationWarnings[origin];
+    this.projectPublicationWarning();
+  }
+
+  private handlePublicationWarning(
+    warning: PublicationWarning,
+    origin: "publication" | "check"
   ): void {
-    if (this.index === manager && this.publicationManager === publication)
-      this.publicationScheduler.recordIntent(publication, result);
+    const message =
+      origin === "check"
+        ? `Synchronized index ${warning.phase === "adopt" ? "adoption" : "check"} failed: ${warning.message}`
+        : `Index saved locally, but publication failed: ${warning.message}`;
+    this.publicationWarnings[origin] = message;
+    this.projectPublicationWarning();
   }
 
-  private scheduleAutomaticPublication(
-    delay = this.getSettings().filo.automaticPublicationDelayMs,
-    source: SchedulerSource = this.currentSchedulerSource
-  ): void {
-    this.publicationScheduler.schedule(delay, source);
+  private clearPublicationWarnings(): void {
+    delete this.publicationWarnings.publication;
+    delete this.publicationWarnings.check;
+    this.projectPublicationWarning();
   }
 
-  private publishOnQuit(): Promise<void> | undefined {
-    return this.publicationScheduler.publishOnQuit(this.publicationManager);
-  }
-
-  private stopAutomaticPublication(): void {
-    this.publicationScheduler.stop();
-  }
-
-  private clearPublicationIntentAfterAdoption(): void {
-    this.publicationScheduler.stop();
-    this.refreshSchedulerMessage();
-  }
-
-  private handlePublicationWarning(_warning: PublicationWarning): void {
-    if (this.indexStatus)
-      this.indexStatus.setPublicationWarning("Index saved locally, but publication failed.");
+  private projectPublicationWarning(): void {
+    const warning = this.publicationWarnings.check ?? this.publicationWarnings.publication;
+    if (warning === this.projectedPublicationWarning) return;
+    this.projectedPublicationWarning = warning;
+    this.indexStatus?.setPublicationWarning(warning);
   }
 
   private notifyPublicationFileEvent(path: string): void {
-    const manager = this.publicationManager;
-    if (!manager || path !== manager.store.path) return;
-    manager.notifyFileEvent(path);
-  }
-
-  private stopAutomaticSemanticWork(): void {
-    this.semanticScheduler.stop();
-  }
-
-  /** Cancels the operation currently shown by Filo and suppresses automatic rescheduling. */
-  private cancelActiveIndexOperation(): void {
-    this.lexicalScheduler.cancelActive();
-    this.semanticScheduler.cancelActive();
-    // Explicit semantic work is owned by the same status lease, while this
-    // controller remains a compatibility path for callers outside Filo.
-    this.explicitIndex.semanticAbort?.abort();
-  }
-
-  private scheduleAutomaticSemantic(source: SchedulerSource = "event"): void {
-    this.semanticScheduler.schedule(source);
-  }
-
-  private stopAutomaticWork(markStale = true, rescheduleAfterAbort = false): void {
-    this.lexicalScheduler.stop(markStale, rescheduleAfterAbort);
-  }
-
-  private markQueuedWorkStale(): void {
-    this.lexicalScheduler.markStale();
-  }
-
-  private runFullIndex(signal: AbortSignal): Promise<void> {
-    return this.explicitIndex.runFullIndex(signal);
-  }
-
-  private runBothIndexes(signal: AbortSignal): Promise<void> {
-    return this.explicitIndex.runBothIndexes(signal);
-  }
-
-  private runIndex(signal: AbortSignal, force: boolean, settleStatus = true): Promise<void> {
-    return this.explicitIndex.runIndex(signal, force, settleStatus);
-  }
-
-  private scheduleReconcile(source: SchedulerSource = "event"): void {
-    this.lexicalScheduler.schedule(source);
+    if (path === this.publicationManager?.store.path) void this.checkPublication();
   }
 
   private registerVaultEvents(vault: any): void {
@@ -782,18 +500,46 @@ export class TramaPlugin extends Plugin {
   }
 
   private queueVaultMutation(mutation: IndexPathMutation): void {
-    this.lexicalScheduler.queueMutation(mutation);
+    if (this.compositionReplacement) {
+      this.compositionDirty = true;
+      return;
+    }
+    const manager = this.index;
+    const scheduler = this.maintenance;
+    if (!manager || !scheduler) return;
+    manager.recordPathMutation(mutation);
+    scheduler.invalidate();
+    if (!this.getSettings().automaticMaintenance) {
+      this.updateIndexCapabilities(manager);
+      if (scheduler.snapshot.lane === "idle") this.indexStatus?.markStale(manager.hasUsableIndex());
+    }
   }
 
   private requestFullRecovery(path?: string): void {
-    if (!path || !this.isPublicationPath(path)) this.lexicalScheduler.requestFullRecovery();
+    if (path && this.isPublicationPath(path)) return;
+    if (this.compositionReplacement) {
+      this.compositionDirty = true;
+      return;
+    }
+    const manager = this.index;
+    const scheduler = this.maintenance;
+    if (!manager || !scheduler) return;
+    manager.requestFullRecovery();
+    scheduler.invalidate();
   }
 
   private isPublicationPath(path: string): boolean {
     return this.vaultEvents.isPublicationPath(path);
   }
-
   private isVisibleMarkdown(path: string): boolean {
     return this.vaultEvents.isVisibleMarkdown(path);
+  }
+  private resolveSqliteIdentity(
+    adapter: import("@/index/IndexManager").SnapshotDataAdapter
+  ): Promise<string> {
+    return this.sqliteRuntime.resolveIdentity(adapter);
+  }
+  private createSqliteWorker(app: any): SqliteWorkerLike {
+    return this.sqliteRuntime.createWorker(app);
   }
 }

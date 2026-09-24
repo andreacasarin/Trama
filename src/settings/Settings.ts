@@ -26,17 +26,15 @@ export type LenteSearchMethod = "hybrid" | "keyword";
 export interface LenteSettings {
   readonly searchMethod: LenteSearchMethod;
   readonly maxResults: number;
-  readonly automaticSearchDelayMs: number;
+  readonly automaticSearches: boolean;
 }
 export interface FiloSettings {
-  readonly automaticLexicalDelayMs: number;
-  readonly automaticSemanticDelayMs: number;
-  readonly automaticPublicationDelayMs: number;
   readonly excludedPaths: readonly string[];
 }
 export interface TramaSettings {
   readonly schemaVersion: 5;
   readonly publicationDirectory: string;
+  readonly automaticMaintenance: boolean;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly lente: LenteSettings;
@@ -59,27 +57,6 @@ function isValidLenteMaxResults(value: unknown): value is number {
     value >= 5 &&
     value <= 50 &&
     value % 5 === 0
-  );
-}
-
-function isValidLenteAutomaticSearchDelay(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= 1000 &&
-    value % 50 === 0
-  );
-}
-
-function isValidAutomaticDelay(value: unknown, max: number, step: number): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isFinite(value) &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= max &&
-    value % step === 0
   );
 }
 
@@ -141,6 +118,7 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   schemaVersion: 5,
   publicationDirectory: DEFAULT_PUBLICATION_DIRECTORY,
+  automaticMaintenance: false,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
     modelId: "",
@@ -155,12 +133,9 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   lente: Object.freeze({
     searchMethod: "hybrid",
     maxResults: 20,
-    automaticSearchDelayMs: 0,
+    automaticSearches: false,
   }),
   filo: Object.freeze({
-    automaticLexicalDelayMs: 750,
-    automaticSemanticDelayMs: 0,
-    automaticPublicationDelayMs: 30000,
     excludedPaths: Object.freeze([]),
   }),
   approvedOrigins: Object.freeze([]),
@@ -175,7 +150,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      ![2, 3, 4, 5].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
+      (data as { schemaVersion?: unknown }).schemaVersion !== 5
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -228,43 +203,15 @@ export class SettingsStore {
       maxResults: isValidLenteMaxResults(rawLente.maxResults)
         ? rawLente.maxResults
         : DEFAULT_SETTINGS.lente.maxResults,
-      automaticSearchDelayMs: isValidLenteAutomaticSearchDelay(rawLente.automaticSearchDelayMs)
-        ? rawLente.automaticSearchDelayMs
-        : DEFAULT_SETTINGS.lente.automaticSearchDelayMs,
+      automaticSearches: rawLente.automaticSearches === true,
     };
-    const legacyFilo = input.schemaVersion !== 5;
     const filo = {
-      automaticLexicalDelayMs: legacyFilo
-        ? rawFilo.automaticUpdates === true
-          ? 1500
-          : 0
-        : this.validatedAutomaticDelay(
-            rawFilo.automaticLexicalDelayMs,
-            10000,
-            250,
-            DEFAULT_SETTINGS.filo.automaticLexicalDelayMs
-          ),
-      automaticSemanticDelayMs: legacyFilo
-        ? DEFAULT_SETTINGS.filo.automaticSemanticDelayMs
-        : this.validatedAutomaticDelay(
-            rawFilo.automaticSemanticDelayMs,
-            60000,
-            1000,
-            DEFAULT_SETTINGS.filo.automaticSemanticDelayMs
-          ),
-      automaticPublicationDelayMs: legacyFilo
-        ? DEFAULT_SETTINGS.filo.automaticPublicationDelayMs
-        : this.validatedAutomaticDelay(
-            rawFilo.automaticPublicationDelayMs,
-            300000,
-            5000,
-            DEFAULT_SETTINGS.filo.automaticPublicationDelayMs
-          ),
       excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
     };
     this.value = {
       schemaVersion: 5,
       publicationDirectory,
+      automaticMaintenance: input.automaticMaintenance === true,
       chat: Object.freeze(chat),
       embedding: Object.freeze(embedding),
       lente: Object.freeze(lente),
@@ -288,9 +235,6 @@ export class SettingsStore {
   }
   private positiveInt(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
-  }
-  private validatedAutomaticDelay(value: unknown, max: number, step: number, fallback: number) {
-    return isValidAutomaticDelay(value, max, step) ? value : fallback;
   }
   private optionalMaxOutputTokens(value: unknown): { maxOutputTokens?: number } {
     return isValidMaxOutputTokens(value) ? { maxOutputTokens: value } : {};
@@ -353,10 +297,10 @@ export class SettingsStore {
     const chatControls = this.validateChatControls(next.chat);
     const lente = this.validateLente(next.lente);
     const publicationDirectory = this.strictPublicationDirectory(next.publicationDirectory);
-    const filo = this.validateFilo(next.filo);
     return {
       schemaVersion: 5,
       publicationDirectory,
+      automaticMaintenance: next.automaticMaintenance === true,
       chat: Object.freeze({
         endpoint: chatEndpoint,
         modelId: next.chat.modelId,
@@ -364,24 +308,11 @@ export class SettingsStore {
       }),
       embedding: Object.freeze({ ...next.embedding, endpoint: embeddingEndpoint }),
       lente: Object.freeze(lente),
-      filo: Object.freeze(filo),
+      filo: Object.freeze({
+        excludedPaths: Object.freeze(normalizeExcludedPaths(next.filo.excludedPaths)),
+      }),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
       detailedDebug: next.detailedDebug === true,
-    };
-  }
-  private validateFilo(filo: FiloSettings): FiloSettings {
-    const delays: Array<[number, number, number]> = [
-      [filo.automaticLexicalDelayMs, 10000, 250],
-      [filo.automaticSemanticDelayMs, 60000, 1000],
-      [filo.automaticPublicationDelayMs, 300000, 5000],
-    ];
-    if (delays.some(([value, max, step]) => !isValidAutomaticDelay(value, max, step)))
-      throw new Error("Automatic update delays must be aligned integer milliseconds within range.");
-    return {
-      automaticLexicalDelayMs: filo.automaticLexicalDelayMs,
-      automaticSemanticDelayMs: filo.automaticSemanticDelayMs,
-      automaticPublicationDelayMs: filo.automaticPublicationDelayMs,
-      excludedPaths: Object.freeze(normalizeExcludedPaths(filo.excludedPaths)),
     };
   }
   private strictPublicationDirectory(value: unknown): string {
@@ -397,15 +328,10 @@ export class SettingsStore {
     if (!isValidLenteMaxResults(lente.maxResults)) {
       throw new Error("Lente maximum displayed results must be from 5 to 50 in increments of 5.");
     }
-    if (!isValidLenteAutomaticSearchDelay(lente.automaticSearchDelayMs)) {
-      throw new Error(
-        "Lente automatic search delay must be from 0 to 1000 ms in increments of 50."
-      );
-    }
     return {
       searchMethod: lente.searchMethod,
       maxResults: lente.maxResults,
-      automaticSearchDelayMs: lente.automaticSearchDelayMs,
+      automaticSearches: lente.automaticSearches === true,
     };
   }
   private validateChatControls(

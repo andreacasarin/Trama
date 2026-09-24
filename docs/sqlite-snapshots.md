@@ -37,10 +37,10 @@ checksum, hash-named file, device head, timestamp ordering, merge catalog,
 compressed file, chunked transfer, or `VACUUM INTO` output. The publication ID
 inside the SQLite copy is opaque and is used only for equality.
 
-## Publish, adopt, and retry
+## Publish and adopt
 
-After a converged lexical Build, Update, or Rebuild—or a successful semantic
-Prepare—Trama automatically blocks local index writes and adoption, then:
+After unified Update or Rebuild converges lexical and configured semantic work,
+the maintenance scheduler starts a publication fence. Trama then:
 
 1. prepares a consistent candidate with a fresh publication ID;
 2. stages it and validates the read-back SQLite copy;
@@ -48,14 +48,15 @@ Prepare—Trama automatically blocks local index writes and adoption, then:
 4. stamps the same ID into the live OPFS database before unblocking writes.
 
 A failed or cancelled local operation is not published. A failed publication
-does not roll back a successful local operation: the index remains searchable,
-the warning is retryable, and **Retry publication** makes a fresh copy of the
-current local index without rebuilding it. Local index mutations cannot
+does not roll back successful committed local work: the index remains searchable,
+the error is displayed, pending intent is preserved, and automatic maintenance is
+suspended without a retry timer. A later explicit Update republishes the current
+converged state without discarding it. Local index mutations cannot
 intervene between copying and ID finalization. The previous vault file is
 retained until finalization and restored if that step fails.
 
-On startup and on a coalesced change event, Trama inspects only the exact
-configured file. A missing file is ignored. A valid file with the same ID is
+On startup, an exact publication-file event, or explicit **Check synchronized file**,
+Trama inspects only the exact configured file. A missing file is ignored. A valid file with the same ID is
 ignored. Any valid file with a different ID is adopted, regardless of UUID
 shape, age, timestamp, local change counter, or perceived ordering. Adoption
 does not reconcile Markdown, contact AI, change settings, or publish again.
@@ -65,7 +66,7 @@ supported operating model is single-writer-in-time: finish indexing and
 publication on device A, wait for Obsidian Sync or iCloud to converge, then
 index on device B. Concurrent publication can lose derived work, and a provider
 conflict that exposes an older valid corpus may require another Update/Rebuild
-and Prepare.
+and configured semantic work.
 
 ## Freshness and compatibility
 
@@ -95,7 +96,7 @@ assertions. Real-device validation remains pending:
 - same-ID ignore, differing-ID adoption, search before reconciliation, and no
   adoption republish;
 - mobile-to-desktop publication after sync convergence;
-- reachable LAN embedding Prepare, Hybrid, Filo, and Voce;
+- reachable LAN embedding Update, Hybrid, Filo, and Voce;
 - unreachable-AI lexical fallback;
 - interrupted, invalid, and incompatible synchronized files;
 - sequential device handoff and provider conflict behavior; and

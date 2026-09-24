@@ -1,7 +1,6 @@
 import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
-import { formatIndexProgress, type IndexStatus } from "@/ui/index/IndexStatusModel";
+import { formatIndexProgress, IndexStatus } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 
@@ -42,11 +41,10 @@ export class FiloView extends ItemView {
 
   constructor(
     leaf: WorkspaceLeaf,
-    private statusSource: StatusSource | IndexStatusController,
+    private statusSource: StatusSource,
     private relatedSource: RelatedSource | RelatedNotes | undefined,
-    private readonly runIndex?: (kind: "index" | "reindex") => Promise<void>,
-    private readonly cancelIndex?: () => void,
-    private readonly runPrepare?: () => Promise<void>
+    private readonly runIndex: (kind: "index" | "reindex") => Promise<void>,
+    private readonly cancelIndex: () => void
   ) {
     super(leaf);
     this.status = statusSource.getStatus();
@@ -62,10 +60,7 @@ export class FiloView extends ItemView {
     return TRAMA_ICONS.filo;
   }
 
-  setDependencies(
-    status: StatusSource | IndexStatusController,
-    related: RelatedSource | RelatedNotes | undefined
-  ): void {
+  setDependencies(status: StatusSource, related: RelatedSource | RelatedNotes | undefined): void {
     const wasOpen = this.isViewOpen;
     this.teardown();
     this.statusSource = status;
@@ -130,20 +125,7 @@ export class FiloView extends ItemView {
     const path = this.currentPath();
     if (path !== this.activePath) this.expandedPaths.clear();
     this.activePath = path;
-    const transientStatus = [
-      "building",
-      "preparing",
-      "cancelling",
-      "updating",
-      "stale",
-      "error",
-      "cancelled",
-    ].includes(this.status.kind);
-    if (
-      !path ||
-      !this.relatedSource ||
-      (!this.semanticReady() && !(transientStatus && this.related))
-    ) {
+    if (!path || !this.relatedSource || !this.semanticReady()) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
       this.requestKey = undefined;
@@ -159,8 +141,7 @@ export class FiloView extends ItemView {
     }
     this.requestAbort?.abort();
     this.requestKey = key;
-    // Keep the last settled rows visible while a new semantic head is being
-    // looked up; a successful result replaces them atomically.
+    this.related = undefined;
     this.relatedError = false;
     this.render();
     const generation = ++this.requestGeneration;
@@ -187,12 +168,7 @@ export class FiloView extends ItemView {
   private acceptsResult(result: RelatedNotesResult): boolean {
     // A completed read remains usable after a mutable-index counter bump. The
     // next request observes the new snapshot key and refreshes the cache.
-    if (result.currentPath !== this.activePath) return false;
-    const key = this.relatedSource?.snapshotKey?.(result.currentPath);
-    // RelatedNotes keys include the visible semantic head content hash. This
-    // rejects a late result from an older head without exposing paths in any
-    // diagnostic payload.
-    return !key || key.includes(`\0${result.contentHash}\0`);
+    return result.currentPath === this.activePath;
   }
 
   private render(): void {
@@ -226,28 +202,28 @@ export class FiloView extends ItemView {
     if (status.kind === "index-required") {
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
-        text: "Build the lexical index, then update the semantic index to discover related notes.",
+        text: "Build the index to discover related notes.",
       });
-      if (status.canIndex) this.actionButton("Build lexical index", "index");
+      if (status.canIndex) this.actionButton("Update index", "index");
       return;
     }
-    if (status.kind === "building" || status.kind === "preparing" || status.kind === "cancelling") {
-      if (status.kind === "cancelling" || !this.renderProgress(status))
+    if (status.kind === "building" || status.kind === "preparing") {
+      if (!this.renderProgress(status))
         this.root.createDiv({
           cls: "setting-item-description trama-filo__message",
           text: status.message ?? "Updating lexical or semantic index…",
         });
-      if (status.canCancel) this.actionButton("Stop indexing", "cancel");
+      if (status.canCancel) this.actionButton("Stop", "cancel");
       return;
     }
     if (status.kind === "stale") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: status.message ?? "Lexical index has changes; update required.",
+        text: status.message ?? "Index has changes; update required.",
       });
-      if (status.canIndex) this.actionButton("Update lexical index", "index");
-      if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
+      if (status.canIndex) this.actionButton("Update index", "index");
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -255,15 +231,12 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text:
-          status.channel === "semantic"
-            ? "Unable to update the semantic index."
-            : "Unable to build the lexical index.",
+        text: status.message ?? "Lexical or semantic indexing failed.",
       });
       if (status.channel === "semantic") {
-        if (status.canPrepare) this.semanticButtons();
-      } else if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
-      else if (status.canIndex) this.actionButton("Build lexical index", "index");
+        if (status.canIndex) this.actionButton("Update index", "index");
+      } else if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Update index", "index");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -271,22 +244,13 @@ export class FiloView extends ItemView {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: `${status.channel === "semantic" ? "Semantic" : "Lexical"} indexing cancelled.`,
+        text: status.message ?? "Lexical or semantic indexing cancelled.",
       });
       if (status.channel === "semantic") {
-        if (status.canPrepare) this.semanticButtons();
-      } else if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
-      else if (status.canIndex) this.actionButton("Build lexical index", "index");
+        if (status.canIndex) this.actionButton("Update index", "index");
+      } else if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Update index", "index");
       this.renderFreshnessWarning(status.freshness);
-      return;
-    }
-    if (status.kind === "updating") {
-      if (this.related) this.renderRows();
-      if (!this.renderProgress(status))
-        this.root.createDiv({
-          cls: "setting-item-description trama-filo__message",
-          text: "Updating lexical index…",
-        });
       return;
     }
     if (status.kind === "empty") {
@@ -294,8 +258,8 @@ export class FiloView extends ItemView {
         cls: "setting-item-description trama-filo__message",
         text: "No related notes found.",
       });
-      if (status.canReindex) this.actionButton("Rebuild lexical index", "reindex");
-      else if (status.canIndex) this.actionButton("Build lexical index", "index");
+      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      else if (status.canIndex) this.actionButton("Update index", "index");
       return;
     }
     if (capabilities && !capabilities.semantic.searchable) {
@@ -303,15 +267,16 @@ export class FiloView extends ItemView {
         capabilities.semantic.activity === "updating"
           ? "Updating semantic index…"
           : capabilities.semantic.state === "partial"
-            ? "Semantic index is incomplete. Update the lexical index or semantic vectors to discover related notes."
+            ? "Semantic index is incomplete. Update the index to discover related notes."
             : capabilities.semantic.state === "incompatible"
-              ? "Stored semantic vectors are incompatible. Update the semantic index to refresh them."
-              : "Update the semantic index to discover related notes.";
+              ? "Stored semantic vectors are incompatible. Update the index to refresh them."
+              : "Update the index to discover related notes.";
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
         text: message,
       });
-      if (capabilities.semantic.activity !== "updating") this.semanticButtons();
+      if (capabilities.semantic.activity !== "updating" && status.canIndex)
+        this.actionButton("Update index", "index");
       this.renderFreshnessWarning(capabilities.freshness);
       return;
     }
@@ -329,21 +294,14 @@ export class FiloView extends ItemView {
         cls: "setting-item-description mod-warning trama-filo__message",
         text:
           this.related.unavailableReason === "incomplete-vectors"
-            ? "Semantic coverage is incomplete. Update the semantic index to discover related notes."
-            : "Semantic related notes are unavailable. Update the semantic index when available.",
+            ? "Semantic coverage is incomplete. Update the index to discover related notes."
+            : "Semantic related notes are unavailable. Update the index when available.",
       });
-      this.semanticButtons();
+      if (status.canIndex) this.actionButton("Update index", "index");
       this.renderFreshnessWarning(this.related.freshness);
       return;
     }
     this.renderRows();
-    if (capabilities?.semantic.state === "partial") {
-      this.root.createDiv({
-        cls: "setting-item-description mod-warning trama-filo__message",
-        text: "Semantic index is incomplete; related notes use available vectors.",
-      });
-      this.semanticButtons();
-    }
     this.renderFreshnessWarning(capabilities?.freshness ?? this.related?.freshness);
   }
 
@@ -363,22 +321,6 @@ export class FiloView extends ItemView {
           ? "Snapshot loaded — not locally reconciled. Related notes reflect the synchronized snapshot."
           : "Index may be stale; related notes reflect the indexed content until an update.",
     });
-  }
-
-  private semanticButtons(): void {
-    const source = this.statusSource as IndexStatusController;
-    const actions = [
-      ["Update semantic index", () => this.runPrepare?.() ?? source.run("prepare")],
-      ["Rebuild semantic index", () => source.run("rebuild-semantic")],
-    ] as const;
-    for (const [label, run] of actions) {
-      const button = this.root.createEl("button", {
-        cls: "trama-filo__action",
-        text: label,
-        attr: { type: "button", "aria-label": label },
-      });
-      button.addEventListener("click", () => void run());
-    }
   }
 
   private renderProgress(status: IndexStatus): boolean {
@@ -474,26 +416,15 @@ export class FiloView extends ItemView {
   private actionButton(label: string, action: "index" | "reindex" | "cancel"): void {
     const button = this.root.createEl("button", {
       cls: `${action === "cancel" ? "clickable-icon " : ""}trama-filo__action`,
-      // Obsidian's setIcon replaces this fallback text in the live view. It
-      // keeps simple render stubs and screen readers from losing the action
-      // before the icon is attached; aria-label and tooltip are authoritative.
-      text: action === "cancel" ? "Cancel" : label,
+      text: label,
       attr: { type: "button", "aria-label": label },
     });
-    if (action === "cancel") {
-      setIcon(button, "square");
-      setTooltip(button, label);
-      button.setAttribute?.("aria-label", label);
-    }
+    if (action === "cancel") setIcon(button, "square");
     button.addEventListener("click", () => {
       if (action === "cancel") {
-        if (this.cancelIndex) this.cancelIndex();
-        else (this.statusSource as IndexStatusController).cancel();
+        this.cancelIndex();
       } else {
-        const run = this.runIndex
-          ? this.runIndex(action)
-          : (this.statusSource as IndexStatusController).run(action);
-        void run;
+        void this.runIndex(action);
       }
     });
   }

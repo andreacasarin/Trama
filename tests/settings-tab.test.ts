@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { Setting } from "obsidian";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import {
-  formatAutomaticDelay,
   projectSettingsWithDraft,
+  TramaSettingsTab,
   validateChatDraft,
   type SettingsDraft,
 } from "@/ui/settings/SettingsTab";
@@ -17,15 +18,136 @@ const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   embeddingModelId: "embed-v1",
   lenteSearchMethod: "hybrid",
   lenteMaxResults: 20,
-  lenteAutomaticSearchDelayMs: 0,
-  filoAutomaticLexicalDelayMs: DEFAULT_SETTINGS.filo.automaticLexicalDelayMs,
-  filoAutomaticSemanticDelayMs: DEFAULT_SETTINGS.filo.automaticSemanticDelayMs,
-  filoAutomaticPublicationDelayMs: DEFAULT_SETTINGS.filo.automaticPublicationDelayMs,
+  lenteAutomaticSearches: false,
+  automaticMaintenance: false,
   filoExcludedPaths: [],
   ...overrides,
 });
 
 describe("settings projection", () => {
+  it("wires Settings Update and Rebuild buttons to required maintenance callbacks", async () => {
+    const updateIndex = vi.fn(async () => undefined);
+    const rebuildIndex = vi.fn(async () => undefined);
+    const stopIndex = vi.fn(async () => undefined);
+    const callbacks = new Map<string, () => unknown>();
+    const warnings: string[] = [];
+    let indexStatus: { kind?: string; message?: string; publicationWarning?: string } | undefined;
+    const proto = Setting.prototype as any;
+    const originals = new Map<string, PropertyDescriptor | undefined>();
+    const chain = [
+      "setName",
+      "setDesc",
+      "setHeading",
+      "setPlaceholder",
+      "setLimits",
+      "setValue",
+      "setDynamicTooltip",
+    ];
+    for (const method of chain) {
+      originals.set(method, Object.getOwnPropertyDescriptor(proto, method));
+      Object.defineProperty(proto, method, {
+        configurable: true,
+        value() {
+          return this;
+        },
+      });
+    }
+    originals.set("addButton", Object.getOwnPropertyDescriptor(proto, "addButton"));
+    Object.defineProperty(proto, "addButton", {
+      configurable: true,
+      value(configure: (button: any) => void) {
+        let label = "";
+        const button = {
+          setButtonText(value: string) {
+            label = value;
+            return this;
+          },
+          onClick(callback: () => unknown) {
+            callbacks.set(label, callback);
+            return this;
+          },
+        };
+        configure(button);
+        return this;
+      },
+    });
+    for (const method of ["addToggle", "addDropdown", "addText", "addSlider"]) {
+      originals.set(method, Object.getOwnPropertyDescriptor(proto, method));
+      Object.defineProperty(proto, method, {
+        configurable: true,
+        value(configure: (control: any) => void) {
+          const control = {
+            addOption() {
+              return this;
+            },
+            setLimits() {
+              return this;
+            },
+            setValue() {
+              return this;
+            },
+            setDynamicTooltip() {
+              return this;
+            },
+            onChange() {
+              return this;
+            },
+            setPlaceholder() {
+              return this;
+            },
+          };
+          configure(control);
+          return this;
+        },
+      });
+    }
+    try {
+      const tab = new TramaSettingsTab(
+        {} as any,
+        {
+          getSettings: () => DEFAULT_SETTINGS,
+          getIndexStatus: () => indexStatus,
+          updateIndex,
+          rebuildIndex,
+          stopIndex,
+        } as any
+      );
+      (tab as any).containerEl = {
+        empty() {},
+        createEl(_tag: string, options?: { text?: string }) {
+          if (options?.text) warnings.push(options.text);
+          return {
+            addEventListener(_event: string, callback: () => unknown) {
+              callbacks.set("Save", callback);
+            },
+          };
+        },
+      };
+      tab.display();
+      await callbacks.get("Update")?.();
+      await callbacks.get("Rebuild")?.();
+      expect(updateIndex).toHaveBeenCalledOnce();
+      expect(rebuildIndex).toHaveBeenCalledOnce();
+      expect(callbacks.has("Prepare")).toBe(false);
+
+      indexStatus = { kind: "error", message: "Lexical write failed." };
+      await callbacks.get("Update")?.();
+      await vi.waitFor(() => expect(warnings).toContain("Lexical write failed."));
+      indexStatus = { kind: "error", message: "Semantic service failed." };
+      await callbacks.get("Rebuild")?.();
+      await vi.waitFor(() => expect(warnings).toContain("Semantic service failed."));
+      indexStatus = { publicationWarning: "Index saved locally, but publication failed: offline" };
+      await callbacks.get("Update")?.();
+      await vi.waitFor(() =>
+        expect(warnings).toContain("Index saved locally, but publication failed: offline")
+      );
+    } finally {
+      for (const [method, descriptor] of originals)
+        if (descriptor) Object.defineProperty(proto, method, descriptor);
+        else delete proto[method];
+    }
+  });
+
   it("normalizes one complete draft without mutating current settings", () => {
     const projected = projectSettingsWithDraft(
       DEFAULT_SETTINGS,
@@ -36,9 +158,6 @@ describe("settings projection", () => {
         embeddingModelId: "embed-v2",
         lenteSearchMethod: "keyword",
         lenteMaxResults: 35,
-        filoAutomaticLexicalDelayMs: 1250,
-        filoAutomaticSemanticDelayMs: 2000,
-        filoAutomaticPublicationDelayMs: 25000,
         filoExcludedPaths: [" ./Projects\\Private/ "],
       })
     );
@@ -47,21 +166,19 @@ describe("settings projection", () => {
     expect(projected).toMatchObject({
       chat: { endpoint: "http://127.0.0.1:5678/v1", modelId: "chat-v2" },
       embedding: { endpoint: "http://127.0.0.1:4321/v1", modelId: "embed-v2" },
-      lente: { searchMethod: "keyword", maxResults: 35 },
-      filo: {
-        automaticLexicalDelayMs: 1250,
-        automaticSemanticDelayMs: 2000,
-        automaticPublicationDelayMs: 25000,
-        excludedPaths: ["Projects/Private"],
-      },
+      lente: { searchMethod: "keyword", maxResults: 35, automaticSearches: false },
+      filo: { excludedPaths: ["Projects/Private"] },
     });
   });
 
-  it("formats automatic delays as Off or readable seconds", () => {
-    expect(formatAutomaticDelay(0)).toBe("Off");
-    expect(formatAutomaticDelay(250)).toBe("0.25 sec");
-    expect(formatAutomaticDelay(1500)).toBe("1.5 sec");
-    expect(formatAutomaticDelay(2000)).toBe("2 sec");
+  it("projects the two opt-in settings independently", () => {
+    const projected = projectSettingsWithDraft(
+      DEFAULT_SETTINGS,
+      draft({ lenteAutomaticSearches: true, automaticMaintenance: true })
+    );
+    expect(projected.lente.automaticSearches).toBe(true);
+    expect(projected.automaticMaintenance).toBe(true);
+    expect(projected.filo).not.toHaveProperty("automaticUpdates");
   });
 
   it.each([

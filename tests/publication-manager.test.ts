@@ -1,12 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PublicationManager,
-  type AdoptionResult,
   type PublicationIndexPort,
 } from "@/index/publications/PublicationManager";
-import { StructuredError } from "@/domain/contracts";
-import { sqliteError } from "@/index/sqlite/protocol";
 import { type PublicationDataAdapter } from "@/index/publications/PublicationStore";
+import { sqliteError } from "@/index/sqlite/protocol";
 import type {
   PublicationInspection,
   PublicationPrepared,
@@ -107,64 +105,6 @@ describe("PublicationManager", () => {
     expect(fixture.getLive().publicationId).toBe("publication-1");
   });
 
-  it("settles the composition wakeup after failed publish and same-id inspection", async () => {
-    const fixture = setup();
-    const settled = vi.fn();
-    const originalWrite = fixture.adapter.writeBinary!;
-    fixture.adapter.writeBinary = async () => {
-      throw new Error("offline");
-    };
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "failed-publication",
-      onOperationSettled: settled,
-    });
-
-    await expect(manager.publish()).resolves.toMatchObject({
-      published: false,
-      warning: { phase: "stage" },
-    });
-    expect(settled).toHaveBeenCalledTimes(1);
-
-    fixture.adapter.writeBinary = originalWrite;
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-    vi.mocked(fixture.index.getState!).mockResolvedValue(state("remote"));
-    vi.mocked(fixture.index.inspectPublication).mockResolvedValue({
-      valid: true,
-      publicationId: "remote",
-      state: state("remote"),
-      byteSize: fixture.bytes.byteLength,
-    });
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      ignored: "same-id",
-    });
-    expect(settled).toHaveBeenCalledTimes(2);
-    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
-
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(new Error("inspect failed"));
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      warning: { phase: "inspect" },
-    });
-    expect(settled).toHaveBeenCalledTimes(3);
-
-    const adopt = vi
-      .spyOn(fixture.index, "adoptPublication")
-      .mockRejectedValueOnce(new Error("adopt failed"));
-    vi.mocked(fixture.index.inspectPublication).mockResolvedValueOnce({
-      valid: true,
-      publicationId: "other-remote",
-      state: state("other-remote"),
-      byteSize: fixture.bytes.byteLength,
-    });
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      warning: { phase: "adopt" },
-    });
-    expect(adopt).toHaveBeenCalledTimes(1);
-    expect(settled).toHaveBeenCalledTimes(4);
-  });
-
   it("can finish publication after inspection transfers the read-back buffer", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter, {
@@ -187,151 +127,14 @@ describe("PublicationManager", () => {
     expect([...new Uint8Array((await manager.store.read())!)]).toEqual([9, 8, 7]);
   });
 
-  it("coalesces exact-file events and adopts a differing ID without republishing", async () => {
+  it("adopts a differing ID without republishing", async () => {
     const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, { debounceMs: 100 });
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
     await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-    manager.notifyFileEvent("Trama/index/index.sqlite3");
-    manager.notifyFileEvent("Trama/index/index.sqlite3");
-    manager.notifyFileEvent("other.md");
-    expect(await manager.flushPendingEvents()).toMatchObject({ adopted: true });
+    expect(await manager.adoptCurrent()).toMatchObject({ adopted: true });
     expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
     expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
     expect(fixture.publish).not.toHaveBeenCalled();
-  });
-
-  it("keeps one pending event through a busy retry", async () => {
-    vi.useFakeTimers();
-    try {
-      const fixture = setup();
-      const manager = new PublicationManager(fixture.index, fixture.adapter);
-      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-      vi.mocked(fixture.index.inspectPublication)
-        .mockRejectedValueOnce(new StructuredError("busy", "busy", true))
-        .mockResolvedValueOnce({
-          valid: true,
-          publicationId: "remote",
-          state: state("remote"),
-          byteSize: fixture.bytes.byteLength,
-        });
-
-      manager.notifyFileEvent(manager.store.path);
-      await expect(manager.flushPendingEvents()).resolves.toMatchObject({
-        adopted: false,
-        warning: { retryable: true },
-      });
-      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
-
-      await vi.advanceTimersByTimeAsync(25);
-      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(2);
-      expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("unwraps nested busy protocol errors for inbound retry", async () => {
-    vi.useFakeTimers();
-    try {
-      const fixture = setup();
-      const manager = new PublicationManager(fixture.index, fixture.adapter);
-      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-      vi.mocked(fixture.index.inspectPublication)
-        .mockRejectedValueOnce({
-          error: { code: "busy", message: "maintenance", retryable: true, phase: "execute" },
-        })
-        .mockResolvedValueOnce({
-          valid: true,
-          publicationId: "remote",
-          state: state("remote"),
-          byteSize: fixture.bytes.byteLength,
-        });
-
-      manager.notifyFileEvent(manager.store.path);
-      await expect(manager.flushPendingEvents()).resolves.toMatchObject({
-        warning: { retryable: true },
-      });
-      await vi.advanceTimersByTimeAsync(25);
-      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not poll indefinitely after a permanent nested integrity failure", async () => {
-    vi.useFakeTimers();
-    try {
-      const fixture = setup();
-      const manager = new PublicationManager(fixture.index, fixture.adapter);
-      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-      vi.mocked(fixture.index.inspectPublication).mockRejectedValue(
-        sqliteError("integrity_failed", "invalid publication", true, "execute")
-      );
-
-      manager.notifyFileEvent(manager.store.path);
-      await expect(manager.flushPendingEvents()).resolves.toMatchObject({
-        warning: { retryable: false },
-      });
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("runs one follow-up adoption when the exact file changes during adoption", async () => {
-    vi.useFakeTimers();
-    try {
-      const fixture = setup();
-      const adopted: AdoptionResult[] = [];
-      let entered!: () => void;
-      const enteredPromise = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const manager = new PublicationManager(fixture.index, fixture.adapter, {
-        onEventAdopted: (result) => {
-          adopted.push(result);
-        },
-      });
-      await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-      let inspections = 0;
-      vi.mocked(fixture.index.inspectPublication).mockImplementation(async () => {
-        inspections++;
-        if (inspections === 1) {
-          entered();
-          await gate;
-        }
-        return {
-          valid: true,
-          publicationId: inspections === 1 ? "remote-a" : "remote-b",
-          state: state(inspections === 1 ? "remote-a" : "remote-b"),
-          byteSize: fixture.bytes.byteLength,
-        };
-      });
-
-      manager.notifyFileEvent(manager.store.path);
-      const first = manager.flushPendingEvents();
-      await enteredPromise;
-      manager.notifyFileEvent(manager.store.path);
-      release();
-      await expect(first).resolves.toMatchObject({
-        adopted: true,
-        publicationId: "remote-a",
-      });
-      expect(await manager.flushPendingEvents()).toMatchObject({
-        adopted: true,
-        publicationId: "remote-b",
-      });
-      expect(inspections).toBe(2);
-      expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(2);
-      expect(adopted).toHaveLength(2);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("retries a failed stage from the current local index", async () => {
@@ -374,5 +177,18 @@ describe("PublicationManager", () => {
     });
     expect(await manager.store.read()).toEqual(oldBytes);
     expect(fixture.getLive().publicationId).toBeUndefined();
+  });
+  it("classifies nested permanent publication errors without making them retryable", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("integrity_failed", "invalid publication", true, "execute")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      warning: { phase: "inspect", retryable: false },
+    });
   });
 });
