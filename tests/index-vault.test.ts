@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 
 describe("ObsidianIndexVault", () => {
@@ -88,58 +88,5 @@ describe("ObsidianIndexVault", () => {
     await expect(vault.isMarkdownAvailable("new.md", new AbortController().signal)).resolves.toBe(
       true
     );
-  });
-
-  it("estimates chunk work from metadata without reading or chunking notes", async () => {
-    const content = Array.from({ length: 80 }, () => "x".repeat(250)).join("\n");
-    const files = [
-      { path: "one.md", stat: { size: content.length } },
-      { path: "empty.md", stat: { size: 0 } },
-    ] as any[];
-    const read = vi.fn(async (file: { path: string }) => (file.path === "one.md" ? content : ""));
-    const vault = new ObsidianIndexVault(
-      {
-        getMarkdownFiles: () => files,
-        getFileByPath: (path) => files.find((file) => file.path === path) ?? null,
-        read,
-      },
-      () => true
-    );
-
-    await expect(
-      vault.estimateMarkdownTextCount(
-        files.map((file) => file.path),
-        384,
-        64,
-        new AbortController().signal
-      )
-    ).resolves.toBe(Math.ceil(content.length / 320));
-    expect(read).not.toHaveBeenCalled();
-  });
-
-  it("does not sample or read a large vault during estimation", async () => {
-    const files = Array.from({ length: 100 }, (_, index) => ({
-      path: `note-${index}.md`,
-      stat: { size: 1_000 + index },
-    })) as any[];
-    const read = vi.fn(async () => "line\n".repeat(200));
-    const vault = new ObsidianIndexVault(
-      {
-        getMarkdownFiles: () => files,
-        getFileByPath: (path) => files.find((file) => file.path === path) ?? null,
-        read,
-      },
-      () => true
-    );
-
-    await expect(
-      vault.estimateMarkdownTextCount(
-        files.map((file) => file.path),
-        384,
-        64,
-        new AbortController().signal
-      )
-    ).resolves.toBeGreaterThan(0);
-    expect(read).not.toHaveBeenCalled();
   });
 });

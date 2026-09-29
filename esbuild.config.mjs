@@ -1,9 +1,12 @@
 import esbuild from "esbuild";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const production = process.argv[2] === "production";
+const runtimeBuildId = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), ".cache/runtime-build.json"), "utf8")
+).buildId;
 
 await esbuild.build({
   entryPoints: ["src/main.ts"],
@@ -16,6 +19,7 @@ await esbuild.build({
   sourcemap: production ? false : "inline",
   minify: production,
   logLevel: "info",
+  define: { __TRAMA_RUNTIME_BUILD_ID__: JSON.stringify(runtimeBuildId) },
 });
 
 await esbuild.build({
@@ -28,6 +32,7 @@ await esbuild.build({
   sourcemap: false,
   minify: production,
   logLevel: "info",
+  define: { __TRAMA_RUNTIME_BUILD_ID__: JSON.stringify(runtimeBuildId) },
 });
 
 const root = dirname(fileURLToPath(import.meta.url));

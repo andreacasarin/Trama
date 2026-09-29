@@ -67,6 +67,13 @@ export interface EmbeddingProgress {
   readonly unit: "texts";
 }
 
+/** Optional provider limits used by bounded semantic indexing. */
+export interface EmbeddingBatchLimits {
+  readonly maxItems?: number;
+  readonly maxInputBytes?: number;
+  readonly maxVectorBytes?: number;
+}
+
 export type IndexOperation = "full" | "incremental" | "startup";
 
 /** Both search channels use the same readiness and activity vocabulary. */
@@ -120,6 +127,7 @@ export interface EmbeddingModel {
     onProgress?: (progress: EmbeddingProgress) => void
   ): Promise<readonly number[][]>;
   readonly dimensions: number;
+  readonly batchLimits?: EmbeddingBatchLimits;
 }
 
 /** Cancellation passed through model, tool, and vault operations. */

@@ -156,7 +156,7 @@ describe("LenteSearch", () => {
     expect(search).toHaveBeenCalledWith("needle", "hybrid", undefined);
   });
 
-  it("applies a configured display limit without shrinking the candidate pool", async () => {
+  it("keeps the fixed display limit without shrinking the candidate pool", async () => {
     const candidates = Array.from({ length: 30 }, (_, index) =>
       hit(`note-${index}.md`, 1 - index / 100)
     );
@@ -168,9 +168,9 @@ describe("LenteSearch", () => {
       },
       { getMtime: () => 1 }
     );
-    const result = await service.search("needle", { maxResults: 5 });
-    expect(result.displayLimit).toBe(5);
-    expect(result.results).toHaveLength(5);
+    const result = await service.search("needle");
+    expect(result.displayLimit).toBe(20);
+    expect(result.results).toHaveLength(20);
     expect(result.canonicalResults).toHaveLength(30);
   });
 

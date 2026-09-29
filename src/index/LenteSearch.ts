@@ -21,7 +21,6 @@ export type LenteSearchMethod = VaultSearchMethod;
 
 export interface LenteSearchOptions {
   readonly searchMethod?: LenteSearchMethod;
-  readonly maxResults?: number;
   readonly sort?: LenteSort;
   readonly signal?: AbortSignal;
 }
@@ -76,7 +75,7 @@ export class LenteSearch {
 
   async search(query: string, options: LenteSearchOptions = {}): Promise<LenteBatch> {
     const elapsedMs = startDiagnosticTimer();
-    const displayLimit = appliedDisplayLimit(options.maxResults);
+    const displayLimit = MAX_RESULTS;
     let mode: LenteRetrievalMode = options.searchMethod === "keyword" ? "lexical" : "hybrid";
     try {
       const {
@@ -143,12 +142,6 @@ function isCancelled(error: unknown): boolean {
     ((error as { code?: unknown }).code === "cancelled" ||
       (error as { cancelled?: unknown }).cancelled === true)
   );
-}
-
-function appliedDisplayLimit(value: number | undefined): number {
-  return Number.isSafeInteger(value)
-    ? Math.max(0, Math.min(MAX_CANDIDATES, value as number))
-    : MAX_RESULTS;
 }
 
 /** Pure, deterministic note collapse and ordering used by the service and tests. */

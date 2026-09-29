@@ -158,30 +158,20 @@ export class TramaTestWorld {
     await this.index.build(signal);
     const state = await this.index.getState();
     if (state) {
-      await this.publicationManager.publishAfterSuccessfulOperation({
-        operation: "build",
-        changed: true,
-        converged: !state.incomplete,
-        state,
-      });
+      if (!state.incomplete) await this.publicationManager.publish();
     }
   }
   async update(): Promise<void> {
-    this.index.queueChange();
+    this.index.requestFullRecovery();
     const result = await this.index.synchronize(signal);
     const state = await this.index.getState();
     if (state) {
-      await this.publicationManager.publishAfterSuccessfulOperation({
-        operation: "update",
-        changed: result.changed,
-        converged: result.converged,
-        state,
-      });
+      if (result.changed && result.converged) await this.publicationManager.publish();
     }
   }
 
   async prepare(): Promise<void> {
     const result = await this.index.prepareSemantic(signal);
-    await this.publicationManager.publishAfterSuccessfulOperation(result);
+    if (result.changed && result.converged) await this.publicationManager.publish();
   }
 }

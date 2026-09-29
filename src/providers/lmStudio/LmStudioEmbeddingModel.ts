@@ -1,4 +1,9 @@
-import { EmbeddingModel, EmbeddingProgress, StructuredError } from "@/domain/contracts";
+import {
+  EmbeddingModel,
+  EmbeddingProgress,
+  StructuredError,
+  type EmbeddingBatchLimits,
+} from "@/domain/contracts";
 import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
 export interface LmStudioEmbeddingOptions {
   readonly endpoint: string;
@@ -16,6 +21,7 @@ interface ModelListResponse {
 /** Adapts LM Studio's OpenAI-compatible embeddings API with bounded batches and dimension checks. */
 export class LmStudioEmbeddingModel implements EmbeddingModel {
   readonly dimensions: number;
+  readonly batchLimits: EmbeddingBatchLimits;
   private readonly options: LmStudioEmbeddingOptions;
   private readonly transport: LmStudioTransport;
   constructor(options: LmStudioEmbeddingOptions) {
@@ -27,6 +33,7 @@ export class LmStudioEmbeddingModel implements EmbeddingModel {
       );
     this.options = options;
     this.dimensions = options.dimensions;
+    this.batchLimits = { maxItems: options.batchSize ?? 32 };
     this.transport = options.transport ?? new LmStudioTransport();
   }
   async discoverModels(signal: AbortSignal): Promise<readonly string[]> {

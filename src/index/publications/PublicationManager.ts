@@ -1,29 +1,38 @@
 import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
-import type { IndexOperationResult, SemanticPrepareResult } from "@/index/IndexManager";
-import type {
-  PublicationInspection,
-  PublicationPrepared,
-  SqliteState,
+import { sha256Hex } from "@/index/Identity";
+import {
+  SqliteProtocolError,
+  type PublicationInspection,
+  type PublicationPrepared,
+  type SqliteState,
 } from "@/index/sqlite/protocol";
 import { PublicationStore, type PublicationDataAdapter } from "./PublicationStore";
 
 export interface PublicationIndexPort {
   publishPublication<T>(
     publicationId: string,
-    install: (prepared: PublicationPrepared) => Promise<T>,
+    install: (
+      prepared: PublicationPrepared,
+      inspect?: (bytes: ArrayBuffer, transferOwnership?: boolean) => Promise<PublicationInspection>
+    ) => Promise<T>,
     settle?: (committed: boolean) => Promise<void>
   ): Promise<{ prepared: PublicationPrepared; installed: T }>;
   inspectPublication(
     bytes: ArrayBuffer,
     transferOwnership?: boolean
   ): Promise<PublicationInspection>;
-  adoptPublication(bytes: ArrayBuffer, expectedPublicationId?: string): Promise<SqliteState>;
+  adoptPublication(
+    bytes: ArrayBuffer,
+    expectedPublicationId?: string,
+    inspection?: PublicationInspection
+  ): Promise<SqliteState>;
   getState?(): Promise<SqliteState | undefined>;
   capabilities?(): IndexCapabilities;
 }
 
 export interface PublicationWarning {
   readonly phase: "prepare" | "stage" | "replace" | "finalize" | "inspect" | "adopt";
+  readonly code?: string;
   readonly message: string;
   readonly error: unknown;
   readonly retryable: boolean;
@@ -47,6 +56,7 @@ export interface PublicationResult {
 
 export interface AdoptionResult {
   readonly adopted: boolean;
+  readonly replacementRequired?: boolean;
   readonly ignored?: "missing" | "same-id";
   readonly publicationId?: string;
   readonly state?: SqliteState;
@@ -59,27 +69,18 @@ export interface PublicationManagerOptions {
   readonly idFactory?: () => string;
   readonly onWarning?: (warning: PublicationWarning) => void;
   readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
-  readonly debounceMs?: number;
 }
 
-type SuccessfulOperation = IndexOperationResult | SemanticPrepareResult;
-
 /**
- * Serializes publication and adoption around the IndexManager maintenance
- * seam. It intentionally has no merge, timestamp, hash, manifest, or ordering
- * policy: the synchronized provider chooses which valid single file arrives.
+ * Executes publication and adoption transactions. Timing and serialization are
+ * owned by MaintenanceScheduler; the index port fences mutations once started.
  */
 export class PublicationManager {
   private readonly idFactory: () => string;
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
-  private readonly debounceMs: number;
-  private queue: Promise<unknown> = Promise.resolve();
-  private eventPending = false;
-  private eventTimer?: ReturnType<typeof setTimeout>;
-  private eventPromise?: Promise<AdoptionResult>;
-  private lastWarning?: PublicationWarning;
   private lastMetrics?: PublicationResourceMetrics;
+  private replacementTargetDigest?: string;
 
   readonly store: PublicationStore;
 
@@ -98,59 +99,19 @@ export class PublicationManager {
     this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
-    this.debounceMs = Math.max(0, options.debounceMs ?? 0);
-  }
-
-  get warning(): PublicationWarning | undefined {
-    return this.lastWarning;
   }
 
   get metrics(): PublicationResourceMetrics | undefined {
     return this.lastMetrics;
   }
 
-  /** Publish after a converged Build, Update, Rebuild, or semantic Prepare. */
-  async publishAfterSuccessfulOperation(result: SuccessfulOperation): Promise<PublicationResult> {
-    if (!isPublishableOperation(result) || !result.converged) return { published: false };
-    return this.publish();
-  }
-
   async publish(): Promise<PublicationResult> {
-    return this.serialize(() => this.publishSerialized());
+    return this.publishSerialized();
   }
 
-  /** Inspect and adopt the exact configured file. Adoption never publishes. */
+  /** Inspect and adopt the exact configured file without publishing directly. */
   async adoptCurrent(): Promise<AdoptionResult> {
-    return this.serialize(() => this.adoptSerialized());
-  }
-
-  /** Coalesce duplicate/out-of-order vault events for the exact target only. */
-  notifyFileEvent(path = this.store.path): void {
-    if (path !== this.store.path) return;
-    this.eventPending = true;
-    if (this.eventTimer) return;
-    this.eventTimer = setTimeout(() => {
-      this.eventTimer = undefined;
-      if (!this.eventPending) return;
-      this.eventPending = false;
-      this.eventPromise = this.adoptCurrent().finally(() => {
-        this.eventPromise = undefined;
-      });
-    }, this.debounceMs);
-  }
-
-  async flushPendingEvents(): Promise<AdoptionResult | undefined> {
-    if (this.eventTimer) {
-      clearTimeout(this.eventTimer);
-      this.eventTimer = undefined;
-    }
-    if (this.eventPending) {
-      this.eventPending = false;
-      this.eventPromise = this.adoptCurrent().finally(() => {
-        this.eventPromise = undefined;
-      });
-    }
-    return this.eventPromise;
+    return this.adoptSerialized();
   }
 
   private async publishSerialized(): Promise<PublicationResult> {
@@ -161,17 +122,21 @@ export class PublicationManager {
     try {
       const { prepared, installed } = await this.index.publishPublication(
         id,
-        async (candidate) => {
+        async (candidate, inspect) => {
           phase = "stage";
           const stageStarted = Date.now();
           const staged = await this.store.stage(candidate.bytes, id);
           const stageDurationMs = Date.now() - stageStarted;
           try {
             phase = "inspect";
-            const inspection = await this.index.inspectPublication(staged.bytes, true);
+            const inspection = await (inspect ?? this.index.inspectPublication.bind(this.index))(
+              staged.bytes,
+              true
+            );
             if (inspection.publicationId !== id)
               throw new StructuredError("internal", "Publication ID changed in staged copy.", true);
             phase = "replace";
+            await this.verifyReplacementTarget();
             const replaceStarted = Date.now();
             hadPrevious = await this.store.replace(staged, true);
             phase = "finalize";
@@ -195,8 +160,8 @@ export class PublicationManager {
         stageDurationMs: installed.stageDurationMs,
         replaceDurationMs: installed.replaceDurationMs,
       };
-      this.lastWarning = undefined;
       this.lastMetrics = metrics;
+      this.replacementTargetDigest = undefined;
       try {
         this.onMetrics?.(metrics);
       } catch {
@@ -215,7 +180,10 @@ export class PublicationManager {
     } catch (error) {
       return { adopted: false, warning: this.warn("inspect", error) };
     }
-    if (!bytes) return { adopted: false, ignored: "missing" };
+    if (!bytes) {
+      this.replacementTargetDigest = undefined;
+      return { adopted: false, ignored: "missing" };
+    }
     return this.adoptBytesSerialized(bytes);
   }
 
@@ -224,8 +192,13 @@ export class PublicationManager {
     try {
       inspection = await this.index.inspectPublication(bytes);
     } catch (error) {
+      if (publicationErrorDetails(error).code === "incompatible_state") {
+        this.replacementTargetDigest = await sha256Hex(bytes);
+        return { adopted: false, replacementRequired: true };
+      }
       return { adopted: false, warning: this.warn("inspect", error) };
     }
+    this.replacementTargetDigest = undefined;
     let current: string | undefined;
     try {
       current = await this.currentPublicationId();
@@ -235,9 +208,8 @@ export class PublicationManager {
     if (current === inspection.publicationId)
       return { adopted: false, ignored: "same-id", publicationId: current };
     try {
-      const state = await this.index.adoptPublication(bytes, inspection.publicationId);
-      // An adopted candidate is authoritative as loaded data. Never call
-      // publishAfterSuccessfulOperation or reconcile here.
+      const state = await this.index.adoptPublication(bytes, inspection.publicationId, inspection);
+      // An adopted candidate is authoritative as loaded data. Never publish or reconcile here.
       return { adopted: true, publicationId: inspection.publicationId, state };
     } catch (error) {
       return {
@@ -254,19 +226,38 @@ export class PublicationManager {
     return this.index.capabilities?.().publicationId;
   }
 
+  /** Refuse to overwrite a synchronized target that changed during local convergence. */
+  private async verifyReplacementTarget(): Promise<void> {
+    const expected = this.replacementTargetDigest;
+    if (!expected) return;
+    const current = await this.store.read();
+    if (!current || (await sha256Hex(current)) === expected) return;
+    try {
+      await this.index.inspectPublication(current);
+    } catch (error) {
+      if (publicationErrorDetails(error).code === "upgrade_required") throw error;
+    }
+    throw new StructuredError(
+      "busy",
+      "The synchronized index changed while its replacement was being prepared. Check it again.",
+      true
+    );
+  }
+
   private failed(phase: PublicationWarning["phase"], error: unknown): PublicationResult {
     const warning = this.warn(phase, error);
     return { published: false, warning };
   }
 
   private warn(phase: PublicationWarning["phase"], error: unknown): PublicationWarning {
+    const details = publicationErrorDetails(error);
     const warning: PublicationWarning = {
       phase,
+      ...(details.code ? { code: details.code } : {}),
       error,
       message: error instanceof Error ? error.message : String(error),
       retryable: isRetryable(error),
     };
-    this.lastWarning = warning;
     try {
       this.onWarning?.(warning);
     } catch {
@@ -274,30 +265,60 @@ export class PublicationManager {
     }
     return warning;
   }
-
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(operation, operation);
-    this.queue = next.then(
-      () => undefined,
-      () => undefined
-    );
-    return next;
-  }
-}
-
-function isPublishableOperation(result: SuccessfulOperation): boolean {
-  return (
-    result.operation === "build" ||
-    result.operation === "update" ||
-    result.operation === "rebuild" ||
-    result.operation === "prepare"
-  );
 }
 
 function isRetryable(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "retryable" in error
-    ? (error as { retryable?: unknown }).retryable !== false
-    : true;
+  const details = publicationErrorDetails(error);
+  if (details.code && PERMANENT_PUBLICATION_CODES.has(details.code)) return false;
+  if (details.retryable !== undefined) return details.retryable;
+  if (details.code === "busy") return true;
+  return true;
+}
+
+interface PublicationErrorDetails {
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly phase?: string;
+}
+
+const PERMANENT_PUBLICATION_CODES = new Set([
+  "integrity_failed",
+  "invalid_request",
+  "incompatible_state",
+  "upgrade_required",
+  "limit_exceeded",
+]);
+
+/** Reads direct and nested RPC errors without assuming a same-realm Error instance. */
+function publicationErrorDetails(error: unknown): PublicationErrorDetails {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  let result: PublicationErrorDetails = {};
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const value = current as {
+      code?: unknown;
+      retryable?: unknown;
+      phase?: unknown;
+      error?: unknown;
+    };
+    const code = typeof value.code === "string" ? value.code : undefined;
+    const retryable = typeof value.retryable === "boolean" ? value.retryable : undefined;
+    const phase = typeof value.phase === "string" ? value.phase : undefined;
+    if (code !== undefined || retryable !== undefined || phase !== undefined) {
+      result = {
+        code: code ?? result.code,
+        retryable: retryable ?? result.retryable,
+        phase: phase ?? result.phase,
+      };
+    }
+    if (current instanceof SqliteProtocolError || value.error !== undefined) {
+      current = value.error;
+      continue;
+    }
+    break;
+  }
+  return result;
 }
 
 function randomPublicationId(): string {

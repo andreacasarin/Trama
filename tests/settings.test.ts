@@ -17,41 +17,39 @@ describe("Settings module", () => {
         expect(Object.isFrozen(DEFAULT_SETTINGS.approvedOrigins)).toBe(true);
       });
 
-      it("migrates v2 defaults with max tokens and reasoning in Auto state", () => {
+      it("loads current-schema defaults with max tokens and reasoning in Auto state", () => {
         const store = new SettingsStore();
-        const loaded = store.load({ schemaVersion: 2, chat: {}, embedding: {} });
+        const loaded = store.load({ schemaVersion: 5, chat: {}, embedding: {} });
 
-        expect(loaded.schemaVersion).toBe(4);
+        expect(loaded.schemaVersion).toBe(5);
         expect(loaded.publicationDirectory).toBe("Trama/index");
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
         expect(loaded.lente).toEqual({
           searchMethod: "hybrid",
-          maxResults: 20,
-          automaticSearchDelayMs: 0,
+          automaticSearches: false,
         });
-        expect(loaded.filo).toEqual({ automaticUpdates: false, excludedPaths: [] });
+        expect(loaded.filo).toEqual({ excludedPaths: [] });
+        expect(loaded.automaticMaintenance).toBe(false);
         expect(loaded.detailedDebug).toBe(false);
       });
 
       it("sanitizes Lente and Filo settings while keeping defaults immutable", () => {
         const loaded = new SettingsStore().load({
-          schemaVersion: 3,
+          schemaVersion: 5,
           lente: { searchMethod: "keyword", maxResults: 35 },
           filo: {
-            automaticUpdates: true,
             excludedPaths: [" ./Projects\\ ", "Projects", "private//notes/", "../outside", ""],
           },
         });
 
         expect(loaded.lente).toEqual({
           searchMethod: "keyword",
-          maxResults: 35,
-          automaticSearchDelayMs: 0,
+          automaticSearches: false,
         });
+        expect(loaded.lente).not.toHaveProperty("maxResults");
         expect(loaded.filo).toEqual({
-          automaticUpdates: true,
           excludedPaths: ["Projects", "private/notes"],
         });
         expect(Object.isFrozen(DEFAULT_SETTINGS.lente)).toBe(true);
@@ -61,15 +59,15 @@ describe("Settings module", () => {
 
       it("falls back independently for invalid Lente settings", () => {
         const loaded = new SettingsStore().load({
-          schemaVersion: 3,
+          schemaVersion: 5,
           lente: { searchMethod: "semantic", maxResults: 21 },
         });
         expect(loaded.lente).toEqual(DEFAULT_SETTINGS.lente);
       });
 
-      it("sanitizes detailed debugging independently while preserving v2 settings", () => {
+      it("sanitizes detailed debugging independently", () => {
         const persisted = {
-          schemaVersion: 2,
+          schemaVersion: 5,
           chat: {
             endpoint: "http://127.0.0.1:1234/v1",
             modelId: "chat-v1",
@@ -102,17 +100,17 @@ describe("Settings module", () => {
 
       it("ignores the removed detailedVoceDebug key without migration", () => {
         const loaded = new SettingsStore().load({
-          schemaVersion: 2,
+          schemaVersion: 5,
           detailedVoceDebug: true,
         });
         expect(loaded.detailedDebug).toBe(false);
         expect(loaded).not.toHaveProperty("detailedVoceDebug");
       });
 
-      it("accepts exact v2 parameter boundaries and every reasoning effort", () => {
+      it("accepts exact parameter boundaries and every reasoning effort", () => {
         for (const reasoningEffort of ["none", "low", "medium", "high"] as const) {
           const loaded = new SettingsStore().load({
-            schemaVersion: 2,
+            schemaVersion: 5,
             chat: { temperature: 0, maxOutputTokens: 131072, reasoningEffort },
           });
           expect(loaded.chat).toMatchObject({
@@ -121,7 +119,7 @@ describe("Settings module", () => {
             reasoningEffort,
           });
         }
-        const loaded = new SettingsStore().load({ schemaVersion: 2, chat: { temperature: 1 } });
+        const loaded = new SettingsStore().load({ schemaVersion: 5, chat: { temperature: 1 } });
         expect(loaded.chat.temperature).toBe(1);
       });
 
@@ -135,20 +133,20 @@ describe("Settings module", () => {
           0.15,
           1.1,
         ]) {
-          expect(store.load({ schemaVersion: 2, chat: { temperature } }).chat.temperature).toBe(
+          expect(store.load({ schemaVersion: 5, chat: { temperature } }).chat.temperature).toBe(
             0.7
           );
         }
         for (const maxOutputTokens of [0, 1023, 2049, 132096, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
           expect(
-            store.load({ schemaVersion: 2, chat: { maxOutputTokens } }).chat
+            store.load({ schemaVersion: 5, chat: { maxOutputTokens } }).chat
           ).not.toHaveProperty("maxOutputTokens");
         }
       });
 
       it("rejects pre-release data from older schema versions without migration", () => {
         const store = new SettingsStore();
-        expect(store.load({ schemaVersion: 1, chat: { maxTokens: 4096 } })).toBe(DEFAULT_SETTINGS);
+        expect(store.load({ schemaVersion: 3, chat: { maxTokens: 4096 } })).toBe(DEFAULT_SETTINGS);
       });
 
       it("normalizes a safe publication folder and falls back for invalid persisted values", () => {
@@ -163,7 +161,7 @@ describe("Settings module", () => {
         ])
           expect(normalizePublicationDirectory(value)).toBe("Trama/index");
         expect(
-          new SettingsStore().load({ schemaVersion: 4, publicationDirectory: " ./sync\\folder/ " })
+          new SettingsStore().load({ schemaVersion: 5, publicationDirectory: " ./sync\\folder/ " })
             .publicationDirectory
         ).toBe("sync/folder");
       });
@@ -176,7 +174,7 @@ describe("Settings module", () => {
           chat: { ...DEFAULT_SETTINGS.chat, endpoint: "http://127.0.0.1:1234" },
           embedding: { ...DEFAULT_SETTINGS.embedding, endpoint: "http://127.0.0.1:4321/v1" },
         });
-        expect(settings.schemaVersion).toBe(4);
+        expect(settings.schemaVersion).toBe(5);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
         expect(settings.detailedDebug).toBe(false);
@@ -296,14 +294,8 @@ describe("Settings module", () => {
         }
       });
 
-      it("validates Lente settings on explicit Save", () => {
+      it("validates the Lente search method on explicit Save", () => {
         const store = new SettingsStore();
-        expect(() =>
-          store.stage({
-            ...DEFAULT_SETTINGS,
-            lente: { ...DEFAULT_SETTINGS.lente, maxResults: 21 },
-          })
-        ).toThrow();
         expect(() =>
           store.stage({
             ...DEFAULT_SETTINGS,
@@ -312,34 +304,32 @@ describe("Settings module", () => {
         ).toThrow();
       });
 
-      it("validates and round-trips the modal automatic search delay", () => {
+      it("stores independent opt-in automatic-search and maintenance settings", () => {
         const store = new SettingsStore();
-        for (const delay of [0, 50, 1000]) {
-          expect(
-            store.stage({
-              ...DEFAULT_SETTINGS,
-              lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: delay },
-            }).lente.automaticSearchDelayMs
-          ).toBe(delay);
-          expect(
-            store.load({
-              schemaVersion: 3,
-              lente: { automaticSearchDelayMs: delay },
-            }).lente.automaticSearchDelayMs
-          ).toBe(delay);
-        }
-        for (const delay of [-50, 25, 1001, 1.5, Number.NaN]) {
-          expect(
-            store.load({ schemaVersion: 3, lente: { automaticSearchDelayMs: delay } }).lente
-              .automaticSearchDelayMs
-          ).toBe(0);
-          expect(() =>
-            store.stage({
-              ...DEFAULT_SETTINGS,
-              lente: { ...DEFAULT_SETTINGS.lente, automaticSearchDelayMs: delay },
-            })
-          ).toThrow();
-        }
+        const saved = store.stage({
+          ...DEFAULT_SETTINGS,
+          automaticMaintenance: true,
+          lente: { ...DEFAULT_SETTINGS.lente, automaticSearches: true },
+        });
+        expect(saved.automaticMaintenance).toBe(true);
+        expect(saved.lente.automaticSearches).toBe(true);
+        expect(saved.lente).not.toHaveProperty("automaticSearchDelayMs");
+        expect(saved.filo).not.toHaveProperty("automaticUpdates");
+        expect(store.load({ schemaVersion: 5, lente: { automaticSearches: true } })).toMatchObject({
+          automaticMaintenance: false,
+          lente: { automaticSearches: true },
+        });
+        expect(
+          store.load({
+            schemaVersion: 5,
+            lente: { automaticSearchDelayMs: 500 },
+            filo: { automaticUpdates: true },
+          })
+        ).toMatchObject({
+          automaticMaintenance: false,
+          lente: { automaticSearches: false },
+          filo: { excludedPaths: [] },
+        });
       });
 
       it("normalizes and matches excluded files and directories purely", () => {

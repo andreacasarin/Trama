@@ -1,155 +1,52 @@
 import { describe, expect, it } from "vitest";
-import { MutableSqliteDatabase } from "@/index/sqlite/database";
-import { loadTestSqlite } from "./sqlite-test-client";
+import {
+  applyTestLexicalRun,
+  createTestSqliteClient,
+  inspectPersistedOccurrences,
+} from "./sqlite-test-client";
 
-const id = (letter: string) => letter.repeat(64);
+const digest = (_value: string) => "a".repeat(64);
 
-async function openIndex() {
-  const sqlite = await loadTestSqlite();
-  const database = new sqlite.oo1.DB(":memory:", "c");
-  const index = new MutableSqliteDatabase(database);
-  index.boot(id("f"), 2);
-  return { index, database };
-}
-
-describe("mutable SQLite reconciliation", () => {
-  it("makes rename, delete, and replay acknowledgements idempotent", async () => {
-    const { index, database } = await openIndex();
-    index.upsertNote({
-      path: "old.md",
-      contentId: id("a"),
-      chunks: [
-        {
-          id: `${id("a")}:0`,
-          ordinal: 0,
-          startLine: 1,
-          endLine: 1,
-          text: "same",
-        },
-      ],
+describe("revision reconciliation", () => {
+  it("keeps lexical and semantic heads independent", async () => {
+    const client = createTestSqliteClient();
+    await client.call("boot", {
+      corpusFingerprint: digest("corpus"),
+      embeddingFingerprint: digest("embedding"),
+      dimensions: 2,
     });
-    expect(index.renameNote("old.md", "new.md", id("a")).status).toBe("changed");
-    expect(index.renameNote("old.md", "new.md", id("a")).status).toBe("alreadyApplied");
-    expect(index.deleteNote("missing.md")).toMatchObject({ changed: false, status: "absent" });
-    index.upsertNote({ path: "other.md", contentId: id("b"), chunks: [] });
-    expect(index.renameNote("new.md", "other.md", id("a"))).toMatchObject({
-      changed: false,
-      status: "state_changed",
-      rescan: true,
-    });
-    index.close();
-    database.close();
+    const markdown = "# Heading\nalpha";
+    await applyTestLexicalRun(client, [{ path: "note.md", markdown, size: 384 }]);
+    const state = await client.call("getState", {});
+    expect(state.semanticHeadCount).toBe(0);
+    expect(state.semanticEligibleCount).toBe(1);
   });
 
-  it("finishes only from an exact sorted summary and persists empty notes", async () => {
-    const { index, database } = await openIndex();
-    index.upsertNote({ path: "empty.md", contentId: id("e"), chunks: [] });
-    expect(
-      index.finishReconciliation(
-        [{ path: "empty.md", contentId: id("x"), chunkCount: 0 }],
-        index.getState().changeCounter
-      ).incomplete
-    ).toBe(true);
-    expect(
-      index.finishReconciliation(
-        [{ path: "empty.md", contentId: id("e"), chunkCount: 1 }],
-        index.getState().changeCounter
-      ).incomplete
-    ).toBe(true);
-    expect(
-      index.finishReconciliation(
-        [{ path: "empty.md", contentId: id("e") }],
-        index.getState().changeCounter
-      ).incomplete
-    ).toBe(false);
-    index.markIncomplete();
-    expect(
-      index.finishReconciliation(
-        [{ path: "empty.md", contentId: id("e"), chunkCount: 0 }],
-        index.getState().changeCounter
-      ).incomplete
-    ).toBe(false);
-    expect(index.getState().incomplete).toBe(false);
-    index.close();
-    database.close();
-  });
-
-  it("plans deterministic renames, upserts, and deletes inside SQLite", async () => {
-    const { index, database } = await openIndex();
-    index.upsertNote({ path: "old.md", contentId: id("a"), chunks: [] });
-    index.upsertNote({ path: "changed.md", contentId: id("b"), chunks: [] });
-    index.upsertNote({ path: "gone.md", contentId: id("c"), chunks: [] });
-    index.finishReconciliation(
-      [
-        { path: "changed.md", contentId: id("b") },
-        { path: "gone.md", contentId: id("c") },
-        { path: "old.md", contentId: id("a") },
-      ],
-      index.getState().changeCounter
+  it("accepts skipped Markdown heading levels through the Worker lexical path", async () => {
+    const identity = {};
+    const client = createTestSqliteClient(identity);
+    const corpusFingerprint = digest("corpus");
+    await client.call("boot", {
+      corpusFingerprint,
+      embeddingFingerprint: digest("embedding"),
+      dimensions: 2,
+    });
+    const markdown = "# Parent\n\n### First\n\n### Second\n\nbody";
+    await expect(
+      applyTestLexicalRun(client, [{ path: "skipped.md", markdown, size: 384 }])
+    ).resolves.toMatchObject({ applied: { changed: true } });
+    await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 1 });
+    await expect(inspectPersistedOccurrences(identity)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          headingContext: JSON.stringify(["Parent", "Second"]),
+          embeddingInput: JSON.stringify({
+            v: 1,
+            heading: ["Parent", "Second"],
+            body: "body",
+          }),
+        }),
+      ])
     );
-
-    const plan = index.planReconciliation([
-      { path: "added.md", contentId: id("d") },
-      { path: "changed.md", contentId: id("e") },
-      { path: "new.md", contentId: id("a") },
-    ]);
-
-    expect(plan).toMatchObject({
-      renames: [{ from: "old.md", to: "new.md", contentId: id("a") }],
-      upserts: [
-        { path: "added.md", contentId: id("d") },
-        { path: "changed.md", contentId: id("e") },
-      ],
-      deletes: [{ path: "gone.md", contentId: id("c") }],
-      state: { incomplete: true },
-    });
-    index.close();
-    database.close();
-  });
-
-  it("pairs same-content renames by binary path order and deletes extra rows at finish", async () => {
-    const { index, database } = await openIndex();
-    index.upsertNote({ path: "old-b.md", contentId: id("a"), chunks: [] });
-    index.upsertNote({ path: "old-a.md", contentId: id("a"), chunks: [] });
-    const summaries = [
-      { path: "new-b.md", contentId: id("a"), chunkCount: 0 },
-      { path: "new-a.md", contentId: id("a"), chunkCount: 0 },
-    ];
-    expect(index.planReconciliation(summaries).renames).toEqual([
-      { from: "old-a.md", to: "new-a.md", contentId: id("a") },
-      { from: "old-b.md", to: "new-b.md", contentId: id("a") },
-    ]);
-    index.upsertNote({ path: "new-a.md", contentId: id("a"), chunks: [] });
-    index.upsertNote({ path: "new-b.md", contentId: id("a"), chunks: [] });
-    expect(index.finishReconciliation(summaries, index.getState().changeCounter)).toMatchObject({
-      incomplete: false,
-      noteCount: 2,
-    });
-    const paths: string[] = [];
-    database.exec({
-      sql: "SELECT path FROM notes ORDER BY path",
-      rowMode: "object",
-      callback: (row: Record<string, unknown>) => paths.push(String(row.path)),
-    });
-    expect(paths).toEqual(["new-a.md", "new-b.md"]);
-    index.close();
-  });
-
-  it("preserves a published state across Worker restart", async () => {
-    const { index, database } = await openIndex();
-    index.upsertNote({ path: "note.md", contentId: id("d"), chunks: [] });
-    const published = index.finishReconciliation(
-      [{ path: "note.md", contentId: id("d"), chunkCount: 0 }],
-      index.getState().changeCounter
-    );
-    expect(published.incomplete).toBe(false);
-    const reopened = index.boot(id("f"), 2);
-    expect(reopened).toMatchObject({ incomplete: false, noteCount: 1 });
-    expect(reopened.changeCounter).toBe(published.changeCounter);
-    const fenced = index.markIncomplete();
-    expect(fenced).toMatchObject({ incomplete: true });
-    expect(fenced.changeCounter).toBe(published.changeCounter + 1);
-    index.close();
-    database.close();
   });
 });

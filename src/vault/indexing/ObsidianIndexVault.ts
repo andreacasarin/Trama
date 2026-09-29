@@ -52,23 +52,4 @@ export class ObsidianIndexVault implements IndexVaultPort {
     if (signal.aborted) throw new Error("Operation cancelled");
     return this.isIndexEligible(path) && this.vault.getFileByPath(path) !== null;
   }
-
-  async estimateMarkdownTextCount(
-    paths: readonly string[],
-    chunkSize: number,
-    overlap: number,
-    signal: AbortSignal
-  ): Promise<number> {
-    if (signal.aborted) throw new Error("Operation cancelled");
-    const stride = Math.max(1, chunkSize - overlap);
-    let estimated = 0;
-    for (const path of paths) {
-      if (signal.aborted) throw new Error("Operation cancelled");
-      const file = this.vault.getFileByPath(path);
-      if (!file) continue;
-      const bytes = Math.max(0, Number(file.stat?.size ?? 0));
-      if (bytes > 0) estimated += Math.max(1, Math.ceil(bytes / stride));
-    }
-    return estimated;
-  }
 }

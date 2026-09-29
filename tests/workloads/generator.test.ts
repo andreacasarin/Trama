@@ -15,6 +15,9 @@ describe("deterministic Trama workload generator", () => {
     expect(
       first.notes.flatMap((note) => note.chunks).every((chunk) => chunk.vector.length === 768)
     ).toBe(true);
+    expect(first.notes.flatMap((note) => note.chunks).every((chunk) => chunk.embeddingInput)).toBe(
+      true
+    );
     expect(first.mutations.map((mutation) => mutation.kind)).toEqual([
       "unchanged",
       "add",

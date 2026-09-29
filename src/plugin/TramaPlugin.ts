@@ -1,109 +1,90 @@
-import { Platform, Plugin, TAbstractFile } from "obsidian";
-import { ChatSession } from "@/chat/ChatSession";
-import { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
-import {
-  IndexManager,
-  IndexVaultPort,
-  type IndexOperationResult,
-  type SnapshotDataAdapter,
-} from "@/index/IndexManager";
-import { bytesToHex, compareCodeUnits } from "@/index/Identity";
-import { LmStudioChatModel } from "@/providers/lmStudio/LmStudioChatModel";
-import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
-import { LmStudioTransport } from "@/providers/lmStudio/LmStudioTransport";
-import { EndpointPolicy } from "@/security/EndpointPolicy";
-import {
-  DEFAULT_SETTINGS,
-  isExcludedPath,
-  SettingsStore,
-  TramaSettings,
-} from "@/settings/Settings";
-import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
-import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
-import {
-  DiscoverLinksTool,
-  FollowLinkTool,
-  ReadNoteTool,
-  ToolRegistry,
-  VaultSearchTool,
-} from "@/tools/ToolRegistry";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { Notice, Plugin } from "obsidian";
+import { formatDiagnosticLogLine, TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
+import { compareCodeUnits } from "@/index/Identity";
+import { IndexManager, type IndexPathMutation } from "@/index/IndexManager";
+import type { MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
+import type { AdoptionResult, PublicationWarning } from "@/index/publications/PublicationManager";
+import { PublicationManager } from "@/index/publications/PublicationManager";
 import { RelatedNotes } from "@/index/RelatedNotes";
-import { TRAMA_ICONS } from "@/ui/icons";
-import { LenteBatch, LenteSearch, LenteSearchOptions } from "@/index/LenteSearch";
-import { ObsidianLenteNoteStats } from "@/vault/readOnly/ObsidianLenteNoteStats";
-import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
-import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
+import type { SqliteWorkerLike } from "@/index/sqlite/client";
+import { ModelRuntime } from "@/plugin/ModelRuntime";
+import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
 import {
-  PublicationManager,
-  type PublicationWarning,
-} from "@/index/publications/PublicationManager";
-import { PublicationStore } from "@/index/publications/PublicationStore";
+  composeRuntime as composePluginRuntime,
+  type ComposedRuntime,
+} from "@/plugin/RuntimeComposition";
+import { SqliteRuntime } from "@/plugin/SqliteRuntime";
+import { VaultEventRouter } from "@/plugin/VaultEventRouter";
+import { LmStudioEmbeddingModel } from "@/providers/lmStudio/LmStudioEmbeddingModel";
+import { EndpointPolicy } from "@/security/EndpointPolicy";
+import { DEFAULT_SETTINGS, SettingsStore, TramaSettings } from "@/settings/Settings";
+import { IndexStatusController } from "@/ui/index/IndexStatus";
 
-interface LenteSearchPort {
-  search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
-}
-
-/** Composes the shared assistant and owns its lifecycle and vault event boundary. */
+/** Composes the shared assistant and owns its lifecycle and vault-event boundary. */
 export class TramaPlugin extends Plugin {
   private runtimeLoaded = false;
   private readonly settingsStore = new SettingsStore();
-  private session?: ChatSession;
-  private chatModel?: LmStudioChatModel;
   private embeddingModel?: LmStudioEmbeddingModel;
   private index?: IndexManager;
   private indexStatus?: IndexStatusController;
   private relatedNotes?: RelatedNotes;
-  private lenteSearch?: LenteSearchPort;
-  private lifecycleAbort?: AbortController;
-  private automaticAbort?: AbortController;
-  private automaticReschedulePending = false;
   private indexLoad?: Promise<boolean>;
-  private indexLoaded = false;
-  private indexReady = false;
-  private combinedRebuildLexicalPhase = false;
-  private compositionRevision = 0;
-  private readonly pendingVaultChanges = new Set<string>();
-  private eventTimer?: ReturnType<typeof setTimeout>;
-  private reconcilePromise?: Promise<void>;
-  private queuedWork = false;
-  private readonly eventRefs: Array<{ unsubscribe?: () => void }> = [];
-  private saveQueue: Promise<void> = Promise.resolve();
-  private sqliteIdentity?: string;
-  private sqliteIdentityAdapter?: SnapshotDataAdapter;
+  private maintenance?: ComposedRuntime["scheduler"];
   private publicationManager?: PublicationManager;
-  private publicationCheckTimer?: ReturnType<typeof setTimeout>;
-  private semanticAbort?: AbortController;
-  /** Test-only explicit backend injection; production composition leaves this unset. */
-  sqliteClientFactory?: (storage: object) => SqliteWorkerClient;
+  private compositionRevision = 0;
+  private compositionReplacement = false;
+  private compositionDirty = false;
+  private saveQueue: Promise<void> = Promise.resolve();
+  private readonly publicationWarnings: Partial<Record<"publication" | "check", string>> = {};
+  private projectedPublicationWarning?: string;
+  private upgradeNoticeShown = false;
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
+
   private readonly diagnostics: TramaDiagnostics = {
     emit: (record) => {
-      if (this.settingsStore.get().detailedDebug) {
-        // This opt-in sink intentionally writes complete diagnostic payloads to the developer console.
-        try {
-          const operation =
-            record.event === "index_operation"
-              ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
-              : "";
-          const stage = "stage" in record ? ` ${record.stage}` : "";
-          const duration =
-            "durationMs" in record && typeof record.durationMs === "number"
-              ? ` ${Math.round(record.durationMs)} ms`
-              : "";
-          // eslint-disable-next-line no-console
-          console.info(
+      if (!this.settingsStore.get().detailedDebug) return;
+      try {
+        const operation =
+          record.event === "index_operation"
+            ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
+            : "";
+        const stage = "stage" in record ? ` ${record.stage}` : "";
+        const duration =
+          "durationMs" in record && typeof record.durationMs === "number"
+            ? ` ${Math.round(record.durationMs)} ms`
+            : "";
+        // eslint-disable-next-line no-console
+        console.info(
+          formatDiagnosticLogLine(record) ??
             `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
-            record
-          );
-        } catch {
-          // Console instrumentation is observational and must not break chat or indexing.
-        }
+          record
+        );
+      } catch {
+        // Console diagnostics are observational.
       }
     },
   };
+
+  private readonly sqliteRuntime = new SqliteRuntime(() => this.manifest);
+  private readonly modelRuntime = new ModelRuntime({
+    diagnostics: this.diagnostics,
+    getSettings: () => this.getSettings(),
+    getIndex: () => this.index,
+    getIndexStatus: () => this.indexStatus,
+    getRelatedNotes: () => this.relatedNotes,
+  });
+  private readonly vaultEvents = new VaultEventRouter({
+    getSettings: () => this.getSettings(),
+    getConfigDirectory: () =>
+      (this as unknown as { app?: { vault?: { configDir?: string } } }).app?.vault?.configDir ??
+      ".obsidian",
+    registerEvent: (ref) => this.registerEvent(ref),
+    notifyPublicationFileEvent: (path) => this.notifyPublicationFileEvent(path),
+    queueMutation: (mutation) => this.queueVaultMutation(mutation),
+    requestFullRecovery: (path) => this.requestFullRecovery(path),
+  });
 
   override async onload(): Promise<void> {
     this.runtimeLoaded = true;
@@ -111,12 +92,12 @@ export class TramaPlugin extends Plugin {
       try {
         this.settingsStore.load(await this.loadData());
       } catch {
-        // A settings read failure must not prevent the offline shell from loading.
         this.settingsStore.load(undefined);
       }
     }
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
+
     this.visibleMarkdownCatalog = () =>
       app.vault
         .getMarkdownFiles()
@@ -131,129 +112,61 @@ export class TramaPlugin extends Plugin {
       this.lastActiveMarkdownPath ? [this.lastActiveMarkdownPath] : [];
     const fileOpenRef = app.workspace.on?.("file-open", rememberActiveMarkdown);
     if (fileOpenRef) this.registerEvent(fileOpenRef);
-    const [
-      { VoceView, VOCE_VIEW_TYPE },
-      { FiloView, FILO_VIEW_TYPE },
-      { LenteView, LENTE_VIEW_TYPE },
-      { TramaSettingsTab },
-    ] = await Promise.all([
-      import("@/ui/voce/VoceView"),
-      import("@/ui/filo/FiloView"),
-      import("@/ui/lente/LenteView"),
-      import("@/ui/settings/SettingsTab"),
-    ]);
-    this.lifecycleAbort = new AbortController();
-    const settings = this.settingsStore.get();
-    this.composeRuntime(app, settings);
+
+    const ui = await loadPluginUi();
+    this.composeRuntime(app, this.settingsStore.get());
     this.indexStatus = new IndexStatusController(
       this,
       {
-        index: (signal) => this.runIndex(signal, false),
-        reindex: (signal) => this.runFullIndex(signal),
-        prepare: (signal) => this.runSemanticPreparation(signal),
-        rebuildSemantic: (signal) => this.runSemanticPreparation(signal, true),
-        rebuildBoth: (signal) => this.runBothIndexes(signal),
-        cancel: () => this.semanticAbort?.abort(),
+        update: () => this.updateIndex(),
+        rebuild: () => this.rebuildIndex(),
+        stop: () => this.maintenance?.stop(),
       },
       this.diagnostics
     );
     this.indexStatus.register();
-    this.addSettingTab(new TramaSettingsTab(app, this));
-    this.registerView(
-      VOCE_VIEW_TYPE,
-      (leaf) =>
-        new VoceView(
-          leaf,
-          this.session!,
-          this.visibleMarkdownCatalog,
-          this.contextNoteSuggestions,
-          undefined,
-          this.relatedNotes
-        )
-    );
-    this.registerView(
-      FILO_VIEW_TYPE,
-      (leaf) =>
-        new FiloView(
-          leaf,
-          this.indexStatus!,
-          this.relatedNotes,
-          (kind) => this.indexStatus!.run(kind),
-          () => this.indexStatus!.cancel()
-        )
-    );
-    this.registerView(
-      LENTE_VIEW_TYPE,
-      (leaf) =>
-        new LenteView(
-          leaf,
-          this.lenteSearch ?? {
-            search: async () => {
-              throw new Error("Lente is not initialized.");
-            },
-          }
-        )
-    );
-    this.addCommand({
-      id: "open-voce",
-      name: "Open Voce",
-      icon: TRAMA_ICONS.voce,
-      callback: () =>
-        void app.workspace.getLeaf(true).setViewState({ type: VOCE_VIEW_TYPE, active: true }),
-    });
-    this.addCommand({
-      id: "open-filo",
-      name: "Open Filo",
-      icon: TRAMA_ICONS.filo,
-      callback: () =>
-        void app.workspace.getLeaf(true).setViewState({ type: FILO_VIEW_TYPE, active: true }),
-    });
-    this.addCommand({
-      id: "open-lente",
-      name: "Open Lente",
-      icon: TRAMA_ICONS.lente,
-      callback: () =>
-        void app.workspace.getLeaf(true).setViewState({ type: LENTE_VIEW_TYPE, active: true }),
-    });
-    this.addCommand({
-      id: "search-with-lente",
-      name: "Search with Lente",
-      icon: TRAMA_ICONS.lente,
-      callback: () => {
-        const searchSource: LenteSearchPort = {
-          search: (query, options = {}) =>
-            this.lenteSearch?.search(query, options) ??
-            Promise.reject({ code: "unavailable", message: "Lente is unavailable." }),
-        };
-        new LenteSearchModal(
-          app,
-          searchSource,
-          this.getSettings().lente.automaticSearchDelayMs
-        ).open();
-      },
+    registerPluginUi(this, app, ui, {
+      session: this.modelRuntime.session!,
+      status: this.indexStatus,
+      relatedNotes: this.relatedNotes,
+      visibleMarkdownCatalog: this.visibleMarkdownCatalog,
+      contextNoteSuggestions: this.contextNoteSuggestions,
+      getLenteSearch: () => this.modelRuntime.lenteSearch,
+      getSettings: () => this.getSettings(),
+      stopMaintenance: () => this.maintenance?.stop(),
     });
     this.registerVaultEvents(app.vault);
   }
 
   override onunload(): void {
-    this.indexReady = false;
-    this.semanticAbort?.abort();
-    this.semanticAbort = undefined;
-    this.index?.disposeImmediately();
+    const maintenance = this.maintenance;
+    const index = this.index;
+    const load = this.indexLoad;
+    this.compositionRevision++;
+    this.compositionReplacement = false;
+    this.compositionDirty = false;
+    this.vaultEvents.dispose();
+    this.maintenance = undefined;
+    this.indexLoad = undefined;
     this.index = undefined;
-    this.indexStatus?.cancel();
-    this.lifecycleAbort?.abort();
-    this.stopAutomaticWork(false);
-    if (this.publicationCheckTimer) clearTimeout(this.publicationCheckTimer);
-    this.publicationCheckTimer = undefined;
+    this.publicationManager = undefined;
+    this.indexStatus = undefined;
+    delete this.publicationWarnings.publication;
+    delete this.publicationWarnings.check;
+    this.projectedPublicationWarning = undefined;
     this.relatedNotes?.cancel();
     this.relatedNotes = undefined;
-    this.session?.cancel();
-    for (const ref of this.eventRefs) ref.unsubscribe?.();
-    this.eventRefs.length = 0;
-    this.publicationManager = undefined;
+    this.modelRuntime.session?.cancel();
+    this.modelRuntime.session = undefined;
+    this.modelRuntime.lenteSearch = undefined;
+    this.embeddingModel = undefined;
     this.runtimeLoaded = false;
+    const disposal = maintenance?.dispose() ?? Promise.resolve();
+    void Promise.all([load ?? Promise.resolve(), disposal])
+      .catch(() => undefined)
+      .finally(() => index?.disposeImmediately());
   }
+
   isDesktopLoaded(): boolean {
     return this.runtimeLoaded;
   }
@@ -263,21 +176,25 @@ export class TramaPlugin extends Plugin {
   getSettings(): TramaSettings {
     return this.settingsStore.get() ?? DEFAULT_SETTINGS;
   }
+
   saveSettings(
     settings: TramaSettings | ((current: TramaSettings) => TramaSettings)
   ): Promise<void> {
     return this.enqueueSettingsUpdate(typeof settings === "function" ? settings : () => settings);
   }
+
   private enqueueSettingsUpdate(update: (current: TramaSettings) => TramaSettings): Promise<void> {
     const operation = this.saveQueue.then(() => this.performSave(update(this.settingsStore.get())));
     this.saveQueue = operation.catch(() => undefined);
     return operation;
   }
+
   private async performSave(settings: TramaSettings): Promise<void> {
     const before = this.settingsStore.get();
     const saved = this.settingsStore.stage(settings);
     if (typeof this.saveData === "function") await this.saveData(saved);
     this.settingsStore.commit(saved);
+
     const chatChanged =
       before.chat.endpoint !== saved.chat.endpoint ||
       before.chat.modelId !== saved.chat.modelId ||
@@ -288,48 +205,61 @@ export class TramaPlugin extends Plugin {
       before.embedding.endpoint !== saved.embedding.endpoint ||
       before.embedding.modelId !== saved.embedding.modelId ||
       before.embedding.dimensions !== saved.embedding.dimensions;
-    const lenteChanged =
-      before.lente.searchMethod !== saved.lente.searchMethod ||
-      before.lente.maxResults !== saved.lente.maxResults;
+    const lenteChanged = before.lente.searchMethod !== saved.lente.searchMethod;
     const exclusionsChanged =
       before.filo.excludedPaths.length !== saved.filo.excludedPaths.length ||
       before.filo.excludedPaths.some((path, index) => path !== saved.filo.excludedPaths[index]);
-    const indexDefinitionChanged = embeddingChanged || exclusionsChanged;
-    const publicationDirectoryChanged = before.publicationDirectory !== saved.publicationDirectory;
+    const definitionChanged =
+      embeddingChanged ||
+      exclusionsChanged ||
+      before.publicationDirectory !== saved.publicationDirectory;
     const app = (this as unknown as { app?: any }).app;
 
-    if (!saved.filo.automaticUpdates)
-      this.stopAutomaticWork(true, before.filo.automaticUpdates && !saved.filo.automaticUpdates);
-    else if (!before.filo.automaticUpdates) this.armAutomaticWork();
+    if (!definitionChanged && before.automaticMaintenance !== saved.automaticMaintenance)
+      this.maintenance?.setAutomaticEnabled(saved.automaticMaintenance);
 
-    if (indexDefinitionChanged || publicationDirectoryChanged) {
-      this.stopAutomaticWork(false);
-      this.session?.cancel();
-      this.semanticAbort?.abort();
-      this.semanticAbort = undefined;
-      this.relatedNotes?.cancel();
-      this.indexStatus?.cancel();
+    if (definitionChanged) {
+      const oldMaintenance = this.maintenance;
       const oldIndex = this.index;
-      oldIndex?.invalidate();
-      this.lifecycleAbort?.abort();
-      try {
-        await oldIndex?.waitForBuild();
-      } catch {
-        // The old build is intentionally cancelled before composing its replacement.
-      }
-      await oldIndex?.dispose();
-      this.lifecycleAbort = new AbortController();
-      this.indexStatus?.markStale(false);
-    }
-    if (app?.vault && app.workspace && app.metadataCache && this.session) {
-      if (chatChanged && !indexDefinitionChanged && !publicationDirectoryChanged)
-        this.replaceChatModel(saved);
-      else if (indexDefinitionChanged || publicationDirectoryChanged)
-        this.composeRuntime(app, saved);
-    }
+      const oldLoad = this.indexLoad;
+      this.compositionReplacement = true;
+      this.compositionDirty ||= Boolean(
+        oldMaintenance?.snapshot.pending || oldIndex?.hasPendingWork()
+      );
 
-    if (lenteChanged && !indexDefinitionChanged && this.index) this.replaceLenteSearch(app);
+      // Detach callbacks before awaiting any old asynchronous work.
+      this.compositionRevision++;
+      this.maintenance = undefined;
+      this.index = undefined;
+      this.indexLoad = undefined;
+      this.publicationManager = undefined;
+      this.clearPublicationWarnings();
+      this.relatedNotes?.cancel();
+      this.relatedNotes = undefined;
+      this.modelRuntime.session?.cancel();
+
+      const maintenanceDisposal = oldMaintenance?.dispose() ?? Promise.resolve();
+      await oldLoad?.catch(() => false);
+      await maintenanceDisposal;
+      oldIndex?.invalidate();
+      await oldIndex?.dispose();
+      this.indexStatus?.markStale(false);
+
+      if (app?.vault && app.workspace && app.metadataCache) {
+        try {
+          this.composeRuntime(app, saved);
+          this.compositionReplacement = false;
+        } catch (error) {
+          this.compositionDirty = true;
+          throw error;
+        }
+      }
+    } else {
+      if (chatChanged) this.modelRuntime.replaceChatModel(saved);
+      if (lenteChanged && this.index) this.modelRuntime.replaceLenteSearch(app);
+    }
   }
+
   updateChatEndpoint(value: string): Promise<void> {
     return this.enqueueSettingsUpdate((current) => ({
       ...current,
@@ -356,291 +286,77 @@ export class TramaPlugin extends Plugin {
   }
 
   private composeRuntime(app: any, settings: TramaSettings): void {
-    const transport = new LmStudioTransport({
-      policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
-    });
-    const readonlyVault = new ObsidianReadonlyVault(app.vault, app.workspace, app.metadataCache);
-    const excludedPaths = [...settings.filo.excludedPaths];
-    const isIndexEligible = (path: string) =>
-      this.isVisibleMarkdown(path) &&
-      !isExcludedPath(path, [...excludedPaths, settings.publicationDirectory]);
-    const indexVault: IndexVaultPort = new ObsidianIndexVault(app.vault, {
-      isBaseVisible: (path) => this.isVisibleMarkdown(path),
-      isIndexEligible,
-    });
-    const embedding = new LmStudioEmbeddingModel({ ...settings.embedding, transport });
-    this.embeddingModel = embedding;
-    // The callback is installed before the manager can be constructed.
-    // eslint-disable-next-line prefer-const
-    let composedPublication: PublicationManager | undefined;
-    const manager = new IndexManager(
-      indexVault,
-      embedding,
-      settings.embedding.endpoint,
-      settings.embedding.modelId,
-      {
-        excludedPaths,
-        publicationDirectory: settings.publicationDirectory,
-        isIndexEligible,
-        workerFactory: () => this.createSqliteWorker(app),
-        sqliteIdentity: this.resolveSqliteIdentity(app.vault.adapter),
-        sqliteClient: this.sqliteClientFactory?.(app.vault),
-        onSuccessfulOperation: (result) => {
-          if (this.combinedRebuildLexicalPhase && result.operation === "rebuild") return;
-          void this.publishAfterIndexOperation(manager, composedPublication, result);
-        },
-        onProgress: (progress) => this.indexStatus?.reportProgress(progress),
-      },
-      this.diagnostics
-    );
-    this.index = manager;
-    composedPublication = new PublicationManager(
-      manager,
-      new PublicationStore(app.vault.adapter, { directory: settings.publicationDirectory }),
-      {
-        onWarning: (warning) => {
-          if (this.index === manager) this.handlePublicationWarning(warning);
-        },
-        onMetrics: () => this.updateIndexCapabilities(manager),
-      }
-    );
-    this.publicationManager = composedPublication;
-    this.relatedNotes?.cancel();
-    this.relatedNotes = new RelatedNotes(manager, this.diagnostics);
-    this.lenteSearch = this.createLenteSearch(manager, app, settings);
     const compositionRevision = ++this.compositionRevision;
-    const registry = new ToolRegistry([
-      new ReadNoteTool(readonlyVault),
-      new DiscoverLinksTool(readonlyVault),
-      new FollowLinkTool(readonlyVault),
-      new VaultSearchTool(this.index),
-    ]);
-    this.composeChatSession(app, settings, readonlyVault, registry, transport);
-    this.indexLoaded = false;
-    this.indexReady = false;
-    const publication = composedPublication;
-    const loadPromise = manager
-      .load({ emitDiagnostics: false })
-      .then(async (loaded) => {
-        if (loaded && this.index === manager) {
-          const adoption = await publication!.adoptCurrent();
-          if (adoption.warning) this.handlePublicationWarning(adoption.warning);
-        }
-        return loaded;
-      })
-      .catch(() => false);
-    this.indexLoad = loadPromise;
-    void loadPromise.then((loaded) => {
-      if (this.index !== manager || compositionRevision !== this.compositionRevision) return;
-      this.indexLoaded = true;
-      this.indexReady = loaded;
-      this.updateIndexCapabilities(manager);
-      const hadPendingChanges = this.pendingVaultChanges.size > 0;
-      if (this.pendingVaultChanges.size) manager.queueChange();
-      this.pendingVaultChanges.clear();
-      if (!loaded || !manager.isComplete()) {
-        // The initial persisted-index decision is startup bookkeeping and must
-        // stay silent even if debugging is enabled immediately after onload.
-        if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
-        else this.indexStatus?.setIndexRequired(true);
-        return;
-      }
-      if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
-      else this.indexStatus?.setReady(true);
-      this.refreshOpenRelatedSuggestions(app);
-      if (hadPendingChanges) {
-        if (this.getSettings().filo.automaticUpdates) this.scheduleReconcile();
-        else this.markQueuedWorkStale();
-      }
-    });
-  }
-
-  private async resolveSqliteIdentity(adapter: SnapshotDataAdapter): Promise<string> {
-    const path = ".trama/sqlite/v1/identity.json";
-    if (this.sqliteIdentity && this.sqliteIdentityAdapter === adapter) return this.sqliteIdentity;
-    if (typeof adapter.read !== "function" || typeof adapter.write !== "function")
-      throw new Error("SQLite identity storage is unavailable.");
-    let identity: string | undefined;
-    try {
-      const raw = await adapter.read.call(adapter, path);
-      const parsed = JSON.parse(raw) as { readonly version?: unknown; readonly identity?: unknown };
-      if (
-        parsed.version === 1 &&
-        typeof parsed.identity === "string" &&
-        /^[0-9a-f]{64}$/i.test(parsed.identity)
-      )
-        identity = parsed.identity.toLowerCase();
-    } catch {
-      // A missing or malformed identity is replaced with a new opaque token.
-    }
-    if (!identity) {
-      const bytes = new Uint8Array(32);
-      globalThis.crypto.getRandomValues(bytes);
-      identity = bytesToHex(bytes);
-      if (typeof adapter.mkdir !== "function")
-        throw new Error("SQLite identity storage is unavailable.");
-      await adapter.mkdir.call(adapter, ".trama");
-      await adapter.mkdir.call(adapter, ".trama/sqlite");
-      await adapter.mkdir.call(adapter, ".trama/sqlite/v1");
-      await adapter.write.call(adapter, path, JSON.stringify({ version: 1, identity }));
-    }
-    this.sqliteIdentity = identity;
-    this.sqliteIdentityAdapter = adapter;
-    return identity;
-  }
-
-  private sqliteAssetUrl(app: any, fileName: string): string {
-    const adapter = app?.vault?.adapter;
-    if (!adapter || typeof adapter.getResourcePath !== "function")
-      throw new Error("SQLite Worker resource path is unavailable.");
-    const configDir =
-      typeof app?.vault?.configDir === "string" && app.vault.configDir
-        ? app.vault.configDir
-        : ".obsidian";
-    const pluginId = this.manifest?.id || "trama";
-    const pluginDir = this.manifest?.dir || `${configDir}/plugins/${pluginId}`;
-    return adapter.getResourcePath.call(adapter, `${pluginDir}/${fileName}`);
-  }
-
-  private sqliteWorkerUrl(app: any): string {
-    return this.sqliteAssetUrl(app, "sqlite-worker.mjs");
-  }
-
-  private createSqliteWorker(app: any): SqliteWorkerLike {
-    if (typeof Worker !== "function") throw new Error("SQLite Worker APIs are unavailable.");
-    const workerUrl = this.sqliteWorkerUrl(app);
-    if (!Platform.isDesktopApp)
-      return new Worker(workerUrl, { type: "module" }) as unknown as SqliteWorkerLike;
-    if (
-      typeof Blob !== "function" ||
-      typeof URL?.createObjectURL !== "function" ||
-      typeof URL?.revokeObjectURL !== "function"
-    )
-      throw new Error("SQLite Worker APIs are unavailable.");
-    const assets = {
-      moduleUrl: this.sqliteAssetUrl(app, "sqlite3.mjs"),
-      wasmUrl: this.sqliteAssetUrl(app, "sqlite3.wasm"),
-    };
-    const bootstrap = `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify(assets)};const __tramaWorkerUrl=${JSON.stringify(workerUrl)};let __tramaStartupError;try{await import(__tramaWorkerUrl)}catch{__tramaStartupError={code:"storage_unavailable",message:"SQLite Worker could not be started. Ensure the bundled SQLite assets are installed.",retryable:true}}URL.revokeObjectURL(globalThis.location.href);if(__tramaStartupError)self.onmessage=({data})=>self.postMessage({v:1,id:Number.isSafeInteger(data?.id)?data.id:0,ok:false,error:__tramaStartupError});`;
-    const bootstrapUrl = URL.createObjectURL(new Blob([bootstrap], { type: "text/javascript" }));
-    try {
-      return new Worker(bootstrapUrl, { type: "module" }) as unknown as SqliteWorkerLike;
-    } catch (error) {
-      URL.revokeObjectURL(bootstrapUrl);
-      throw error;
-    }
-  }
-
-  private createLenteSearch(
-    manager: IndexManager,
-    app: any,
-    settings: TramaSettings
-  ): LenteSearchPort {
-    const search = new LenteSearch(
-      manager,
-      new ObsidianLenteNoteStats(app.vault),
-      this.diagnostics
+    const runtime = composePluginRuntime(
+      {
+        diagnostics: this.diagnostics,
+        modelRuntime: this.modelRuntime,
+        isVisibleMarkdown: (path) => this.isVisibleMarkdown(path),
+        createWorker: (currentApp) => this.createSqliteWorker(currentApp),
+        resolveIdentity: (adapter) => this.resolveSqliteIdentity(adapter),
+        createClient: (storage) => this.sqliteRuntime.createClient(storage),
+        isCurrent: (manager) => this.index === manager,
+        getIndexStatus: () => this.indexStatus,
+        isAutomaticMaintenanceEnabled: () => this.getSettings().automaticMaintenance,
+        onComposed: ({ manager, publication, scheduler, relatedNotes, embedding }) => {
+          this.index = manager;
+          this.publicationManager = publication;
+          this.maintenance = scheduler;
+          this.relatedNotes = relatedNotes;
+          this.embeddingModel = embedding;
+          if (this.compositionReplacement && this.compositionDirty) {
+            manager.requestFullRecovery();
+            scheduler.invalidate();
+            this.compositionDirty = false;
+          }
+        },
+        onIndexOperation: (manager, changed) => this.afterIndexOperation(manager, changed),
+        onMaintenanceSnapshot: (manager, snapshot) =>
+          this.applyMaintenanceSnapshot(manager, snapshot),
+        onPublicationWarning: (manager, warning, origin) => {
+          if (this.index === manager) this.handlePublicationWarning(warning, origin);
+        },
+        onPublicationMetrics: (manager) => this.updateIndexCapabilities(manager),
+        onPublicationSuccess: (manager) => {
+          if (this.index === manager) this.clearPublicationWarning("publication");
+        },
+        onAdoptionResult: (manager, result) => this.applyAdoptionResult(manager, result),
+        onInitialState: (manager, loaded) => {
+          if (this.index !== manager || compositionRevision !== this.compositionRevision || !loaded)
+            return;
+          this.updateIndexCapabilities(manager);
+        },
+        onLoadSettled: (manager, loaded, currentApp) =>
+          this.finishRuntimeLoad(manager, loaded, currentApp, compositionRevision),
+      },
+      app,
+      settings
     );
-    return {
-      search: (query, options = {}) =>
-        search.search(query, {
-          ...options,
-          searchMethod: settings.lente.searchMethod,
-          maxResults: settings.lente.maxResults,
-        }),
-    };
+    this.indexLoad = runtime.load;
   }
 
-  private replaceLenteSearch(app: any, refreshSubmitted = true): void {
-    const manager = this.index;
-    if (!manager || !app?.vault) return;
-    this.lenteSearch = this.createLenteSearch(manager, app, this.getSettings());
-    this.composeLenteViews(app);
-    if (refreshSubmitted) this.refreshOpenLente(app);
-  }
-
-  private replaceChatModel(settings: TramaSettings): void {
-    const model = new LmStudioChatModel({
-      ...settings.chat,
-      transport: new LmStudioTransport({
-        policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
-      }),
-      diagnostics: this.diagnostics,
-    });
-    this.chatModel = model;
-    this.session?.replaceModel(model);
-  }
-
-  private refreshOpenRelatedSuggestions(app: any): void {
-    if (!app?.workspace) return;
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
-      const view = (leaf as { view?: { refreshRelatedSuggestions?: () => void } }).view;
-      view?.refreshRelatedSuggestions?.();
-    }
-  }
-
-  private refreshOpenLente(app: any): void {
-    if (!app?.workspace) return;
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
-      const view = (leaf as { view?: { refreshSubmitted?: () => void } }).view;
-      view?.refreshSubmitted?.();
-    }
-  }
-
-  private composeChatSession(
+  private finishRuntimeLoad(
+    manager: IndexManager,
+    loaded: boolean,
     app: any,
-    settings: TramaSettings,
-    readonlyVault: ObsidianReadonlyVault,
-    existingRegistry?: ToolRegistry,
-    existingTransport?: LmStudioTransport
+    revision: number
   ): void {
-    const transport =
-      existingTransport ??
-      new LmStudioTransport({
-        policy: new EndpointPolicy({ approvals: settings.approvedOrigins }),
-      });
-    const registry =
-      existingRegistry ??
-      new ToolRegistry([
-        new ReadNoteTool(readonlyVault),
-        new DiscoverLinksTool(readonlyVault),
-        new FollowLinkTool(readonlyVault),
-        new VaultSearchTool(this.index!),
-      ]);
-    this.chatModel = new LmStudioChatModel({
-      ...settings.chat,
-      transport,
-      diagnostics: this.diagnostics,
-    });
-    this.session = new ChatSession(this.chatModel, registry, readonlyVault, this.diagnostics);
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {
-      const view = (
-        leaf as {
-          view?: {
-            setSession?: (session: ChatSession) => void;
-            setRelatedNotes?: (relatedNotes?: RelatedNotes) => void;
-          };
-        }
-      ).view;
-      view?.setSession?.(this.session);
-      view?.setRelatedNotes?.(this.relatedNotes);
+    if (this.index !== manager || revision !== this.compositionRevision) return;
+    this.updateIndexCapabilities(manager);
+    const maintenance = this.maintenance?.snapshot;
+    if (maintenance && (maintenance.pending || maintenance.lane !== "idle")) {
+      if (maintenance.lane === "idle" && manager.hasUsableIndex())
+        this.indexStatus?.markStale(true);
+      return;
     }
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-filo") ?? []) {
-      const view = (leaf as { view?: { setDependencies?: (status: any, related: any) => void } })
-        .view;
-      view?.setDependencies?.(this.indexStatus, this.relatedNotes);
+    if (!loaded || !manager.isComplete()) {
+      if (manager.hasUsableIndex()) this.indexStatus?.markStale(true);
+      else this.indexStatus?.setIndexRequired(true);
+      return;
     }
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
-      const view = (leaf as { view?: { setSearch?: (search: LenteSearchPort) => void } }).view;
-      if (this.lenteSearch) view?.setSearch?.(this.lenteSearch);
-    }
-  }
-
-  private composeLenteViews(app: any): void {
-    for (const leaf of app.workspace.getLeavesOfType?.("trama-lente") ?? []) {
-      const view = (leaf as { view?: { setSearch?: (search: LenteSearchPort) => void } }).view;
-      if (this.lenteSearch) view?.setSearch?.(this.lenteSearch);
-    }
+    if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
+    else this.indexStatus?.setReady(true);
+    this.modelRuntime.refreshOpenRelatedSuggestions(app);
   }
 
   async addApprovedOrigin(endpoint: string): Promise<void> {
@@ -656,6 +372,7 @@ export class TramaPlugin extends Plugin {
       return { ...current, approvedOrigins: [...approvals, approval] };
     });
   }
+
   async removeApprovedOrigin(origin: {
     scheme: "http" | "https";
     host: string;
@@ -669,376 +386,169 @@ export class TramaPlugin extends Plugin {
       ),
     }));
   }
+
   async discoverModels(target: "chat" | "embedding"): Promise<readonly string[]> {
     const signal = new AbortController().signal;
     if (target === "chat") {
-      if (!this.chatModel) throw new Error("Assistant is not initialized.");
-      return this.chatModel.discoverModels(signal);
+      if (!this.modelRuntime.chatModel) throw new Error("Assistant is not initialized.");
+      return this.modelRuntime.chatModel.discoverModels(signal);
     }
     if (!this.embeddingModel) throw new Error("Assistant is not initialized.");
     return this.embeddingModel.discoverModels(signal);
   }
 
-  /** Retries the last staged publication without rerunning local indexing. */
-  async retryPublication(): Promise<void> {
-    const result = await this.publicationManager?.publish();
-    if (result?.warning) this.handlePublicationWarning(result.warning);
-    else if (result?.published) this.indexStatus?.setPublicationWarning(undefined);
+  async updateIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.update();
   }
-
-  async prepareSemantic(): Promise<void> {
-    if (!this.index) throw new Error("Index is not initialized.");
-    if (this.indexStatus) return this.indexStatus.prepare();
-    const controller = new AbortController();
-    this.semanticAbort?.abort();
-    this.semanticAbort = controller;
-    try {
-      await this.runSemanticPreparation(controller.signal);
-    } finally {
-      if (this.semanticAbort === controller) this.semanticAbort = undefined;
-    }
+  async rebuildIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.rebuild();
   }
-
-  async updateLexical(): Promise<void> {
-    await this.indexStatus?.run("index");
+  async publishIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.publishCurrent();
   }
-
-  async rebuildLexical(): Promise<void> {
-    await this.indexStatus?.run("reindex");
-  }
-
-  async rebuildSemantic(): Promise<void> {
-    await this.indexStatus?.run("rebuild-semantic");
-  }
-
-  async rebuildBothIndexes(): Promise<void> {
-    await this.indexStatus?.run("rebuild-both");
-  }
-
-  private async runSemanticPreparation(signal: AbortSignal, rebuild = false): Promise<void> {
-    if (!this.index) throw new Error("Index is not initialized.");
-    try {
-      const result = rebuild
-        ? await this.index.rebuildSemantic(signal)
-        : await this.index.prepareSemantic(signal);
-      this.indexReady = true;
-      this.updateIndexCapabilities(this.index);
-      if (!result.converged && this.queuedWork)
-        this.indexStatus?.markStale(
-          this.index.hasUsableIndex(),
-          "Semantic indexing finished for the indexed notes. Unindexed note changes remain; update the lexical index, then update missing semantic vectors."
-        );
-    } finally {
-      if (this.queuedWork && this.getSettings().filo.automaticUpdates) this.scheduleReconcile();
-    }
+  async stopIndex(): Promise<void> {
+    this.maintenance?.stop();
   }
 
   getIndexStatus(): ReturnType<IndexStatusController["getStatus"]> | undefined {
     return this.indexStatus?.getStatus();
   }
-
   getPublicationMetrics(): { byteSize: number; durationMs: number } | undefined {
     const metrics = this.publicationManager?.metrics;
     return metrics ? { byteSize: metrics.byteSize, durationMs: metrics.durationMs } : undefined;
   }
 
-  /** Checks the exact configured synchronized file and adopts it when its ID differs. */
   async checkPublication(): Promise<void> {
-    const result = await this.publicationManager?.adoptCurrent();
-    if (result?.warning) this.handlePublicationWarning(result.warning);
-    else if (result?.adopted && this.index) {
-      this.updateIndexCapabilities(this.index);
-      this.indexReady = true;
-      this.indexStatus?.setPublicationWarning(undefined);
-      this.refreshOpenRelatedSuggestions((this as unknown as { app?: any }).app);
-      this.refreshOpenLente((this as unknown as { app?: any }).app);
-    }
+    const scheduler = this.maintenance;
+    const manager = this.index;
+    const result = await scheduler?.checkPublication();
+    if (!scheduler || scheduler !== this.maintenance || manager !== this.index || !result) return;
+    this.applyAdoptionResult(manager!, result);
   }
 
-  getRelatedNotes(): RelatedNotes | undefined {
-    return this.relatedNotes;
+  private applyAdoptionResult(manager: IndexManager, result: AdoptionResult): void {
+    if (this.index !== manager) return;
+    if (result.warning) {
+      this.handlePublicationWarning(result.warning, "check");
+      return;
+    }
+    this.clearPublicationWarning("check");
+    if (!result.adopted) return;
+    this.updateIndexCapabilities(manager);
+    const snapshot = this.maintenance?.snapshot;
+    if (snapshot?.pending || snapshot?.lane !== "idle") return;
+    if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
+    else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true, true);
+    else this.indexStatus?.setReady(true);
+    const app = (this as unknown as { app?: any }).app;
+    this.modelRuntime.refreshOpenRelatedSuggestions(app);
+    this.modelRuntime.refreshOpenLente(app);
   }
 
   private updateIndexCapabilities(manager: IndexManager): void {
-    if (this.index !== manager || !this.indexStatus) return;
-    this.indexStatus.setCapabilities(manager.capabilities());
+    if (this.index === manager) this.indexStatus?.setCapabilities(manager.capabilities());
   }
 
-  private async publishAfterIndexOperation(
-    manager: IndexManager,
-    publication: PublicationManager | undefined,
-    result: IndexOperationResult
-  ): Promise<void> {
-    if (!publication) return;
-    // IndexManager invokes its hook before its operation's finally block clears
-    // its maintenance flag. Defer publication until the live database is idle.
-    while (
-      this.index === manager &&
-      (manager.isBuilding() ||
-        manager.isInMaintenance() ||
-        manager.capabilities().semantic.activity === "updating")
-    ) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  private afterIndexOperation(manager: IndexManager, changed: boolean): void {
+    if (this.index !== manager) return;
+    this.updateIndexCapabilities(manager);
+    const app = (this as unknown as { app?: any }).app;
+    this.modelRuntime.refreshOpenRelatedSuggestions(app);
+    if (changed) this.modelRuntime.refreshOpenLente(app);
+  }
+
+  private applyMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void {
+    if (this.index !== manager) return;
+    this.indexStatus?.setMaintenance(snapshot);
+  }
+
+  private clearPublicationWarning(origin: "publication" | "check"): void {
+    delete this.publicationWarnings[origin];
+    this.projectPublicationWarning();
+  }
+
+  private handlePublicationWarning(
+    warning: PublicationWarning,
+    origin: "publication" | "check"
+  ): void {
+    if (warning.code === "upgrade_required" && !this.upgradeNoticeShown) {
+      this.upgradeNoticeShown = true;
+      new Notice(warning.message);
     }
-    if (this.index === manager) await publication.publishAfterSuccessfulOperation(result);
+    const message =
+      origin === "check"
+        ? `Synchronized index ${warning.phase === "adopt" ? "adoption" : "check"} failed: ${warning.message}`
+        : `Index saved locally, but publication failed: ${warning.message}`;
+    this.publicationWarnings[origin] = message;
+    this.projectPublicationWarning();
   }
 
-  private handlePublicationWarning(warning: PublicationWarning): void {
-    if (this.indexStatus)
-      this.indexStatus.setPublicationWarning(
-        `Index saved locally, but publication failed: ${warning.message}`
-      );
+  private clearPublicationWarnings(): void {
+    delete this.publicationWarnings.publication;
+    delete this.publicationWarnings.check;
+    this.projectPublicationWarning();
+  }
+
+  private projectPublicationWarning(): void {
+    const warning = this.publicationWarnings.check ?? this.publicationWarnings.publication;
+    if (warning === this.projectedPublicationWarning) return;
+    this.projectedPublicationWarning = warning;
+    this.indexStatus?.setPublicationWarning(warning);
   }
 
   private notifyPublicationFileEvent(path: string): void {
-    const manager = this.publicationManager;
-    if (!manager) return;
-    manager.notifyFileEvent(path);
-    if (this.publicationCheckTimer) clearTimeout(this.publicationCheckTimer);
-    this.publicationCheckTimer = setTimeout(() => {
-      this.publicationCheckTimer = undefined;
-      if (this.index?.isBuilding() || this.index?.isInMaintenance()) {
-        this.notifyPublicationFileEvent(manager.store.path);
-        return;
-      }
-      void manager.flushPendingEvents().then((result) => {
-        if (this.publicationManager !== manager || !result?.adopted) return;
-        this.indexReady = true;
-        this.updateIndexCapabilities(this.index!);
-        this.indexStatus?.setPublicationWarning(undefined);
-        const app = (this as unknown as { app?: any }).app;
-        this.refreshOpenRelatedSuggestions(app);
-        this.refreshOpenLente(app);
-      });
-    }, 0);
-  }
-
-  private armAutomaticWork(): void {
-    if (this.getSettings().filo.automaticUpdates && this.queuedWork && this.indexReady)
-      this.scheduleReconcile();
-  }
-
-  private stopAutomaticWork(markStale = true, rescheduleAfterAbort = false): void {
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.eventTimer = undefined;
-    if (this.automaticAbort) {
-      this.automaticAbort.abort();
-      this.automaticAbort = undefined;
-      if (rescheduleAfterAbort) this.automaticReschedulePending = true;
-      this.queuedWork = true;
-    }
-    if (markStale && this.queuedWork) this.markQueuedWorkStale();
-  }
-
-  private markQueuedWorkStale(): void {
-    if (!this.indexStatus) return;
-    const manager = this.index as (IndexManager & { hasUsableIndex?: () => boolean }) | undefined;
-    const hasLastGood = manager?.hasUsableIndex?.() ?? this.indexReady;
-    this.indexStatus.markStale(hasLastGood);
-  }
-
-  private async runFullIndex(signal: AbortSignal): Promise<void> {
-    return this.runIndex(signal, true);
-  }
-
-  private async runBothIndexes(signal: AbortSignal): Promise<void> {
-    this.combinedRebuildLexicalPhase = true;
-    try {
-      await this.runIndex(signal, true, false);
-    } finally {
-      this.combinedRebuildLexicalPhase = false;
-    }
-    if (!this.index?.isComplete())
-      throw new Error("Lexical index did not converge; semantic index was not rebuilt.");
-    this.indexStatus?.beginSemanticRebuild();
-    await this.runSemanticPreparation(signal, true);
-  }
-
-  private async runIndex(signal: AbortSignal, force: boolean, settleStatus = true): Promise<void> {
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.eventTimer = undefined;
-    this.stopAutomaticWork(false);
-    const manager = this.index;
-    if (!manager) throw new Error("Index is not initialized.");
-    await this.indexLoad;
-    if (this.index !== manager) throw new Error("Index was replaced during indexing.");
-    const result = force
-      ? (await manager.build(signal), { changed: true, converged: manager.isComplete() })
-      : await manager.synchronize(signal);
-    this.indexReady = true;
-    this.updateIndexCapabilities(manager);
-    const app = (this as unknown as { app?: any }).app;
-    if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-    if (result.changed && app?.workspace) this.refreshOpenLente(app);
-    this.pendingVaultChanges.clear();
-    if (this.queuedWork) await this.reconcileNow("explicit", signal).catch(() => undefined);
-    else if (settleStatus) {
-      if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
-      else if (this.visibleMarkdownCatalog().length === 0) this.indexStatus?.setEmpty(true);
-      else this.indexStatus?.setReady();
-    }
-  }
-
-  private scheduleReconcile(): void {
-    if (!this.getSettings().filo.automaticUpdates) return;
-    if (this.eventTimer) clearTimeout(this.eventTimer);
-    this.diagnostics.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "incremental",
-      stage: "scheduled",
-      durationMs: 1500,
-      counts: { queued: this.queuedWork ? 1 : 0 },
-    });
-    this.eventTimer = setTimeout(() => {
-      this.eventTimer = undefined;
-      void this.reconcileNow("automatic").catch(() => undefined);
-    }, 1500);
-  }
-
-  private async reconcileNow(
-    source: "automatic" | "explicit" = "explicit",
-    explicitSignal?: AbortSignal
-  ): Promise<void> {
-    if (source === "automatic") {
-      if (!this.getSettings().filo.automaticUpdates) return;
-      if (!this.automaticAbort) this.automaticAbort = new AbortController();
-    }
-    const manager = this.index;
-    if (!manager || !this.indexReady || !this.lifecycleAbort) return;
-    // Explicit builds own the user-facing state. The queued work remains in
-    // IndexManager and is picked up after the build commits or fails.
-    if (manager.isBuilding()) return;
-    if (manager.capabilities().semantic.activity === "updating") {
-      this.queuedWork = true;
-      return;
-    }
-    if (this.reconcilePromise) return this.reconcilePromise;
-    this.queuedWork = false;
-    if (source === "automatic") this.indexStatus?.setUpdating();
-    const operationSignal =
-      source === "automatic"
-        ? this.automaticAbort!.signal
-        : (explicitSignal ?? this.lifecycleAbort.signal);
-    let completed = false;
-    this.reconcilePromise = manager
-      .reconcileQueuedChanges(operationSignal)
-      .then((result) => {
-        completed = true;
-        this.updateIndexCapabilities(manager);
-        if (result.converged && manager.isComplete()) this.indexStatus?.setReady();
-        else this.indexStatus?.markStale(manager.hasUsableIndex?.() ?? this.indexReady);
-        const app = (this as unknown as { app?: any }).app;
-        if (app?.workspace) this.refreshOpenRelatedSuggestions(app);
-        if (result.changed && app?.workspace) this.refreshOpenLente(app);
-      })
-      .catch((error) => {
-        this.queuedWork = true;
-        if (this.index === manager) this.indexStatus?.markStale(true);
-        throw error;
-      })
-      .finally(() => {
-        this.reconcilePromise = undefined;
-        const shouldResumeAfterCancellation =
-          source === "automatic" && this.automaticReschedulePending;
-        if (
-          source === "automatic" &&
-          (completed || shouldResumeAfterCancellation) &&
-          this.queuedWork &&
-          this.indexReady &&
-          this.getSettings().filo.automaticUpdates
-        ) {
-          this.automaticReschedulePending = false;
-          this.scheduleReconcile();
-        }
-        if (source === "automatic" && this.automaticAbort?.signal === operationSignal)
-          this.automaticAbort = undefined;
-      });
-    return this.reconcilePromise;
+    if (path === this.publicationManager?.store.path)
+      void this.checkPublication().catch(() => undefined);
   }
 
   private registerVaultEvents(vault: any): void {
-    this.registerVaultEvent(vault, "create", (file: TAbstractFile) => {
-      this.notifyPublicationFileEvent(file.path);
-      this.queueVaultOperation({ kind: "create", path: file.path });
-    });
-    this.registerVaultEvent(vault, "modify", (file: TAbstractFile) => {
-      this.notifyPublicationFileEvent(file.path);
-      this.queueVaultOperation({ kind: "modify", path: file.path });
-    });
-    this.registerVaultEvent(vault, "delete", (file: TAbstractFile) => {
-      this.notifyPublicationFileEvent(file.path);
-      this.queueVaultOperation({ kind: "delete", path: file.path });
-    });
-    this.registerVaultEvent(vault, "rename", (file: TAbstractFile, oldPath: string) => {
-      this.notifyPublicationFileEvent(oldPath);
-      this.notifyPublicationFileEvent(file.path);
-      const oldEligible = this.isIndexEligible(oldPath);
-      const newEligible = this.isIndexEligible(file.path);
-      if (oldEligible && newEligible)
-        this.queueVaultOperation({ kind: "rename", oldPath, path: file.path });
-      else if (oldEligible) this.queueVaultOperation({ kind: "delete", path: oldPath });
-      else if (newEligible) this.queueVaultOperation({ kind: "create", path: file.path });
-    });
+    this.vaultEvents.register(vault);
   }
-  private registerVaultEvent(vault: any, event: string, callback: (...args: any[]) => void): void {
-    const ref = vault.on(event, callback);
-    this.eventRefs.push(ref);
-    this.registerEvent(ref);
-  }
-  private queueVaultOperation(
-    operation:
-      | { kind: "create" | "modify" | "delete" | "empty" | "unchanged"; path: string }
-      | { kind: "rename"; oldPath: string; path: string }
-  ): void {
-    const paths =
-      operation.kind === "rename" ? [operation.oldPath, operation.path] : [operation.path];
-    if (paths.every((path) => !this.isIndexEligible(path)) || !this.index) return;
-    this.diagnostics.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "incremental",
-      stage: "queued",
-      path: operation.path,
-      counts: { automatic: this.getSettings().filo.automaticUpdates ? 1 : 0 },
-    });
-    if (!this.indexLoaded || !this.indexReady) {
-      this.index.queueChange();
-      for (const path of paths) this.pendingVaultChanges.add(path);
-      this.queuedWork = true;
+
+  private queueVaultMutation(mutation: IndexPathMutation): void {
+    if (this.compositionReplacement) {
+      this.compositionDirty = true;
       return;
     }
-    this.queuedWork = true;
-    this.index.queueChange();
-    if (this.getSettings().filo.automaticUpdates) {
-      if (!this.index.isBuilding() && this.index.capabilities().semantic.activity !== "updating")
-        this.indexStatus?.setUpdating();
-      this.scheduleReconcile();
-    } else {
-      if (this.index.capabilities().semantic.activity !== "updating") this.markQueuedWorkStale();
+    const manager = this.index;
+    const scheduler = this.maintenance;
+    if (!manager || !scheduler) return;
+    manager.recordPathMutation(mutation);
+    scheduler.invalidate();
+    if (!this.getSettings().automaticMaintenance) {
+      this.updateIndexCapabilities(manager);
+      if (scheduler.snapshot.lane === "idle") this.indexStatus?.markStale(manager.hasUsableIndex());
     }
   }
 
-  private isIndexEligible(path: string): boolean {
-    return (
-      this.isVisibleMarkdown(path) &&
-      !isExcludedPath(path, [
-        ...this.getSettings().filo.excludedPaths,
-        this.getSettings().publicationDirectory,
-      ])
-    );
+  private requestFullRecovery(path?: string): void {
+    if (path && this.isPublicationPath(path)) return;
+    if (this.compositionReplacement) {
+      this.compositionDirty = true;
+      return;
+    }
+    const manager = this.index;
+    const scheduler = this.maintenance;
+    if (!manager || !scheduler) return;
+    manager.requestFullRecovery();
+    scheduler.invalidate();
   }
 
+  private isPublicationPath(path: string): boolean {
+    return this.vaultEvents.isPublicationPath(path);
+  }
   private isVisibleMarkdown(path: string): boolean {
-    const configDir = (
-      (this as unknown as { app?: { vault?: { configDir?: string } } }).app?.vault?.configDir ??
-      ".obsidian"
-    ).replace(/\/$/, "");
-    return (
-      /\.md$/i.test(path) &&
-      !path.split("/").some((part) => part.startsWith(".")) &&
-      !path.startsWith(`${configDir}/`) &&
-      !path.startsWith(".trama/")
-    );
+    return this.vaultEvents.isVisibleMarkdown(path);
+  }
+  private resolveSqliteIdentity(
+    adapter: import("@/index/IndexManager").SnapshotDataAdapter
+  ): Promise<string> {
+    return this.sqliteRuntime.resolveIdentity(adapter);
+  }
+  private createSqliteWorker(app: any): SqliteWorkerLike {
+    return this.sqliteRuntime.createWorker(app);
   }
 }

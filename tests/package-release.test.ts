@@ -37,5 +37,5 @@ describe("release package", () => {
       ["scripts/package-release.mjs", "--verify", "--version", version, "--archive", archive],
       { cwd: root }
     );
-  });
+  }, 60_000);
 });

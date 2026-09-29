@@ -1,6 +1,6 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 5;
-export const SQLITE_PROTOCOL_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 9;
+export const SQLITE_PROTOCOL_VERSION = 9;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
 export function schemaSql(dimensions: number): string {
@@ -21,57 +21,88 @@ CREATE TABLE IF NOT EXISTS index_state (
   build_identity TEXT NOT NULL,
   extraction_version INTEGER NOT NULL,
   chunk_algorithm_version INTEGER NOT NULL,
+  embedding_input_version INTEGER NOT NULL DEFAULT 1,
   dimensions INTEGER NOT NULL CHECK (dimensions > 0),
   corpus_fingerprint TEXT NOT NULL,
   embedding_fingerprint TEXT NOT NULL,
   incomplete INTEGER NOT NULL CHECK (incomplete IN (0,1)),
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
+  lexical_generation INTEGER NOT NULL DEFAULT 0 CHECK (lexical_generation >= 0),
+  semantic_generation INTEGER NOT NULL DEFAULT 0 CHECK (semantic_generation >= 0),
   publication_id TEXT,
   snapshot_loaded INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_loaded IN (0,1)),
   reconciliation_summary TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE TABLE IF NOT EXISTS notes (
   note_pk INTEGER PRIMARY KEY,
+  note_id INTEGER NOT NULL UNIQUE,
   path TEXT COLLATE BINARY NOT NULL UNIQUE,
-  content_id TEXT COLLATE BINARY NOT NULL
+  content_id TEXT COLLATE BINARY NOT NULL,
+  lexical_revision_id INTEGER REFERENCES note_revisions(revision_id) DEFERRABLE INITIALLY DEFERRED,
+  semantic_revision_id INTEGER REFERENCES note_revisions(revision_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 CREATE INDEX IF NOT EXISTS notes_content_id ON notes(content_id);
-CREATE TABLE IF NOT EXISTS chunks (
-  chunk_pk INTEGER PRIMARY KEY,
-  note_pk INTEGER NOT NULL REFERENCES notes(note_pk) ON DELETE CASCADE,
+-- Revisions and embedding inputs are immutable; notes owns the active lexical
+-- and semantic heads.
+CREATE TABLE IF NOT EXISTS note_revisions (
+  revision_id INTEGER PRIMARY KEY,
+  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
   content_id TEXT COLLATE BINARY NOT NULL,
+  extraction_version INTEGER NOT NULL,
+  chunk_algorithm_version INTEGER NOT NULL,
+  created_change_counter INTEGER NOT NULL CHECK (created_change_counter >= 0),
+  UNIQUE(note_id, content_id, extraction_version, chunk_algorithm_version)
+) STRICT;
+CREATE INDEX IF NOT EXISTS note_revisions_note ON note_revisions(note_id, revision_id);
+CREATE TABLE IF NOT EXISTS chunk_occurrences (
+  occurrence_id INTEGER PRIMARY KEY,
+  revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
+  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
   chunk_id TEXT COLLATE BINARY NOT NULL,
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  kind TEXT NOT NULL,
   start_line INTEGER NOT NULL CHECK (start_line >= 1),
   end_line INTEGER NOT NULL CHECK (end_line >= start_line),
-  path_text TEXT COLLATE BINARY NOT NULL,
-  filename TEXT COLLATE BINARY NOT NULL,
+  display_text TEXT NOT NULL,
+  heading_context TEXT NOT NULL,
+  embedding_input TEXT NOT NULL,
+  embedding_input_digest TEXT COLLATE BINARY NOT NULL,
   body TEXT NOT NULL,
-  UNIQUE(note_pk, ordinal),
-  UNIQUE(note_pk, chunk_id)
+  UNIQUE(revision_id, ordinal),
+  UNIQUE(revision_id, chunk_id)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS chunks_note_ordinal ON chunks(note_pk, ordinal);
-CREATE INDEX IF NOT EXISTS chunks_content_id ON chunks(content_id);
-CREATE TABLE IF NOT EXISTS chunk_vectors (
-  chunk_pk INTEGER PRIMARY KEY REFERENCES chunks(chunk_pk) ON DELETE CASCADE,
-  content_id TEXT COLLATE BINARY NOT NULL,
-  chunk_id TEXT COLLATE BINARY NOT NULL,
+CREATE INDEX IF NOT EXISTS chunk_occurrences_note ON chunk_occurrences(note_id, revision_id, ordinal);
+CREATE INDEX IF NOT EXISTS chunk_occurrences_embedding_input ON chunk_occurrences(embedding_input_digest, note_id, revision_id);
+CREATE TABLE IF NOT EXISTS embedding_inputs (
+  input_id INTEGER PRIMARY KEY,
   embedding_fingerprint TEXT COLLATE BINARY NOT NULL,
+  serialized_input TEXT NOT NULL,
+  preprocessing TEXT NOT NULL,
+  action_key TEXT COLLATE BINARY NOT NULL UNIQUE
+) STRICT;
+CREATE INDEX IF NOT EXISTS embedding_inputs_fingerprint ON embedding_inputs(embedding_fingerprint);
+CREATE TABLE IF NOT EXISTS embedding_cache (
+  cache_id INTEGER PRIMARY KEY,
+  input_digest TEXT COLLATE BINARY NOT NULL,
+  action_key TEXT COLLATE BINARY NOT NULL UNIQUE,
+  embedding_fingerprint TEXT COLLATE BINARY NOT NULL,
+  preprocessing TEXT NOT NULL,
   vector BLOB NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS chunk_vectors_fingerprint ON chunk_vectors(embedding_fingerprint);
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  body, path_text, filename, content='chunks', content_rowid='chunk_pk', tokenize='unicode61 remove_diacritics 2'
+CREATE INDEX IF NOT EXISTS embedding_cache_fingerprint ON embedding_cache(embedding_fingerprint);
+CREATE INDEX IF NOT EXISTS embedding_cache_lookup ON embedding_cache(input_digest, embedding_fingerprint, preprocessing);
+CREATE TABLE IF NOT EXISTS active_lexical (
+  occurrence_id INTEGER PRIMARY KEY REFERENCES chunk_occurrences(occurrence_id) ON DELETE CASCADE,
+  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+  revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
+  path_text TEXT COLLATE BINARY NOT NULL,
+  filename TEXT COLLATE BINARY NOT NULL,
+  body TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS active_lexical_note ON active_lexical(note_id, revision_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS active_lexical_fts USING fts5(
+  body, path_text, filename, content='active_lexical', content_rowid='occurrence_id',
+  tokenize='unicode61 remove_diacritics 2'
 );
-CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-  INSERT INTO chunks_fts(rowid, body, path_text, filename) VALUES (new.chunk_pk, new.body, new.path_text, new.filename);
-END;
-CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, body, path_text, filename) VALUES ('delete', old.chunk_pk, old.body, old.path_text, old.filename);
-END;
-CREATE TRIGGER IF NOT EXISTS chunks_au_fts AFTER UPDATE OF body, path_text, filename ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, body, path_text, filename) VALUES ('delete', old.chunk_pk, old.body, old.path_text, old.filename);
-  INSERT INTO chunks_fts(rowid, body, path_text, filename) VALUES (new.chunk_pk, new.body, new.path_text, new.filename);
-END;
 `;
 }

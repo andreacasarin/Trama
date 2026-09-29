@@ -123,14 +123,13 @@ export class RelatedNotes {
     }
     const existing = this.inFlight.get(key);
     if (existing && !existing.controller.signal.aborted && !refresh)
-      return this.forConsumer(existing.promise, signal, cap, key, currentPath);
+      return this.forConsumer(existing.promise, signal, cap);
     if (existing?.controller.signal.aborted) this.inFlight.delete(key);
     const controller = new AbortController();
     this.emitDiagnostic({
       area: "filo",
       event: "related_search",
       stage: "started",
-      path: currentPath,
       generation: state.generationId,
       resultCount: 0,
     });
@@ -144,7 +143,6 @@ export class RelatedNotes {
             area: "filo",
             event: "related_search",
             stage: "completed",
-            path: result.currentPath,
             generation: result.generationId,
             resultCount: result.results.length,
             durationMs: Date.now() - started,
@@ -153,7 +151,6 @@ export class RelatedNotes {
           this.emitDiagnostic({
             area: "filo",
             event: "related_search",
-            path: result.currentPath,
             generation: result.generationId,
             resultCount: result.results.length,
             durationMs: Date.now() - started,
@@ -165,7 +162,7 @@ export class RelatedNotes {
         if (this.inFlight.get(key)?.promise === run) this.inFlight.delete(key);
       });
     this.inFlight.set(key, { promise: run, controller });
-    return this.forConsumer(run, signal, cap, key, currentPath);
+    return this.forConsumer(run, signal, cap);
   }
 
   cancel(): void {
@@ -180,9 +177,7 @@ export class RelatedNotes {
   private forConsumer(
     shared: Promise<RelatedNotesResult>,
     signal: AbortSignal,
-    limit: number,
-    expectedKey?: string,
-    expectedPath?: string
+    limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) return Promise.reject(new Error("Operation cancelled"));
     return new Promise((resolve, reject) => {
@@ -190,8 +185,6 @@ export class RelatedNotes {
         this.emitDiagnostic({
           area: "filo",
           event: "related_search",
-          path: expectedPath,
-          generation: expectedKey?.split("\0")[0],
           resultCount: 0,
           cancelled: true,
           error: { name: "Error", code: "cancelled", retryable: true, cancelled: true },
@@ -210,7 +203,6 @@ export class RelatedNotes {
             this.emitDiagnostic({
               area: "filo",
               event: "related_search",
-              path: expectedPath,
               resultCount: 0,
               error: {
                 ...projectDiagnosticError(error),
@@ -235,7 +227,6 @@ export class RelatedNotes {
       area: "filo",
       event: "related_search",
       stage: "retrieve-completed",
-      path: state.currentPath,
       generation: state.generationId,
       resultCount: hits.length,
       durationMs: Date.now() - retrieveStarted,
@@ -282,11 +273,11 @@ export class RelatedNotes {
   }
 
   private key(state: RelatedIndexState): string {
-    return `${state.changeCounter ?? state.generationId ?? 0}\0${state.currentPath}\0${state.contentHash}\0${state.freshness ?? ""}\0${state.publicationId ?? ""}`;
+    return `${state.currentPath}\0${state.contentHash}\0${state.publicationId ?? ""}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.changeCounter ?? result.generationId ?? 0}\0${result.currentPath}\0${result.contentHash}\0${result.freshness ?? ""}\0${result.publicationId ?? ""}`;
+    return `${result.currentPath}\0${result.contentHash}\0${result.publicationId ?? ""}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

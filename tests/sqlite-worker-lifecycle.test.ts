@@ -6,6 +6,82 @@ import {
 } from "@/index/sqlite/worker-lifecycle";
 
 describe("SQLite Worker storage lifecycle", () => {
+  it("does not throw while sanitizing an open failure with no message", async () => {
+    const platformError = Object.create(Error.prototype) as Error;
+    Object.defineProperty(platformError, "message", { value: undefined });
+    Object.defineProperty(platformError, "name", { value: undefined });
+    vi.stubGlobal("self", { onmessage: undefined });
+    try {
+      const { storageFailureDetail, workerFailureLocation, workerFailureReply } =
+        await import("@/index/sqlite/worker");
+      expect(() => storageFailureDetail(platformError)).not.toThrow();
+      expect(storageFailureDetail(platformError)).toBe("unknown failure");
+
+      const namedError = Object.create(Error.prototype) as Error & {
+        code?: unknown;
+        resultCode?: unknown;
+      };
+      Object.defineProperties(namedError, {
+        message: { value: undefined },
+        name: { value: "DOMException" },
+        code: { value: "E_OPEN" },
+      });
+      expect(storageFailureDetail(namedError)).toBe("name=DOMException code=E_OPEN");
+
+      const privateError = Object.create(Error.prototype) as Error & { code?: unknown };
+      Object.defineProperties(privateError, {
+        message: { value: undefined },
+        name: { value: "/vault/secret.md" },
+        code: { value: "/private/content" },
+      });
+      expect(storageFailureDetail(privateError)).toBe("unknown failure");
+      const stackError = new Error("private content");
+      Object.defineProperty(stackError, "stack", {
+        value: "Error: private content\n    at load (/private/vault/sqlite-worker.mjs:42:7)",
+      });
+      expect(workerFailureLocation(stackError)).toBe("load@sqlite-worker.mjs:42");
+      expect(workerFailureLocation(stackError)).not.toContain("/private");
+      const electronError = new TypeError("Cannot read properties of undefined");
+      Object.defineProperty(electronError, "stack", {
+        value:
+          "TypeError: Cannot read properties of undefined\n    at async openDatabase (file:///vault/sqlite-worker.mjs:17:9)",
+      });
+      for (const phase of ["validation", "dispatch", "open", "execute"] as const) {
+        const reply = workerFailureReply(electronError, "getState", phase);
+        expect(reply).toMatchObject({
+          code: "internal",
+          method: "getState",
+          phase,
+          debugLocation: "openDatabase@sqlite-worker.mjs:17",
+        });
+        expect(JSON.stringify(reply)).not.toContain("/vault");
+      }
+      expect(
+        workerFailureReply(
+          { error: { code: "storage_unavailable", message: "hash failed", retryable: true } },
+          "getState",
+          "execute"
+        )
+      ).toMatchObject({ method: "getState", phase: "execute" });
+      expect(
+        workerFailureReply(
+          {
+            error: {
+              code: "storage_unavailable",
+              message: "open failed",
+              retryable: true,
+              phase: "open",
+            },
+          },
+          "boot",
+          "execute"
+        )
+      ).toMatchObject({ method: "boot", phase: "open" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("clears database references before a throwing close", () => {
     const state: {
       database?: { close(): void };

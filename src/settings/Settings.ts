@@ -25,16 +25,15 @@ export interface EmbeddingSettings {
 export type LenteSearchMethod = "hybrid" | "keyword";
 export interface LenteSettings {
   readonly searchMethod: LenteSearchMethod;
-  readonly maxResults: number;
-  readonly automaticSearchDelayMs: number;
+  readonly automaticSearches: boolean;
 }
 export interface FiloSettings {
-  readonly automaticUpdates: boolean;
   readonly excludedPaths: readonly string[];
 }
 export interface TramaSettings {
-  readonly schemaVersion: 4;
+  readonly schemaVersion: 5;
   readonly publicationDirectory: string;
+  readonly automaticMaintenance: boolean;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly lente: LenteSettings;
@@ -48,26 +47,6 @@ const LENTE_SEARCH_METHODS = ["hybrid", "keyword"] as const;
 
 function isLenteSearchMethod(value: unknown): value is LenteSearchMethod {
   return LENTE_SEARCH_METHODS.includes(value as LenteSearchMethod);
-}
-
-function isValidLenteMaxResults(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 5 &&
-    value <= 50 &&
-    value % 5 === 0
-  );
-}
-
-function isValidLenteAutomaticSearchDelay(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= 1000 &&
-    value % 50 === 0
-  );
 }
 
 /** Normalizes one vault-relative file or directory path, or returns undefined when invalid. */
@@ -126,8 +105,9 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
-  schemaVersion: 4,
+  schemaVersion: 5,
   publicationDirectory: DEFAULT_PUBLICATION_DIRECTORY,
+  automaticMaintenance: false,
   chat: Object.freeze({
     endpoint: "http://127.0.0.1:1234/v1",
     modelId: "",
@@ -141,11 +121,9 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   }),
   lente: Object.freeze({
     searchMethod: "hybrid",
-    maxResults: 20,
-    automaticSearchDelayMs: 0,
+    automaticSearches: false,
   }),
   filo: Object.freeze({
-    automaticUpdates: false,
     excludedPaths: Object.freeze([]),
   }),
   approvedOrigins: Object.freeze([]),
@@ -160,7 +138,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      ![2, 3, 4].includes((data as { schemaVersion?: unknown }).schemaVersion as number)
+      (data as { schemaVersion?: unknown }).schemaVersion !== 5
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -210,20 +188,15 @@ export class SettingsStore {
       searchMethod: isLenteSearchMethod(rawLente.searchMethod)
         ? rawLente.searchMethod
         : DEFAULT_SETTINGS.lente.searchMethod,
-      maxResults: isValidLenteMaxResults(rawLente.maxResults)
-        ? rawLente.maxResults
-        : DEFAULT_SETTINGS.lente.maxResults,
-      automaticSearchDelayMs: isValidLenteAutomaticSearchDelay(rawLente.automaticSearchDelayMs)
-        ? rawLente.automaticSearchDelayMs
-        : DEFAULT_SETTINGS.lente.automaticSearchDelayMs,
+      automaticSearches: rawLente.automaticSearches === true,
     };
     const filo = {
-      automaticUpdates: rawFilo.automaticUpdates === true,
       excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
     };
     this.value = {
-      schemaVersion: 4,
+      schemaVersion: 5,
       publicationDirectory,
+      automaticMaintenance: input.automaticMaintenance === true,
       chat: Object.freeze(chat),
       embedding: Object.freeze(embedding),
       lente: Object.freeze(lente),
@@ -310,8 +283,9 @@ export class SettingsStore {
     const lente = this.validateLente(next.lente);
     const publicationDirectory = this.strictPublicationDirectory(next.publicationDirectory);
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       publicationDirectory,
+      automaticMaintenance: next.automaticMaintenance === true,
       chat: Object.freeze({
         endpoint: chatEndpoint,
         modelId: next.chat.modelId,
@@ -320,7 +294,6 @@ export class SettingsStore {
       embedding: Object.freeze({ ...next.embedding, endpoint: embeddingEndpoint }),
       lente: Object.freeze(lente),
       filo: Object.freeze({
-        automaticUpdates: next.filo.automaticUpdates === true,
         excludedPaths: Object.freeze(normalizeExcludedPaths(next.filo.excludedPaths)),
       }),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
@@ -337,18 +310,9 @@ export class SettingsStore {
     if (!isLenteSearchMethod(lente.searchMethod)) {
       throw new Error("Lente search method must be hybrid or keyword.");
     }
-    if (!isValidLenteMaxResults(lente.maxResults)) {
-      throw new Error("Lente maximum displayed results must be from 5 to 50 in increments of 5.");
-    }
-    if (!isValidLenteAutomaticSearchDelay(lente.automaticSearchDelayMs)) {
-      throw new Error(
-        "Lente automatic search delay must be from 0 to 1000 ms in increments of 50."
-      );
-    }
     return {
       searchMethod: lente.searchMethod,
-      maxResults: lente.maxResults,
-      automaticSearchDelayMs: lente.automaticSearchDelayMs,
+      automaticSearches: lente.automaticSearches === true,
     };
   }
   private validateChatControls(

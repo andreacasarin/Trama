@@ -1,12 +1,12 @@
 # Trama
 
-Trama is an Obsidian plugin for local AI conversation and semantic connections on desktop and mobile. **Voce** is the agent chat that can navigate linked notes, **Filo** discovers semantically related notes, and **Lente** searches indexed visible Markdown notes. Chat and embedding requests go only to a user-approved LM Studio endpoint. Trama performs no network requests at startup; provider access is triggered only by an explicit chat, search, or semantic-preparation action.
+Trama is an Obsidian plugin for local AI conversation and semantic connections on desktop and mobile. **Voce** is the agent chat that can navigate linked notes, **Filo** discovers semantically related notes, and **Lente** searches indexed visible Markdown notes. Chat and embedding requests go only to a user-approved endpoint. The current OpenAI-compatible transport is tested with LM Studio 0.3.29+ and does not yet support API-key-authenticated services such as OpenAI or OpenRouter. Trama performs no network requests at startup or while loading settings. Provider access is triggered by an explicit chat/search/index action, or by vault-event maintenance after the separate **Scheduled maintenance** consent is enabled.
 
 ## Setup
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer** on a device that can reach the configured endpoint, load a chat model and (when desired) an embedding model, and enable its local OpenAI-compatible server.
 2. Configure the chat model, embedding model, and optional publication folder in plugin settings. The default synchronized file is `Trama/index/index.sqlite3`.
-3. Use **Update lexical index** from the command palette for the initial explicit lexical index. This step makes no AI request. Use **Update semantic index** when embeddings are available, then open **Voce**, **Filo**, or **Lente**.
+3. Use **Update index** for the initial index. It converges lexical state, adds semantic vectors when an embedding model is configured, and publishes the converged result. With no embedding model it remains network-silent. Then open **Voce**, **Filo**, or **Lente**.
 
 The live index is one mutable SQLite WASM database persisted through the official
 OPFS SAH pool. Trama publishes exactly one synchronized artifact,
@@ -15,9 +15,9 @@ folder is vault-relative, case-sensitive, and defaults to `Trama/index`; changin
 it affects future publications and does not move or delete the old folder. The
 publication folder is automatically excluded from Markdown indexing.
 
-Build, Update, and Rebuild reconcile lexical notes/chunks/FTS without embeddings.
-**Update semantic index** is explicit and resumable: it adds compatible vectors
-in bounded batches and can be retried after an interruption or provider failure.
+One maintenance scheduler owns Update, Rebuild, Stop, automatic timing, publication,
+and synchronized-file adoption. Lexical, semantic, publication, and adoption remain
+separate executors. Semantic vectors are committed in bounded resumable batches.
 Search remains available while semantic coverage is none or partial. A loaded
 publication is immediately searchable and reports **snapshot loaded — not locally
 reconciled** until a user-triggered Update or Rebuild converges it with Markdown.
@@ -29,7 +29,7 @@ publication on device A, wait for Obsidian Sync or iCloud to converge, then inde
 on device B. The provider chooses the last/authoritative file version (including
 its conflict behavior); Trama adopts any differing valid file and does not compare
 timestamps or invent a merge. Concurrent writers can lose derived work and may
-need a new lexical or semantic Update.
+need a new Update.
 
 ## Filo related notes
 
@@ -46,33 +46,37 @@ or Low using constants owned by the view.
 
 ## Lente search
 
-Lente searches indexed visible Markdown only after Enter or Search is pressed.
-Results are unique notes with their winning passage. Relevant uses deterministic
+By default, Lente searches indexed visible Markdown only after Enter or Search is
+pressed. The separate **Automatic searches** toggle uses a fixed 500 ms debounce.
+Results are limited to twenty unique notes with their winning passage. Relevant uses deterministic
 hybrid vector/BM25 ranking; Updated uses live note modification times. If query
 embeddings are unavailable, Lente retries lexical filename, path, and body
 matching and labels the result degraded. Its derived FTS5 lexical index is maintained
 inside the mutable SQLite backend.
 
-Indexing is explicit the first time. After a usable index exists, visible Markdown
-create, modify, delete, and rename events are coalesced for about 1.5 seconds and
-processed as per-note incremental updates. **Update lexical index** is the normal offline lexical
-reconciliation mode: it scans the current vault, compares committed content identities,
-updates notes/chunks/FTS, and removes deleted paths without contacting an AI service.
-**Rebuild lexical index** is the explicit forced lexical reconciliation for recovery or
-configuration refresh. **Update semantic index** requests vectors for missing or
-incompatible chunks. **Rebuild semantic index** discards existing vectors and regenerates
-them; **Rebuild lexical and semantic indexes** runs both rebuilds in that order. If a note is moved or deleted during
+Indexing is explicit the first time. **Update index** runs finite lexical passes to
+convergence, finishes configured semantic work, then publishes. **Rebuild index**
+performs fresh lexical construction, clears configured semantic vectors once, resumes
+vector batches after safe-boundary interruptions, and publishes only after convergence.
+Queuing Rebuild never destroys the currently committed searchable generation. If a note is moved or deleted during
 lexical indexing, that stale path is logged and skipped, then the queued vault event
-is reconciled without failing the whole operation. Semantic preparation finishes against
-the committed SQLite notes even if vault notes change during the run. It then reports
-the index as stale; a lexical Update followed by semantic Update processes only changed
-notes and missing vectors, without rebuilding everything. An interrupted or failed pass may leave
+is reconciled without failing the whole operation. An interrupted or failed pass may leave
 the searchable index incomplete; a later Update or Rebuild reconciles it deterministically
 while search remains available.
 
 During a full lexical rebuild, status reports note and estimated chunk progress with time
-estimates. Hashing and chunking run in the SQLite Worker. **Update semantic index** reports whole-job vector progress and
+estimates. Hashing and chunking run in the SQLite Worker. The semantic phase reports whole-job vector progress and
 keeps already committed batches when a provider request fails or is cancelled.
+
+Scheduled maintenance is opt-in. After vault changes, it automatically updates the
+lexical index, prepares semantic vectors when an embedding model is configured, and
+publishes the converged SQLite index for synchronization. Semantic preparation sends note excerpts to the configured
+embedding endpoint and may incur provider cost. Its adaptive quiet windows are 3, 9, then 20 seconds,
+with a 60-second maximum wait for an outstanding edit generation. Stop preserves pending
+intent, suspends automatic starts, and lets an already-started publication or adoption
+fence settle. Failures display an error and suspend automatic work; there is no hidden
+failure retry timer. Advanced settings expose **Update**, **Rebuild**, **Publish**,
+**Stop**, and **Check**.
 
 ## Voce chat
 
@@ -194,10 +198,13 @@ through the production chunker. Results are written to the ignored
 npm run benchmark
 ```
 
-The single 10,000-chunk Trama workload reports lexical rebuild, semantic preparation,
-unchanged-update time, mutation timings, search latency, process RSS delta, package
-bytes, deterministic feature-path results, and publication byte/copy metrics. Metrics
-unavailable to the in-memory Node
+The command defaults to the `trama-small` profile. Select the larger deterministic
+profiles with `TRAMA_BENCHMARK_PROFILE=trama-10k npm run benchmark` or
+`TRAMA_BENCHMARK_PROFILE=trama-large npm run benchmark`. Each profile reports lexical
+rebuild, semantic preparation, unchanged-update time, mutation timings, search latency,
+observed process RSS, package bytes, deterministic feature-path results, and publication
+byte/copy metrics. Complete evidence is written to
+`.artifacts/trama-benchmark/<profile>.json`. Metrics unavailable to the in-memory Node
 harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
 CI renders the metrics as a GitHub Actions job summary and retains the complete JSON
 report as a downloadable workflow artifact.
@@ -226,11 +233,11 @@ manual validation. Before relying on a synchronized vault, check the following:
   prompting, AI calls, Markdown reconciliation, or republishing. Search before local
   reconciliation and confirm the freshness message.
 - After provider convergence, publish from mobile back to desktop. Test reachable LAN
-  Prepare/Hybrid/Filo/Voce, unreachable-AI lexical fallback, interrupted/invalid/
+  Update/Hybrid/Filo/Voce, unreachable-AI lexical fallback, interrupted/invalid/
   incompatible files, and sequential two-device handoff.
 
 These real-device, Obsidian Sync/iCloud, LAN, publication-size, and two-device conflict
 checks are pending user validation; automated tests do not claim them as successful.
 
 See [SQLite publication details](docs/sqlite-snapshots.md) for the file, adoption,
-retry, compatibility, and crash-boundary contract.
+compatibility, and crash-boundary contract.

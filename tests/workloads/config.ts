@@ -3,18 +3,33 @@ export const WORKLOAD_DIMENSIONS = 768;
 export const WORKLOAD_FINGERPRINT = "a".repeat(64);
 
 export interface WorkloadProfile {
-  readonly id: "trama-10k";
+  readonly id: "trama-small" | "trama-10k" | "trama-large";
   readonly noteCount: number;
   readonly targetChunks: number;
 }
 
-export const WORKLOAD_PROFILE: WorkloadProfile = {
-  id: "trama-10k",
-  noteCount: 1_100,
-  targetChunks: 10_000,
+export const WORKLOAD_PROFILES: Readonly<Record<WorkloadProfile["id"], WorkloadProfile>> = {
+  "trama-small": {
+    id: "trama-small",
+    noteCount: 24,
+    targetChunks: 128,
+  },
+  "trama-10k": {
+    id: "trama-10k",
+    noteCount: 1_100,
+    targetChunks: 10_000,
+  },
+  "trama-large": {
+    id: "trama-large",
+    noteCount: 2_750,
+    targetChunks: 25_000,
+  },
 };
 
+export const WORKLOAD_PROFILE = WORKLOAD_PROFILES["trama-10k"];
+
 export function workloadProfile(id: WorkloadProfile["id"]): WorkloadProfile {
-  if (id !== WORKLOAD_PROFILE.id) throw new Error(`Unknown workload profile: ${id}`);
-  return WORKLOAD_PROFILE;
+  const profile = WORKLOAD_PROFILES[id];
+  if (!profile) throw new Error(`Unknown workload profile: ${id}`);
+  return profile;
 }

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
+import { MutableSqliteDatabase } from "@/index/sqlite/database";
+import { applyLexicalMarkdownBatch } from "@/index/sqlite/markdown";
+import { WorkerPublicationOperations } from "@/index/sqlite/worker-publication";
 import {
   PublicationManager,
   type PublicationIndexPort,
@@ -9,7 +13,11 @@ import {
   PublicationStore,
   type PublicationDataAdapter,
 } from "@/index/publications/PublicationStore";
-import { createTestSqliteClient } from "./sqlite-test-client";
+import {
+  createTestSqliteClient,
+  loadTestSqlite,
+  snapshotWithUserVersion,
+} from "./sqlite-test-client";
 
 const vault: IndexVaultPort = {
   listMarkdownPaths: async () => ["one.md"],
@@ -79,6 +87,96 @@ function publication(
 }
 
 describe("single-file SQLite publications", () => {
+  it("boots a publication candidate before pruning a lagging semantic cache", async () => {
+    const sqlite = await loadTestSqlite();
+    const files = new Map<string, Uint8Array>();
+    class PoolDatabase {
+      private readonly raw: any;
+
+      constructor(name: string) {
+        this.raw = new sqlite.oo1.DB(":memory:", "c");
+        const bytes = files.get(name);
+        if (!bytes) return;
+        const pointer = sqlite.wasm.allocFromTypedArray(bytes);
+        const flags =
+          sqlite.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite.capi.SQLITE_DESERIALIZE_RESIZEABLE;
+        if (
+          sqlite.capi.sqlite3_deserialize(
+            this.raw.pointer,
+            "main",
+            pointer,
+            bytes.byteLength,
+            bytes.byteLength,
+            flags
+          ) !== 0
+        )
+          throw new Error("failed to deserialize test publication");
+      }
+
+      exec(options: any): void {
+        this.raw.exec(options);
+      }
+
+      close(): void {
+        this.raw.close();
+      }
+    }
+    const pool = {
+      OpfsSAHPoolDb: PoolDatabase,
+      exportFile: (name: string) => files.get(name)!,
+      importDb: (name: string, bytes: Uint8Array | ArrayBuffer) => {
+        files.set(name, new Uint8Array(bytes));
+        return 0;
+      },
+      unlink: (name: string) => files.delete(name),
+    };
+    const config = {
+      corpus: "a".repeat(64),
+      embedding: "b".repeat(64),
+      dimensions: 2,
+      buildIdentity: SQLITE_BUILD_IDENTITY,
+    };
+    const liveRaw = new sqlite.oo1.DB(":memory:", "c");
+    let live: MutableSqliteDatabase | undefined = new MutableSqliteDatabase(liveRaw);
+    live.boot(config.corpus, config.dimensions, config.embedding, config.buildIdentity);
+    const firstRun = live.beginLexicalRun({ scope: { mayClearIncomplete: true } });
+    await applyLexicalMarkdownBatch(live, firstRun.runId, [{ path: "one.md", markdown: "alpha" }]);
+    live.finishLexicalRun(firstRun.runId);
+    const work = live.prepareSemanticWork(config.embedding, undefined, 128, 4 * 1024 * 1024);
+    live.commitSemanticResults(
+      work.requests.map((request) => ({
+        ...request,
+        vector: new Float32Array([1, 0]),
+      })),
+      config.embedding
+    );
+    const secondRun = live.beginLexicalRun({ scope: { mayClearIncomplete: true } });
+    await applyLexicalMarkdownBatch(live, secondRun.runId, [{ path: "one.md", markdown: "beta" }]);
+    live.finishLexicalRun(secondRun.runId);
+    const lagging = live.getState();
+    expect(lagging.semanticLagCount).toBe(1);
+    files.set("/index.sqlite3", new Uint8Array(sqlite.capi.sqlite3_js_db_export(liveRaw.pointer)));
+    const storage = { opfsPool: pool };
+    const operations = new WorkerPublicationOperations({
+      storage: storage as any,
+      openDatabase: async () => {
+        if (!live) live = new MutableSqliteDatabase(new PoolDatabase("/index.sqlite3"));
+        return live;
+      },
+      closeConnection: () => {
+        live?.close();
+        live = undefined;
+      },
+      runtimeConfig: () => config,
+    });
+    const prepared = await operations.prepare("lagging-publication");
+    expect(prepared.state).toMatchObject({
+      semanticLagCount: 1,
+      compatibleVectorCount: 1,
+      semanticReady: false,
+    });
+  });
+
   it("publishes one validated file with an opaque ID and resource metrics", async () => {
     const storage = adapter();
     const index = manager({});
@@ -89,20 +187,7 @@ describe("single-file SQLite publications", () => {
     const before = await index.search("alpha", new AbortController().signal, 5);
     const state = await index.getState();
     expect(state?.incomplete).toBe(false);
-    await expect(
-      publisher.publishAfterSuccessfulOperation({
-        operation: "update",
-        changed: true,
-        converged: false,
-        state: state!,
-      })
-    ).resolves.toMatchObject({ published: false });
-    const result = await publisher.publishAfterSuccessfulOperation({
-      operation: "update",
-      changed: true,
-      converged: true,
-      state: state!,
-    });
+    const result = await publisher.publish();
 
     expect(result).toMatchObject({ published: true, publicationId: "publication-1" });
     expect(result.metrics).toMatchObject({
@@ -118,23 +203,6 @@ describe("single-file SQLite publications", () => {
     const publishedBytes = await storage.readBinary("Trama/index/index.sqlite3");
     expect(publishedBytes.byteLength).toBe(result.metrics?.byteSize);
     expect(await index.search("alpha", new AbortController().signal, 5)).toEqual(before);
-  });
-
-  it("auto-publishes a converged no-op update", async () => {
-    const storage = adapter();
-    const index = manager({});
-    const publisher = publication(index, storage, () => "no-op-publication");
-    await index.build(new AbortController().signal);
-    const state = await index.getState();
-
-    await expect(
-      publisher.publishAfterSuccessfulOperation({
-        operation: "update",
-        changed: false,
-        converged: true,
-        state: state!,
-      })
-    ).resolves.toMatchObject({ published: true, publicationId: "no-op-publication" });
   });
 
   it("can prepare semantic vectors after publication reopens the live database", async () => {
@@ -184,6 +252,7 @@ describe("single-file SQLite publications", () => {
     const source = manager({});
     const sourcePublisher = publication(source, storage, () => "z-from-provider");
     await source.build(new AbortController().signal);
+    await source.prepareSemantic(new AbortController().signal);
     await sourcePublisher.publish();
 
     const readMarkdown = vi.fn(async () => ({ path: "different.md", content: "different" }));
@@ -204,6 +273,9 @@ describe("single-file SQLite publications", () => {
     expect(readMarkdown).not.toHaveBeenCalled();
     expect((await receiver.getState())?.publicationId).toBe("z-from-provider");
     expect(await receiver.search("alpha", new AbortController().signal, 5)).toHaveLength(1);
+    await expect(receiver.findRelated("one.md", new AbortController().signal, 5)).resolves.toEqual(
+      []
+    );
   });
 
   it("uses a changed configured folder and only publishes its exact target", async () => {
@@ -323,5 +395,97 @@ describe("single-file SQLite publications", () => {
     });
     expect(await index.getState()).toEqual(beforeState);
     expect(await index.search("alpha", new AbortController().signal, 5)).toEqual(beforeSearch);
+  });
+
+  it("requests a plugin update instead of replacing a newer publication format", async () => {
+    const storage = adapter();
+    const index = manager({});
+    const publisher = publication(index, storage, () => "newer-publication");
+    await index.build(new AbortController().signal);
+    await publisher.publish();
+    const bytes = await storage.readBinary("Trama/index/index.sqlite3");
+    const newer = await snapshotWithUserVersion(bytes, 10, { dropIndexState: true });
+
+    await expect(index.inspectPublication(newer.slice().buffer)).rejects.toMatchObject({
+      error: {
+        code: "upgrade_required",
+        message: expect.stringContaining("Check for updates"),
+      },
+    });
+  });
+
+  it("rejects inspection metadata from one publication when adoption bytes come from another", async () => {
+    const storageA = adapter();
+    const sourceA = manager({});
+    await sourceA.build(new AbortController().signal);
+    await publication(sourceA, storageA, () => "publication-a").publish();
+    const bytesA = await storageA.readBinary("Trama/index/index.sqlite3");
+    const inspectionA = await sourceA.inspectPublication(bytesA);
+
+    const storageB = adapter();
+    const sourceB = manager({});
+    await sourceB.build(new AbortController().signal);
+    await publication(sourceB, storageB, () => "publication-b").publish();
+    const bytesB = await storageB.readBinary("Trama/index/index.sqlite3");
+
+    const receiver = manager({});
+    await receiver.load();
+    const before = await receiver.getState();
+    await expect(
+      receiver.adoptPublication(bytesB, inspectionA.publicationId, inspectionA)
+    ).rejects.toMatchObject({ error: { code: "incompatible_state" } });
+    expect(await receiver.getState()).toEqual(before);
+  }, 30_000);
+
+  it("fences direct publication operations around active lexical runs", async () => {
+    const client = createTestSqliteClient({});
+    await client.call("boot", {
+      corpusFingerprint: "a".repeat(64),
+      embeddingFingerprint: "b".repeat(64),
+      dimensions: 2,
+    });
+    const prepared = (await client.call("preparePublication", {
+      publicationId: "before-run",
+    })) as { bytes: ArrayBuffer };
+    const run = (await client.call("beginLexicalRun", { summaries: [] })) as { runId: string };
+
+    for (const request of [
+      client.call("preparePublication", { publicationId: "blocked-prepare" }),
+      client.call("inspectPublication", { bytes: prepared.bytes.slice(0) }),
+      client.call("adoptPublication", {
+        bytes: prepared.bytes.slice(0),
+        expectedPublicationId: "before-run",
+      }),
+    ])
+      await expect(request).rejects.toMatchObject({
+        error: { code: "busy", retryable: true },
+      });
+
+    await client.call("abortLexicalRun", { runId: run.runId });
+    await expect(client.call("getState", {})).resolves.toMatchObject({ incomplete: true });
+    await expect(
+      client.call("preparePublication", { publicationId: "after-abort" })
+    ).resolves.toMatchObject({ publicationId: "after-abort" });
+    await expect(
+      client.call("inspectPublication", { bytes: prepared.bytes.slice(0) })
+    ).resolves.toMatchObject({ publicationId: "before-run" });
+    await expect(
+      client.call("adoptPublication", {
+        bytes: prepared.bytes.slice(0),
+        expectedPublicationId: "before-run",
+      })
+    ).resolves.toMatchObject({ publicationId: "before-run" });
+
+    const finished = (await client.call("beginLexicalRun", { summaries: [] })) as {
+      runId: string;
+    };
+    await expect(client.call("finishLexicalRun", { runId: finished.runId })).resolves.toMatchObject(
+      {
+        complete: true,
+      }
+    );
+    await expect(
+      client.call("preparePublication", { publicationId: "after-finish" })
+    ).resolves.toMatchObject({ publicationId: "after-finish" });
   });
 });

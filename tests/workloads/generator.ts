@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chunkMarkdown, type IndexChunk } from "@/index/chunking";
+import { chunkMarkdownBlocks, type MarkdownBlock } from "@/index/chunking";
 import { compareCodeUnits } from "@/index/Identity";
 import {
   workloadProfile,
@@ -9,7 +9,7 @@ import {
   type WorkloadProfile,
 } from "./config";
 
-export interface WorkloadChunk extends IndexChunk {
+export interface WorkloadChunk extends MarkdownBlock {
   readonly id: string;
   readonly ordinal: number;
   readonly vector: Float32Array;
@@ -79,23 +79,23 @@ function vectorFor(key: string, forced?: "tie"): Float32Array {
 }
 
 function paddedLine(path: string, ordinal: number, seed: number, marker = "anchor"): string {
-  const prefix = `# ${marker} ${path} chunk ${ordinal} seed ${seed} — naïve café 東京 🚀 `;
-  return `${prefix} ${"alpha beta gamma delta ".repeat(32)}`.slice(0, 380).padEnd(380, "x");
+  const prefix = `${marker} ${path} chunk ${ordinal} seed ${seed} — naïve café 東京 🚀 `;
+  return `${prefix} ${"alpha beta gamma delta ".repeat(22)}`.slice(0, 300).padEnd(300, "x");
 }
 
 function contentFor(path: string, chunkCount: number, seed: number, marker = "anchor"): string {
   return Array.from({ length: chunkCount }, (_, ordinal) =>
     paddedLine(path, ordinal, seed, marker)
-  ).join("\n");
+  ).join("\n\n");
 }
 
 function noteFrom(path: string, content: string): WorkloadNote {
   const contentId = hashHex(`${WORKLOAD_FINGERPRINT}\0${content}`);
-  const chunks = chunkMarkdown(content).map((chunk, ordinal) => ({
+  const chunks = chunkMarkdownBlocks(content).map((chunk, ordinal) => ({
     ...chunk,
     id: `${contentId}:${ordinal}`,
     ordinal,
-    vector: vectorFor(`${path}\0${ordinal}\0${chunk.text}`),
+    vector: vectorFor(`${path}\0${ordinal}\0${chunk.embeddingInput}`),
   }));
   return { path, content, contentId, chunks };
 }

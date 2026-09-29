@@ -4,6 +4,7 @@ import {
   type PublicationIndexPort,
 } from "@/index/publications/PublicationManager";
 import { type PublicationDataAdapter } from "@/index/publications/PublicationStore";
+import { sqliteError } from "@/index/sqlite/protocol";
 import type {
   PublicationInspection,
   PublicationPrepared,
@@ -20,12 +21,18 @@ const state = (publicationId?: string): SqliteState => ({
   incomplete: false,
   snapshotLoaded: false,
   changeCounter: 3,
+  lexicalGeneration: 1,
+  semanticGeneration: 1,
   noteCount: 1,
   chunkCount: 1,
   compatibleVectorCount: 1,
   vectorCount: 1,
   vectorCoverage: "complete",
   semanticReady: true,
+  semanticEligibleCount: 1,
+  semanticHeadCount: 1,
+  semanticLagCount: 0,
+  semanticMissingCount: 0,
   ...(publicationId ? { publicationId } : {}),
 });
 
@@ -89,19 +96,14 @@ function setup() {
 }
 
 describe("PublicationManager", () => {
-  it("publishes converged operations and validates the installed copy", async () => {
+  it("publishes and validates the installed copy", async () => {
     const fixture = setup();
     const metrics: unknown[] = [];
     const manager = new PublicationManager(fixture.index, fixture.adapter, {
       idFactory: () => "publication-1",
       onMetrics: (value) => metrics.push(value),
     });
-    const result = await manager.publishAfterSuccessfulOperation({
-      operation: "build",
-      changed: true,
-      converged: true,
-      state: state(),
-    });
+    const result = await manager.publish();
     expect(result).toMatchObject({ published: true, publicationId: "publication-1" });
     expect(metrics).toHaveLength(1);
     expect(fixture.publish).toHaveBeenCalledTimes(1);
@@ -131,17 +133,76 @@ describe("PublicationManager", () => {
     expect([...new Uint8Array((await manager.store.read())!)]).toEqual([9, 8, 7]);
   });
 
-  it("coalesces exact-file events and adopts a differing ID without republishing", async () => {
+  it("adopts a differing ID without republishing", async () => {
     const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, { debounceMs: 100 });
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
     await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-    manager.notifyFileEvent("Trama/index/index.sqlite3");
-    manager.notifyFileEvent("Trama/index/index.sqlite3");
-    manager.notifyFileEvent("other.md");
-    expect(await manager.flushPendingEvents()).toMatchObject({ adopted: true });
+    expect(await manager.adoptCurrent()).toMatchObject({ adopted: true });
     expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
     expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
     expect(fixture.publish).not.toHaveBeenCalled();
+  });
+
+  it("requests replacement of an incompatible synchronized index", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter, {
+      idFactory: () => "current-publication",
+    });
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("incompatible_state", "incompatible synchronized index")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      replacementRequired: true,
+    });
+    expect(fixture.publish).not.toHaveBeenCalled();
+    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
+    expect(fixture.getLive().publicationId).toBeUndefined();
+  });
+
+  it("keeps a newer synchronized index and requests a plugin update", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "newer"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("upgrade_required", "Update Trama from Obsidian's Community plugins settings")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      warning: {
+        phase: "inspect",
+        code: "upgrade_required",
+        retryable: false,
+        message: "Update Trama from Obsidian's Community plugins settings",
+      },
+    });
+    expect(fixture.publish).not.toHaveBeenCalled();
+    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a synchronized index that changes during replacement preparation", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter, {
+      idFactory: () => "current-publication",
+    });
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("incompatible_state", "incompatible synchronized index")
+    );
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({ replacementRequired: true });
+
+    const changed = new Uint8Array([1, 2, 3]).buffer;
+    await fixture.adapter.writeBinary!(manager.store.path, changed);
+
+    await expect(manager.publish()).resolves.toMatchObject({
+      published: false,
+      warning: { phase: "replace", code: "busy", retryable: true },
+    });
+    expect(await manager.store.read()).toEqual(changed);
+    expect(fixture.getLive().publicationId).toBeUndefined();
   });
 
   it("retries a failed stage from the current local index", async () => {
@@ -184,5 +245,18 @@ describe("PublicationManager", () => {
     });
     expect(await manager.store.read()).toEqual(oldBytes);
     expect(fixture.getLive().publicationId).toBeUndefined();
+  });
+  it("classifies nested permanent publication errors without making them retryable", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("integrity_failed", "invalid publication", true, "execute")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      warning: { phase: "inspect", retryable: false },
+    });
   });
 });
