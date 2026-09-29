@@ -170,12 +170,11 @@ export class RetrievalService implements VaultRetrievalPort {
       return null;
     const counter = this.runtime.changeCounter();
     const identity = indexIdentity(counter);
-    const visibleHead = this.runtime.state?.semanticHeadKey || identity;
     return {
       changeCounter: counter,
       generationId: identity,
       currentPath,
-      contentHash: visibleHead,
+      contentHash: identity,
       semantic: this.runtime.capabilities().semantic,
       freshness: this.runtime.freshness,
       ...(this.runtime.state?.publicationId

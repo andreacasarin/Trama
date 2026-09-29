@@ -147,6 +147,23 @@ describe("SqliteWorkerClient", () => {
     expect(worker.messages[0].transfer).toEqual([vector.buffer]);
   });
 
+  it("does not treat an unsupported vectors alias as semantic results", async () => {
+    const worker = new FakeWorker();
+    const client = new SqliteWorkerClient(worker);
+    const vector = new Float32Array([1, 0]);
+
+    await client.call("commitSemanticResults", {
+      embeddingFingerprint: "a".repeat(64),
+      dimensions: 2,
+      expectedCount: 0,
+      results: [],
+      vectors: [{ vector }],
+    } as any);
+
+    expect(worker.messages[0].transfer).toEqual([]);
+    expect(worker.messages[0].value.payload.vectors[0].vector).not.toBe(vector);
+  });
+
   it("transfers owned publication readback without copying it on the main thread", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);

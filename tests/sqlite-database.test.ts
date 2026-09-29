@@ -109,6 +109,31 @@ describe("revision cache database", () => {
     });
   });
 
+  it("requires both publication generation fences to match", async () => {
+    const client = createTestSqliteClient();
+    await client.call("boot", { corpusFingerprint: digest("publication-fence"), dimensions: 2 });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
+    const prepared = await client.call("preparePublication", { publicationId: "fenced-1" });
+
+    await expect(
+      client.call("finalizePublication", {
+        publicationId: "fenced-1",
+        expectedChangeCounter: prepared.state.changeCounter,
+        expectedLexicalGeneration: prepared.state.lexicalGeneration + 1,
+        expectedSemanticGeneration: prepared.state.semanticGeneration,
+      })
+    ).rejects.toMatchObject({ error: { code: "busy" } });
+
+    await expect(
+      client.call("finalizePublication", {
+        publicationId: "fenced-1",
+        expectedChangeCounter: prepared.state.changeCounter,
+        expectedLexicalGeneration: prepared.state.lexicalGeneration,
+        expectedSemanticGeneration: prepared.state.semanticGeneration,
+      })
+    ).resolves.toMatchObject({ publicationId: "fenced-1" });
+  });
+
   it("keeps cache-only semantic stores off the visible generation", async () => {
     const client = createTestSqliteClient();
     const corpusFingerprint = digest("cache-only");

@@ -12,12 +12,18 @@ const state: SqliteState = {
   incomplete: false,
   snapshotLoaded: false,
   changeCounter: 1,
+  lexicalGeneration: 1,
+  semanticGeneration: 1,
   noteCount: 1,
   chunkCount: 1,
   compatibleVectorCount: 1,
   vectorCount: 1,
   vectorCoverage: "complete",
   semanticReady: true,
+  semanticEligibleCount: 1,
+  semanticHeadCount: 1,
+  semanticLagCount: 0,
+  semanticMissingCount: 0,
 };
 
 describe("search index channels", () => {
@@ -47,10 +53,16 @@ describe("search index channels", () => {
   });
 
   it("searches available semantic vectors while reporting partial coverage", () => {
-    expect(semanticIndex.status({ ...state, vectorCount: 0 }, true, false).state).toBe("empty");
     expect(
       semanticIndex.status(
-        { ...state, vectorCoverage: "partial", semanticReady: false },
+        { ...state, semanticEligibleCount: 0, semanticHeadCount: 0 },
+        true,
+        false
+      ).state
+    ).toBe("empty");
+    expect(
+      semanticIndex.status(
+        { ...state, vectorCoverage: "partial", semanticReady: false, semanticLagCount: 1 },
         true,
         false
       )
@@ -61,11 +73,30 @@ describe("search index channels", () => {
     });
     expect(
       semanticIndex.status(
-        { ...state, compatibleVectorCount: 0, vectorCoverage: "none", semanticReady: false },
+        {
+          ...state,
+          compatibleVectorCount: 0,
+          vectorCoverage: "none",
+          semanticReady: false,
+          semanticHeadCount: 0,
+          semanticMissingCount: 1,
+        },
         true,
         false
       )
     ).toMatchObject({ state: "incompatible", searchable: false });
+    expect(
+      semanticIndex.status(
+        {
+          ...state,
+          semanticHeadCount: 0,
+          semanticMissingCount: 1,
+          semanticReady: false,
+        },
+        true,
+        false
+      )
+    ).toMatchObject({ state: "partial", searchable: false });
     expect(
       semanticIndex.status({ ...state, incomplete: true, semanticReady: false }, true, false)
     ).toMatchObject({ state: "partial", searchable: true });

@@ -211,8 +211,8 @@ export class MutableSqliteDatabase {
   finalizePublication(
     publicationId: string,
     expectedChangeCounter: number,
-    expectedLexicalGeneration?: number,
-    expectedSemanticGeneration?: number
+    expectedLexicalGeneration: number,
+    expectedSemanticGeneration: number
   ): SqliteState | undefined {
     return this.publication.finalizePublication(
       publicationId,

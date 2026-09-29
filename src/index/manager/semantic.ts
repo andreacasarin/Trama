@@ -38,14 +38,7 @@ export class SemanticCoordinator {
   /** True only while this manager has usable stored vectors for its current embedding identity. */
   hasCompatibleSemanticVectors(): boolean {
     const state = this.runtime.state;
-    return Boolean(
-      this.runtime.loaded &&
-      state &&
-      (state.semanticHeadCount ?? state.compatibleVectorCount ?? 0) > 0 &&
-      (state.semanticMissingCount === undefined ||
-        state.semanticEligibleCount === undefined ||
-        state.semanticMissingCount < state.semanticEligibleCount)
-    );
+    return Boolean(this.runtime.loaded && state && state.semanticHeadCount > 0);
   }
 
   /** True when the configured embedding provider has semantic work awaiting storage or promotion. */
@@ -58,14 +51,7 @@ export class SemanticCoordinator {
       !this.runtime.fingerprint.modelId.trim()
     )
       return false;
-    if (state.semanticEligibleCount !== undefined) {
-      const missing = state.semanticMissingCount ?? 0;
-      const lagging =
-        state.semanticLagCount ??
-        Math.max(0, state.semanticEligibleCount - (state.semanticHeadCount ?? 0));
-      return missing > 0 || lagging > 0;
-    }
-    return false;
+    return state.semanticMissingCount > 0 || state.semanticLagCount > 0;
   }
 
   async rebuildSemantic(
@@ -135,8 +121,8 @@ export class SemanticCoordinator {
         Math.max(1, Math.floor(maxVectorBytes / (this.embedding.dimensions * 4)))
       );
       const totalMissing = Math.max(
-        this.runtime.state.semanticMissingCount ?? 0,
-        this.runtime.state.semanticEligibleCount ?? 0,
+        this.runtime.state.semanticMissingCount,
+        this.runtime.state.semanticEligibleCount,
         this.runtime.state.chunkCount - this.runtime.state.compatibleVectorCount
       );
       this.runtime.reportProgress({

@@ -104,6 +104,9 @@ function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean
 function validOptionalGeneration(value: unknown): boolean {
   return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
+function validGeneration(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
 function validOptionalDimensions(value: unknown): boolean {
   return (
     value === undefined ||
@@ -289,8 +292,8 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
         !validPublicationId(value.publicationId) ||
         !Number.isSafeInteger(value.expectedChangeCounter) ||
         value.expectedChangeCounter < 0 ||
-        !validOptionalGeneration(value.expectedLexicalGeneration) ||
-        !validOptionalGeneration(value.expectedSemanticGeneration)
+        !validGeneration(value.expectedLexicalGeneration) ||
+        !validGeneration(value.expectedSemanticGeneration)
       )
         throw sqliteError("invalid_request", "Invalid publication finalization payload");
       return;

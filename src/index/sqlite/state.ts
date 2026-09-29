@@ -246,10 +246,18 @@ export class SqliteStateStore {
       this.context.db,
       `SELECT count(*) AS eligible,
               sum(CASE WHEN n.semantic_revision_id IS NOT NULL THEN 1 ELSE 0 END) AS semanticHeads,
+              count(DISTINCT CASE WHEN n.semantic_revision_id IS NOT NULL AND EXISTS (
+                SELECT 1
+                FROM chunk_occurrences so
+                JOIN embedding_cache sec ON sec.input_digest=so.embedding_input_digest
+                  AND sec.embedding_fingerprint=? AND sec.preprocessing=?
+                WHERE so.note_id=n.note_id AND so.revision_id=n.semantic_revision_id
+              ) THEN n.note_id END) AS usableSemanticHeads,
               sum(CASE WHEN n.semantic_revision_id=n.lexical_revision_id THEN 1 ELSE 0 END) AS currentSemanticHeads,
               sum(CASE WHEN EXISTS (SELECT 1 FROM chunk_occurrences eo WHERE eo.note_id=n.note_id AND eo.revision_id=n.lexical_revision_id) THEN 1 ELSE 0 END) AS nonempty,
               sum(CASE WHEN n.semantic_revision_id=n.lexical_revision_id THEN 0 ELSE 1 END) AS lagging
-       FROM notes n WHERE n.lexical_revision_id IS NOT NULL`
+       FROM notes n WHERE n.lexical_revision_id IS NOT NULL`,
+      [String(s.embedding_fingerprint), EMBEDDING_PREPROCESSING_VERSION]
     )[0];
     const missing = rows(
       this.context.db,
@@ -261,10 +269,6 @@ export class SqliteStateStore {
        WHERE ec.cache_id IS NULL`,
       [String(s.embedding_fingerprint), EMBEDDING_PREPROCESSING_VERSION]
     )[0];
-    const revisionMode =
-      Number(heads.eligible ?? 0) > 0 ||
-      Number(rows(this.context.db, "SELECT count(*) AS count FROM active_lexical")[0]?.count ?? 0) >
-        0;
     const chunks = Number(c.chunks);
     const compatible = Number(c.vectors);
     const coverage = compatible === 0 ? "none" : compatible === chunks ? "complete" : "partial";
@@ -285,22 +289,17 @@ export class SqliteStateStore {
       compatibleVectorCount: compatible,
       vectorCount: Number(c.vectors),
       vectorCoverage: coverage,
-      semanticReady: revisionMode
-        ? Number(heads.eligible ?? 0) > 0 &&
-          Number(heads.eligible ?? 0) === Number(heads.semanticHeads ?? 0) &&
-          Number(heads.eligible ?? 0) === Number(heads.currentSemanticHeads ?? 0) &&
-          Number(heads.nonempty ?? 0) > 0 &&
-          Number(missing.missing ?? 0) === 0 &&
-          !Number(s.incomplete)
-        : coverage === "complete" && !Number(s.incomplete),
-      ...(revisionMode
-        ? {
-            semanticEligibleCount: Number(heads.eligible ?? 0),
-            semanticHeadCount: Number(heads.semanticHeads ?? 0),
-            semanticLagCount: Number(heads.lagging ?? 0),
-            semanticMissingCount: Number(missing.missing ?? 0),
-          }
-        : {}),
+      semanticReady:
+        Number(heads.eligible ?? 0) > 0 &&
+        Number(heads.eligible ?? 0) === Number(heads.semanticHeads ?? 0) &&
+        Number(heads.eligible ?? 0) === Number(heads.currentSemanticHeads ?? 0) &&
+        Number(heads.nonempty ?? 0) > 0 &&
+        Number(missing.missing ?? 0) === 0 &&
+        !Number(s.incomplete),
+      semanticEligibleCount: Number(heads.eligible ?? 0),
+      semanticHeadCount: Number(heads.usableSemanticHeads ?? 0),
+      semanticLagCount: Number(heads.lagging ?? 0),
+      semanticMissingCount: Number(missing.missing ?? 0),
       ...(s.publication_id == null ? {} : { publicationId: String(s.publication_id) }),
     };
   }

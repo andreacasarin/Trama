@@ -558,7 +558,58 @@ describe("semantic index module", () => {
     );
     await changedModel.load();
     expect(changedModel.hasCompatibleSemanticVectors()).toBe(false);
+    expect(changedModel.capabilities().semantic.searchable).toBe(false);
     expect(await changedModel.getState()).toMatchObject({ compatibleVectorCount: 0 });
+  });
+
+  it("keeps partial vectors searchable during an embedding identity transition", async () => {
+    const identity = {};
+    const contents = { "a.md": `alpha ${"first ".repeat(100)}` };
+    const originalModel = embeddings();
+    originalModel.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));
+    const original = new IndexManager(
+      fixture(contents),
+      originalModel,
+      "http://127.0.0.1:1234/v1",
+      "embed-v1",
+      { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
+    );
+    await original.build(signal);
+    await original.prepareSemantic(signal);
+
+    const currentModel = embeddings();
+    currentModel.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));
+    const changedModel = new IndexManager(
+      fixture(contents),
+      currentModel,
+      "http://127.0.0.1:1234/v1",
+      "embed-v2",
+      {
+        size: 100,
+        overlap: 10,
+        prepareBatchSize: 1,
+        sqliteClient: createTestSqliteClient(identity),
+      }
+    );
+    await changedModel.load();
+    expect(changedModel.hasCompatibleSemanticVectors()).toBe(false);
+    await expect(changedModel.prepareSemanticCacheBatch(signal)).resolves.toMatchObject({
+      converged: false,
+      stored: 1,
+    });
+
+    const state = await changedModel.getState();
+    expect(state!.semanticHeadCount).toBeGreaterThan(0);
+    expect(state!.semanticMissingCount).toBeGreaterThan(0);
+    expect(state!.semanticEligibleCount).toBeGreaterThan(0);
+    expect(changedModel.hasCompatibleSemanticVectors()).toBe(true);
+    expect(changedModel.capabilities().semantic).toMatchObject({
+      state: "partial",
+      searchable: true,
+    });
+    await expect(changedModel.search("alpha", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
   });
 
   it("rebuilds semantic vectors without rebuilding the lexical index", async () => {

@@ -145,9 +145,8 @@ export interface SqliteState {
   readonly incomplete: boolean;
   readonly snapshotLoaded: boolean;
   readonly changeCounter: number;
-  /** Present in protocol v8; optional for structural compatibility with older adapters. */
-  readonly lexicalGeneration?: number;
-  readonly semanticGeneration?: number;
+  readonly lexicalGeneration: number;
+  readonly semanticGeneration: number;
   readonly noteCount: number;
   readonly chunkCount: number;
   readonly compatibleVectorCount: number;
@@ -155,12 +154,10 @@ export interface SqliteState {
   readonly vectorCoverage: VectorCoverage;
   readonly semanticReady: boolean;
   /** Counts derived from active lexical/semantic revision heads. */
-  readonly semanticEligibleCount?: number;
-  readonly semanticHeadCount?: number;
-  readonly semanticLagCount?: number;
-  readonly semanticMissingCount?: number;
-  /** @deprecated The v7 O(N) head key is no longer returned. */
-  readonly semanticHeadKey?: never;
+  readonly semanticEligibleCount: number;
+  readonly semanticHeadCount: number;
+  readonly semanticLagCount: number;
+  readonly semanticMissingCount: number;
   readonly publicationId?: string;
 }
 export interface SqliteNoteSummary {
@@ -179,8 +176,8 @@ export type SqliteMutationStatus =
 export function sqliteGenerationToken(state: SqliteState): SqliteGenerationToken {
   return {
     changeCounter: state.changeCounter,
-    lexicalGeneration: state.lexicalGeneration ?? 0,
-    semanticGeneration: state.semanticGeneration ?? 0,
+    lexicalGeneration: state.lexicalGeneration,
+    semanticGeneration: state.semanticGeneration,
   };
 }
 export function sqliteMutationReceipt(
@@ -272,8 +269,8 @@ export interface SqliteRequestPayloads {
   finalizePublication: {
     readonly publicationId: string;
     readonly expectedChangeCounter: number;
-    readonly expectedLexicalGeneration?: number;
-    readonly expectedSemanticGeneration?: number;
+    readonly expectedLexicalGeneration: number;
+    readonly expectedSemanticGeneration: number;
   };
   inspectPublication: {
     readonly bytes: ArrayBuffer;

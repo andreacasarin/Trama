@@ -94,12 +94,19 @@ describe("SQLite protocol", () => {
     for (const option of retrievalOptions)
       expect(() => validateRequest(request("retrieve", { limit: 10, ...option }))).toThrow();
 
-    for (const fence of [{ expectedLexicalGeneration: -1 }, { expectedSemanticGeneration: 1.5 }])
+    for (const fence of [
+      { expectedLexicalGeneration: -1 },
+      { expectedSemanticGeneration: 1.5 },
+      { expectedLexicalGeneration: undefined },
+      { expectedSemanticGeneration: undefined },
+    ])
       expect(() =>
         validateRequest(
           request("finalizePublication", {
             publicationId: "publication-1",
             expectedChangeCounter: 1,
+            expectedLexicalGeneration: 0,
+            expectedSemanticGeneration: 0,
             ...fence,
           })
         )

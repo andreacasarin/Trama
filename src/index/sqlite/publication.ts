@@ -160,8 +160,8 @@ export class SqlitePublicationStore {
   finalizePublication(
     publicationId: string,
     expectedChangeCounter: number,
-    expectedLexicalGeneration?: number,
-    expectedSemanticGeneration?: number
+    expectedLexicalGeneration: number,
+    expectedSemanticGeneration: number
   ): SqliteState | undefined {
     const generation = rows(
       this.context.db,
@@ -170,10 +170,8 @@ export class SqlitePublicationStore {
     if (
       !generation ||
       Number(generation.changeCounter) !== expectedChangeCounter ||
-      (expectedLexicalGeneration !== undefined &&
-        Number(generation.lexicalGeneration) !== expectedLexicalGeneration) ||
-      (expectedSemanticGeneration !== undefined &&
-        Number(generation.semanticGeneration) !== expectedSemanticGeneration)
+      Number(generation.lexicalGeneration) !== expectedLexicalGeneration ||
+      Number(generation.semanticGeneration) !== expectedSemanticGeneration
     )
       throw sqliteError(
         "busy",
@@ -184,15 +182,13 @@ export class SqlitePublicationStore {
       this.context.db.exec({
         sql: `UPDATE index_state SET publication_id=?
               WHERE id=1 AND change_counter=?
-                AND (? IS NULL OR lexical_generation=?)
-                AND (? IS NULL OR semantic_generation=?)`,
+                AND lexical_generation=?
+                AND semantic_generation=?`,
         bind: [
           publicationId,
           expectedChangeCounter,
-          expectedLexicalGeneration ?? null,
-          expectedLexicalGeneration ?? null,
-          expectedSemanticGeneration ?? null,
-          expectedSemanticGeneration ?? null,
+          expectedLexicalGeneration,
+          expectedSemanticGeneration,
         ],
       })
     );
@@ -200,10 +196,8 @@ export class SqlitePublicationStore {
     if (
       state.publicationId !== publicationId ||
       state.changeCounter !== expectedChangeCounter ||
-      (expectedLexicalGeneration !== undefined &&
-        state.lexicalGeneration !== expectedLexicalGeneration) ||
-      (expectedSemanticGeneration !== undefined &&
-        state.semanticGeneration !== expectedSemanticGeneration)
+      state.lexicalGeneration !== expectedLexicalGeneration ||
+      state.semanticGeneration !== expectedSemanticGeneration
     )
       return undefined;
     return state;

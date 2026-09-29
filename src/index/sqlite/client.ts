@@ -265,8 +265,7 @@ function cloneRequest<M extends SqliteMethod>(
   if (payload.vector instanceof Float32Array && payload.vector.buffer instanceof ArrayBuffer)
     transfer.push(payload.vector.buffer);
   if (payload.bytes instanceof ArrayBuffer) transfer.push(payload.bytes);
-  const vectors = (payload.results ?? payload.vectors) as
-    readonly { vector?: Float32Array }[] | undefined;
+  const vectors = payload.results as readonly { vector?: Float32Array }[] | undefined;
   if (vectors)
     for (const item of vectors)
       if (item.vector?.buffer instanceof ArrayBuffer) transfer.push(item.vector.buffer);

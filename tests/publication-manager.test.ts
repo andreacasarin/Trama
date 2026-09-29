@@ -21,12 +21,18 @@ const state = (publicationId?: string): SqliteState => ({
   incomplete: false,
   snapshotLoaded: false,
   changeCounter: 3,
+  lexicalGeneration: 1,
+  semanticGeneration: 1,
   noteCount: 1,
   chunkCount: 1,
   compatibleVectorCount: 1,
   vectorCount: 1,
   vectorCoverage: "complete",
   semanticReady: true,
+  semanticEligibleCount: 1,
+  semanticHeadCount: 1,
+  semanticLagCount: 0,
+  semanticMissingCount: 0,
   ...(publicationId ? { publicationId } : {}),
 });
 

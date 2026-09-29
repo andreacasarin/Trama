@@ -7,6 +7,7 @@ import {
 import { CHUNK_SIZE } from "@/index/chunking";
 import {
   type SqliteLexicalBatchNoteInput,
+  type SqliteLexicalBatchResult,
   type SqliteLexicalRunResult,
   type SqliteNoteSummary,
   type SqliteState,
@@ -300,17 +301,9 @@ export class LexicalSnapshotService {
           ),
         },
         signal
-      )) as {
-        changed: boolean;
-        applied: number;
-        skipped: number;
-        occurrences: number;
-        receipt: { generation?: unknown };
-      };
+      )) as SqliteLexicalBatchResult;
       changed ||= result.changed;
       completed += group.length;
-      const generation = result.receipt.generation as
-        { readonly changeCounter?: unknown } | undefined;
       this.runtime.reportProgress(
         {
           operation: operation === "full" || operation === "rebuild" ? "full" : "incremental",
@@ -319,9 +312,7 @@ export class LexicalSnapshotService {
           total: notes.length,
           unit: "notes",
           determinate: true,
-          ...(typeof generation?.changeCounter === "number"
-            ? { generationId: indexIdentity(generation.changeCounter) }
-            : {}),
+          generationId: indexIdentity(result.receipt.generation.changeCounter),
         },
         false
       );
