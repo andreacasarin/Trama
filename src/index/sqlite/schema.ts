@@ -1,6 +1,6 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 8;
-export const SQLITE_PROTOCOL_VERSION = 8;
+export const SQLITE_SCHEMA_VERSION = 9;
+export const SQLITE_PROTOCOL_VERSION = 9;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
 export function schemaSql(dimensions: number): string {
@@ -29,9 +29,6 @@ CREATE TABLE IF NOT EXISTS index_state (
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
   lexical_generation INTEGER NOT NULL DEFAULT 0 CHECK (lexical_generation >= 0),
   semantic_generation INTEGER NOT NULL DEFAULT 0 CHECK (semantic_generation >= 0),
-  lexical_revision_count INTEGER NOT NULL DEFAULT 0 CHECK (lexical_revision_count >= 0),
-  semantic_revision_count INTEGER NOT NULL DEFAULT 0 CHECK (semantic_revision_count >= 0),
-  embedding_input_count INTEGER NOT NULL DEFAULT 0 CHECK (embedding_input_count >= 0),
   publication_id TEXT,
   snapshot_loaded INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_loaded IN (0,1)),
   reconciliation_summary TEXT NOT NULL DEFAULT ''

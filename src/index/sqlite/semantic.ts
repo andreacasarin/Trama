@@ -78,7 +78,7 @@ export class SqliteSemanticStore {
         promoted = this.promoteSemanticHeadsInTransaction(embeddingFingerprint, preprocessing);
         if (promoted)
           this.context.db.exec({
-            sql: "UPDATE index_state SET semantic_revision_count=(SELECT count(*) FROM notes WHERE semantic_revision_id IS NOT NULL),semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
+            sql: "UPDATE index_state SET semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
           });
       });
     const first = rows(
@@ -222,7 +222,7 @@ export class SqliteSemanticStore {
         );
         if (promoted)
           this.context.db.exec({
-            sql: "UPDATE index_state SET semantic_revision_count=(SELECT count(*) FROM notes WHERE semantic_revision_id IS NOT NULL),semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
+            sql: "UPDATE index_state SET semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
           });
       } finally {
         this.context.db.exec("DROP TABLE IF EXISTS semantic_affected_notes");
@@ -268,7 +268,7 @@ export class SqliteSemanticStore {
         bind: [this.context.embeddingFingerprint],
       });
       this.context.db.exec({
-        sql: "UPDATE index_state SET semantic_revision_count=0,semantic_generation=semantic_generation+CASE WHEN ? THEN 1 ELSE 0 END,change_counter=change_counter+1 WHERE id=1",
+        sql: "UPDATE index_state SET semantic_generation=semantic_generation+CASE WHEN ? THEN 1 ELSE 0 END,change_counter=change_counter+1 WHERE id=1",
         bind: [hadVisibleHeads ? 1 : 0],
       });
     });

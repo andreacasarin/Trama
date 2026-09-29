@@ -115,9 +115,6 @@ export class SqlitePublicationStore {
               )`,
         bind: [this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
       });
-      this.context.db.exec(
-        "UPDATE index_state SET lexical_revision_count=(SELECT count(*) FROM notes WHERE lexical_revision_id IS NOT NULL),semantic_revision_count=(SELECT count(*) FROM notes WHERE semantic_revision_id IS NOT NULL),embedding_input_count=(SELECT count(*) FROM embedding_inputs) WHERE id=1"
-      );
     });
   }
   validateSnapshot(

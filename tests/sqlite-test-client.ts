@@ -100,15 +100,18 @@ export async function loadTestSqlite(): Promise<any> {
   return runtimePromise;
 }
 
-export async function malformedSchema7Snapshot(
+export async function malformedSchema8Snapshot(
   defect: "missing-vector" | "wrong-fts" | "wrong-index"
 ): Promise<Uint8Array> {
   const sqlite = await loadTestSqlite();
   const raw = new sqlite.oo1.DB(":memory:", "c");
   raw.exec(schemaSql(2));
-  raw.exec("PRAGMA user_version=7");
+  raw.exec("ALTER TABLE index_state ADD COLUMN lexical_revision_count INTEGER NOT NULL DEFAULT 0");
+  raw.exec("ALTER TABLE index_state ADD COLUMN semantic_revision_count INTEGER NOT NULL DEFAULT 0");
+  raw.exec("ALTER TABLE index_state ADD COLUMN embedding_input_count INTEGER NOT NULL DEFAULT 0");
+  raw.exec("PRAGMA user_version=8");
   raw.exec(
-    "INSERT INTO index_state(id,app_version,schema_version,protocol_version,build_identity,extraction_version,chunk_algorithm_version,embedding_input_version,dimensions,corpus_fingerprint,embedding_fingerprint,incomplete,change_counter,snapshot_loaded) VALUES(1,'trama',7,7,'trama-sqlite-schema-7-protocol-7-heads-fts5-vector-float32-cosine-opfs-sah-v1',1,2,1,2,?, ?,1,0,0)",
+    "INSERT INTO index_state(id,app_version,schema_version,protocol_version,build_identity,extraction_version,chunk_algorithm_version,embedding_input_version,dimensions,corpus_fingerprint,embedding_fingerprint,incomplete,change_counter,snapshot_loaded) VALUES(1,'trama',8,8,'trama-sqlite-schema-8-protocol-8-heads-fts5-vector-float32-cosine-opfs-sah-v1',1,2,1,2,?, ?,1,0,0)",
     { bind: ["a".repeat(64), "b".repeat(64)] }
   );
   if (defect === "missing-vector") raw.exec("ALTER TABLE embedding_cache DROP COLUMN vector");
@@ -125,6 +128,21 @@ export async function malformedSchema7Snapshot(
   const bytes = new Uint8Array(sqlite.capi.sqlite3_js_db_export(raw.pointer));
   raw.close();
   return bytes;
+}
+
+export async function inspectIndexStateColumns(bytes: ArrayBuffer | Uint8Array): Promise<string[]> {
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  try {
+    const columns: string[] = [];
+    opened.raw.exec({
+      sql: "PRAGMA table_info(index_state)",
+      rowMode: "object",
+      callback: (row: { name: string }) => columns.push(row.name),
+    });
+    return columns;
+  } finally {
+    opened.database.close();
+  }
 }
 
 async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {

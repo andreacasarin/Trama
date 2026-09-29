@@ -61,7 +61,7 @@ export class SqliteStateStore {
       if (app !== SQLITE_APPLICATION_ID || version !== SQLITE_SCHEMA_VERSION)
         throw sqliteError(
           "incompatible_state",
-          "SQLite database schema/build is incompatible (expected schema 8).",
+          "SQLite database schema/build is incompatible (expected schema 9).",
           false
         );
       this.assertSchemaLayout();
@@ -114,9 +114,6 @@ export class SqliteStateStore {
         "change_counter",
         "lexical_generation",
         "semantic_generation",
-        "lexical_revision_count",
-        "semantic_revision_count",
-        "embedding_input_count",
         "publication_id",
         "snapshot_loaded",
         "reconciliation_summary",

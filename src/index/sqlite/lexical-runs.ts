@@ -243,9 +243,6 @@ export class SqliteLexicalRunStore {
                   snapshot_loaded=0,reconciliation_summary='',
                   lexical_generation=lexical_generation+?,
                   semantic_generation=semantic_generation+CASE WHEN ? > 0 THEN 1 ELSE 0 END,
-                  lexical_revision_count=(SELECT count(*) FROM notes WHERE lexical_revision_id IS NOT NULL),
-                  semantic_revision_count=(SELECT count(*) FROM notes WHERE semantic_revision_id IS NOT NULL),
-                  embedding_input_count=(SELECT count(*) FROM embedding_inputs),
                   change_counter=change_counter+CASE WHEN ? THEN 1 ELSE 0 END
               WHERE id=1`,
         bind: [converged ? 1 : 0, changed ? 1 : 0, semanticChanged, changed ? 1 : 0],

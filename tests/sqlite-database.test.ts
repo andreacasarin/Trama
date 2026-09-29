@@ -3,18 +3,58 @@ import {
   applyTestLexicalRun,
   createTestSqliteClient,
   embedAllTestInputs,
+  inspectIndexStateColumns,
   inspectSnapshotTables,
+  snapshotFor,
 } from "./sqlite-test-client";
 
 const digest = (_value: string) => "a".repeat(64);
 
 describe("revision cache database", () => {
   it("creates only the revision/cache model", async () => {
-    const client = createTestSqliteClient();
+    const identity = {};
+    const client = createTestSqliteClient(identity, { persistMutations: true });
     await client.call("boot", { corpusFingerprint: digest("schema"), dimensions: 2 });
     const state = await client.call("getState", {});
-    expect(state.schemaVersion).toBe(8);
+    expect(state.schemaVersion).toBe(9);
     expect(state.noteCount).toBe(0);
+    const columns = await inspectIndexStateColumns(await snapshotFor(identity));
+    expect(columns).not.toContain("lexical_revision_count");
+    expect(columns).not.toContain("semantic_revision_count");
+    expect(columns).not.toContain("embedding_input_count");
+  });
+
+  it("derives note counts across empty, populated, updated, and deleted states", async () => {
+    const client = createTestSqliteClient();
+    await client.call("boot", { corpusFingerprint: digest("counts"), dimensions: 2 });
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      noteCount: 0,
+      chunkCount: 0,
+    });
+
+    await applyTestLexicalRun(client, [
+      { path: "one.md", markdown: "alpha", size: 100 },
+      { path: "two.md", markdown: "beta", size: 100 },
+    ]);
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      noteCount: 2,
+      chunkCount: 2,
+    });
+
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha\n\nbeta", size: 100 }]);
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      noteCount: 2,
+      chunkCount: 3,
+    });
+
+    await applyTestLexicalRun(client, [], {
+      deletes: ["one.md", "two.md"],
+      mayClearIncomplete: true,
+    });
+    await expect(client.call("getState", {})).resolves.toMatchObject({
+      noteCount: 0,
+      chunkCount: 0,
+    });
   });
 
   it("deduplicates embedding actions across active occurrences", async () => {
@@ -74,7 +114,6 @@ describe("revision cache database", () => {
 
     const initial = await client.call("getState", {});
     expect(initial).toMatchObject({ lexicalGeneration: 0, semanticGeneration: 0 });
-    expect(initial.semanticHeadKey).toBeUndefined();
 
     await applyTestLexicalRun(client, [{ path: "one.md", markdown, size: 100 }]);
     const lexical = await client.call("getState", {});

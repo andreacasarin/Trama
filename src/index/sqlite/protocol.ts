@@ -1,5 +1,5 @@
 /** Closed, versioned protocol for the mutable SQLite index. */
-export const SQLITE_PROTOCOL_VERSION = 8 as const;
+export const SQLITE_PROTOCOL_VERSION = 9 as const;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
 // Character bound is conservative; hashMarkdown enforces the exact 16 MiB UTF-8 bound.

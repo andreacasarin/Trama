@@ -5,7 +5,7 @@ import {
   applyTestLexicalRun,
   createTestSqliteClient,
   embedAllTestInputs,
-  malformedSchema7Snapshot,
+  malformedSchema8Snapshot,
 } from "./sqlite-test-client";
 
 const hash = "a".repeat(64);
@@ -130,9 +130,9 @@ describe("SQLite protocol", () => {
         embeddingFingerprint: "b".repeat(64),
         dimensions: 2,
       })
-    ).resolves.toMatchObject({ schemaVersion: 8, protocolVersion: SQLITE_PROTOCOL_VERSION });
+    ).resolves.toMatchObject({ schemaVersion: 9, protocolVersion: SQLITE_PROTOCOL_VERSION });
     await expect(client.call("getState", {})).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       protocolVersion: SQLITE_PROTOCOL_VERSION,
     });
   });
@@ -142,14 +142,14 @@ describe("SQLite protocol", () => {
     await client.call("boot", { corpusFingerprint: hash, dimensions: 2 });
     await expect(
       client.call("boot", { corpusFingerprint: hash, dimensions: 3 })
-    ).resolves.toMatchObject({ schemaVersion: 8, dimensions: 3, noteCount: 0 });
+    ).resolves.toMatchObject({ schemaVersion: 9, dimensions: 3, noteCount: 0 });
   });
 
   for (const defect of ["missing-vector", "wrong-fts", "wrong-index"] as const)
-    it(`resets a schema-7 database with ${defect}`, async () => {
+    it(`resets a former-v8 database with ${defect}`, async () => {
       const client = createTestSqliteClient(
         { schemaDefectBoundary: defect },
-        { snapshot: await malformedSchema7Snapshot(defect) }
+        { snapshot: await malformedSchema8Snapshot(defect) }
       );
       await expect(
         client.call("boot", {
@@ -157,11 +157,13 @@ describe("SQLite protocol", () => {
           embeddingFingerprint: "b".repeat(64),
           dimensions: 2,
         })
-      ).resolves.toMatchObject({ schemaVersion: 8, noteCount: 0 });
+      ).resolves.toMatchObject({ schemaVersion: 9, noteCount: 0 });
       await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 0 });
+      await applyTestLexicalRun(client, [{ path: "usable.md", markdown: "rebuilt", size: 100 }]);
+      await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 1 });
     });
 
-  it("preserves valid V7 note/head/cache data on reopen", async () => {
+  it("preserves current note/head/cache data on reopen", async () => {
     const client = createTestSqliteClient({ validReopenBoundary: true });
     const corpusFingerprint = hash;
     const embeddingFingerprint = "b".repeat(64);
