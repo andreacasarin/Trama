@@ -25,7 +25,6 @@ export interface EmbeddingSettings {
 export type LenteSearchMethod = "hybrid" | "keyword";
 export interface LenteSettings {
   readonly searchMethod: LenteSearchMethod;
-  readonly maxResults: number;
   readonly automaticSearches: boolean;
 }
 export interface FiloSettings {
@@ -48,16 +47,6 @@ const LENTE_SEARCH_METHODS = ["hybrid", "keyword"] as const;
 
 function isLenteSearchMethod(value: unknown): value is LenteSearchMethod {
   return LENTE_SEARCH_METHODS.includes(value as LenteSearchMethod);
-}
-
-function isValidLenteMaxResults(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 5 &&
-    value <= 50 &&
-    value % 5 === 0
-  );
 }
 
 /** Normalizes one vault-relative file or directory path, or returns undefined when invalid. */
@@ -132,7 +121,6 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   }),
   lente: Object.freeze({
     searchMethod: "hybrid",
-    maxResults: 20,
     automaticSearches: false,
   }),
   filo: Object.freeze({
@@ -200,9 +188,6 @@ export class SettingsStore {
       searchMethod: isLenteSearchMethod(rawLente.searchMethod)
         ? rawLente.searchMethod
         : DEFAULT_SETTINGS.lente.searchMethod,
-      maxResults: isValidLenteMaxResults(rawLente.maxResults)
-        ? rawLente.maxResults
-        : DEFAULT_SETTINGS.lente.maxResults,
       automaticSearches: rawLente.automaticSearches === true,
     };
     const filo = {
@@ -325,12 +310,8 @@ export class SettingsStore {
     if (!isLenteSearchMethod(lente.searchMethod)) {
       throw new Error("Lente search method must be hybrid or keyword.");
     }
-    if (!isValidLenteMaxResults(lente.maxResults)) {
-      throw new Error("Lente maximum displayed results must be from 5 to 50 in increments of 5.");
-    }
     return {
       searchMethod: lente.searchMethod,
-      maxResults: lente.maxResults,
       automaticSearches: lente.automaticSearches === true,
     };
   }

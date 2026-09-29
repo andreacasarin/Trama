@@ -205,9 +205,7 @@ export class TramaPlugin extends Plugin {
       before.embedding.endpoint !== saved.embedding.endpoint ||
       before.embedding.modelId !== saved.embedding.modelId ||
       before.embedding.dimensions !== saved.embedding.dimensions;
-    const lenteChanged =
-      before.lente.searchMethod !== saved.lente.searchMethod ||
-      before.lente.maxResults !== saved.lente.maxResults;
+    const lenteChanged = before.lente.searchMethod !== saved.lente.searchMethod;
     const exclusionsChanged =
       before.filo.excludedPaths.length !== saved.filo.excludedPaths.length ||
       before.filo.excludedPaths.some((path, index) => path !== saved.filo.excludedPaths[index]);
@@ -299,6 +297,7 @@ export class TramaPlugin extends Plugin {
         createClient: (storage) => this.sqliteRuntime.createClient(storage),
         isCurrent: (manager) => this.index === manager,
         getIndexStatus: () => this.indexStatus,
+        isAutomaticMaintenanceEnabled: () => this.getSettings().automaticMaintenance,
         onComposed: ({ manager, publication, scheduler, relatedNotes, embedding }) => {
           this.index = manager;
           this.publicationManager = publication;
@@ -405,6 +404,10 @@ export class TramaPlugin extends Plugin {
   async rebuildIndex(): Promise<void> {
     if (!this.maintenance) throw new Error("Index is not initialized.");
     await this.maintenance.rebuild();
+  }
+  async publishIndex(): Promise<void> {
+    if (!this.maintenance) throw new Error("Index is not initialized.");
+    await this.maintenance.publishCurrent();
   }
   async stopIndex(): Promise<void> {
     this.maintenance?.stop();

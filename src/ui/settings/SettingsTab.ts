@@ -25,6 +25,7 @@ export interface SettingsTabCallbacks {
   updateIndex(): Promise<void>;
   rebuildIndex(): Promise<void>;
   stopIndex(): Promise<void>;
+  publishIndex(): Promise<void>;
   checkPublication?(): Promise<void>;
   getIndexStatus?():
     | {
@@ -47,13 +48,16 @@ export interface SettingsDraft {
   embeddingEndpoint: string;
   embeddingModelId: string;
   lenteSearchMethod: LenteSearchMethod;
-  lenteMaxResults: number;
   lenteAutomaticSearches: boolean;
   automaticMaintenance: boolean;
   filoExcludedPaths: readonly string[];
 }
 
 const REASONING_EFFORTS = ["auto", "none", "low", "medium", "high"] as const;
+const CHAT_ENDPOINT_DESCRIPTION =
+  "OpenAI-compatible /v1 base URL with GET /models and streaming POST /responses, including function tools. Tested with LM Studio 0.3.29+. API-key services such as OpenAI and OpenRouter are not yet supported.";
+const EMBEDDING_ENDPOINT_DESCRIPTION =
+  "OpenAI-compatible /v1 base URL with GET /models and POST /embeddings. Returned vectors must match the configured dimensions. Tested with LM Studio; API-key services are not yet supported.";
 
 /** Returns the first invalid chat-control draft value, or an empty string. */
 export function validateChatDraft(draft: SettingsDraft): string {
@@ -99,7 +103,6 @@ export function projectSettingsWithDraft(
     },
     lente: {
       searchMethod: draft.lenteSearchMethod,
-      maxResults: draft.lenteMaxResults,
       automaticSearches: draft.lenteAutomaticSearches,
     },
     filo: {
@@ -122,7 +125,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     app: ConstructorParameters<typeof PluginSettingTab>[0],
     private readonly controller: Plugin &
       Partial<SettingsTabCallbacks> &
-      Pick<SettingsTabCallbacks, "updateIndex" | "rebuildIndex" | "stopIndex">
+      Pick<SettingsTabCallbacks, "updateIndex" | "rebuildIndex" | "publishIndex" | "stopIndex">
   ) {
     super(app, controller);
   }
@@ -139,7 +142,6 @@ export class TramaSettingsTab extends PluginSettingTab {
       embeddingEndpoint: settings.embedding.endpoint,
       embeddingModelId: settings.embedding.modelId,
       lenteSearchMethod: settings.lente.searchMethod,
-      lenteMaxResults: settings.lente.maxResults,
       lenteAutomaticSearches: settings.lente.automaticSearches,
       automaticMaintenance: settings.automaticMaintenance,
       filoExcludedPaths: [...settings.filo.excludedPaths],
@@ -167,103 +169,40 @@ export class TramaSettingsTab extends PluginSettingTab {
         toggle.setValue(draft.lenteAutomaticSearches);
         toggle.onChange((value) => {
           draft.lenteAutomaticSearches = value;
+          void this.run(() =>
+            this.controller.saveSettings?.((current) => ({
+              ...current,
+              lente: { ...current.lente, automaticSearches: value },
+            }))
+          );
         });
       });
-    new Setting(this.containerEl)
-      .setName("Maximum displayed results")
-      .setDesc("Controls how many unique notes Lente displays.")
-      .addSlider((slider) => {
-        slider.setLimits(5, 50, 5);
-        slider.setValue(draft.lenteMaxResults);
-        slider.setDynamicTooltip();
-        slider.onChange((value) => {
-          draft.lenteMaxResults = value;
-        });
-      });
-
     this.sectionHeading("Voce");
-    this.text("Chat endpoint", draft.chatEndpoint, (value) => {
-      draft.chatEndpoint = value;
-    });
+    this.text(
+      "Chat endpoint",
+      draft.chatEndpoint,
+      (value) => {
+        draft.chatEndpoint = value;
+      },
+      CHAT_ENDPOINT_DESCRIPTION
+    );
     this.modelSelector("chat", draft);
     this.chatControls(draft);
 
     this.sectionHeading("Filo");
-    this.text("Embedding endpoint", draft.embeddingEndpoint, (value) => {
-      draft.embeddingEndpoint = value;
-    });
+    this.text(
+      "Embedding endpoint",
+      draft.embeddingEndpoint,
+      (value) => {
+        draft.embeddingEndpoint = value;
+      },
+      EMBEDDING_ENDPOINT_DESCRIPTION
+    );
     this.modelSelector("embedding", draft);
-    new Setting(this.containerEl)
-      .setName("Automatic maintenance")
-      .setDesc(
-        "Configured embeddings may send note data to the configured local or remote provider and may have cost. An incompatible synchronized index is always rebuilt and replaced so devices converge, even when this setting is off."
-      )
-      .addToggle((toggle) => {
-        toggle.setValue(draft.automaticMaintenance);
-        toggle.onChange((value) => {
-          draft.automaticMaintenance = value;
-        });
-      });
     this.exclusions(draft);
 
-    this.sectionHeading("Lexical & semantic indexes and sync");
-    new Setting(this.containerEl)
-      .setName("Synchronized SQLite folder")
-      .setDesc(
-        "Vault-relative folder for index.sqlite3. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
-      )
-      .addText((text) => {
-        text.setValue(draft.publicationDirectory ?? "Trama/index");
-        text.onChange((value) => {
-          draft.publicationDirectory = value;
-        });
-      });
-    const status = this.controller.getIndexStatus?.();
-    if (status?.capabilities) {
-      for (const channel of ["lexical", "semantic"] as const) {
-        const current = status.capabilities[channel];
-        this.containerEl.createEl("p", {
-          text: `${channel === "lexical" ? "Lexical" : "Semantic"} index: ${current.state} · ${current.activity}`,
-        });
-      }
-    }
-    new Setting(this.containerEl)
-      .setName("Index maintenance")
-      .setDesc("Update changed notes or rebuild the index and its semantic vectors.")
-      .addButton((button) =>
-        button
-          .setButtonText("Update")
-          .onClick(
-            () => void this.run(() => this.runIndexMaintenance(() => this.controller.updateIndex()))
-          )
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Rebuild")
-          .onClick(
-            () =>
-              void this.run(() => this.runIndexMaintenance(() => this.controller.rebuildIndex()))
-          )
-      )
-      .addButton((button) =>
-        button.setButtonText("Stop").onClick(() => void this.run(() => this.controller.stopIndex()))
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Check")
-          .onClick(() => void this.run(() => this.controller.checkPublication?.()))
-      );
-    if (status?.publicationWarning)
-      this.containerEl.createEl("p", { text: status.publicationWarning, cls: "mod-warning" });
-    const metrics = this.controller.getPublicationMetrics?.();
-    if (metrics)
-      this.containerEl.createEl("p", {
-        text: `Last publication: ${metrics.byteSize} bytes in ${metrics.durationMs} ms.`,
-        cls: "setting-item-description",
-      });
-
     this.sectionHeading("Advanced");
-    this.advanced(settings);
+    this.advanced(settings, draft);
     if (this.errorMessage)
       this.containerEl.createEl("p", { text: this.errorMessage, cls: "mod-warning" });
     const saveButton = this.containerEl.createEl("button", { text: "Save", cls: "mod-cta" });
@@ -285,8 +224,15 @@ export class TramaSettingsTab extends PluginSettingTab {
   override hide(): void {
     // Drafts intentionally survive a temporary Settings hide/reopen.
   }
-  private text(name: string, value: string, update: (value: string) => void): void {
-    new Setting(this.containerEl).setName(name).addText((text) => {
+  private text(
+    name: string,
+    value: string,
+    update: (value: string) => void,
+    description?: string
+  ): void {
+    const setting = new Setting(this.containerEl).setName(name);
+    if (description) setting.setDesc(description);
+    setting.addText((text) => {
       text.setValue(value);
       text.onChange(update);
     });
@@ -303,8 +249,8 @@ export class TramaSettingsTab extends PluginSettingTab {
       .setName(isChat ? "AI model" : "Embedding model")
       .setDesc(
         isChat
-          ? "Click Discover to query LM Studio, then choose an AI model."
-          : "Used by Filo indexing and Hybrid Lente search; changing it requires Update or Rebuild. Click Discover to query LM Studio."
+          ? "Click Discover to query the configured endpoint, then choose an AI model."
+          : "Used by Filo indexing and Hybrid Lente search; changing it requires Update or Rebuild. Click Discover to query the configured endpoint."
       )
       .addDropdown((dropdown) => {
         if (!selectedModel) dropdown.addOption("", "Select a model");
@@ -368,7 +314,84 @@ export class TramaSettingsTab extends PluginSettingTab {
       );
   }
 
-  private advanced(settings: TramaSettings): void {
+  private advanced(settings: TramaSettings, draft: SettingsDraft): void {
+    new Setting(this.containerEl)
+      .setName("Scheduled maintenance")
+      .setDesc(
+        "Automatically updates the lexical index after vault changes, prepares semantic vectors when an embedding model is configured, and publishes the converged SQLite index for synchronization. Semantic preparation sends note excerpts to the configured embedding endpoint and may incur provider cost."
+      )
+      .addToggle((toggle) => {
+        toggle.setValue(draft.automaticMaintenance);
+        toggle.onChange((value) => {
+          draft.automaticMaintenance = value;
+          void this.run(() =>
+            this.controller.saveSettings?.((current) => ({
+              ...current,
+              automaticMaintenance: value,
+            }))
+          );
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Synchronized SQLite folder")
+      .setDesc(
+        "Vault-relative folder for index.sqlite3. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
+      )
+      .addText((text) => {
+        text.setValue(draft.publicationDirectory ?? "Trama/index");
+        text.onChange((value) => {
+          draft.publicationDirectory = value;
+        });
+      });
+    new Setting(this.containerEl)
+      .setName("Index maintenance")
+      .setDesc(
+        "Update changed notes, publish the current index, or rebuild the index and its semantic vectors."
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Update")
+          .onClick(
+            () => void this.run(() => this.runIndexMaintenance(() => this.controller.updateIndex()))
+          )
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Rebuild")
+          .onClick(
+            () =>
+              void this.run(() => this.runIndexMaintenance(() => this.controller.rebuildIndex()))
+          )
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Publish")
+          .onClick(() => void this.run(() => this.controller.publishIndex()))
+      )
+      .addButton((button) =>
+        button.setButtonText("Stop").onClick(() => void this.run(() => this.controller.stopIndex()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Check")
+          .onClick(() => void this.run(() => this.controller.checkPublication?.()))
+      );
+    const status = this.controller.getIndexStatus?.();
+    if (status?.capabilities) {
+      const { lexical, semantic } = status.capabilities;
+      this.containerEl.createEl("p", {
+        text: `Index status: Lexical ${lexical.state} · ${lexical.activity}; Semantic ${semantic.state} · ${semantic.activity}.`,
+        cls: "setting-item-description",
+      });
+    }
+    if (status?.publicationWarning)
+      this.containerEl.createEl("p", { text: status.publicationWarning, cls: "mod-warning" });
+    const metrics = this.controller.getPublicationMetrics?.();
+    if (metrics)
+      this.containerEl.createEl("p", {
+        text: `Last publication: ${metrics.byteSize} bytes in ${metrics.durationMs} ms.`,
+        cls: "setting-item-description",
+      });
     new Setting(this.containerEl)
       .setName("Detailed debugging")
       .setDesc(

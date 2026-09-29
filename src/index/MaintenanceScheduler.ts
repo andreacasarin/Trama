@@ -71,6 +71,7 @@ export class MaintenanceScheduler {
   private firstOutstandingAt?: number;
   private invalidatedAttempts = 0;
   private invalidatedCurrentAttempt = false;
+  private publicationRequired = false;
   private disposed = false;
   private disposal?: Promise<void>;
   private error?: unknown;
@@ -113,10 +114,11 @@ export class MaintenanceScheduler {
   }
 
   /** Call on each vault edit affecting eligible Markdown. */
-  invalidate(): void {
+  invalidate(publicationRequired = false): void {
     if (this.disposed) return;
     const now = this.clock.now();
     this.pending = true;
+    this.publicationRequired ||= publicationRequired;
     this.lastEditAt = now;
     this.firstOutstandingAt ??= now;
     if (this.lane !== "idle") this.invalidatedCurrentAttempt = true;
@@ -129,6 +131,35 @@ export class MaintenanceScheduler {
   }
   rebuild(): Promise<void> {
     return this.enqueue("rebuild");
+  }
+
+  /** Publishes the current converged index without repeating lexical or semantic work. */
+  async publishCurrent(): Promise<void> {
+    if (this.disposed) return;
+    this.suspended = false;
+    this.error = undefined;
+    let cancelled = false;
+    const cancel = () => {
+      cancelled = true;
+    };
+    this.queuedFenceCancels.add(cancel);
+    try {
+      while (this.lane !== "idle") {
+        if (this.disposed || cancelled) return;
+        await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+      }
+      if (this.disposed || cancelled) return;
+      const result = await this.runFenced("update", "publication", { published: false }, () =>
+        this.port.publish()
+      );
+      if (result.warning)
+        throw result.warning.error instanceof Error
+          ? result.warning.error
+          : new Error(result.warning.message);
+      if (!result.published) throw new Error("Index publication did not complete.");
+    } finally {
+      this.queuedFenceCancels.delete(cancel);
+    }
   }
 
   /** Stop aborts cancellable work and leaves outstanding edits pending. */
@@ -340,6 +371,7 @@ export class MaintenanceScheduler {
         this.phase = "lexical";
         this.emit();
         const lexical = await this.port.synchronize(controller.signal);
+        this.publicationRequired ||= lexical.changed;
         if (controller.signal.aborted) return;
         if (this.explicit.length) return;
         if (!lexical.converged || this.invalidatedCurrentAttempt) {
@@ -363,10 +395,13 @@ export class MaintenanceScheduler {
                 controller.signal.aborted
             )
           : { converged: true };
+        this.publicationRequired ||= "changed" in semantic && semantic.changed;
         if (controller.signal.aborted) return;
         if (this.explicit.length) return;
         const published =
-          semantic.converged && !this.invalidatedCurrentAttempt ? await this.publish() : false;
+          semantic.converged && !this.invalidatedCurrentAttempt && this.publicationRequired
+            ? await this.publish()
+            : !this.publicationRequired;
         if (semantic.converged && !this.invalidatedCurrentAttempt && published && !this.suspended)
           this.clearPending();
         else {
@@ -421,6 +456,7 @@ export class MaintenanceScheduler {
     this.lastEditAt = undefined;
     this.firstOutstandingAt = undefined;
     this.invalidatedAttempts = 0;
+    this.publicationRequired = false;
   }
 
   private async runFenced<T>(

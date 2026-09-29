@@ -48,7 +48,6 @@ export class ModelRuntime {
         search.search(query, {
           ...options,
           searchMethod: settings.lente.searchMethod,
-          maxResults: settings.lente.maxResults,
         }),
     };
   }

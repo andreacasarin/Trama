@@ -3,6 +3,7 @@ import { Setting } from "obsidian";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import {
   projectSettingsWithDraft,
+  type SettingsTabCallbacks,
   TramaSettingsTab,
   validateChatDraft,
   type SettingsDraft,
@@ -17,7 +18,6 @@ const draft = (overrides: Partial<SettingsDraft> = {}): SettingsDraft => ({
   embeddingEndpoint: DEFAULT_SETTINGS.embedding.endpoint,
   embeddingModelId: "embed-v1",
   lenteSearchMethod: "hybrid",
-  lenteMaxResults: 20,
   lenteAutomaticSearches: false,
   automaticMaintenance: false,
   filoExcludedPaths: [],
@@ -28,14 +28,22 @@ describe("settings projection", () => {
   it("wires Settings Update and Rebuild buttons to required maintenance callbacks", async () => {
     const updateIndex = vi.fn(async () => undefined);
     const rebuildIndex = vi.fn(async () => undefined);
+    const publishIndex = vi.fn(async () => undefined);
     const stopIndex = vi.fn(async () => undefined);
     const callbacks = new Map<string, () => unknown>();
+    const toggleCallbacks = new Map<string, (value: boolean) => void>();
     const warnings: string[] = [];
-    let indexStatus: { kind?: string; message?: string; publicationWarning?: string } | undefined;
+    const settingNames: string[] = [];
+    let indexStatus: ReturnType<NonNullable<SettingsTabCallbacks["getIndexStatus"]>>;
+    let settings = DEFAULT_SETTINGS;
+    const saveSettings = vi.fn(
+      async (update: (current: typeof DEFAULT_SETTINGS) => typeof DEFAULT_SETTINGS) => {
+        settings = update(settings);
+      }
+    );
     const proto = Setting.prototype as any;
     const originals = new Map<string, PropertyDescriptor | undefined>();
     const chain = [
-      "setName",
       "setDesc",
       "setHeading",
       "setPlaceholder",
@@ -52,6 +60,15 @@ describe("settings projection", () => {
         },
       });
     }
+    originals.set("setName", Object.getOwnPropertyDescriptor(proto, "setName"));
+    Object.defineProperty(proto, "setName", {
+      configurable: true,
+      value(name: string) {
+        this.name = name;
+        settingNames.push(name);
+        return this;
+      },
+    });
     originals.set("addButton", Object.getOwnPropertyDescriptor(proto, "addButton"));
     Object.defineProperty(proto, "addButton", {
       configurable: true,
@@ -71,7 +88,25 @@ describe("settings projection", () => {
         return this;
       },
     });
-    for (const method of ["addToggle", "addDropdown", "addText", "addSlider"]) {
+    originals.set("addToggle", Object.getOwnPropertyDescriptor(proto, "addToggle"));
+    Object.defineProperty(proto, "addToggle", {
+      configurable: true,
+      value(configure: (control: any) => void) {
+        const name = this.name;
+        const control = {
+          setValue() {
+            return this;
+          },
+          onChange(callback: (value: boolean) => void) {
+            toggleCallbacks.set(name, callback);
+            return this;
+          },
+        };
+        configure(control);
+        return this;
+      },
+    });
+    for (const method of ["addDropdown", "addText", "addSlider"]) {
       originals.set(method, Object.getOwnPropertyDescriptor(proto, method));
       Object.defineProperty(proto, method, {
         configurable: true,
@@ -105,10 +140,12 @@ describe("settings projection", () => {
       const tab = new TramaSettingsTab(
         {} as any,
         {
-          getSettings: () => DEFAULT_SETTINGS,
+          getSettings: () => settings,
+          saveSettings,
           getIndexStatus: () => indexStatus,
           updateIndex,
           rebuildIndex,
+          publishIndex,
           stopIndex,
         } as any
       );
@@ -124,11 +161,32 @@ describe("settings projection", () => {
         },
       };
       tab.display();
+      expect(settingNames).toContain("Scheduled maintenance");
+      expect(settingNames).not.toContain("Automatic maintenance");
+      expect(settingNames).not.toContain("Lexical & semantic indexes and sync");
       await callbacks.get("Update")?.();
       await callbacks.get("Rebuild")?.();
+      await callbacks.get("Publish")?.();
       expect(updateIndex).toHaveBeenCalledOnce();
       expect(rebuildIndex).toHaveBeenCalledOnce();
+      expect(publishIndex).toHaveBeenCalledOnce();
       expect(callbacks.has("Prepare")).toBe(false);
+      toggleCallbacks.get("Automatic searches")?.(true);
+      await vi.waitFor(() => expect(settings.lente.automaticSearches).toBe(true));
+      toggleCallbacks.get("Scheduled maintenance")?.(true);
+      await vi.waitFor(() => expect(settings.automaticMaintenance).toBe(true));
+      expect(saveSettings).toHaveBeenCalledTimes(2);
+
+      indexStatus = {
+        capabilities: {
+          availability: "available",
+          lexical: { state: "ready", activity: "idle", searchable: true },
+          semantic: { state: "partial", activity: "idle", searchable: true },
+          freshness: "locally-reconciled",
+        },
+      };
+      tab.display();
+      expect(warnings).toContain("Index status: Lexical ready · idle; Semantic partial · idle.");
 
       indexStatus = { kind: "error", message: "Lexical write failed." };
       await callbacks.get("Update")?.();
@@ -157,7 +215,6 @@ describe("settings projection", () => {
         embeddingEndpoint: "http://127.0.0.1:4321/v1",
         embeddingModelId: "embed-v2",
         lenteSearchMethod: "keyword",
-        lenteMaxResults: 35,
         filoExcludedPaths: [" ./Projects\\Private/ "],
       })
     );
@@ -166,7 +223,7 @@ describe("settings projection", () => {
     expect(projected).toMatchObject({
       chat: { endpoint: "http://127.0.0.1:5678/v1", modelId: "chat-v2" },
       embedding: { endpoint: "http://127.0.0.1:4321/v1", modelId: "embed-v2" },
-      lente: { searchMethod: "keyword", maxResults: 35, automaticSearches: false },
+      lente: { searchMethod: "keyword", automaticSearches: false },
       filo: { excludedPaths: ["Projects/Private"] },
     });
   });

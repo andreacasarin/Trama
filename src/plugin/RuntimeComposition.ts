@@ -34,6 +34,7 @@ interface RuntimeCompositionHost {
   createClient(storage: object): SqliteWorkerClient | undefined;
   isCurrent(manager: IndexManager): boolean;
   getIndexStatus(): IndexStatusController | undefined;
+  isAutomaticMaintenanceEnabled(): boolean;
   onComposed(runtime: Omit<ComposedRuntime, "load">): void;
   onIndexOperation(manager: IndexManager, changed: boolean): void;
   onMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void;
@@ -169,6 +170,16 @@ export function composeRuntime(
       if (usable && host.isCurrent(manager)) {
         const result = await scheduler.checkPublication();
         if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
+        // Catch vault changes missed while stopped; adoption and replacement already own convergence.
+        if (
+          host.isAutomaticMaintenanceEnabled() &&
+          host.isCurrent(manager) &&
+          !result.adopted &&
+          !result.replacementRequired
+        ) {
+          manager.requestFullRecovery();
+          scheduler.invalidate(result.ignored === "missing");
+        }
       }
       return loaded;
     })

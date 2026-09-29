@@ -31,6 +31,7 @@ export function registerPluginUi(
   plugin: Plugin & {
     updateIndex(): Promise<void>;
     rebuildIndex(): Promise<void>;
+    publishIndex(): Promise<void>;
     stopIndex(): Promise<void>;
   },
   app: any,

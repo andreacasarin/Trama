@@ -253,7 +253,12 @@ export class SqliteStateStore {
               sum(CASE WHEN n.semantic_revision_id=n.lexical_revision_id THEN 1 ELSE 0 END) AS currentSemanticHeads,
               sum(CASE WHEN EXISTS (SELECT 1 FROM chunk_occurrences eo WHERE eo.note_id=n.note_id AND eo.revision_id=n.lexical_revision_id) THEN 1 ELSE 0 END) AS nonempty,
               sum(CASE WHEN n.semantic_revision_id=n.lexical_revision_id THEN 0 ELSE 1 END) AS lagging
-       FROM notes n WHERE n.lexical_revision_id IS NOT NULL`,
+       FROM notes n
+       WHERE n.lexical_revision_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM chunk_occurrences eo
+           WHERE eo.note_id=n.note_id AND eo.revision_id=n.lexical_revision_id
+         )`,
       [String(s.embedding_fingerprint), EMBEDDING_PREPROCESSING_VERSION]
     )[0];
     const missing = rows(

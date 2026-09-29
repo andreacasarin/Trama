@@ -478,6 +478,30 @@ describe("semantic index module", () => {
     expect(index.hasPendingSemanticWork()).toBe(false);
   });
 
+  it("does not keep semantic status partial for notes with no indexable chunks", async () => {
+    const model = embeddings();
+    const index = new IndexManager(
+      fixture({ "content.md": "alpha", "empty.md": "" }),
+      model,
+      "http://127.0.0.1:1234/v1",
+      "embed",
+      { size: 64, overlap: 0, sqliteClient: createTestSqliteClient({}) }
+    );
+
+    await index.build(signal);
+    await expect(index.prepareSemantic(signal)).resolves.toMatchObject({ converged: true });
+
+    expect(await index.getState()).toMatchObject({
+      noteCount: 2,
+      semanticEligibleCount: 1,
+      semanticHeadCount: 1,
+      semanticLagCount: 0,
+      semanticMissingCount: 0,
+      semanticReady: true,
+    });
+    expect(index.capabilities().semantic).toMatchObject({ state: "ready", searchable: true });
+  });
+
   it("keeps committed automatic semantic batches when the next request is cancelled", async () => {
     const model = embeddings();
     model.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));

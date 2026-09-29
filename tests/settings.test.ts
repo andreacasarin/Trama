@@ -28,7 +28,6 @@ describe("Settings module", () => {
         expect(loaded.chat).not.toHaveProperty("reasoningEffort");
         expect(loaded.lente).toEqual({
           searchMethod: "hybrid",
-          maxResults: 20,
           automaticSearches: false,
         });
         expect(loaded.filo).toEqual({ excludedPaths: [] });
@@ -47,9 +46,9 @@ describe("Settings module", () => {
 
         expect(loaded.lente).toEqual({
           searchMethod: "keyword",
-          maxResults: 35,
           automaticSearches: false,
         });
+        expect(loaded.lente).not.toHaveProperty("maxResults");
         expect(loaded.filo).toEqual({
           excludedPaths: ["Projects", "private/notes"],
         });
@@ -295,14 +294,8 @@ describe("Settings module", () => {
         }
       });
 
-      it("validates Lente settings on explicit Save", () => {
+      it("validates the Lente search method on explicit Save", () => {
         const store = new SettingsStore();
-        expect(() =>
-          store.stage({
-            ...DEFAULT_SETTINGS,
-            lente: { ...DEFAULT_SETTINGS.lente, maxResults: 21 },
-          })
-        ).toThrow();
         expect(() =>
           store.stage({
             ...DEFAULT_SETTINGS,

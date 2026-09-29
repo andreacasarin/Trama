@@ -158,6 +158,28 @@ describe("MaintenanceScheduler", () => {
     expect([...f.timers.values()][0].at).toBe(63_000);
   });
 
+  it("skips automatic publication when reconciliation makes no changes", async () => {
+    const f = fixture();
+    f.controller.setAutomaticEnabled(true);
+    f.controller.invalidate();
+
+    await f.advance(3_000);
+
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.publish).not.toHaveBeenCalled();
+  });
+
+  it("publishes an unchanged index when the synchronized file is missing", async () => {
+    const f = fixture();
+    f.controller.setAutomaticEnabled(true);
+    f.controller.invalidate(true);
+
+    await f.advance(3_000);
+
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.publish).toHaveBeenCalledOnce();
+  });
+
   it("bypasses delay for explicit update, serializes lanes, and publishes only converged work", async () => {
     const f = fixture();
     let release!: (value: { changed: boolean; converged: boolean }) => void;
@@ -498,6 +520,16 @@ describe("MaintenanceScheduler", () => {
     expect(f.adopt).toHaveBeenCalledTimes(1);
     expect(f.lexical).not.toHaveBeenCalled();
     expect(f.publish).not.toHaveBeenCalled();
+  });
+
+  it("retries publication without repeating index maintenance", async () => {
+    const f = fixture();
+
+    await f.controller.publishCurrent();
+
+    expect(f.publish).toHaveBeenCalledOnce();
+    expect(f.lexical).not.toHaveBeenCalled();
+    expect(f.semantic).not.toHaveBeenCalled();
   });
 
   it("converges and replaces a non-newer incompatible synchronized index", async () => {

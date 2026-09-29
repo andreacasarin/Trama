@@ -1,6 +1,6 @@
 # Trama
 
-Trama is an Obsidian plugin for local AI conversation and semantic connections on desktop and mobile. **Voce** is the agent chat that can navigate linked notes, **Filo** discovers semantically related notes, and **Lente** searches indexed visible Markdown notes. Chat and embedding requests go only to a user-approved LM Studio endpoint. Trama performs no network requests at startup or while loading settings. Provider access is triggered by an explicit chat/search/index action, or by vault-event maintenance after the separate **Automatic maintenance** consent is enabled.
+Trama is an Obsidian plugin for local AI conversation and semantic connections on desktop and mobile. **Voce** is the agent chat that can navigate linked notes, **Filo** discovers semantically related notes, and **Lente** searches indexed visible Markdown notes. Chat and embedding requests go only to a user-approved endpoint. The current OpenAI-compatible transport is tested with LM Studio 0.3.29+ and does not yet support API-key-authenticated services such as OpenAI or OpenRouter. Trama performs no network requests at startup or while loading settings. Provider access is triggered by an explicit chat/search/index action, or by vault-event maintenance after the separate **Scheduled maintenance** consent is enabled.
 
 ## Setup
 
@@ -48,7 +48,7 @@ or Low using constants owned by the view.
 
 By default, Lente searches indexed visible Markdown only after Enter or Search is
 pressed. The separate **Automatic searches** toggle uses a fixed 500 ms debounce.
-Results are unique notes with their winning passage. Relevant uses deterministic
+Results are limited to twenty unique notes with their winning passage. Relevant uses deterministic
 hybrid vector/BM25 ranking; Updated uses live note modification times. If query
 embeddings are unavailable, Lente retries lexical filename, path, and body
 matching and labels the result degraded. Its derived FTS5 lexical index is maintained
@@ -68,14 +68,15 @@ During a full lexical rebuild, status reports note and estimated chunk progress 
 estimates. Hashing and chunking run in the SQLite Worker. The semantic phase reports whole-job vector progress and
 keeps already committed batches when a provider request fails or is cancelled.
 
-Automatic maintenance is opt-in and authorizes future event-triggered configured
-embedding work and publication. Its adaptive quiet windows are 3, 9, then 20 seconds,
+Scheduled maintenance is opt-in. After vault changes, it automatically updates the
+lexical index, prepares semantic vectors when an embedding model is configured, and
+publishes the converged SQLite index for synchronization. Semantic preparation sends note excerpts to the configured
+embedding endpoint and may incur provider cost. Its adaptive quiet windows are 3, 9, then 20 seconds,
 with a 60-second maximum wait for an outstanding edit generation. Stop preserves pending
 intent, suspends automatic starts, and lets an already-started publication or adoption
 fence settle. Failures display an error and suspend automatic work; there is no hidden
-failure retry timer. Settings expose only **Update**, **Rebuild**, **Stop**, and
-**Check synchronized file**. Configured embeddings may send note data to a local or
-remote provider and may incur cost.
+failure retry timer. Advanced settings expose **Update**, **Rebuild**, **Publish**,
+**Stop**, and **Check**.
 
 ## Voce chat
 

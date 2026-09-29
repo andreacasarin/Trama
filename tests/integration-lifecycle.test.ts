@@ -300,6 +300,51 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("queues startup reconciliation when persisted automatic maintenance is enabled", async () => {
+    const app = projectedApp();
+    const IndexManager = (await import("@/index/IndexManager")).IndexManager;
+    const MaintenanceScheduler = (await import("@/index/MaintenanceScheduler"))
+      .MaintenanceScheduler;
+    const requestFullRecovery = vi.spyOn(IndexManager.prototype, "requestFullRecovery");
+    const invalidate = vi.spyOn(MaintenanceScheduler.prototype, "invalidate");
+    const checkPublication = vi
+      .spyOn(MaintenanceScheduler.prototype, "checkPublication")
+      .mockResolvedValue({
+        adopted: false,
+        ignored: "same-id",
+      });
+    const plugin = projectedPlugin(app, { ...DEFAULT_SETTINGS, automaticMaintenance: true });
+
+    await plugin.onload();
+    await expect((plugin as any).indexLoad).resolves.toBe(true);
+
+    expect(checkPublication).toHaveBeenCalledOnce();
+    expect(requestFullRecovery).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect((plugin as any).maintenance.snapshot.pending).toBe(true);
+  });
+
+  it("does not reconcile a synchronized snapshot immediately after startup adoption", async () => {
+    const app = projectedApp();
+    const IndexManager = (await import("@/index/IndexManager")).IndexManager;
+    const MaintenanceScheduler = (await import("@/index/MaintenanceScheduler"))
+      .MaintenanceScheduler;
+    const requestFullRecovery = vi.spyOn(IndexManager.prototype, "requestFullRecovery");
+    const invalidate = vi.spyOn(MaintenanceScheduler.prototype, "invalidate");
+    vi.spyOn(MaintenanceScheduler.prototype, "checkPublication").mockResolvedValue({
+      adopted: true,
+      publicationId: "remote",
+    });
+    const plugin = projectedPlugin(app, { ...DEFAULT_SETTINGS, automaticMaintenance: true });
+
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+
+    expect(requestFullRecovery).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+    expect((plugin as any).maintenance.snapshot.pending).toBe(false);
+  });
+
   it("routes eligible vault events and exact publication-file changes through maintenance", async () => {
     vi.spyOn(
       (await import("@/index/IndexManager")).IndexManager.prototype,
