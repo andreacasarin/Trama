@@ -158,6 +158,28 @@ describe("index maintenance actions", () => {
     });
   });
 
+  it("projects the unified semantic phase and Stop capability", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    status.setMaintenance({
+      lane: "automatic",
+      phase: "semantic",
+      pending: true,
+      suspended: false,
+    });
+    expect(status.getStatus()).toMatchObject({
+      kind: "preparing",
+      channel: "semantic",
+      canCancel: true,
+    });
+    status.setMaintenance({ lane: "idle", pending: true, suspended: true });
+    expect(status.getStatus()).toMatchObject({ kind: "cancelled", canCancel: false });
+  });
+
   it("shows Stop suspension before pending stale state", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
