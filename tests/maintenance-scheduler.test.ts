@@ -492,12 +492,32 @@ describe("MaintenanceScheduler", () => {
     expect(f.timers.size).toBe(1);
   });
 
-  it("fences adoption and never reconciles or republishes it", async () => {
+  it("fences a compatible or absent publication check without republishing", async () => {
     const f = fixture();
     await f.controller.checkPublication();
     expect(f.adopt).toHaveBeenCalledTimes(1);
     expect(f.lexical).not.toHaveBeenCalled();
     expect(f.publish).not.toHaveBeenCalled();
+  });
+
+  it("converges and replaces a non-newer incompatible synchronized index", async () => {
+    const f = fixture();
+    f.adopt.mockResolvedValueOnce({ adopted: false, replacementRequired: true });
+
+    await expect(f.controller.checkPublication()).resolves.toEqual({ adopted: false });
+    expect(f.lexical).toHaveBeenCalledOnce();
+    expect(f.semantic).toHaveBeenCalledOnce();
+    expect(f.publish).toHaveBeenCalledOnce();
+  });
+
+  it("does not replace an incompatible synchronized index when convergence fails", async () => {
+    const f = fixture();
+    f.adopt.mockResolvedValueOnce({ adopted: false, replacementRequired: true });
+    f.lexical.mockRejectedValueOnce(new Error("offline"));
+
+    await expect(f.controller.checkPublication()).rejects.toThrow("offline");
+    expect(f.publish).not.toHaveBeenCalled();
+    expect(f.controller.snapshot.suspended).toBe(true);
   });
 
   it("reschedules internal automatic nonconvergence from pass completion", async () => {

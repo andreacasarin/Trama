@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 import { formatDiagnosticLogLine, TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import { compareCodeUnits } from "@/index/Identity";
 import { IndexManager, type IndexPathMutation } from "@/index/IndexManager";
@@ -37,6 +37,7 @@ export class TramaPlugin extends Plugin {
   private saveQueue: Promise<void> = Promise.resolve();
   private readonly publicationWarnings: Partial<Record<"publication" | "check", string>> = {};
   private projectedPublicationWarning?: string;
+  private upgradeNoticeShown = false;
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
@@ -470,6 +471,10 @@ export class TramaPlugin extends Plugin {
     warning: PublicationWarning,
     origin: "publication" | "check"
   ): void {
+    if (warning.code === "upgrade_required" && !this.upgradeNoticeShown) {
+      this.upgradeNoticeShown = true;
+      new Notice(warning.message);
+    }
     const message =
       origin === "check"
         ? `Synchronized index ${warning.phase === "adopt" ? "adoption" : "check"} failed: ${warning.message}`
@@ -492,7 +497,8 @@ export class TramaPlugin extends Plugin {
   }
 
   private notifyPublicationFileEvent(path: string): void {
-    if (path === this.publicationManager?.store.path) void this.checkPublication();
+    if (path === this.publicationManager?.store.path)
+      void this.checkPublication().catch(() => undefined);
   }
 
   private registerVaultEvents(vault: any): void {

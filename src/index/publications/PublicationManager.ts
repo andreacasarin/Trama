@@ -1,4 +1,5 @@
 import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
+import { sha256Hex } from "@/index/Identity";
 import {
   SqliteProtocolError,
   type PublicationInspection,
@@ -31,6 +32,7 @@ export interface PublicationIndexPort {
 
 export interface PublicationWarning {
   readonly phase: "prepare" | "stage" | "replace" | "finalize" | "inspect" | "adopt";
+  readonly code?: string;
   readonly message: string;
   readonly error: unknown;
   readonly retryable: boolean;
@@ -54,6 +56,7 @@ export interface PublicationResult {
 
 export interface AdoptionResult {
   readonly adopted: boolean;
+  readonly replacementRequired?: boolean;
   readonly ignored?: "missing" | "same-id";
   readonly publicationId?: string;
   readonly state?: SqliteState;
@@ -77,6 +80,7 @@ export class PublicationManager {
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
   private lastMetrics?: PublicationResourceMetrics;
+  private replacementTargetDigest?: string;
 
   readonly store: PublicationStore;
 
@@ -105,7 +109,7 @@ export class PublicationManager {
     return this.publishSerialized();
   }
 
-  /** Inspect and adopt the exact configured file. Adoption never publishes. */
+  /** Inspect and adopt the exact configured file without publishing directly. */
   async adoptCurrent(): Promise<AdoptionResult> {
     return this.adoptSerialized();
   }
@@ -132,6 +136,7 @@ export class PublicationManager {
             if (inspection.publicationId !== id)
               throw new StructuredError("internal", "Publication ID changed in staged copy.", true);
             phase = "replace";
+            await this.verifyReplacementTarget();
             const replaceStarted = Date.now();
             hadPrevious = await this.store.replace(staged, true);
             phase = "finalize";
@@ -156,6 +161,7 @@ export class PublicationManager {
         replaceDurationMs: installed.replaceDurationMs,
       };
       this.lastMetrics = metrics;
+      this.replacementTargetDigest = undefined;
       try {
         this.onMetrics?.(metrics);
       } catch {
@@ -174,7 +180,10 @@ export class PublicationManager {
     } catch (error) {
       return { adopted: false, warning: this.warn("inspect", error) };
     }
-    if (!bytes) return { adopted: false, ignored: "missing" };
+    if (!bytes) {
+      this.replacementTargetDigest = undefined;
+      return { adopted: false, ignored: "missing" };
+    }
     return this.adoptBytesSerialized(bytes);
   }
 
@@ -183,8 +192,13 @@ export class PublicationManager {
     try {
       inspection = await this.index.inspectPublication(bytes);
     } catch (error) {
+      if (publicationErrorDetails(error).code === "incompatible_state") {
+        this.replacementTargetDigest = await sha256Hex(bytes);
+        return { adopted: false, replacementRequired: true };
+      }
       return { adopted: false, warning: this.warn("inspect", error) };
     }
+    this.replacementTargetDigest = undefined;
     let current: string | undefined;
     try {
       current = await this.currentPublicationId();
@@ -212,14 +226,34 @@ export class PublicationManager {
     return this.index.capabilities?.().publicationId;
   }
 
+  /** Refuse to overwrite a synchronized target that changed during local convergence. */
+  private async verifyReplacementTarget(): Promise<void> {
+    const expected = this.replacementTargetDigest;
+    if (!expected) return;
+    const current = await this.store.read();
+    if (!current || (await sha256Hex(current)) === expected) return;
+    try {
+      await this.index.inspectPublication(current);
+    } catch (error) {
+      if (publicationErrorDetails(error).code === "upgrade_required") throw error;
+    }
+    throw new StructuredError(
+      "busy",
+      "The synchronized index changed while its replacement was being prepared. Check it again.",
+      true
+    );
+  }
+
   private failed(phase: PublicationWarning["phase"], error: unknown): PublicationResult {
     const warning = this.warn(phase, error);
     return { published: false, warning };
   }
 
   private warn(phase: PublicationWarning["phase"], error: unknown): PublicationWarning {
+    const details = publicationErrorDetails(error);
     const warning: PublicationWarning = {
       phase,
+      ...(details.code ? { code: details.code } : {}),
       error,
       message: error instanceof Error ? error.message : String(error),
       retryable: isRetryable(error),
@@ -251,6 +285,7 @@ const PERMANENT_PUBLICATION_CODES = new Set([
   "integrity_failed",
   "invalid_request",
   "incompatible_state",
+  "upgrade_required",
   "limit_exceeded",
 ]);
 

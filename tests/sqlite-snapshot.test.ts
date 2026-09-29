@@ -13,7 +13,11 @@ import {
   PublicationStore,
   type PublicationDataAdapter,
 } from "@/index/publications/PublicationStore";
-import { createTestSqliteClient, loadTestSqlite } from "./sqlite-test-client";
+import {
+  createTestSqliteClient,
+  loadTestSqlite,
+  snapshotWithUserVersion,
+} from "./sqlite-test-client";
 
 const vault: IndexVaultPort = {
   listMarkdownPaths: async () => ["one.md"],
@@ -391,6 +395,23 @@ describe("single-file SQLite publications", () => {
     });
     expect(await index.getState()).toEqual(beforeState);
     expect(await index.search("alpha", new AbortController().signal, 5)).toEqual(beforeSearch);
+  });
+
+  it("requests a plugin update instead of replacing a newer publication format", async () => {
+    const storage = adapter();
+    const index = manager({});
+    const publisher = publication(index, storage, () => "newer-publication");
+    await index.build(new AbortController().signal);
+    await publisher.publish();
+    const bytes = await storage.readBinary("Trama/index/index.sqlite3");
+    const newer = await snapshotWithUserVersion(bytes, 10, { dropIndexState: true });
+
+    await expect(index.inspectPublication(newer.slice().buffer)).rejects.toMatchObject({
+      error: {
+        code: "upgrade_required",
+        message: expect.stringContaining("Check for updates"),
+      },
+    });
   });
 
   it("rejects inspection metadata from one publication when adoption bytes come from another", async () => {

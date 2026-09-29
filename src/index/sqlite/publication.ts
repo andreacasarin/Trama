@@ -128,6 +128,11 @@ export class SqlitePublicationStore {
     this.context.embeddingFingerprint = embeddingFingerprint;
     const app = Number(rows(this.context.db, "PRAGMA application_id")[0]?.application_id ?? 0);
     const version = Number(rows(this.context.db, "PRAGMA user_version")[0]?.user_version ?? 0);
+    if (app === SQLITE_APPLICATION_ID && version > SQLITE_SCHEMA_VERSION)
+      throw sqliteError(
+        "upgrade_required",
+        "This synchronized index requires a newer Trama version. Open Obsidian Settings → Community plugins and select Check for updates."
+      );
     const state = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
     const required = rows(
       this.context.db,

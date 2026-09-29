@@ -21,6 +21,7 @@ const SQLITE_ERROR_CODES = new Set([
   "busy",
   "invalid_request",
   "incompatible_state",
+  "upgrade_required",
   "integrity_failed",
   "storage_unavailable",
   "unsupported",

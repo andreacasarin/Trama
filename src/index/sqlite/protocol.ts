@@ -305,6 +305,7 @@ export interface SqliteErrorShape {
     | "invalid_request"
     | "limit_exceeded"
     | "incompatible_state"
+    | "upgrade_required"
     | "integrity_failed"
     | "storage_unavailable"
     | "unsupported"

@@ -196,7 +196,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Automatic maintenance")
       .setDesc(
-        "Configured embeddings may send note data to the configured local or remote provider and may have cost."
+        "Configured embeddings may send note data to the configured local or remote provider and may have cost. An incompatible synchronized index is always rebuilt and replaced so devices converge, even when this setting is off."
       )
       .addToggle((toggle) => {
         toggle.setValue(draft.automaticMaintenance);

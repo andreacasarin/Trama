@@ -154,7 +154,7 @@ export class MaintenanceScheduler {
     return this.disposal;
   }
 
-  /** Adoption is an explicit/startup exact-file check and never schedules publish. */
+  /** Check adopts a compatible file or converges and replaces a non-newer incompatible one. */
   async checkPublication(): Promise<AdoptionResult> {
     if (this.disposed) return { adopted: false, ignored: "missing" };
     let cancelled = false;
@@ -168,9 +168,16 @@ export class MaintenanceScheduler {
         await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
       }
       if (this.disposed || cancelled) return { adopted: false, ignored: "missing" };
-      return await this.runFenced("adoption", "adopt", { adopted: false, ignored: "missing" }, () =>
-        this.port.adoptCurrent()
+      const result = await this.runFenced(
+        "adoption",
+        "adopt",
+        { adopted: false, ignored: "missing" },
+        () => this.port.adoptCurrent()
       );
+      if (!result.replacementRequired || this.disposed || cancelled) return result;
+      await this.update();
+      if (this.disposed || cancelled || this.suspended) return result;
+      return { adopted: false };
     } finally {
       this.queuedFenceCancels.delete(cancel);
     }

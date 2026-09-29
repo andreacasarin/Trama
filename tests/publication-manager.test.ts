@@ -143,6 +143,68 @@ describe("PublicationManager", () => {
     expect(fixture.publish).not.toHaveBeenCalled();
   });
 
+  it("requests replacement of an incompatible synchronized index", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter, {
+      idFactory: () => "current-publication",
+    });
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("incompatible_state", "incompatible synchronized index")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      replacementRequired: true,
+    });
+    expect(fixture.publish).not.toHaveBeenCalled();
+    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
+    expect(fixture.getLive().publicationId).toBeUndefined();
+  });
+
+  it("keeps a newer synchronized index and requests a plugin update", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "newer"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("upgrade_required", "Update Trama from Obsidian's Community plugins settings")
+    );
+
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      warning: {
+        phase: "inspect",
+        code: "upgrade_required",
+        retryable: false,
+        message: "Update Trama from Obsidian's Community plugins settings",
+      },
+    });
+    expect(fixture.publish).not.toHaveBeenCalled();
+    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a synchronized index that changes during replacement preparation", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter, {
+      idFactory: () => "current-publication",
+    });
+    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
+    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
+      sqliteError("incompatible_state", "incompatible synchronized index")
+    );
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({ replacementRequired: true });
+
+    const changed = new Uint8Array([1, 2, 3]).buffer;
+    await fixture.adapter.writeBinary!(manager.store.path, changed);
+
+    await expect(manager.publish()).resolves.toMatchObject({
+      published: false,
+      warning: { phase: "replace", code: "busy", retryable: true },
+    });
+    expect(await manager.store.read()).toEqual(changed);
+    expect(fixture.getLive().publicationId).toBeUndefined();
+  });
+
   it("retries a failed stage from the current local index", async () => {
     const fixture = setup();
     let fail = true;

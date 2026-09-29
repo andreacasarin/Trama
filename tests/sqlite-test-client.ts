@@ -145,6 +145,22 @@ export async function inspectIndexStateColumns(bytes: ArrayBuffer | Uint8Array):
   }
 }
 
+export async function snapshotWithUserVersion(
+  bytes: ArrayBuffer | Uint8Array,
+  version: number,
+  options: { readonly dropIndexState?: boolean } = {}
+): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(version) || version < 0) throw new Error("Invalid SQLite user version");
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  try {
+    opened.raw.exec(`PRAGMA user_version=${version}`);
+    if (options.dropIndexState) opened.raw.exec("DROP TABLE index_state");
+    return await serialized(opened);
+  } finally {
+    opened.database.close();
+  }
+}
+
 async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {
   const sqlite = await loadTestSqlite();
   const raw = new sqlite.oo1.DB(":memory:", "c");
