@@ -50,6 +50,40 @@ const bytesMetric = (metric, value) =>
 const memoryMetric = (metric, value) =>
   metric.toLowerCase().includes("samplecount") ? value : bytesMetric(metric, value);
 const rows = [
+  ["indexing through publication", milliseconds(report.indexingThroughPublicationMs)],
+  ["completed scenarios", report.core.scenarioNames.join(", ")],
+  ["provider calls", report.core.providerCalls],
+  ["provider texts", report.core.providerTexts],
+  [
+    "reference base / tree",
+    `${report.provenance.referenceBaseRevision} / ${report.provenance.referenceTreeStatus}`,
+  ],
+  ["source manifest SHA-256", report.provenance.referenceSourceManifestSha256],
+  ["provider challenge SHA-256", report.provider.challengeSha256],
+  ["query vectors SHA-256", report.provider.queryVectorSha256],
+  [
+    "initial notes / occurrences",
+    `${report.core.observable.initial.noteCount} / ${report.core.observable.initial.occurrenceCount}`,
+  ],
+  [
+    "final notes / occurrences",
+    `${report.core.observable.final.noteCount} / ${report.core.observable.final.occurrenceCount}`,
+  ],
+  ["initial active occurrence SHA-256", report.core.observable.initial.occurrenceContentSha256],
+  ["final active occurrence SHA-256", report.core.observable.final.occurrenceContentSha256],
+  ["published semantic state", JSON.stringify(report.core.observable.semantic)],
+  [
+    "RSS peak / samples",
+    `${megabytes(report.core.rssBytes.peak)} / ${report.core.rssBytes.samples}`,
+  ],
+  ...(report.memory?.rssWindow
+    ? [
+        [
+          "RSS sampling window",
+          `${report.memory.rssWindow.start} → ${report.memory.rssWindow.end ?? "not completed"}; excludes ${report.memory.rssWindow.excludes.join(", ")}`,
+        ],
+      ]
+    : []),
   ...Object.entries(report.durationMs).map(([metric, value]) => [metric, milliseconds(value)]),
   ...Object.entries(report.latencyMs).flatMap(([metric, value]) => [
     [`${metric} samples`, value.samples ?? 1],
@@ -64,8 +98,10 @@ const rows = [
     [`RPC ${metric} max`, milliseconds(value.max)],
   ]),
   ...Object.entries(report.bytes).map(([metric, value]) => [metric, bytesMetric(metric, value)]),
-  ...Object.entries(report.memory).map(([metric, value]) => [metric, memoryMetric(metric, value)]),
-  ...Object.entries(report.counters).flatMap(([metric, value]) =>
+  ...Object.entries(report.memory ?? {})
+    .filter(([metric]) => metric !== "rssWindow")
+    .map(([metric, value]) => [metric, memoryMetric(metric, value)]),
+  ...Object.entries(report.counters ?? {}).flatMap(([metric, value]) =>
     typeof value === "object" ? [] : [[`counter ${metric}`, value]]
   ),
 ];

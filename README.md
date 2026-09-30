@@ -192,7 +192,9 @@ npm run build
 
 Performance measurements are opt-in and use deterministic synthetic Markdown passed
 through the production chunker. Results are written to the ignored
-`.artifacts/trama-benchmark/` directory; no vault is read or modified.
+`.artifacts/trama-benchmark/` directory; no vault is read or modified. See the
+[lifecycle benchmark contract](docs/lifecycle-benchmark-contract.md) and
+[run and comparison guide](docs/lifecycle-benchmark-baseline.md).
 
 ```sh
 npm run benchmark
@@ -200,14 +202,15 @@ npm run benchmark
 
 The command defaults to the `trama-small` profile. Select the larger deterministic
 profiles with `TRAMA_BENCHMARK_PROFILE=trama-10k npm run benchmark` or
-`TRAMA_BENCHMARK_PROFILE=trama-large npm run benchmark`. Each profile reports lexical
+`TRAMA_BENCHMARK_PROFILE=trama-large npm run benchmark`. For a single observation,
+use `TRAMA_BENCHMARK_REPETITIONS=1 TRAMA_BENCHMARK_TIMEOUT_MS=900000`
+with either profile. Each profile reports lexical
 rebuild, semantic preparation, unchanged-update time, mutation timings, search latency,
 observed process RSS, package bytes, deterministic feature-path results, and publication
-byte/copy metrics. Complete evidence is written to
+bytes. Complete evidence is written to
 `.artifacts/trama-benchmark/<profile>.json`. Metrics unavailable to the in-memory Node
 harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
-CI renders the metrics as a GitHub Actions job summary and retains the complete JSON
-report as a downloadable workflow artifact.
+CI renders the metrics as a GitHub Actions job summary.
 
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
 limitations include the cost of exact SQLite vector scans and maintaining FTS5 on large

@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { ChatSession } from "@/chat/ChatSession";
 import type { ChatModel, EmbeddingModel, ReadonlyVault } from "@/domain/contracts";
@@ -12,8 +13,31 @@ import {
   type PublicationDataAdapter,
 } from "@/index/publications/PublicationStore";
 import { ToolRegistry, VaultSearchTool } from "@/tools/ToolRegistry";
-import { createTestSqliteClient } from "../sqlite-test-client";
-import type { Workload, WorkloadMutation, WorkloadNote } from "./generator";
+import {
+  createTestSqliteClient,
+  inspectBenchmarkSnapshot,
+  snapshotFor,
+} from "../sqlite-test-client";
+import {
+  deterministicProviderChallengeDigest,
+  workloadQueryVectorDigest,
+  workloadSourceDigest,
+  type Workload,
+  type WorkloadMutation,
+  type WorkloadNote,
+} from "./generator";
+import {
+  deterministicProviderChallengeSha256,
+  DETERMINISTIC_PROVIDER_BEHAVIOR_VERSION,
+  expectedOutputsV1ByProfile,
+  queryVectorSha256V1,
+  referenceBaselineV1,
+  REFERENCE_SOURCE_MANIFEST_SHA256,
+  sourceDigestsV1,
+  WORKLOAD_CONTRACT_VERSION,
+} from "./contract-v1";
+import { WORKLOAD_DIMENSIONS, WORKLOAD_FINGERPRINT } from "./config";
+import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import {
   createBenchmarkCounters,
   createBenchmarkMemorySampler,
@@ -33,7 +57,55 @@ export interface BenchmarkScenario {
   readonly providerStubTexts?: number;
 }
 
+export interface BenchmarkRssWindow {
+  readonly start: "before-full-build-call";
+  readonly end?: "after-successful-publish";
+  readonly excludes: readonly [
+    "fixture-generation",
+    "manager-construction",
+    "adoption",
+    "retrieval-queries",
+    "chat-tool-turn",
+  ];
+}
+
+export function benchmarkRssWindow(publicationCompleted: boolean): BenchmarkRssWindow {
+  return {
+    start: "before-full-build-call",
+    ...(publicationCompleted ? { end: "after-successful-publish" as const } : {}),
+    excludes: [
+      "fixture-generation",
+      "manager-construction",
+      "adoption",
+      "retrieval-queries",
+      "chat-tool-turn",
+    ],
+  };
+}
+
 export interface TramaBenchmark {
+  readonly reportVersion: "trama-benchmark-report-v2";
+  readonly lifecycle: {
+    readonly initialState: string;
+    readonly completion: string;
+    readonly resetBoundary: string;
+  };
+  readonly workloadContractVersion: string;
+  readonly buildIdentity: string;
+  readonly provenance: {
+    readonly referenceBaseRevision: string;
+    readonly referenceTreeStatus: string;
+    readonly referenceSourceManifestSha256: string;
+  };
+  readonly sourceDigest: string;
+  readonly provider: {
+    readonly name: "deterministic-fixture";
+    readonly behaviorVersion: string;
+    readonly dimensions: number;
+    readonly fingerprint: string;
+    readonly challengeSha256: string;
+    readonly queryVectorSha256: string;
+  };
   readonly profile: string;
   readonly seed: number;
   readonly environment: {
@@ -49,21 +121,73 @@ export interface TramaBenchmark {
   readonly latencyMs: Readonly<
     Record<string, { samples: number; p50: number; p95: number; max: number }>
   >;
-  readonly semanticPrepareTimingMs: {
+  readonly semanticPrepareTimingMs?: {
     readonly beginning: number;
     readonly middle: number;
     readonly end: number;
   };
-  readonly rpcLatencyMs: Readonly<
+  readonly rpcLatencyMs?: Readonly<
     Record<string, { samples: number; p50: number; p95: number; max: number }>
   >;
   readonly scenarios: Readonly<Record<string, BenchmarkScenario>>;
-  readonly counters: BenchmarkCounters;
+  readonly counters?: BenchmarkCounters;
   readonly counts: Readonly<Record<string, number>>;
   readonly bytes: Readonly<Record<string, number | "unsupported">>;
-  readonly memory: Readonly<Record<string, number>>;
+  readonly memory: {
+    readonly processRssBefore: number;
+    readonly processRssAfter: number;
+    readonly processRssObservedPeak: number;
+    readonly processRssSampleCount: number;
+    readonly processRssDelta: number;
+    readonly rssWindow: BenchmarkRssWindow;
+  };
   readonly correctness: Readonly<Record<string, boolean>>;
   readonly unsupported: readonly string[];
+  readonly indexingThroughPublicationMs: number;
+  readonly core: {
+    readonly scenarioNames: readonly string[];
+    readonly rssBytes: {
+      readonly before: number;
+      readonly after: number;
+      readonly peak: number;
+      readonly samples: number;
+      readonly boundary: string;
+    };
+    readonly providerCalls: number;
+    readonly providerTexts: number;
+    readonly observable: {
+      readonly initial: {
+        readonly noteCount: number;
+        readonly occurrenceCount: number;
+        readonly perPathOccurrenceCountsSha256: string;
+        readonly occurrenceContentSha256: string;
+      };
+      readonly final: {
+        readonly noteCount: number;
+        readonly occurrenceCount: number;
+        readonly perPathOccurrenceCountsSha256: string;
+        readonly occurrenceContentSha256: string;
+      };
+      readonly semantic: {
+        readonly semanticEligibleCount: number;
+        readonly semanticHeadCount: number;
+        readonly semanticLagCount: number;
+        readonly semanticMissingCount: number;
+        readonly compatibleVectorCount: number;
+        readonly semanticReady: boolean;
+      };
+      readonly lexical: readonly { readonly path: string; readonly occurrenceOrdinal?: number }[];
+      readonly hybrid: readonly { readonly path: string; readonly occurrenceOrdinal?: number }[];
+      readonly filo: readonly { readonly path: string }[];
+      readonly voce: readonly { readonly path: string; readonly occurrenceOrdinal?: number }[];
+    };
+  };
+  readonly diagnostics?: {
+    readonly rpcLatencyMs: Readonly<
+      Record<string, { samples: number; p50: number; p95: number; max: number }>
+    >;
+    readonly phaseCounts: Readonly<Record<string, number>>;
+  };
 }
 
 const percentile = (values: readonly number[], fraction: number): number => {
@@ -244,12 +368,14 @@ function manager(
   embedding: BenchmarkEmbedding,
   identity: object,
   counters: BenchmarkCounters,
-  sampleMemory?: () => void
+  sampleMemory?: () => void,
+  diagnostics = true
 ): IndexManager {
   const client = instrumentSqliteClient(
-    createTestSqliteClient(identity, { persistMutations: false }),
+    createTestSqliteClient(identity, { persistMutations: false, captureLifecycleSnapshots: true }),
     counters,
-    sampleMemory
+    sampleMemory,
+    diagnostics
   );
   return new IndexManager(vault, embedding, "http://benchmark.invalid/v1", "fixture", {
     sqliteClient: client,
@@ -296,6 +422,7 @@ export async function runTramaBenchmark(
   options: {
     readonly repetitions?: number;
     readonly timeoutMs?: number;
+    readonly diagnostics?: boolean;
     readonly onScenario?: (
       name: string,
       scenario: BenchmarkScenario,
@@ -311,22 +438,28 @@ export async function runTramaBenchmark(
   const sampleMemory = () => {
     memorySampler.sample();
   };
-  const rssBefore = memorySampler.peak;
+  let rssBefore = memorySampler.peak;
+  let rssAfter = memorySampler.peak;
+  let indexingThroughPublicationMs = 0;
+  let publicationCompleted = false;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   timeout.unref?.();
   const signal = controller.signal;
   const counters = createBenchmarkCounters();
+  const diagnostics = options.diagnostics ?? true;
   const vault = new BenchmarkVault(counters, workload.notes);
   const embedding = new BenchmarkEmbedding(workload, counters, sampleMemory);
   const publicationAdapter = new MemoryPublicationAdapter();
-  const index = manager(vault, embedding, {}, counters, sampleMemory);
+  const initialIdentity = {};
+  const index = manager(vault, embedding, initialIdentity, counters, sampleMemory, diagnostics);
   const publication = new PublicationManager(
     index,
     new PublicationStore(publicationAdapter, { directory: "Trama/index" })
   );
   const durationMs: Record<string, number> = {};
   const scenarios: Record<string, BenchmarkScenario> = {};
+  let indexingStarted = 0;
   let restarted: IndexManager | undefined;
   try {
     const measure = async <T extends { changed?: boolean; converged?: boolean } | void>(
@@ -349,11 +482,15 @@ export async function runTramaBenchmark(
       return result;
     };
 
+    rssBefore = memorySampler.reset();
+    indexingStarted = performance.now();
     await measure("fullBuild", async () => {
       await index.build(signal);
       return { changed: true, converged: (await index.getState())?.incomplete === false };
     });
     const initialState = await index.getState();
+    const initialSnapshot = await snapshotFor(initialIdentity);
+    const initialOutput = await inspectBenchmarkSnapshot(initialSnapshot);
     await measure("immediateNoop", () => index.reconcileQueuedChanges(signal));
     await measure("unchangedFullReconciliation", () => index.synchronize(signal));
     const uncached = await measure("semanticUncached", () => index.prepareSemantic(signal));
@@ -391,15 +528,23 @@ export async function runTramaBenchmark(
 
     const published = await measure("publish", async () => {
       const result = await publication.publish();
+      indexingThroughPublicationMs = performance.now() - indexingStarted;
+      publicationCompleted = result.published;
+      rssAfter = memorySampler.stop();
       return { changed: result.published, converged: result.published };
     });
     const publicationBytes = await publication.store.read();
+    const publicationOutput = publicationBytes
+      ? await inspectBenchmarkSnapshot(publicationBytes)
+      : undefined;
+    const restartedIdentity = {};
     const restartedManager = manager(
       vault,
       new BenchmarkEmbedding(workload, counters, sampleMemory),
-      {},
+      restartedIdentity,
       counters,
-      sampleMemory
+      sampleMemory,
+      diagnostics
     );
     restarted = restartedManager;
     const restartedPublication = new PublicationManager(
@@ -411,6 +556,7 @@ export async function runTramaBenchmark(
       const result = await restartedPublication.adoptCurrent();
       return { changed: result.adopted, converged: result.adopted };
     });
+    const adoptedOutput = await inspectBenchmarkSnapshot(await snapshotFor(restartedIdentity));
 
     const query = workload.queries.find((candidate) => candidate.id === "hostile")!;
     const lente = new LenteSearch(restartedManager, {
@@ -418,13 +564,14 @@ export async function runTramaBenchmark(
     });
     const queryStarted = performance.now();
     let latestLente: Awaited<ReturnType<LenteSearch["search"]>> | undefined;
+    let latestLexical: Awaited<ReturnType<LenteSearch["search"]>> | undefined;
     let latestFilo: Awaited<ReturnType<RelatedNotes["find"]>> | undefined;
     let latestVoce: Awaited<ReturnType<VaultSearchTool["execute"]>> | undefined;
     const latencyMs = {
-      lexical: await latency(
-        () => lente.search(query.text, { searchMethod: "keyword" }),
-        repetitions
-      ),
+      lexical: await latency(async () => {
+        latestLexical = await lente.search(query.text, { searchMethod: "keyword" });
+        return latestLexical;
+      }, repetitions),
       hybrid: await latency(async () => {
         latestLente = await lente.search(query.text);
         return latestLente;
@@ -499,13 +646,14 @@ export async function runTramaBenchmark(
       ])
     );
     const semanticPrepareSamples = counters.rpcElapsedMs.prepareSemanticWork ?? [];
-    const semanticPrepareTimingMs = {
-      beginning: semanticPrepareSamples[0] ?? 0,
-      middle: semanticPrepareSamples[Math.floor(semanticPrepareSamples.length / 2)] ?? 0,
-      end: semanticPrepareSamples.at(-1) ?? 0,
-    };
+    const semanticPrepareTimingMs = semanticPrepareSamples.length
+      ? {
+          beginning: semanticPrepareSamples[0]!,
+          middle: semanticPrepareSamples[Math.floor(semanticPrepareSamples.length / 2)]!,
+          end: semanticPrepareSamples.at(-1)!,
+        }
+      : undefined;
     const expectedChunks = expectedChunkCount(vault);
-    const rssAfter = memorySampler.sample();
     memorySampler.sample();
 
     const allConverged = [
@@ -517,7 +665,108 @@ export async function runTramaBenchmark(
       published,
       adopted,
     ].every((result) => result?.converged !== false);
+    const finalOutput = await inspectBenchmarkSnapshot(await snapshotFor(restartedIdentity));
+    const digestCounts = (value: typeof initialOutput) =>
+      createHash("sha256").update(JSON.stringify(value.perPathOccurrenceCounts)).digest("hex");
+    const identities = (results: readonly { path: string; ordinal?: number }[] = []) =>
+      results.map((result) => ({
+        path: result.path,
+        ...(result.ordinal === undefined ? {} : { occurrenceOrdinal: result.ordinal }),
+      }));
+    const adoptedPublicSemanticState = finalState && {
+      semanticEligibleCount: finalState.semanticEligibleCount,
+      semanticHeadCount: finalState.semanticHeadCount,
+      semanticLagCount: finalState.semanticLagCount,
+      semanticMissingCount: finalState.semanticMissingCount,
+      compatibleVectorCount: finalState.compatibleVectorCount,
+      semanticReady: finalState.semanticReady,
+    };
+    const publishedMatchesAdopted = Boolean(
+      publicationOutput &&
+      JSON.stringify(publicationOutput.perPathOccurrenceCounts) ===
+        JSON.stringify(finalOutput.perPathOccurrenceCounts) &&
+      publicationOutput.occurrenceContentSha256 === finalOutput.occurrenceContentSha256 &&
+      JSON.stringify(publicationOutput.semanticState) ===
+        JSON.stringify(finalOutput.semanticState) &&
+      JSON.stringify(publicationOutput.semanticState) === JSON.stringify(adoptedPublicSemanticState)
+    );
+    const expected = expectedOutputsV1ByProfile[workload.profile.id];
+    const sourceDigest = workloadSourceDigest(workload);
+    const renamedOriginal = workload.notes.find((note) => note.path === renamed.path)!;
+    const modifiedOriginal = workload.notes.find((note) => note.path === modified.path)!;
+    const deletedOriginal = workload.notes.find((note) => note.path === deleted.path)!;
+    const expectedFinalOccurrenceCount =
+      initialOutput.occurrenceCount +
+      added.note!.chunks.length +
+      (modified.note!.chunks.length - modifiedOriginal.chunks.length) -
+      deletedOriginal.chunks.length +
+      (renamed.note!.chunks.length - renamedOriginal.chunks.length);
+    const expectedFinalNoteCount = initialOutput.noteCount + 1 - 1;
+    const actualOracle = {
+      initial: {
+        noteCount: initialOutput.noteCount,
+        occurrenceCount: initialOutput.occurrenceCount,
+        perPathOccurrenceCountsSha256: digestCounts(initialOutput),
+        occurrenceContentSha256: initialOutput.occurrenceContentSha256,
+      },
+      final: {
+        noteCount: finalOutput.noteCount,
+        occurrenceCount: finalOutput.occurrenceCount,
+        perPathOccurrenceCountsSha256: digestCounts(finalOutput),
+        occurrenceContentSha256: finalOutput.occurrenceContentSha256,
+      },
+      semantic: publicationOutput?.semanticState ?? {
+        semanticEligibleCount: 0,
+        semanticHeadCount: 0,
+        semanticLagCount: 0,
+        semanticMissingCount: 0,
+        compatibleVectorCount: 0,
+        semanticReady: false,
+      },
+      probes: {
+        lexical: identities(latestLexical?.results ?? []),
+        hybrid: identities(latestLente?.canonicalResults ?? []),
+        filo: (latestFilo?.results ?? []).map((result) => ({ path: result.path })),
+        voce: identities(
+          (
+            (latestVoce?.provenance ?? []) as readonly {
+              path?: string;
+              occurrenceOrdinal?: number;
+              ordinal?: number;
+            }[]
+          ).flatMap((result) =>
+            result.path
+              ? [{ path: result.path, ordinal: result.occurrenceOrdinal ?? result.ordinal }]
+              : []
+          )
+        ),
+      },
+    };
     return {
+      reportVersion: "trama-benchmark-report-v2",
+      lifecycle: {
+        initialState: "fresh empty SQLite index, fixture vault populated, no publication present",
+        completion:
+          "semantic cache converged, scoped mutations reconciled, publication adopted, and pinned outputs match",
+        resetBoundary:
+          "each invocation creates a new vault, SQLite client identity, publication adapter, and deterministic embedding fixture",
+      },
+      workloadContractVersion: WORKLOAD_CONTRACT_VERSION,
+      buildIdentity: SQLITE_BUILD_IDENTITY,
+      provenance: {
+        referenceBaseRevision: referenceBaselineV1.referenceBaseRevision,
+        referenceTreeStatus: referenceBaselineV1.referenceTreeStatus,
+        referenceSourceManifestSha256: REFERENCE_SOURCE_MANIFEST_SHA256,
+      },
+      provider: {
+        name: "deterministic-fixture",
+        behaviorVersion: DETERMINISTIC_PROVIDER_BEHAVIOR_VERSION,
+        dimensions: WORKLOAD_DIMENSIONS,
+        fingerprint: WORKLOAD_FINGERPRINT,
+        challengeSha256: deterministicProviderChallengeDigest(),
+        queryVectorSha256: workloadQueryVectorDigest(workload),
+      },
+      sourceDigest,
       profile: workload.profile.id,
       seed: workload.seed,
       environment: {
@@ -531,10 +780,11 @@ export async function runTramaBenchmark(
       chunks: workload.notes.reduce((sum, note) => sum + note.chunks.length, 0),
       durationMs,
       latencyMs,
-      semanticPrepareTimingMs,
-      rpcLatencyMs,
+      ...(diagnostics
+        ? { ...(semanticPrepareTimingMs ? { semanticPrepareTimingMs } : {}), rpcLatencyMs }
+        : {}),
       scenarios,
-      counters,
+      ...(diagnostics ? { counters } : {}),
       counts: {
         initialIndexedNotes: initialState?.noteCount ?? 0,
         initialIndexedChunks: initialState?.chunkCount ?? 0,
@@ -550,10 +800,6 @@ export async function runTramaBenchmark(
       bytes: {
         package: packageBytes(),
         publication: publicationBytes?.byteLength ?? "unsupported",
-        publicationCopyBytes: publication.metrics?.copyBytes ?? "unsupported",
-        publicationDurationMs: publication.metrics?.durationMs ?? "unsupported",
-        publicationStageDurationMs: publication.metrics?.stageDurationMs ?? "unsupported",
-        publicationReplaceDurationMs: publication.metrics?.replaceDurationMs ?? "unsupported",
       },
       memory: {
         processRssBefore: rssBefore,
@@ -561,6 +807,7 @@ export async function runTramaBenchmark(
         processRssObservedPeak: memorySampler.peak,
         processRssSampleCount: memorySampler.sampleCount,
         processRssDelta: rssAfter - rssBefore,
+        rssWindow: benchmarkRssWindow(publicationCompleted),
       },
       correctness: {
         fixtureChunkCount:
@@ -579,6 +826,22 @@ export async function runTramaBenchmark(
         allMutationsConverged: allConverged,
         publicationPublished: published?.changed === true,
         publicationAdopted: adopted?.changed === true,
+        publishedOutputMatchesAdopted: publishedMatchesAdopted,
+        initialOutputSnapshotInspected: initialOutput.occurrenceCount === initialState?.chunkCount,
+        finalOutputSnapshotInspected: adoptedOutput.occurrenceCount === finalState?.chunkCount,
+        sourceDigestPinned: sourceDigest === sourceDigestsV1[workload.profile.id],
+        outputOracleMatches: JSON.stringify(actualOracle) === JSON.stringify(expected),
+        occurrenceContentMatches:
+          actualOracle.initial.occurrenceContentSha256 ===
+            expected.initial.occurrenceContentSha256 &&
+          actualOracle.final.occurrenceContentSha256 === expected.final.occurrenceContentSha256,
+        mutationArithmeticMatches:
+          finalOutput.occurrenceCount === expectedFinalOccurrenceCount &&
+          finalOutput.noteCount === expectedFinalNoteCount,
+        publishedSemanticMatchesAdopted: publishedMatchesAdopted,
+        providerIdentityMatches:
+          deterministicProviderChallengeDigest() === deterministicProviderChallengeSha256,
+        queryVectorIdentityMatches: workloadQueryVectorDigest(workload) === queryVectorSha256V1,
       },
       unsupported: [
         "Worker+OPFS browser harness (repository has no packaged browser benchmark runner)",
@@ -586,6 +849,29 @@ export async function runTramaBenchmark(
         "real LM Studio inference",
         "real Obsidian UI",
       ],
+      indexingThroughPublicationMs,
+      core: {
+        scenarioNames: Object.keys(scenarios),
+        rssBytes: {
+          before: rssBefore,
+          after: rssAfter,
+          peak: memorySampler.peak,
+          samples: memorySampler.sampleCount,
+          boundary:
+            "immediately before fullBuild through successful publish completion; sampled every 25ms and at instrumented boundaries, excluding adoption and queries",
+        },
+        providerCalls: counters.providerCalls,
+        providerTexts: counters.providerTexts,
+        observable: {
+          initial: actualOracle.initial,
+          final: actualOracle.final,
+          semantic: actualOracle.semantic,
+          ...actualOracle.probes,
+        },
+      },
+      ...(diagnostics
+        ? { diagnostics: { rpcLatencyMs, phaseCounts: { ...counters.progressByPhase } } }
+        : {}),
     };
   } finally {
     memorySampler.stop();

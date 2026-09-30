@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { SqliteWorkerClient, type SqliteCallHandler } from "@/index/sqlite/client";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
@@ -71,6 +72,86 @@ export async function snapshotFor(identity: object): Promise<Uint8Array> {
   const durable = storage.get(identity);
   if (!durable?.snapshot) throw new Error("SQLite test client has no persisted snapshot");
   return durable.snapshot.slice();
+}
+
+export async function inspectBenchmarkSnapshot(bytes: ArrayBuffer | Uint8Array): Promise<{
+  readonly noteCount: number;
+  readonly occurrenceCount: number;
+  readonly perPathOccurrenceCounts: readonly (readonly [string, number])[];
+  readonly occurrenceContentSha256: string;
+  readonly semanticState: {
+    readonly semanticEligibleCount: number;
+    readonly semanticHeadCount: number;
+    readonly semanticLagCount: number;
+    readonly semanticMissingCount: number;
+    readonly compatibleVectorCount: number;
+    readonly semanticReady: boolean;
+  };
+}> {
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  try {
+    const rows: {
+      path: string;
+      ordinal: number;
+      kind: string;
+      startLine: number;
+      endLine: number;
+      displayText: string;
+      headingContext: string;
+      body: string;
+      embeddingInput: string;
+    }[] = [];
+    opened.raw.exec({
+      sql: `SELECT n.path AS path,o.ordinal AS ordinal,o.kind AS kind,
+                   o.start_line AS startLine,o.end_line AS endLine,
+                   o.display_text AS displayText,o.heading_context AS headingContext,
+                   o.body AS body,o.embedding_input AS embeddingInput
+            FROM notes n JOIN chunk_occurrences o
+              ON o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
+            JOIN active_lexical a ON a.occurrence_id=o.occurrence_id
+            ORDER BY n.path COLLATE BINARY,o.ordinal`,
+      rowMode: "object",
+      callback: (row: (typeof rows)[number]) =>
+        rows.push({
+          ...row,
+          ordinal: Number(row.ordinal),
+          startLine: Number(row.startLine),
+          endLine: Number(row.endLine),
+        }),
+    });
+    const state = opened.database.getState();
+    const pathCounts = new Map<string, number>();
+    for (const row of rows) pathCounts.set(row.path, (pathCounts.get(row.path) ?? 0) + 1);
+    const tuples = rows.map((row) => [
+      row.path,
+      row.ordinal,
+      row.kind,
+      row.startLine,
+      row.endLine,
+      row.displayText,
+      row.headingContext,
+      row.body,
+      row.embeddingInput,
+    ]);
+    return {
+      noteCount: pathCounts.size,
+      occurrenceCount: rows.length,
+      perPathOccurrenceCounts: [...pathCounts],
+      occurrenceContentSha256: createHash("sha256")
+        .update(JSON.stringify(tuples), "utf8")
+        .digest("hex"),
+      semanticState: {
+        semanticEligibleCount: state.semanticEligibleCount,
+        semanticHeadCount: state.semanticHeadCount,
+        semanticLagCount: state.semanticLagCount,
+        semanticMissingCount: state.semanticMissingCount,
+        compatibleVectorCount: state.compatibleVectorCount,
+        semanticReady: state.semanticReady,
+      },
+    };
+  } finally {
+    opened.database.close();
+  }
 }
 
 export const hashTestMarkdown = (markdown: string, corpusFingerprint: string) =>
@@ -260,7 +341,11 @@ export async function inspectPersistedLexicalRevisionCount(identity: object): Pr
 /** Test-only RPC adapter backed by the same generated SQLite WASM database as production. */
 export function createTestSqliteClient(
   identity: object = {},
-  options: { readonly persistMutations?: boolean; readonly snapshot?: Uint8Array } = {}
+  options: {
+    readonly persistMutations?: boolean;
+    readonly snapshot?: Uint8Array;
+    readonly captureLifecycleSnapshots?: boolean;
+  } = {}
 ): SqliteWorkerClient {
   const durable = storage.get(identity) ?? {};
   if (!durable.snapshot && options.snapshot) durable.snapshot = options.snapshot;
@@ -513,7 +598,12 @@ export function createTestSqliteClient(
         default:
           throw sqliteError("unsupported", `SQLite method ${method} is unavailable`);
       }
-      if (options.persistMutations !== false) await persist(opened);
+      if (
+        options.persistMutations !== false ||
+        (options.captureLifecycleSnapshots &&
+          (method === "finishLexicalRun" || method === "adoptPublication"))
+      )
+        await persist(opened);
       return result;
     } finally {
       if (isMaintenance) maintenance = false;

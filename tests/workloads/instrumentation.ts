@@ -6,7 +6,8 @@ export interface BenchmarkMemorySampler {
   readonly peak: number;
   readonly sampleCount: number;
   sample(): number;
-  stop(): void;
+  reset(): number;
+  stop(): number;
 }
 
 export function createBenchmarkMemorySampler(
@@ -37,10 +38,18 @@ export function createBenchmarkMemorySampler(
       return sampleCount;
     },
     sample,
+    reset() {
+      if (stopped) return peak;
+      peak = 0;
+      sampleCount = 0;
+      return sample();
+    },
     stop() {
-      if (stopped) return;
+      if (stopped) return peak;
+      const final = sample();
       stopped = true;
       clearInterval(interval);
+      return final;
     },
   };
 }
@@ -146,7 +155,8 @@ export function observeProgress(
 export function instrumentSqliteClient(
   client: SqliteWorkerClient,
   counters: BenchmarkCounters,
-  sampleMemory?: () => void
+  sampleMemory?: () => void,
+  diagnostics = true
 ): SqliteWorkerClient {
   const original = (client.call as any).bind(client) as (
     method: string,
@@ -161,18 +171,21 @@ export function instrumentSqliteClient(
     options?: any
   ) => {
     sampleMemory?.();
-    counters.rpcCalls++;
-    counters.rpcByMethod[method] = (counters.rpcByMethod[method] ?? 0) + 1;
+    if (diagnostics) {
+      counters.rpcCalls++;
+      counters.rpcByMethod[method] = (counters.rpcByMethod[method] ?? 0) + 1;
+    }
     if (method === "applyLexicalBatch") {
       // The Worker hashes every Markdown item before parsing, including items
       // that it later skips as unchanged.
       const notes = payload.notes ?? payload.markdown ?? [];
-      counters.contentHashCalls += notes.length;
-      counters.contentHashBytes += notes.reduce(
-        (sum: number, note: { markdown?: unknown }) =>
-          sum + Buffer.byteLength(String(note.markdown ?? ""), "utf8"),
-        0
-      );
+      if (diagnostics) counters.contentHashCalls += notes.length;
+      if (diagnostics)
+        counters.contentHashBytes += notes.reduce(
+          (sum: number, note: { markdown?: unknown }) =>
+            sum + Buffer.byteLength(String(note.markdown ?? ""), "utf8"),
+          0
+        );
     }
     if (method === "getState" || method === "boot") counters.stateCalls++;
     if (method === "prepareSemanticWork") counters.semanticPrepareCalls++;
@@ -182,34 +195,49 @@ export function instrumentSqliteClient(
     try {
       result = await original(method, payload, signal, options);
     } finally {
-      (counters.rpcElapsedMs[method] ??= []).push(performance.now() - started);
+      if (diagnostics) (counters.rpcElapsedMs[method] ??= []).push(performance.now() - started);
       sampleMemory?.();
     }
     if (method === "applyLexicalBatch") {
       const batch = result as { inputHashCount?: unknown; inputHashBytes?: unknown };
-      counters.inputHashCount += Number(batch.inputHashCount ?? 0);
-      counters.inputHashBytes += Number(batch.inputHashBytes ?? 0);
+      if (diagnostics) {
+        counters.inputHashCount += Number(batch.inputHashCount ?? 0);
+        counters.inputHashBytes += Number(batch.inputHashBytes ?? 0);
+      }
     }
     if (method === "prepareSemanticWork") {
-      if (payload.promoteUnrestricted !== false) counters.semanticUnrestrictedPromotionCalls++;
+      if (diagnostics && payload.promoteUnrestricted !== false)
+        counters.semanticUnrestrictedPromotionCalls++;
       const work = result as { requests?: readonly { serialization?: unknown }[] };
-      counters.semanticPreparedItems += work.requests?.length ?? 0;
-      counters.semanticPreparedInputBytes += (work.requests ?? []).reduce(
-        (sum, request) => sum + Buffer.byteLength(String(request.serialization ?? ""), "utf8"),
-        0
-      );
+      if (diagnostics) counters.semanticPreparedItems += work.requests?.length ?? 0;
+      if (diagnostics)
+        counters.semanticPreparedInputBytes += (work.requests ?? []).reduce(
+          (sum, request) => sum + Buffer.byteLength(String(request.serialization ?? ""), "utf8"),
+          0
+        );
     } else if (method === "commitSemanticResults") {
-      counters.semanticStoredRows += Number((result as { stored?: unknown }).stored ?? 0);
+      if (diagnostics)
+        counters.semanticStoredRows += Number((result as { stored?: unknown }).stored ?? 0);
     }
     if (method === "preparePublication") {
-      counters.publicationValidationPasses += 2;
-      counters.publicationValidationVectorRows += Number((result as any)?.state?.vectorCount ?? 0);
+      if (diagnostics) {
+        counters.publicationValidationPasses += 2;
+        counters.publicationValidationVectorRows += Number(
+          (result as any)?.state?.vectorCount ?? 0
+        );
+      }
     } else if (method === "inspectPublication") {
-      counters.publicationValidationPasses++;
-      counters.publicationValidationVectorRows += Number((result as any)?.state?.vectorCount ?? 0);
+      if (diagnostics) {
+        counters.publicationValidationPasses++;
+        counters.publicationValidationVectorRows += Number(
+          (result as any)?.state?.vectorCount ?? 0
+        );
+      }
     } else if (method === "adoptPublication") {
-      counters.publicationValidationPasses++;
-      counters.publicationValidationVectorRows += Number((result as any)?.vectorCount ?? 0);
+      if (diagnostics) {
+        counters.publicationValidationPasses++;
+        counters.publicationValidationVectorRows += Number((result as any)?.vectorCount ?? 0);
+      }
     }
     return result;
   };

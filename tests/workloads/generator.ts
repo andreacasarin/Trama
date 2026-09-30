@@ -43,6 +43,65 @@ export interface Workload {
   readonly queries: readonly WorkloadQuery[];
 }
 
+export const PROVIDER_CHALLENGE_INPUTS_V1 = [
+  "",
+  "provider fixture challenge",
+  "line one\nline two",
+  "naïve café 東京\nsecond line 🚀",
+  "anchor alpha",
+  "naïve café 東京",
+  "tie",
+  "large",
+  'alpha OR beta "quoted" -tag NEAR/3 (unsafe)',
+] as const;
+
+const queryDefinitionsV1 = [
+  ["semantic", "anchor alpha", "query:semantic"],
+  ["unicode", "naïve café 東京", "query:unicode"],
+  ["tie", "tie", "fixed-tie"],
+  ["empty", "", "query:empty"],
+  ["large", "large", "query:large"],
+  ["hostile", 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)', "query:hostile"],
+] as const satisfies readonly (readonly [WorkloadQuery["id"], string, string])[];
+
+function vectorBytes(vector: Float32Array): Buffer {
+  const bytes = Buffer.alloc(vector.length * Float32Array.BYTES_PER_ELEMENT);
+  vector.forEach((value, index) =>
+    bytes.writeFloatLE(value, index * Float32Array.BYTES_PER_ELEMENT)
+  );
+  return bytes;
+}
+
+function updateLengthPrefixed(hash: ReturnType<typeof createHash>, value: string): void {
+  const bytes = Buffer.from(value, "utf8");
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(bytes.length);
+  hash.update(length).update(bytes);
+}
+
+export function deterministicProviderChallengeDigest(): string {
+  const hash = createHash("sha256");
+  for (const input of PROVIDER_CHALLENGE_INPUTS_V1) {
+    updateLengthPrefixed(hash, input);
+    hash.update(vectorBytes(deterministicEmbeddingVector(input)));
+  }
+  return hash.digest("hex");
+}
+
+export function workloadQueryVectorDigest(workload: Workload): string {
+  const hash = createHash("sha256");
+  for (const query of workload.queries) {
+    updateLengthPrefixed(hash, query.id);
+    updateLengthPrefixed(hash, query.text);
+    hash.update(vectorBytes(query.vector));
+  }
+  return hash.digest("hex");
+}
+
+export function deterministicEmbeddingVector(input: string, forced?: "tie"): Float32Array {
+  return vectorFor(input, forced);
+}
+
 function hashHex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -95,7 +154,7 @@ function noteFrom(path: string, content: string): WorkloadNote {
     ...chunk,
     id: `${contentId}:${ordinal}`,
     ordinal,
-    vector: vectorFor(`${path}\0${ordinal}\0${chunk.embeddingInput}`),
+    vector: deterministicEmbeddingVector(chunk.embeddingInput),
   }));
   return { path, content, contentId, chunks };
 }
@@ -164,19 +223,32 @@ export function createWorkload(profileOrId: WorkloadProfile | WorkloadProfile["i
         note: noteFrom("mutations/renamed.md", renamed.content),
       },
     ],
-    queries: [
-      { id: "semantic", text: "anchor alpha", vector: vectorFor("query:semantic") },
-      { id: "unicode", text: "naïve café 東京", vector: vectorFor("query:unicode") },
-      { id: "tie", text: "tie", vector: tieVector },
-      { id: "empty", text: "", vector: vectorFor("query:empty") },
-      { id: "large", text: "large", vector: vectorFor("query:large") },
-      {
-        id: "hostile",
-        text: 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)',
-        vector: vectorFor("query:hostile"),
-      },
-    ],
+    queries: queryDefinitionsV1.map(([id, text, vectorKey]) => ({
+      id,
+      text,
+      vector: vectorKey === "fixed-tie" ? tieVector : deterministicEmbeddingVector(vectorKey),
+    })),
   };
+}
+
+export function workloadSourceBytes(workload: Workload): string {
+  return JSON.stringify({
+    contract: "trama-workload-source-v1",
+    profile: workload.profile.id,
+    seed: workload.seed,
+    notes: workload.notes.map(({ path, content }) => ({ path, content })),
+    mutations: workload.mutations.map(({ kind, path, to, note }) => ({
+      kind,
+      path,
+      to: to ?? null,
+      note: note ? { path: note.path, content: note.content } : null,
+    })),
+    queries: workload.queries.map(({ id, text }) => ({ id, text })),
+  });
+}
+
+export function workloadSourceDigest(workload: Workload): string {
+  return hashHex(workloadSourceBytes(workload));
 }
 
 export function workloadDigest(workload: Workload): string {
