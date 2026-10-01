@@ -1,9 +1,10 @@
 import { Plugin } from "obsidian";
 import {
   emitTramaDiagnostic,
+  diagnosticsEnabled,
   NOOP_TRAMA_DIAGNOSTICS,
   TramaDiagnostics,
-  TramaDiagnosticRecord,
+  TramaDiagnosticInput,
 } from "@/diagnostics/TramaDiagnostics";
 import type { IndexProgress } from "@/domain/contracts";
 import type { IndexCapabilities, IndexFreshness } from "@/domain/contracts";
@@ -374,7 +375,7 @@ export class IndexStatusController {
       publicationId: this.status.publicationId,
       publicationWarning: this.status.publicationWarning,
     };
-    if (emitDiagnostic)
+    if (emitDiagnostic && diagnosticsEnabled(this.diagnostics, "detailed"))
       this.emitDiagnostic({
         area: "index",
         event: "index_status",
@@ -395,7 +396,7 @@ export class IndexStatusController {
       canCancel: false,
     };
   }
-  private emitDiagnostic(record: TramaDiagnosticRecord): void {
+  private emitDiagnostic(record: TramaDiagnosticInput): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
   /** Starts the requested operation when its command is currently available. */

@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
+import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
 import { createTestSqliteClient } from "./sqlite-test-client";
+import {
+  sourceDigestsV1,
+  deterministicProviderChallengeSha256,
+  queryVectorSha256V1,
+} from "../test-vaults/benchmark/contract-v1";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -27,6 +33,7 @@ function projectedApp() {
   const adapterBinary = new Map<string, ArrayBuffer>();
   const vault = {
     configDir: ".obsidian",
+    getName: () => "test-vault",
     getMarkdownFiles: () => files,
     getFileByPath: (path: string) => files.find((file) => file.path === path),
     read: async (file: { path: string }) => `contents of ${file.path}`,
@@ -132,6 +139,56 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.restoreAllMocks();
   });
 
+  it("keeps a valid generated benchmark vault cold with settings and command only", async () => {
+    const app = projectedApp();
+    const marker = {
+      version: "trama-obsidian-vault-v1",
+      runId: "d802aace-b48f-4ce1-a0c3-e6d9224c9001",
+      vaultName: "Trama Benchmark Vault",
+      expectedPath:
+        "/Users/andreacasarin/Documents/Code/trama/.artifacts/test-vaults/benchmark/Trama Benchmark Vault",
+      profile: "trama-small",
+      noteCount: 24,
+      targetChunks: 128,
+      sourceDigest: sourceDigestsV1["trama-small"],
+      providerChallengeSha256: deterministicProviderChallengeSha256,
+      queryVectorSha256: queryVectorSha256V1,
+      timeoutMs: 300000,
+      mutations: [
+        { kind: "add", path: "mutations/added.md", content: "added" },
+        { kind: "modify", path: "notes/00006/note-6.md", content: "modified" },
+        { kind: "delete", path: "notes/00007/note-7.md" },
+        { kind: "rename", path: "notes/00008/note-8.md", to: "mutations/renamed.md" },
+      ],
+    };
+    (app.vault as any).getName = () => marker.vaultName;
+    (app.vault.adapter as any).getBasePath = () => marker.expectedPath;
+    const originalRead = app.vault.adapter.read;
+    app.vault.adapter.read = async (path) =>
+      path === ".trama-benchmark-vault" ? JSON.stringify(marker) : originalRead(path);
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    expect((plugin as any).index).toBeUndefined();
+    expect((plugin as any).indexLoad).toBeUndefined();
+    expect((plugin as any).maintenance).toBeUndefined();
+    expect((plugin.addSettingTab as ReturnType<typeof vi.fn>).mock.calls).toEqual([
+      [expect.any(TramaSettingsTab)],
+    ]);
+    expect(plugin.registerView).not.toHaveBeenCalled();
+    expect(plugin.registerEvent).not.toHaveBeenCalled();
+    expect(
+      (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(([command]) => command.id)
+    ).toEqual(["run-obsidian-benchmark"]);
+    await plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      diagnosticsMode: "performance",
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "new-model" },
+    });
+    expect(plugin.getSettings().diagnosticsMode).toBe("performance");
+    expect((plugin as any).index).toBeUndefined();
+    expect((plugin as any).modelRuntime.session).toBeUndefined();
+  });
+
   it("keeps the committed runtime untouched when settings persistence rejects", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
@@ -169,14 +226,14 @@ describe("TramaPlugin lifecycle integration", () => {
       error: new Error("hidden"),
       durationMs: 1,
     });
-    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: true });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, diagnosticsMode: "detailed" });
     diagnostics.emit({
       area: "chat",
       event: "model_error",
       error: new Error("visible"),
       durationMs: 12,
     });
-    await plugin.saveSettings({ ...DEFAULT_SETTINGS, detailedDebug: false });
+    await plugin.saveSettings({ ...DEFAULT_SETTINGS, diagnosticsMode: "off" });
     diagnostics.emit({
       area: "chat",
       event: "model_error",
@@ -193,12 +250,14 @@ describe("TramaPlugin lifecycle integration", () => {
     ).toEqual([
       [
         "[Trama] chat:model_error 12 ms",
-        {
+        expect.objectContaining({
           area: "chat",
           event: "model_error",
           error: expect.objectContaining({ message: "visible" }),
           durationMs: 12,
-        },
+          tier: "detailed",
+          facets: ["chat"],
+        }),
       ],
     ]);
   });
@@ -218,7 +277,7 @@ describe("TramaPlugin lifecycle integration", () => {
       })
     );
     await plugin.onload();
-    await plugin.saveSettings({ ...settings, detailedDebug: true });
+    await plugin.saveSettings({ ...settings, diagnosticsMode: "detailed" });
 
     await (plugin as any).embeddingModel.embed(["private note"], new AbortController().signal);
 

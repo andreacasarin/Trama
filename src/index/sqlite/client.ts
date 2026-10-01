@@ -1,5 +1,9 @@
 import {
+  SQLITE_DIAGNOSTICS_CONFIG_TYPE,
+  SQLITE_DIAGNOSTIC_EVENT_TYPE,
   SQLITE_PROTOCOL_VERSION,
+  type SqliteDiagnosticsConfigRequest,
+  type SqliteDiagnosticEventMessage,
   type SqliteMethod,
   type SqliteReply,
   type SqliteRequest,
@@ -7,6 +11,12 @@ import {
   SqliteProtocolError,
   sqliteError,
 } from "./protocol";
+import {
+  NOOP_TRAMA_DIAGNOSTICS,
+  diagnosticsEnabled,
+  emitTramaDiagnostic,
+  type TramaDiagnostics,
+} from "@/diagnostics/TramaDiagnostics";
 
 const HANDSHAKE_TYPE = "trama-runtime-handshake";
 const HANDSHAKE_TIMEOUT_MS = 1_000;
@@ -39,10 +49,16 @@ interface Pending {
 
 /** Main-thread RPC client. Requests copy caller buffers unless ownership is explicitly transferred. */
 export class SqliteWorkerClient {
+  private static nextIncarnation = 1;
+  private readonly incarnation = SqliteWorkerClient.nextIncarnation++;
+  private nextOperation = 1;
   private nextId = 1;
   private closed = false;
   private readonly pending = new Map<number, Pending>();
   private handshakePromise?: Promise<string>;
+  private configurationQueue: Promise<void> = Promise.resolve();
+  private configurationPending = 0;
+  private configurationState?: { id: number; finish: (error?: unknown) => void };
   private handshakeState?: {
     id: number;
     expectedBuildId: string;
@@ -55,7 +71,8 @@ export class SqliteWorkerClient {
 
   constructor(
     private readonly worker?: SqliteWorkerLike,
-    private readonly handler?: SqliteCallHandler
+    private readonly handler?: SqliteCallHandler,
+    private readonly diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {
     if (worker) {
       worker.addEventListener("message", this.onMessageBound);
@@ -68,15 +85,34 @@ export class SqliteWorkerClient {
     method: M,
     payload: SqliteRequestPayloads[M],
     signal?: AbortSignal,
-    options: { readonly transferOwnedBytes?: boolean } = {}
+    options: {
+      readonly transferOwnedBytes?: boolean;
+      readonly diagnosticOperationId?: string;
+      readonly diagnosticParentOperationId?: string;
+      readonly diagnosticBatchId?: string;
+    } = {}
   ): Promise<any> {
+    if (this.configurationPending)
+      return this.configurationQueue.then(() => this.call(method, payload, signal, options));
     if (this.closed)
       return Promise.reject(sqliteError("storage_unavailable", "Worker client is closed"));
     if (this.handler) return this.handler(method, payload, signal);
     if (!this.worker)
       return Promise.reject(sqliteError("storage_unavailable", "SQLite Worker is unavailable"));
     const id = this.nextId++;
-    const request = { v: SQLITE_PROTOCOL_VERSION, id, method, payload } as SqliteRequest<M>;
+    const request = {
+      v: SQLITE_PROTOCOL_VERSION,
+      id,
+      method,
+      payload,
+      ...(options.diagnosticOperationId
+        ? { diagnosticOperationId: options.diagnosticOperationId }
+        : {}),
+      ...(options.diagnosticParentOperationId
+        ? { diagnosticParentOperationId: options.diagnosticParentOperationId }
+        : {}),
+      ...(options.diagnosticBatchId ? { diagnosticBatchId: options.diagnosticBatchId } : {}),
+    } as SqliteRequest<M>;
     return new Promise((resolve, reject) => {
       let settled = false;
       let cleanup: () => void = () => undefined;
@@ -138,6 +174,60 @@ export class SqliteWorkerClient {
     });
   }
 
+  /** Unique across replacement Worker clients, even when RPC ids restart at one. */
+  diagnosticOperationId(): string {
+    return `w${this.incarnation}_o${this.nextOperation++}`;
+  }
+
+  configureDiagnostics(strict = false): Promise<void> {
+    if (!this.worker || this.closed) return Promise.resolve();
+    const diagnostics = {
+      performance: diagnosticsEnabled(this.diagnostics, "performance"),
+      detailed: diagnosticsEnabled(this.diagnostics, "detailed"),
+      sessionId: this.diagnostics.context?.sessionId ?? "none",
+    };
+    this.configurationPending++;
+    const work = this.configurationQueue.then(() => this.postDiagnosticsConfiguration(diagnostics));
+    this.configurationQueue = work.then(
+      () => {
+        this.configurationPending--;
+      },
+      () => {
+        this.configurationPending--;
+      }
+    );
+    return strict ? work : this.configurationQueue;
+  }
+
+  private postDiagnosticsConfiguration(
+    diagnostics: SqliteDiagnosticsConfigRequest["diagnostics"]
+  ): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("SQLite Worker client is closed."));
+    const id = this.nextId++;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => finish(new Error("SQLite diagnostic configuration timed out.")),
+        HANDSHAKE_TIMEOUT_MS
+      );
+      const finish = (error?: unknown) => {
+        clearTimeout(timer);
+        this.configurationState = undefined;
+        if (error) reject(error);
+        else resolve();
+      };
+      this.configurationState = { id, finish };
+      try {
+        this.worker!.postMessage({
+          type: SQLITE_DIAGNOSTICS_CONFIG_TYPE,
+          id,
+          diagnostics,
+        } satisfies SqliteDiagnosticsConfigRequest);
+      } catch (error) {
+        finish(error);
+      }
+    });
+  }
+
   handshake(expectedBuildId: string, signal?: AbortSignal): Promise<string> {
     if (this.handler) return Promise.resolve(expectedBuildId);
     if (!this.worker)
@@ -164,7 +254,15 @@ export class SqliteWorkerClient {
       this.handshakeState = { id, expectedBuildId, finish };
       signal?.addEventListener("abort", abort, { once: true });
       try {
-        this.worker!.postMessage({ type: HANDSHAKE_TYPE, id });
+        this.worker!.postMessage({
+          type: HANDSHAKE_TYPE,
+          id,
+          diagnostics: {
+            performance: diagnosticsEnabled(this.diagnostics, "performance"),
+            detailed: diagnosticsEnabled(this.diagnostics, "detailed"),
+            sessionId: this.diagnostics.context?.sessionId ?? "none",
+          },
+        });
       } catch (error) {
         finish(error);
       }
@@ -214,6 +312,33 @@ export class SqliteWorkerClient {
   }
 
   private onMessage(reply: SqliteReply): void {
+    const config = this.configurationState;
+    if (
+      config &&
+      (reply as any)?.type === SQLITE_DIAGNOSTICS_CONFIG_TYPE &&
+      (reply as any).id === config.id
+    ) {
+      config.finish(
+        (reply as any).configured === true
+          ? undefined
+          : new Error("SQLite diagnostic configuration failed.")
+      );
+      return;
+    }
+    if ((reply as any)?.type === SQLITE_DIAGNOSTIC_EVENT_TYPE) {
+      const record = (reply as unknown as SqliteDiagnosticEventMessage).record;
+      if (
+        record?.tier === "performance" &&
+        record.context?.sessionId === this.diagnostics.context?.sessionId &&
+        (!record.context?.operationId ||
+          record.context.operationId.startsWith(`w${this.incarnation}_`)) &&
+        (!record.context?.parentOperationId ||
+          record.context.parentOperationId.startsWith(`w${this.incarnation}_`)) &&
+        (!record.context?.batchId || record.context.batchId.startsWith(`w${this.incarnation}_`))
+      )
+        emitTramaDiagnostic(this.diagnostics, record);
+      return;
+    }
     const handshake = this.handshakeState;
     if (
       handshake &&
@@ -221,8 +346,9 @@ export class SqliteWorkerClient {
       (reply as any).id === handshake.id
     ) {
       const actual = (reply as any).buildId;
+      const configured = (reply as any).diagnosticsConfigured === true;
       handshake.finish(
-        actual === handshake.expectedBuildId
+        actual === handshake.expectedBuildId && configured
           ? undefined
           : new Error("SQLite Worker build identity mismatch."),
         actual
@@ -241,6 +367,7 @@ export class SqliteWorkerClient {
   }
 
   private crash(error: unknown): void {
+    this.configurationState?.finish(error);
     const handshake = this.handshakeState;
     if (handshake) {
       this.handshakeState = undefined;

@@ -3,9 +3,10 @@ import type { IndexFreshness } from "@/domain/contracts";
 import { compareCodeUnits } from "@/index/Identity";
 import {
   emitTramaDiagnostic,
+  diagnosticsEnabled,
   NOOP_TRAMA_DIAGNOSTICS,
   projectDiagnosticError,
-  TramaDiagnosticRecord,
+  TramaDiagnosticInput,
   TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
 
@@ -80,7 +81,7 @@ export class RelatedNotes {
     limit = 7,
     refresh = false
   ): Promise<RelatedNotesResult> {
-    const started = Date.now();
+    const started = diagnosticsEnabled(this.diagnostics, "detailed") ? Date.now() : undefined;
     if (signal.aborted) throw new Error("Operation cancelled");
     const cap = Math.max(0, Math.min(RelatedNotes.MAX_RESULTS, Math.floor(limit)));
     const state = this.index.relatedState(currentPath);
@@ -126,35 +127,38 @@ export class RelatedNotes {
       return this.forConsumer(existing.promise, signal, cap);
     if (existing?.controller.signal.aborted) this.inFlight.delete(key);
     const controller = new AbortController();
-    this.emitDiagnostic({
-      area: "filo",
-      event: "related_search",
-      stage: "started",
-      generation: state.generationId,
-      resultCount: 0,
-    });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.emitDiagnostic({
+        area: "filo",
+        event: "related_search",
+        stage: "started",
+        generation: state.generationId,
+        resultCount: 0,
+      });
     const run = this.compute(state, controller.signal, RelatedNotes.MAX_RESULTS)
       .then((result) => {
         if (controller.signal.aborted) throw new Error("Operation cancelled");
         if (this.snapshotKey(result.currentPath) === key) {
           this.cache.set(key, result);
           this.publish(result, key);
-          this.emitDiagnostic({
-            area: "filo",
-            event: "related_search",
-            stage: "completed",
-            generation: result.generationId,
-            resultCount: result.results.length,
-            durationMs: Date.now() - started,
-          });
+          if (diagnosticsEnabled(this.diagnostics, "detailed"))
+            this.emitDiagnostic({
+              area: "filo",
+              event: "related_search",
+              stage: "completed",
+              generation: result.generationId,
+              resultCount: result.results.length,
+              durationMs: started === undefined ? 0 : Date.now() - started,
+            });
         } else {
-          this.emitDiagnostic({
-            area: "filo",
-            event: "related_search",
-            generation: result.generationId,
-            resultCount: result.results.length,
-            durationMs: Date.now() - started,
-          });
+          if (diagnosticsEnabled(this.diagnostics, "detailed"))
+            this.emitDiagnostic({
+              area: "filo",
+              event: "related_search",
+              generation: result.generationId,
+              resultCount: result.results.length,
+              durationMs: started === undefined ? 0 : Date.now() - started,
+            });
         }
         return result;
       })
@@ -182,13 +186,14 @@ export class RelatedNotes {
     if (signal.aborted) return Promise.reject(new Error("Operation cancelled"));
     return new Promise((resolve, reject) => {
       const onAbort = () => {
-        this.emitDiagnostic({
-          area: "filo",
-          event: "related_search",
-          resultCount: 0,
-          cancelled: true,
-          error: { name: "Error", code: "cancelled", retryable: true, cancelled: true },
-        });
+        if (diagnosticsEnabled(this.diagnostics, "detailed"))
+          this.emitDiagnostic({
+            area: "filo",
+            event: "related_search",
+            resultCount: 0,
+            cancelled: true,
+            error: { name: "Error", code: "cancelled", retryable: true, cancelled: true },
+          });
         reject(new Error("Operation cancelled"));
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -200,14 +205,15 @@ export class RelatedNotes {
         (error) => {
           signal.removeEventListener("abort", onAbort);
           if (!signal.aborted) {
-            this.emitDiagnostic({
-              area: "filo",
-              event: "related_search",
-              resultCount: 0,
-              error: {
-                ...projectDiagnosticError(error),
-              },
-            });
+            if (diagnosticsEnabled(this.diagnostics, "detailed"))
+              this.emitDiagnostic({
+                area: "filo",
+                event: "related_search",
+                resultCount: 0,
+                error: {
+                  ...projectDiagnosticError(error),
+                },
+              });
             reject(error);
           }
         }
@@ -221,16 +227,19 @@ export class RelatedNotes {
     limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) throw new Error("Operation cancelled");
-    const retrieveStarted = Date.now();
+    const retrieveStarted = diagnosticsEnabled(this.diagnostics, "detailed")
+      ? Date.now()
+      : undefined;
     const hits = await this.index.findRelated(state.currentPath, signal, 128);
-    this.emitDiagnostic({
-      area: "filo",
-      event: "related_search",
-      stage: "retrieve-completed",
-      generation: state.generationId,
-      resultCount: hits.length,
-      durationMs: Date.now() - retrieveStarted,
-    });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.emitDiagnostic({
+        area: "filo",
+        event: "related_search",
+        stage: "retrieve-completed",
+        generation: state.generationId,
+        resultCount: hits.length,
+        durationMs: retrieveStarted === undefined ? 0 : Date.now() - retrieveStarted,
+      });
     const best = new Map<string, RelatedNoteResult>();
     for (const hit of hits) {
       if (hit.path === state.currentPath) continue;
@@ -286,7 +295,7 @@ export class RelatedNotes {
     for (const listener of this.listeners) listener(result);
   }
 
-  private emitDiagnostic(record: TramaDiagnosticRecord): void {
+  private emitDiagnostic(record: TramaDiagnosticInput): void {
     emitTramaDiagnostic(this.diagnostics, record);
   }
 }

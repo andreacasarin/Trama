@@ -11,7 +11,34 @@ import {
 const RRF_K = 60;
 
 export class SqliteRetrieval {
-  constructor(private readonly context: SqliteContext) {}
+  constructor(
+    private readonly context: SqliteContext,
+    private readonly onPhase?: (
+      phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+      durationMs: number,
+      itemCount: number
+    ) => void,
+    private readonly phaseEnabled?: () => boolean
+  ) {}
+
+  private startPhase(): (() => number) | undefined {
+    if (!this.phaseEnabled?.()) return undefined;
+    const started = performance.now();
+    return () => Math.max(0, performance.now() - started);
+  }
+
+  private finishPhase(
+    phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+    timer: (() => number) | undefined,
+    itemCount: number
+  ): void {
+    if (!timer) return;
+    try {
+      this.onPhase?.(phase, timer(), itemCount);
+    } catch {
+      /* Observation only. */
+    }
+  }
 
   /** Revision-head retrieval. Vectors are read only for active semantic heads.
    * This deliberately uses a scalar cosine pass: vector_full_scan applies its
@@ -39,6 +66,7 @@ export class SqliteRetrieval {
       Math.max(0, options.lexicalCandidateLimit ?? limit)
     );
     const semantic: SqliteHit[] = [];
+    const semanticTimer = this.startPhase();
     if (vector && semanticLimit) {
       const q = normalizedVector(vector, this.context.dimensions);
       const current = currentPath
@@ -89,7 +117,9 @@ export class SqliteRetrieval {
         if (semantic.length >= semanticLimit) break;
       }
     }
+    this.finishPhase("semanticCandidates", semanticTimer, semantic.length);
     const lexical: SqliteHit[] = [];
+    const lexicalTimer = this.startPhase();
     const expression = query
       ? [...new Set(literalTerms(query))]
           .slice(0, 64)
@@ -139,8 +169,10 @@ export class SqliteRetrieval {
         if (lexical.length >= lexicalLimit) break;
       }
     }
+    this.finishPhase("lexicalCandidates", lexicalTimer, lexical.length);
     if (!semantic.length) return lexical.slice(0, limit);
     if (!lexical.length) return semantic.slice(0, limit);
+    const fusionTimer = this.startPhase();
     const fused = new Map<string, SqliteHit & { fused: number; rank: number }>();
     semantic.forEach((h, i) => {
       const fusedScore = 1 / (RRF_K + i + 1);
@@ -159,7 +191,7 @@ export class SqliteRetrieval {
         });
       else fused.set(key, { ...h, fused: add, rank: i, fusedScore: add });
     });
-    return [...fused.values()]
+    const result = [...fused.values()]
       .sort(
         (a, b) =>
           b.fused - a.fused ||
@@ -168,6 +200,8 @@ export class SqliteRetrieval {
           compareCodeUnits(a.id, b.id)
       )
       .slice(0, limit);
+    this.finishPhase("fusion", fusionTimer, result.length);
+    return result;
   }
 
   retrieve(
@@ -190,6 +224,7 @@ export class SqliteRetrieval {
   findRelated(path: string, vector: Float32Array | undefined, limit: number): readonly SqliteHit[] {
     let q = vector;
     if (!q) {
+      const centroidTimer = this.startPhase();
       const sum = new Float64Array(this.context.dimensions);
       let count = 0;
       this.context.db.exec({
@@ -213,6 +248,7 @@ export class SqliteRetrieval {
       if (!(norm > 0)) return [];
       q = new Float32Array(sum.length);
       for (let i = 0; i < q.length; i++) q[i] = sum[i] / Math.sqrt(norm);
+      this.finishPhase("centroid", centroidTimer, count);
     }
     return this.retrieve(undefined, q, limit, path, {
       semanticCandidateLimit: Math.min(128, Math.max(limit, 1)),

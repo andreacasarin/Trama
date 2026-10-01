@@ -9,6 +9,8 @@ coverage/
 .DS_Store
 .artifacts/
 .cache/
+test-vaults/**/.obsidian/
+test-vaults/**/.trama/
 
 # Audited SQLite inputs and licensing are source-controlled. Production
 # outputs are materialized at the ignored repository root by the cache builder.

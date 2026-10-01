@@ -1,5 +1,6 @@
 import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import { StructuredError } from "@/domain/contracts";
+import { diagnosticsEnabled } from "@/diagnostics/TramaDiagnostics";
 import {
   SQLITE_SNAPSHOT_MAX_BYTES,
   type PublicationInspection,
@@ -21,6 +22,7 @@ export class PublicationService {
       throw new StructuredError("busy", "Index maintenance is already running.", true);
     if (!publicationId)
       throw new StructuredError("invalid_request", "Publication ID is required.", false);
+    const overallTimer = this.runtime.performanceTimer();
     this.runtime.beginMaintenance();
     try {
       if (!this.runtime.loaded) await this.runtime.load();
@@ -28,20 +30,85 @@ export class PublicationService {
         throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
       if (this.runtime.state.incomplete)
         throw new StructuredError("busy", "Index must be converged before publication.", true);
-      const prepared = (await this.runtime.ensureClient().call("preparePublication", {
-        publicationId,
-      })) as PublicationPrepared;
+      const overallOperationId = overallTimer
+        ? this.runtime.ensureClient().diagnosticOperationId()
+        : undefined;
+      const prepareTimer = this.runtime.performanceTimer();
+      const prepareClient = this.runtime.ensureClient();
+      const prepareOperationId = prepareTimer ? prepareClient.diagnosticOperationId() : undefined;
+      const prepared = (await prepareClient.call(
+        "preparePublication",
+        {
+          publicationId,
+        },
+        undefined,
+        {
+          diagnosticOperationId: prepareOperationId,
+          diagnosticParentOperationId: overallOperationId,
+          diagnosticBatchId: prepareOperationId,
+        }
+      )) as PublicationPrepared;
+      this.runtime.emitPhase(
+        "publication",
+        "prepare",
+        prepareTimer,
+        1,
+        prepared.byteSize,
+        prepareOperationId,
+        overallOperationId,
+        prepareOperationId
+      );
+      const installTimer = this.runtime.performanceTimer();
       const installed = await install(prepared, (bytes, transferOwnership) =>
-        this.inspectPublicationReserved(bytes, transferOwnership)
+        this.inspectPublicationReserved(
+          bytes,
+          transferOwnership,
+          overallOperationId,
+          prepareOperationId
+        )
+      );
+      this.runtime.emitPhase(
+        "publication",
+        "install",
+        installTimer,
+        1,
+        prepared.byteSize,
+        prepareOperationId,
+        overallOperationId,
+        prepareOperationId
       );
       let state: SqliteState | undefined;
       try {
-        state = (await this.runtime.ensureClient().call("finalizePublication", {
-          publicationId,
-          expectedChangeCounter: prepared.state.changeCounter,
-          expectedLexicalGeneration: prepared.state.lexicalGeneration,
-          expectedSemanticGeneration: prepared.state.semanticGeneration,
-        })) as SqliteState | undefined;
+        const finalizeTimer = this.runtime.performanceTimer();
+        const finalizeClient = this.runtime.ensureClient();
+        const finalizeOperationId = finalizeTimer
+          ? finalizeClient.diagnosticOperationId()
+          : undefined;
+        state = (await finalizeClient.call(
+          "finalizePublication",
+          {
+            publicationId,
+            expectedChangeCounter: prepared.state.changeCounter,
+            expectedLexicalGeneration: prepared.state.lexicalGeneration,
+            expectedSemanticGeneration: prepared.state.semanticGeneration,
+          },
+          undefined,
+          {
+            diagnosticOperationId: finalizeOperationId,
+            diagnosticParentOperationId: overallOperationId,
+            diagnosticBatchId: prepareOperationId,
+          }
+        )) as SqliteState | undefined;
+        this.runtime.emitPhase(
+          "publication",
+          "finalize",
+          finalizeTimer,
+          1,
+          undefined,
+          finalizeOperationId,
+          overallOperationId,
+          prepareOperationId
+        );
         if (!state) throw new StructuredError("busy", "Local changes prevented publication.", true);
       } catch (error) {
         await settle(false);
@@ -49,6 +116,14 @@ export class PublicationService {
       }
       this.runtime.setState(state);
       await settle(true);
+      this.runtime.emitPhase(
+        "publication",
+        "overall",
+        overallTimer,
+        1,
+        prepared.byteSize,
+        overallOperationId
+      );
       return { prepared, installed };
     } finally {
       this.runtime.endMaintenance();
@@ -77,12 +152,18 @@ export class PublicationService {
 
   private async inspectPublicationReserved(
     bytes: ArrayBuffer,
-    transferOwnership = false
+    transferOwnership = false,
+    parentOperationId?: string,
+    batchId?: string
   ): Promise<PublicationInspection> {
     if (!this.runtime.loaded) await this.runtime.load();
     if (this.runtime.unavailable || !this.runtime.state)
       throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    return (await this.runtime.ensureClient().call(
+    const client = this.runtime.ensureClient();
+    const operationId = diagnosticsEnabled(this.runtime.diagnostics, "performance")
+      ? client.diagnosticOperationId()
+      : undefined;
+    return (await client.call(
       "inspectPublication",
       {
         bytes,
@@ -92,7 +173,12 @@ export class PublicationService {
         dimensions: this.runtime.fingerprint.dimensions,
       },
       undefined,
-      { transferOwnedBytes: transferOwnership }
+      {
+        transferOwnedBytes: transferOwnership,
+        diagnosticOperationId: operationId,
+        diagnosticParentOperationId: parentOperationId,
+        diagnosticBatchId: batchId,
+      }
     )) as PublicationInspection;
   }
 
@@ -110,20 +196,30 @@ export class PublicationService {
       bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES
     )
       throw new StructuredError("invalid_request", "Publication bytes are invalid.", false);
+    const adoptionTimer = this.runtime.performanceTimer();
     this.runtime.beginMaintenance();
     try {
       if (!this.runtime.loaded) await this.runtime.load();
       if (this.runtime.unavailable || !this.runtime.state)
         throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-      const state = (await this.runtime.ensureClient().call("adoptPublication", {
-        bytes,
-        expectedPublicationId,
-        inspection,
-        corpusFingerprint: await this.runtime.corpusFingerprintId(),
-        embeddingFingerprint: await this.runtime.embeddingFingerprintId(),
-        buildIdentity: SQLITE_BUILD_IDENTITY,
-        dimensions: this.runtime.fingerprint.dimensions,
-      })) as SqliteState;
+      const adoptionClient = this.runtime.ensureClient();
+      const adoptionOperationId = adoptionTimer
+        ? adoptionClient.diagnosticOperationId()
+        : undefined;
+      const state = (await adoptionClient.call(
+        "adoptPublication",
+        {
+          bytes,
+          expectedPublicationId,
+          inspection,
+          corpusFingerprint: await this.runtime.corpusFingerprintId(),
+          embeddingFingerprint: await this.runtime.embeddingFingerprintId(),
+          buildIdentity: SQLITE_BUILD_IDENTITY,
+          dimensions: this.runtime.fingerprint.dimensions,
+        },
+        undefined,
+        { diagnosticOperationId: adoptionOperationId }
+      )) as SqliteState;
       this.runtime.setState(state);
       this.runtime.unavailable = false;
       this.runtime.freshness = state.incomplete
@@ -131,6 +227,14 @@ export class PublicationService {
         : state.snapshotLoaded
           ? "snapshot-loaded"
           : "locally-reconciled";
+      this.runtime.emitPhase(
+        "adoption",
+        "overall",
+        adoptionTimer,
+        1,
+        bytes.byteLength,
+        adoptionOperationId
+      );
       return state;
     } finally {
       this.runtime.endMaintenance();

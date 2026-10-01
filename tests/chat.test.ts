@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ChatMessage, ChatModel, ChatResponse, ReadonlyNote } from "@/domain/contracts";
 import { CHAT_LIMITS, ChatSession, dedupeProvenance, SendTurnInput } from "@/chat/ChatSession";
-import { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 import { ReadonlyTool, ToolRegistry } from "@/tools/ToolRegistry";
 
 const input = (content: string, attachmentPaths: readonly string[] = []): SendTurnInput => ({
@@ -38,6 +38,25 @@ describe("ChatSession module", () => {
 
   describe("ChatSession", () => {
     describe("send()", () => {
+      it("keeps the turn successful when diagnostic enablement throws", async () => {
+        const emitted = vi.fn();
+        const session = new ChatSession(
+          { complete: async () => response({ role: "assistant", content: "answer" }, "stop") },
+          new ToolRegistry([]),
+          vault(async () => {
+            throw new Error("no attachment expected");
+          }),
+          {
+            enabled: () => {
+              throw new Error("diagnostics failed");
+            },
+            emit: emitted,
+          }
+        );
+        const state = await session.send(input("question"));
+        expect(state.error).toBeUndefined();
+        expect(emitted).not.toHaveBeenCalled();
+      });
       it("sends selected-note contents only with their active user turn", async () => {
         const requests: (readonly ChatMessage[])[] = [];
         const model: ChatModel = {
@@ -147,7 +166,7 @@ describe("ChatSession module", () => {
           { complete },
           new ToolRegistry([]),
           vault(async (path) => ({ path, content: "x".repeat(CHAT_LIMITS.maxAttachmentContent) })),
-          { emit: (record) => records.push(record) }
+          { enabled: () => true, emit: (record) => records.push(record) }
         );
 
         await expect(
@@ -393,7 +412,7 @@ describe("ChatSession module", () => {
           },
           new ToolRegistry([]),
           vault(async (path) => ({ path, content: "note" })),
-          { emit: (record) => records.push(record) }
+          { enabled: () => true, emit: (record) => records.push(record) }
         ).send(input("question", ["A.md"]));
 
         expect(records.map((record) => record.event)).toEqual([
@@ -437,7 +456,7 @@ describe("ChatSession module", () => {
           },
           new ToolRegistry([tool("read", async () => result)]),
           vault(async (path) => ({ path, content: "note" })),
-          { emit: (record) => records.push(record) }
+          { enabled: () => true, emit: (record) => records.push(record) }
         );
 
         await toolSession.send(input("question"));
@@ -453,7 +472,7 @@ describe("ChatSession module", () => {
           { complete: vi.fn(async () => Promise.reject(error)) },
           new ToolRegistry([]),
           vault(async (path) => ({ path, content: "note" })),
-          { emit: (record) => records.push(record) }
+          { enabled: () => true, emit: (record) => records.push(record) }
         ).send(input("question"));
 
         expect(records.find((record) => record.event === "error")).toMatchObject({ error });
@@ -469,6 +488,7 @@ describe("ChatSession module", () => {
           new ToolRegistry([]),
           vault(async (path) => ({ path, content: "note" })),
           {
+            enabled: () => true,
             emit: () => {
               throw new Error("diagnostics unavailable");
             },

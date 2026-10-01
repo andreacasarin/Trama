@@ -57,7 +57,8 @@ export class SqliteRuntime {
   workerUrl(app: any): string {
     const url = this.assetUrl(app, "sqlite-worker.mjs");
     const version = this.getManifest()?.version || SQLITE_PROTOCOL_VERSION;
-    return `${url}?v=${encodeURIComponent(String(version))}&nonce=${encodeURIComponent(this.workerCacheNonce)}`;
+    const separator = url.includes("?") ? "&" : "?";
+    return `${url}${separator}v=${encodeURIComponent(String(version))}&nonce=${encodeURIComponent(this.workerCacheNonce)}`;
   }
 
   createWorker(app: any): SqliteWorkerLike {
@@ -75,7 +76,7 @@ export class SqliteRuntime {
       moduleUrl: this.assetUrl(app, "sqlite3.mjs"),
       wasmUrl: this.assetUrl(app, "sqlite3.wasm"),
     };
-    const bootstrap = `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify(assets)};const __tramaWorkerUrl=${JSON.stringify(workerUrl)};let __tramaStartupError;try{await import(__tramaWorkerUrl)}catch{__tramaStartupError={code:"storage_unavailable",message:"SQLite Worker could not be started. Ensure the bundled SQLite assets are installed.",retryable:true}}URL.revokeObjectURL(globalThis.location.href);if(__tramaStartupError)self.onmessage=({data})=>self.postMessage({v:${SQLITE_PROTOCOL_VERSION},id:Number.isSafeInteger(data?.id)?data.id:0,ok:false,error:__tramaStartupError});`;
+    const bootstrap = `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify(assets)};const __tramaWorkerUrl=${JSON.stringify(workerUrl)};const __tramaPending=[];self.onmessage=(event)=>__tramaPending.push(event);let __tramaStartupError;try{await import(__tramaWorkerUrl)}catch{__tramaStartupError={code:"storage_unavailable",message:"SQLite Worker could not be started. Ensure the bundled SQLite assets are installed.",retryable:true}}URL.revokeObjectURL(globalThis.location.href);if(__tramaStartupError)self.onmessage=({data})=>self.postMessage({v:${SQLITE_PROTOCOL_VERSION},id:Number.isSafeInteger(data?.id)?data.id:0,ok:false,error:__tramaStartupError});for(const event of __tramaPending)self.onmessage(event);`;
     const bootstrapUrl = URL.createObjectURL(new Blob([bootstrap], { type: "text/javascript" }));
     try {
       return new Worker(bootstrapUrl, { type: "module" }) as unknown as SqliteWorkerLike;

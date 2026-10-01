@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { StructuredError, type IndexProgress } from "@/domain/contracts";
-import { projectDiagnosticError, type TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import {
+  projectDiagnosticError,
+  type TramaDiagnosticInput as TramaDiagnosticRecord,
+} from "@/diagnostics/TramaDiagnostics";
 import { CHUNK_OVERLAP, CHUNK_SIZE } from "@/index/chunking";
 import { IndexManager, createIndexFingerprint } from "@/index/IndexManager";
 import { LenteSearch } from "@/index/LenteSearch";
@@ -120,7 +123,12 @@ describe("semantic index module", () => {
         events.push("handshake");
         queueMicrotask(() =>
           worker.emit("message", {
-            data: { type: value.type, id: value.id, buildId: TRAMA_RUNTIME_BUILD_ID },
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
           })
         );
         return;
@@ -289,7 +297,7 @@ describe("semantic index module", () => {
       "http://127.0.0.1:1234/v1",
       "embed",
       { size: 100, overlap: 10, sqliteClient: createTestSqliteClient({}) },
-      { emit: (record) => records.push(record) }
+      { enabled: () => true, emit: (record) => records.push(record) }
     );
     await setup.build(signal);
     await setup.search("alpha", signal, 1);
@@ -351,7 +359,7 @@ describe("semantic index module", () => {
       "http://127.0.0.1:1234/v1",
       "embed",
       { onProgress: (value) => progress.push(value), sqliteClient: client },
-      { emit: (record) => records.push(record) }
+      { enabled: () => true, emit: (record) => records.push(record) }
     );
 
     await expect(setup.build(signal)).rejects.toMatchObject({

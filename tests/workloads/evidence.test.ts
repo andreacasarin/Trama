@@ -1,9 +1,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { createWorkload } from "./generator";
+import { createWorkload } from "../../test-vaults/benchmark/generator";
 import {
   benchmarkCorrectnessFailure,
   benchmarkFailureStatus,
@@ -13,7 +14,7 @@ import { benchmarkRssWindow, runTramaBenchmark } from "./trama-benchmark";
 import {
   computeReferenceSourceManifestSha256,
   REFERENCE_SOURCE_MANIFEST_SHA256,
-} from "./contract-v1";
+} from "../../test-vaults/benchmark/contract-v1";
 
 type ManifestEvidence = {
   expectedSha256: string;
@@ -59,7 +60,7 @@ describe("Trama deterministic benchmark", () => {
     } catch (error) {
       if (process.env.TRAMA_BENCHMARK) {
         const profile = process.env.TRAMA_BENCHMARK_PROFILE ?? "trama-small";
-        const outputDirectory = ".artifacts/trama-benchmark";
+        const outputDirectory = ".artifacts/benchmarks";
         mkdirSync(outputDirectory, { recursive: true });
         writeFileSync(
           `${outputDirectory}/${profile}.json`,
@@ -106,8 +107,31 @@ describe("Trama deterministic benchmark", () => {
   it("keeps core observations stable when diagnostics and query repetitions vary", async () => {
     expect(referenceManifest.status).toBe("match");
     const workload = createWorkload("trama-small");
-    const diagnostic = await runTramaBenchmark(workload, { diagnostics: true, repetitions: 1 });
-    const coreOnly = await runTramaBenchmark(workload, { diagnostics: false, repetitions: 1 });
+    const enabledBatches: string[][] = [];
+    const disabledBatches: string[][] = [];
+    let disabledProviderDiagnostics = 0;
+    const diagnostic = await runTramaBenchmark(workload, {
+      diagnostics: true,
+      repetitions: 1,
+      onProviderBatch: (texts) => enabledBatches.push([...texts]),
+    });
+    const coreOnly = await runTramaBenchmark(workload, {
+      diagnostics: false,
+      repetitions: 1,
+      onProviderBatch: (texts) => disabledBatches.push([...texts]),
+      onScenario: (_name, _scenario, counters) => {
+        disabledProviderDiagnostics =
+          counters.providerElapsedMs.length + counters.providerInputDigests.length;
+      },
+    });
+    expect(disabledBatches).toEqual(enabledBatches);
+    expect(disabledProviderDiagnostics).toBe(0);
+    expect(diagnostic.semanticAttribution?.providerInputDigests).toEqual(
+      enabledBatches.map((batch) =>
+        createHash("sha256").update(JSON.stringify(batch)).digest("hex")
+      )
+    );
+    expect(diagnostic.semanticAttribution?.providerElapsedMs).toHaveLength(enabledBatches.length);
     expect(coreOnly.core.scenarioNames).toEqual(diagnostic.core.scenarioNames);
     expect(coreOnly.core.providerCalls).toBe(diagnostic.core.providerCalls);
     expect(coreOnly.core.providerTexts).toBe(diagnostic.core.providerTexts);
@@ -121,8 +145,52 @@ describe("Trama deterministic benchmark", () => {
     expect(coreOnly.sourceDigest).toBe(diagnostic.sourceDigest);
     expect(coreOnly.correctness).toEqual(diagnostic.correctness);
     expect(coreOnly.diagnostics).toBeUndefined();
+    expect(coreOnly.semanticAttribution).toBeUndefined();
     expect(coreOnly.rpcLatencyMs).toBeUndefined();
     expect(coreOnly.counters).toBeUndefined();
+    expect(coreOnly.counts).toEqual(diagnostic.counts);
+    expect(
+      diagnostic.semanticAttribution?.lifecycleCalls.some(
+        (call) =>
+          call.scenario === "semanticUncached" &&
+          call.method === "prepareSemanticWork" &&
+          call.phases.some(
+            (phase) => phase.phase === "boundedMissingSelection" && phase.sqlCalls === 1
+          )
+      )
+    ).toBe(true);
+    expect(
+      diagnostic.semanticAttribution?.isolatedProbeCalls.map((call) => call.scenario)
+    ).toContain("probeNoWork");
+    expect(
+      diagnostic.semanticAttribution?.isolatedProbeCalls.some(
+        (call) => call.scenario === "probeCachedProductive" && call.promoted > 0
+      )
+    ).toBe(true);
+  });
+
+  it("keeps provider output and lifecycle successful when the batch observer throws", async () => {
+    const workload = createWorkload("trama-small");
+    const ordinary = await runTramaBenchmark(workload, { diagnostics: true, repetitions: 1 });
+    let observed = 0;
+    const throwing = await runTramaBenchmark(workload, {
+      diagnostics: true,
+      repetitions: 1,
+      onProviderBatch: () => {
+        observed++;
+        throw new Error("observer failed");
+      },
+    });
+    expect(observed).toBe(ordinary.core.providerCalls);
+    expect(throwing.core.scenarioNames).toEqual(ordinary.core.scenarioNames);
+    expect(throwing.core.providerCalls).toBe(ordinary.core.providerCalls);
+    expect(throwing.core.providerTexts).toBe(ordinary.core.providerTexts);
+    expect(throwing.core.observable).toEqual(ordinary.core.observable);
+    expect(throwing.counts).toEqual(ordinary.counts);
+    expect(throwing.correctness).toEqual(ordinary.correctness);
+    expect(throwing.semanticAttribution?.providerInputDigests).toEqual(
+      ordinary.semanticAttribution?.providerInputDigests
+    );
   });
 
   it.runIf(Boolean(process.env.TRAMA_BENCHMARK))(
@@ -131,7 +199,7 @@ describe("Trama deterministic benchmark", () => {
       const profile = (process.env.TRAMA_BENCHMARK_PROFILE ?? "trama-small") as
         "trama-small" | "trama-10k" | "trama-large";
       const timeoutMs = Number(process.env.TRAMA_BENCHMARK_TIMEOUT_MS ?? 300_000);
-      const outputDirectory = ".artifacts/trama-benchmark";
+      const outputDirectory = ".artifacts/benchmarks";
       mkdirSync(outputDirectory, { recursive: true });
       const started = performance.now();
       const workload = createWorkload(profile);

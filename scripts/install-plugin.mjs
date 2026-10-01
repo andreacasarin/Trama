@@ -55,6 +55,7 @@ export async function installPlugin({
   vaultPath,
   projectRoot: root = projectRoot,
   afterActivation,
+  preserveExistingFiles = true,
 } = {}) {
   if (!vaultPath)
     throw new Error('Provide the Obsidian vault path: npm run install:plugin -- "/path/to/vault"');
@@ -80,7 +81,8 @@ export async function installPlugin({
       () => true,
       () => false
     );
-    if (hadLive) await cp(pluginDirectory, stagingDirectory, { recursive: true });
+    if (hadLive && preserveExistingFiles)
+      await cp(pluginDirectory, stagingDirectory, { recursive: true });
     const hashes = {};
     for (const fileName of PLUGIN_FILES) {
       const source = path.join(root, fileName);

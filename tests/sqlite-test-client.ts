@@ -3,6 +3,20 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { SqliteWorkerClient, type SqliteCallHandler } from "@/index/sqlite/client";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
+import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
+
+export interface SemanticPhaseObservation {
+  readonly operation: "prepare" | "commit";
+  readonly phase: string;
+  readonly wallMs: number;
+  readonly sqlMs: number;
+  readonly sqlCalls: number;
+  readonly callbackRows: number;
+  readonly copiedBytes: number;
+  readonly jsEstimateMs: number;
+  readonly nested: boolean;
+}
+type SemanticPhaseObserver = (observation: SemanticPhaseObservation) => void;
 import { sqliteError } from "@/index/sqlite/protocol";
 import { applyLexicalMarkdownBatch, hashMarkdown } from "@/index/sqlite/markdown";
 import type { SqliteLexicalScope } from "@/index/sqlite/protocol";
@@ -242,7 +256,11 @@ export async function snapshotWithUserVersion(
   }
 }
 
-async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {
+async function open(
+  snapshot?: Uint8Array,
+  semanticObserver?: SemanticPhaseObserver,
+  diagnosticOverride?: TramaDiagnostics
+): Promise<OpenDatabase> {
   const sqlite = await loadTestSqlite();
   const raw = new sqlite.oo1.DB(":memory:", "c");
   if (snapshot?.byteLength) {
@@ -262,7 +280,30 @@ async function open(snapshot?: Uint8Array): Promise<OpenDatabase> {
       throw sqliteError("integrity_failed", "Snapshot integrity check failed");
     }
   }
-  return { raw, database: new MutableSqliteDatabase(raw) };
+  const diagnostics: TramaDiagnostics = {
+    enabled: (tier) => tier === "performance" && Boolean(semanticObserver),
+    emit(record) {
+      if (
+        !("tier" in record) ||
+        record.tier !== "performance" ||
+        record.operation !== "semantic" ||
+        !record.semanticStep
+      )
+        return;
+      semanticObserver?.({
+        operation: record.semanticStep,
+        phase: record.phase,
+        wallMs: record.durationMs,
+        sqlMs: record.sqlMs ?? 0,
+        sqlCalls: record.sqlCalls ?? 0,
+        callbackRows: record.callbackRows ?? 0,
+        copiedBytes: record.copiedBytes ?? 0,
+        jsEstimateMs: Math.max(0, record.durationMs - (record.sqlMs ?? 0)),
+        nested: record.nested === true,
+      });
+    },
+  };
+  return { raw, database: new MutableSqliteDatabase(raw, diagnosticOverride ?? diagnostics) };
 }
 
 async function serialized(opened: OpenDatabase): Promise<Uint8Array> {
@@ -345,13 +386,20 @@ export function createTestSqliteClient(
     readonly persistMutations?: boolean;
     readonly snapshot?: Uint8Array;
     readonly captureLifecycleSnapshots?: boolean;
+    readonly onSemanticPhase?: (phase: SemanticPhaseObservation) => void;
+    readonly onSemanticHandler?: (
+      method: "prepareSemanticWork" | "commitSemanticResults",
+      elapsedMs: number
+    ) => void;
+    readonly diagnostics?: TramaDiagnostics;
   } = {}
 ): SqliteWorkerClient {
   const durable = storage.get(identity) ?? {};
   if (!durable.snapshot && options.snapshot) durable.snapshot = options.snapshot;
   storage.set(identity, durable);
   let openedPromise: Promise<OpenDatabase> | undefined;
-  const current = () => (openedPromise ??= open(durable.snapshot));
+  const current = () =>
+    (openedPromise ??= open(durable.snapshot, options.onSemanticPhase, options.diagnostics));
   const persist = async (opened: OpenDatabase) => {
     durable.snapshot = await serialized(opened);
   };
@@ -359,7 +407,7 @@ export function createTestSqliteClient(
     const state = opened.database.getState();
     const snapshot = await serialized(opened);
     opened.database.close();
-    const next = await open(snapshot);
+    const next = await open(snapshot, options.onSemanticPhase, options.diagnostics);
     next.database.boot(
       state.corpusFingerprint,
       state.dimensions,
@@ -371,6 +419,7 @@ export function createTestSqliteClient(
   };
   let maintenance = false;
   const handler: SqliteCallHandler = async (method, payload, signal) => {
+    const handlerStarted = performance.now();
     const isMaintenance =
       method === "preparePublication" ||
       method === "finalizePublication" ||
@@ -400,7 +449,7 @@ export function createTestSqliteClient(
             if ((error as any)?.error?.code !== "incompatible_state") throw error;
             opened.database.close();
             durable.snapshot = undefined;
-            openedPromise = open();
+            openedPromise = open(undefined, options.onSemanticPhase, options.diagnostics);
             opened = await openedPromise;
             result = opened.database.boot(
               value.corpusFingerprint,
@@ -604,6 +653,14 @@ export function createTestSqliteClient(
           (method === "finishLexicalRun" || method === "adoptPublication"))
       )
         await persist(opened);
+      if (method === "prepareSemanticWork" || method === "commitSemanticResults") {
+        const elapsedMs = performance.now() - handlerStarted;
+        try {
+          options.onSemanticHandler?.(method, elapsedMs);
+        } catch {
+          /* Test observations cannot change a completed RPC. */
+        }
+      }
       return result;
     } finally {
       if (isMaintenance) maintenance = false;

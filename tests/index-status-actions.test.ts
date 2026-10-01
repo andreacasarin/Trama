@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
-import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 describe("index maintenance actions", () => {
   it("exposes only Update, Rebuild, and Stop commands", async () => {
@@ -99,7 +99,7 @@ describe("index maintenance actions", () => {
         rebuild: async () => undefined,
         stop: () => undefined,
       },
-      { emit: (event) => events.push(event) }
+      { enabled: () => true, emit: (event) => events.push(event) }
     );
     status.setReady();
     const run = status.run("index");

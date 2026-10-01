@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { ChatSession } from "@/chat/ChatSession";
+import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import type { ChatModel, EmbeddingModel, ReadonlyVault } from "@/domain/contracts";
 import { chunkMarkdownBlocks } from "@/index/chunking";
 import { IndexManager, type IndexPathMutation, type IndexVaultPort } from "@/index/IndexManager";
@@ -15,6 +16,7 @@ import {
 import { ToolRegistry, VaultSearchTool } from "@/tools/ToolRegistry";
 import {
   createTestSqliteClient,
+  applyTestLexicalRun,
   inspectBenchmarkSnapshot,
   snapshotFor,
 } from "../sqlite-test-client";
@@ -22,10 +24,11 @@ import {
   deterministicProviderChallengeDigest,
   workloadQueryVectorDigest,
   workloadSourceDigest,
+  deterministicEmbeddingVector,
   type Workload,
   type WorkloadMutation,
   type WorkloadNote,
-} from "./generator";
+} from "../../test-vaults/benchmark/generator";
 import {
   deterministicProviderChallengeSha256,
   DETERMINISTIC_PROVIDER_BEHAVIOR_VERSION,
@@ -35,8 +38,8 @@ import {
   REFERENCE_SOURCE_MANIFEST_SHA256,
   sourceDigestsV1,
   WORKLOAD_CONTRACT_VERSION,
-} from "./contract-v1";
-import { WORKLOAD_DIMENSIONS, WORKLOAD_FINGERPRINT } from "./config";
+} from "../../test-vaults/benchmark/contract-v1";
+import { WORKLOAD_DIMENSIONS, WORKLOAD_FINGERPRINT } from "../../test-vaults/benchmark/config";
 import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import {
   createBenchmarkCounters,
@@ -47,6 +50,7 @@ import {
   observeVaultList,
   observeVaultRead,
   type BenchmarkCounters,
+  type SemanticCallObservation,
 } from "./instrumentation";
 
 export interface BenchmarkScenario {
@@ -188,6 +192,114 @@ export interface TramaBenchmark {
     >;
     readonly phaseCounts: Readonly<Record<string, number>>;
   };
+  readonly semanticAttribution?: {
+    readonly lifecycleCalls: readonly (SemanticCallObservation & { readonly position: string })[];
+    readonly isolatedProbeCalls: readonly (SemanticCallObservation & {
+      readonly position: string;
+    })[];
+    readonly providerElapsedMs: readonly number[];
+    readonly providerInputDigests: readonly string[];
+    readonly vectorConversion: {
+      readonly count: number;
+      readonly elapsedMs: number;
+      readonly bytes: number;
+    };
+  };
+}
+
+function classifySemanticCalls(calls: readonly SemanticCallObservation[]) {
+  return calls.map((call) => {
+    const peers = calls.filter(
+      (candidate) =>
+        candidate.scenario === call.scenario &&
+        candidate.method === "prepareSemanticWork" &&
+        (candidate.requestCount > 0 || candidate.promoted > 0)
+    );
+    const index = peers.indexOf(call);
+    return {
+      ...call,
+      position:
+        call.method === "commitSemanticResults"
+          ? "commit"
+          : index < 0
+            ? "empty"
+            : index === 0
+              ? "first-productive"
+              : index === peers.length - 1
+                ? "final-productive"
+                : "middle-productive",
+    };
+  });
+}
+
+async function isolatedSemanticProbes(
+  workload: Workload
+): Promise<readonly SemanticCallObservation[]> {
+  const counters = createBenchmarkCounters();
+  const client = instrumentSqliteClient(
+    createTestSqliteClient(
+      {},
+      {
+        persistMutations: false,
+        onSemanticPhase: (phase) => counters.semanticPhases.push(phase),
+        onSemanticHandler: (_method, elapsedMs) => counters.semanticHandlerMs.push(elapsedMs),
+      }
+    ),
+    counters
+  );
+  const embeddingFingerprint = WORKLOAD_FINGERPRINT;
+  try {
+    await client.call("boot", {
+      corpusFingerprint: "a".repeat(64),
+      embeddingFingerprint,
+      dimensions: WORKLOAD_DIMENSIONS,
+    });
+    await applyTestLexicalRun(
+      client,
+      workload.notes.slice(0, 3).map((note) => ({ path: note.path, markdown: note.content }))
+    );
+    let ordinal = 0;
+    for (;;) {
+      counters.semanticScenario = ordinal++ === 0 ? "probeUncached" : "probePartial";
+      const work = await client.call("prepareSemanticWork", {
+        embeddingFingerprint,
+        limit: 1,
+        maxInputBytes: 4 * 1024 * 1024,
+        promoteUnrestricted: ordinal === 1,
+      });
+      if (!work.requests.length) break;
+      await client.call("commitSemanticResults", {
+        embeddingFingerprint,
+        dimensions: WORKLOAD_DIMENSIONS,
+        expectedCount: work.requests.length,
+        results: work.requests.map(
+          (request: { actionKey: string; inputId: number; serialization: string }) => ({
+            ...request,
+            vector: deterministicEmbeddingVector(request.serialization),
+          })
+        ),
+      });
+      if (!work.hasMore) break;
+    }
+    counters.semanticScenario = "probeCachedProductive";
+    await applyTestLexicalRun(client, [
+      { path: "probe/cached-copy.md", markdown: workload.notes[0].content },
+    ]);
+    await client.call("prepareSemanticWork", {
+      embeddingFingerprint,
+      limit: 1,
+      maxInputBytes: 4 * 1024 * 1024,
+    });
+    counters.semanticScenario = "probeNoWork";
+    await client.call("prepareSemanticWork", {
+      embeddingFingerprint,
+      limit: 1,
+      maxInputBytes: 4 * 1024 * 1024,
+    });
+    return counters.semanticCalls;
+  } finally {
+    await client.shutdown();
+  }
 }
 
 const percentile = (values: readonly number[], fraction: number): number => {
@@ -291,7 +403,9 @@ class BenchmarkEmbedding implements EmbeddingModel {
   constructor(
     workload: Workload,
     private readonly counters: BenchmarkCounters,
-    private readonly sampleMemory?: () => void
+    private readonly sampleMemory?: () => void,
+    private readonly diagnostics = true,
+    private readonly onProviderBatch?: (texts: readonly string[]) => void
   ) {
     for (const note of [
       ...workload.notes,
@@ -302,6 +416,12 @@ class BenchmarkEmbedding implements EmbeddingModel {
   }
 
   async embed(texts: readonly string[]): Promise<readonly number[][]> {
+    const started = this.diagnostics ? performance.now() : 0;
+    try {
+      this.onProviderBatch?.(texts);
+    } catch {
+      /* Test observations cannot change provider output. */
+    }
     this.sampleMemory?.();
     const vectors = texts.map((text) => {
       const vector = this.vectors.get(text);
@@ -310,6 +430,12 @@ class BenchmarkEmbedding implements EmbeddingModel {
       return Array.from(this.fallback());
     });
     observeProvider(this.counters, texts, vectors);
+    if (this.diagnostics) {
+      this.counters.providerElapsedMs.push(performance.now() - started);
+      this.counters.providerInputDigests.push(
+        createHash("sha256").update(JSON.stringify(texts)).digest("hex")
+      );
+    }
     this.sampleMemory?.();
     return vectors;
   }
@@ -372,16 +498,47 @@ function manager(
   diagnostics = true
 ): IndexManager {
   const client = instrumentSqliteClient(
-    createTestSqliteClient(identity, { persistMutations: false, captureLifecycleSnapshots: true }),
+    createTestSqliteClient(identity, {
+      persistMutations: false,
+      captureLifecycleSnapshots: true,
+      ...(diagnostics
+        ? {
+            onSemanticPhase: (phase) => counters.semanticPhases.push(phase),
+            onSemanticHandler: (_method, elapsedMs) => counters.semanticHandlerMs.push(elapsedMs),
+          }
+        : {}),
+    }),
     counters,
     sampleMemory,
     diagnostics
   );
-  return new IndexManager(vault, embedding, "http://benchmark.invalid/v1", "fixture", {
-    sqliteClient: client,
-    publicationDirectory: "Trama/index",
-    onProgress: (progress) => observeProgress(counters, progress, sampleMemory),
-  });
+  const performanceDiagnostics: TramaDiagnostics = {
+    enabled: (tier) => diagnostics && tier === "performance",
+    emit(record) {
+      if (
+        !diagnostics ||
+        !("tier" in record) ||
+        record.tier !== "performance" ||
+        record.phase !== "vectorConversion"
+      )
+        return;
+      counters.vectorConversionCount += record.itemCount ?? 0;
+      counters.vectorConversionMs += record.durationMs;
+      counters.vectorConversionBytes += record.byteCount ?? 0;
+    },
+  };
+  return new IndexManager(
+    vault,
+    embedding,
+    "http://benchmark.invalid/v1",
+    "fixture",
+    {
+      sqliteClient: client,
+      publicationDirectory: "Trama/index",
+      onProgress: (progress) => observeProgress(counters, progress, sampleMemory),
+    },
+    performanceDiagnostics
+  );
 }
 
 function scenario(
@@ -407,6 +564,11 @@ function cloneCounters(counters: BenchmarkCounters): BenchmarkCounters {
       Object.entries(counters.rpcElapsedMs).map(([method, values]) => [method, [...values]])
     ),
     progressByPhase: { ...counters.progressByPhase },
+    semanticPhases: [...counters.semanticPhases],
+    semanticHandlerMs: [...counters.semanticHandlerMs],
+    semanticCalls: [...counters.semanticCalls],
+    providerElapsedMs: [...counters.providerElapsedMs],
+    providerInputDigests: [...counters.providerInputDigests],
   };
 }
 
@@ -423,6 +585,7 @@ export async function runTramaBenchmark(
     readonly repetitions?: number;
     readonly timeoutMs?: number;
     readonly diagnostics?: boolean;
+    readonly onProviderBatch?: (texts: readonly string[]) => void;
     readonly onScenario?: (
       name: string,
       scenario: BenchmarkScenario,
@@ -449,7 +612,13 @@ export async function runTramaBenchmark(
   const counters = createBenchmarkCounters();
   const diagnostics = options.diagnostics ?? true;
   const vault = new BenchmarkVault(counters, workload.notes);
-  const embedding = new BenchmarkEmbedding(workload, counters, sampleMemory);
+  const embedding = new BenchmarkEmbedding(
+    workload,
+    counters,
+    sampleMemory,
+    diagnostics,
+    options.onProviderBatch
+  );
   const publicationAdapter = new MemoryPublicationAdapter();
   const initialIdentity = {};
   const index = manager(vault, embedding, initialIdentity, counters, sampleMemory, diagnostics);
@@ -466,10 +635,12 @@ export async function runTramaBenchmark(
       name: string,
       operation: () => Promise<T>
     ) => {
+      counters.semanticScenario = name;
       sampleMemory();
       const before = cloneCounters(counters);
       const started = performance.now();
       const result = await operation();
+      counters.semanticScenario = "outside-lifecycle";
       sampleMemory();
       const duration = performance.now() - started;
       durationMs[name] = duration;
@@ -540,7 +711,13 @@ export async function runTramaBenchmark(
     const restartedIdentity = {};
     const restartedManager = manager(
       vault,
-      new BenchmarkEmbedding(workload, counters, sampleMemory),
+      new BenchmarkEmbedding(
+        workload,
+        counters,
+        sampleMemory,
+        diagnostics,
+        options.onProviderBatch
+      ),
       restartedIdentity,
       counters,
       sampleMemory,
@@ -645,7 +822,14 @@ export async function runTramaBenchmark(
         },
       ])
     );
-    const semanticPrepareSamples = counters.rpcElapsedMs.prepareSemanticWork ?? [];
+    const semanticPrepareSamples = counters.semanticCalls
+      .filter(
+        (call) =>
+          call.scenario === "semanticUncached" &&
+          call.method === "prepareSemanticWork" &&
+          call.requestCount > 0
+      )
+      .map((call) => call.rpcMs);
     const semanticPrepareTimingMs = semanticPrepareSamples.length
       ? {
           beginning: semanticPrepareSamples[0]!,
@@ -742,6 +926,7 @@ export async function runTramaBenchmark(
         ),
       },
     };
+    const probeCalls = diagnostics ? await isolatedSemanticProbes(workload) : [];
     return {
       reportVersion: "trama-benchmark-report-v2",
       lifecycle: {
@@ -845,7 +1030,6 @@ export async function runTramaBenchmark(
       },
       unsupported: [
         "Worker+OPFS browser harness (repository has no packaged browser benchmark runner)",
-        "transaction and SQL statement counts (test RPC seam exposes calls, not SQLite tracing)",
         "real LM Studio inference",
         "real Obsidian UI",
       ],
@@ -870,7 +1054,20 @@ export async function runTramaBenchmark(
         },
       },
       ...(diagnostics
-        ? { diagnostics: { rpcLatencyMs, phaseCounts: { ...counters.progressByPhase } } }
+        ? {
+            diagnostics: { rpcLatencyMs, phaseCounts: { ...counters.progressByPhase } },
+            semanticAttribution: {
+              lifecycleCalls: classifySemanticCalls(counters.semanticCalls),
+              isolatedProbeCalls: classifySemanticCalls(probeCalls),
+              providerElapsedMs: counters.providerElapsedMs,
+              providerInputDigests: counters.providerInputDigests,
+              vectorConversion: {
+                count: counters.vectorConversionCount,
+                elapsedMs: counters.vectorConversionMs,
+                bytes: counters.vectorConversionBytes,
+              },
+            },
+          }
         : {}),
     };
   } finally {

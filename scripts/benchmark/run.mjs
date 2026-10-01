@@ -22,7 +22,7 @@ const vitestStatus = run(
 );
 
 const profile = process.env.TRAMA_BENCHMARK_PROFILE ?? "trama-small";
-const report = JSON.parse(readFileSync(`.artifacts/trama-benchmark/${profile}.json`, "utf8"));
+const report = JSON.parse(readFileSync(`.artifacts/benchmarks/${profile}.json`, "utf8"));
 if (report.status === "timeout") {
   process.stdout.write(
     `\n## Trama benchmark: ${report.profile}\n\nTimed out after ${report.elapsedMs.toFixed(1)} ms (limit ${report.timeoutMs} ms).\n\n`

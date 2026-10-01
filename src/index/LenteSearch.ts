@@ -2,6 +2,7 @@ import type { IndexFreshness } from "@/domain/contracts";
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import {
   emitTramaDiagnostic,
+  diagnosticsEnabled,
   NOOP_TRAMA_DIAGNOSTICS,
   projectDiagnosticError,
   startDiagnosticTimer,
@@ -110,26 +111,28 @@ export class LenteSearch {
         canonicalResults,
         durationMs: elapsedMs(),
       } as const;
-      emitTramaDiagnostic(this.diagnostics, {
-        area: "index",
-        event: "lente_search",
-        generation: generationId,
-        mode,
-        resultCount: results.length,
-        durationMs: batch.durationMs,
-      } as never);
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        emitTramaDiagnostic(this.diagnostics, {
+          area: "index",
+          event: "lente_search",
+          generation: generationId,
+          mode,
+          resultCount: results.length,
+          durationMs: batch.durationMs,
+        } as never);
       return batch;
     } catch (error) {
-      emitTramaDiagnostic(this.diagnostics, {
-        area: "index",
-        event: "lente_search",
-        generation: this.retrieval.vaultSearchState()?.generationId,
-        mode,
-        resultCount: 0,
-        durationMs: elapsedMs(),
-        cancelled: isCancelled(error),
-        error: projectDiagnosticError(error),
-      } as never);
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        emitTramaDiagnostic(this.diagnostics, {
+          area: "index",
+          event: "lente_search",
+          generation: this.retrieval.vaultSearchState()?.generationId,
+          mode,
+          resultCount: 0,
+          durationMs: elapsedMs(),
+          cancelled: isCancelled(error),
+          error: projectDiagnosticError(error),
+        } as never);
       throw error;
     }
   }

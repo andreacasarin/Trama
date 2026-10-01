@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RelatedNotes } from "@/index/RelatedNotes";
 import type { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
-import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 const signal = new AbortController().signal;
 function snapshot(path: string, _text: string, hits: RelatedIndexHit[], generationId = "1") {
@@ -186,7 +186,7 @@ describe("RelatedNotes", () => {
     const records: TramaDiagnosticRecord[] = [];
     const service = new RelatedNotes(
       { relatedState: () => current.value, findRelated: current.search },
-      { emit: (record) => records.push(record) }
+      { enabled: () => true, emit: (record) => records.push(record) }
     );
 
     await Promise.all([service.find("current.md", signal), service.find("current.md", signal)]);

@@ -5,7 +5,7 @@ import {
   type SqliteLexicalRunResult,
   type SqliteState,
 } from "@/index/sqlite/protocol";
-import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
+import { diagnosticsEnabled, projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
 import type {
   IndexOperationResult,
   IndexPathMutation,
@@ -42,7 +42,9 @@ export class LexicalCoordinator {
   private async buildInternal(signal: AbortSignal): Promise<IndexOperationResult> {
     check(signal);
     this.runtime.building = true;
-    const started = Date.now();
+    const started = diagnosticsEnabled(this.runtime.diagnostics, "detailed")
+      ? Date.now()
+      : undefined;
     try {
       if (!this.runtime.loaded && !(await this.runtime.load()))
         throw (
@@ -74,29 +76,31 @@ export class LexicalCoordinator {
         state: finalState,
       };
       if (!finalState.incomplete) this.runtime.notifySuccessfulOperation(operationResult);
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "build",
-        stage: "completed",
-        durationMs: Date.now() - started,
-        generation: this.runtime.generationId(),
-        counts: {
-          notes: finalState?.noteCount ?? 0,
-          chunks: finalState?.chunkCount ?? 0,
-          incomplete: finalState?.incomplete ? 1 : 0,
-        },
-      });
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "build",
+          stage: "completed",
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          generation: this.runtime.generationId(),
+          counts: {
+            notes: finalState?.noteCount ?? 0,
+            chunks: finalState?.chunkCount ?? 0,
+            incomplete: finalState?.incomplete ? 1 : 0,
+          },
+        });
       return operationResult;
     } catch (error) {
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "build",
-        stage: signal.aborted ? "cancelled" : "failed",
-        durationMs: Date.now() - started,
-        error: projectDiagnosticError(error),
-      });
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "build",
+          stage: signal.aborted ? "cancelled" : "failed",
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          error: projectDiagnosticError(error),
+        });
       throw error;
     } finally {
       this.runtime.building = false;
@@ -256,30 +260,34 @@ export class LexicalCoordinator {
       throw new StructuredError("busy", "Semantic index preparation is already running.", true);
     check(signal);
     this.runtime.building = true;
-    const started = Date.now();
-    this.runtime.emit({
-      area: "index",
-      event: "index_operation",
-      operation: "incremental",
-      stage: "started",
-      ...(phase ? { phase } : {}),
-    });
-    const complete = (changed: boolean): IndexSyncResult => {
+    const started = diagnosticsEnabled(this.runtime.diagnostics, "detailed")
+      ? Date.now()
+      : undefined;
+    if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
       this.runtime.emit({
         area: "index",
         event: "index_operation",
         operation: "incremental",
-        stage: "completed",
+        stage: "started",
         ...(phase ? { phase } : {}),
-        durationMs: Date.now() - started,
-        generation: this.runtime.generationId(),
-        counts: {
-          changed: changed ? 1 : 0,
-          notes: this.runtime.state?.noteCount ?? 0,
-          chunks: this.runtime.state?.chunkCount ?? 0,
-          incomplete: this.runtime.state?.incomplete ? 1 : 0,
-        },
       });
+    const complete = (changed: boolean): IndexSyncResult => {
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "incremental",
+          stage: "completed",
+          ...(phase ? { phase } : {}),
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          generation: this.runtime.generationId(),
+          counts: {
+            changed: changed ? 1 : 0,
+            notes: this.runtime.state?.noteCount ?? 0,
+            chunks: this.runtime.state?.chunkCount ?? 0,
+            incomplete: this.runtime.state?.incomplete ? 1 : 0,
+          },
+        });
       return { changed, converged: this.runtime.state?.incomplete === false };
     };
     try {
@@ -302,15 +310,16 @@ export class LexicalCoordinator {
         });
       return complete(result.changed);
     } catch (error) {
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "incremental",
-        stage: signal.aborted ? "cancelled" : "failed",
-        ...(phase ? { phase } : {}),
-        durationMs: Date.now() - started,
-        error: projectDiagnosticError(error),
-      });
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "incremental",
+          stage: signal.aborted ? "cancelled" : "failed",
+          ...(phase ? { phase } : {}),
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          error: projectDiagnosticError(error),
+        });
       throw error;
     } finally {
       this.runtime.building = false;

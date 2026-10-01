@@ -1,5 +1,5 @@
 import { ChatResponse, ToolCall } from "@/domain/contracts";
-import { isSqliteMethod } from "@/index/sqlite/protocol";
+import { isSqliteMethod, SQLITE_METHODS, type SqliteMethod } from "@/index/sqlite/protocol";
 import { ToolResult } from "@/tools/ToolRegistry";
 
 /** Explicit diagnostic area used to keep chat payloads separate from metadata-only index events. */
@@ -84,7 +84,7 @@ function safeBuildId(value: unknown): string | undefined {
 }
 
 /** Typed diagnostic events emitted by Trama's bounded conversation session. */
-export type TramaDiagnosticRecord =
+export type TramaDetailedInput =
   | { readonly area: "chat"; readonly event: "session_started"; readonly generation: number }
   | {
       readonly area: "chat";
@@ -253,12 +253,271 @@ export type TramaDiagnosticRecord =
       readonly error?: SafeDiagnosticError;
     };
 
+export type DiagnosticTier = "performance" | "detailed";
+export type DiagnosticMode = "off" | "performance" | "detailed";
+export type DiagnosticFacet =
+  | "chat"
+  | "index"
+  | "filo"
+  | "lexical"
+  | "semantic"
+  | "retrieve"
+  | "related"
+  | "adoption"
+  | "publication"
+  | "worker"
+  | "rpc";
+export type PerformanceFacet = Exclude<DiagnosticFacet, "chat">;
+export type PerformancePhase = (typeof PERFORMANCE_PHASE_LIST)[number] | SqliteMethod | "unknown";
+export interface DiagnosticContext {
+  readonly sessionId: string;
+  readonly requestId?: number;
+  readonly operationId?: string;
+  readonly parentOperationId?: string;
+  readonly batchId?: string;
+}
+/** Bounded metadata only. No open-ended context, payload, path, hash, vector, or error fields. */
+export interface TramaPerformanceRecord {
+  readonly tier: "performance";
+  readonly facets: readonly PerformanceFacet[];
+  readonly area: "index" | "filo";
+  readonly event: "phase";
+  readonly operation: "lexical" | "semantic" | "retrieve" | "related" | "publication" | "adoption";
+  readonly phase: PerformancePhase;
+  readonly semanticStep?: "prepare" | "commit";
+  readonly durationMs: number;
+  readonly sqlMs?: number;
+  readonly sqlCalls?: number;
+  readonly callbackRows?: number;
+  readonly copiedBytes?: number;
+  readonly itemCount?: number;
+  readonly byteCount?: number;
+  readonly nested?: boolean;
+  readonly context?: DiagnosticContext;
+}
+export type TramaDiagnosticRecord =
+  | TramaPerformanceRecord
+  | (TramaDetailedInput & {
+      readonly tier: "detailed";
+      readonly facets: readonly DiagnosticFacet[];
+      readonly context?: DiagnosticContext;
+    });
+export type TramaDiagnosticInput = TramaDetailedInput | TramaPerformanceRecord;
+
 /** Receives transient diagnostics without buffering or persisting them. */
 export interface TramaDiagnostics {
-  emit(record: TramaDiagnosticRecord): void;
+  readonly context?: DiagnosticContext;
+  enabled(tier: DiagnosticTier): boolean;
+  emit(record: TramaDiagnosticInput): void;
+  capturePerformance?(
+    configureWorker: () => Promise<void>,
+    work: (records: readonly TramaPerformanceRecord[]) => Promise<void>,
+    onRecord?: (record: TramaPerformanceRecord) => void
+  ): Promise<readonly TramaPerformanceRecord[]>;
 }
 
-export const NOOP_TRAMA_DIAGNOSTICS: TramaDiagnostics = Object.freeze({ emit: () => undefined });
+export const NOOP_TRAMA_DIAGNOSTICS: TramaDiagnostics = Object.freeze({
+  enabled: () => false,
+  emit: () => undefined,
+});
+
+export function modeEnables(mode: DiagnosticMode, tier: DiagnosticTier): boolean {
+  return mode === "detailed" || (mode === "performance" && tier === "performance");
+}
+
+/** An injected diagnostic port is untrusted: observation must never interrupt work. */
+export function diagnosticsEnabled(diagnostics: TramaDiagnostics, tier: DiagnosticTier): boolean {
+  try {
+    return diagnostics.enabled(tier) === true;
+  } catch {
+    return false;
+  }
+}
+
+export function createTramaDiagnostics(
+  getMode: () => DiagnosticMode,
+  sink: (record: TramaDiagnosticRecord) => void,
+  context: DiagnosticContext
+): TramaDiagnostics {
+  const captures: {
+    records: TramaPerformanceRecord[];
+    onRecord?: (record: TramaPerformanceRecord) => void;
+    failure?: Error;
+  }[] = [];
+  return {
+    context,
+    enabled: (tier) => {
+      try {
+        return (captures.length > 0 && tier === "performance") || modeEnables(getMode(), tier);
+      } catch {
+        return false;
+      }
+    },
+    emit(input) {
+      try {
+        const tier = "tier" in input ? input.tier : "detailed";
+        let liveEnabled = false;
+        try {
+          liveEnabled = modeEnables(getMode(), tier);
+        } catch {
+          // A failing settings reader only disables the live sink.
+        }
+        if (!(captures.length > 0 && tier === "performance") && !liveEnabled) return;
+        const record: TramaDiagnosticRecord =
+          tier === "performance"
+            ? safePerformanceRecord(input as TramaPerformanceRecord, context)
+            : ({
+                ...input,
+                tier: "detailed",
+                facets: [input.area],
+                context,
+              } as TramaDiagnosticRecord);
+        if (record.tier === "performance")
+          for (const capture of captures) {
+            if (capture.failure) continue;
+            if (capture.onRecord) {
+              try {
+                capture.onRecord(record);
+              } catch {
+                capture.failure = new Error("Performance capture consumer failed.");
+              }
+            } else if (capture.records.length < 512) capture.records.push(record);
+            else capture.failure = new Error("Performance capture exceeded 512 records.");
+          }
+        if (liveEnabled) sink(record);
+      } catch {
+        // A failing diagnostic sink cannot affect the observed operation.
+      }
+    },
+    async capturePerformance(configureWorker, work, onRecord) {
+      const records: TramaPerformanceRecord[] = [];
+      const capture = { records, onRecord, failure: undefined as Error | undefined };
+      captures.push(capture);
+      try {
+        await configureWorker();
+        await work(records);
+        if (capture.failure) throw capture.failure;
+        return records;
+      } finally {
+        captures.splice(captures.indexOf(capture), 1);
+        await configureWorker();
+      }
+    },
+  };
+}
+
+const PERFORMANCE_FACETS = new Set<PerformanceFacet>([
+  "index",
+  "filo",
+  "lexical",
+  "semantic",
+  "retrieve",
+  "related",
+  "adoption",
+  "publication",
+  "worker",
+  "rpc",
+]);
+const PERFORMANCE_OPERATIONS = new Set<TramaPerformanceRecord["operation"]>([
+  "lexical",
+  "semantic",
+  "retrieve",
+  "related",
+  "publication",
+  "adoption",
+]);
+const PERFORMANCE_PHASE_LIST = [
+  "snapshotRead",
+  "batch",
+  "queryEmbedding",
+  "resultShaping",
+  "overall",
+  "prepareRpc",
+  "provider",
+  "vectorConversion",
+  "commitRpc",
+  "prepare",
+  "install",
+  "finalize",
+  "hybrid",
+  "lexical",
+  "semantic",
+  "related",
+  "firstInputLookup",
+  "boundedMissingSelection",
+  "remainingWorkCheck",
+  "generationLookup",
+  "resultAssembly",
+  "unrestrictedPromotion",
+  "inputRereadValidation",
+  "vectorNormalizationDedup",
+  "transaction",
+  "transactionSetupResultInserts",
+  "knownBlobCopy",
+  "affectedNoteCacheUpsert",
+  "promotion",
+  "cleanup",
+  "semanticCandidates",
+  "lexicalCandidates",
+  "fusion",
+  "centroid",
+] as const;
+const PERFORMANCE_PHASES = new Set<string>([...PERFORMANCE_PHASE_LIST, ...SQLITE_METHODS]);
+function safePerformanceRecord(
+  input: TramaPerformanceRecord,
+  context: DiagnosticContext
+): TramaPerformanceRecord {
+  const count = (value: number | undefined) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+  return {
+    tier: "performance",
+    facets: Array.isArray(input.facets)
+      ? input.facets.filter((facet) => PERFORMANCE_FACETS.has(facet)).slice(0, 8)
+      : [],
+    area: input.area === "filo" ? "filo" : "index",
+    event: "phase",
+    operation: PERFORMANCE_OPERATIONS.has(input.operation) ? input.operation : "lexical",
+    phase: PERFORMANCE_PHASES.has(input.phase) ? input.phase : "unknown",
+    ...(input.semanticStep === "prepare" || input.semanticStep === "commit"
+      ? { semanticStep: input.semanticStep }
+      : {}),
+    durationMs: count(input.durationMs) ?? 0,
+    ...(count(input.sqlMs) === undefined ? {} : { sqlMs: count(input.sqlMs) }),
+    ...(count(input.sqlCalls) === undefined ? {} : { sqlCalls: count(input.sqlCalls) }),
+    ...(count(input.callbackRows) === undefined ? {} : { callbackRows: count(input.callbackRows) }),
+    ...(count(input.copiedBytes) === undefined ? {} : { copiedBytes: count(input.copiedBytes) }),
+    ...(count(input.itemCount) === undefined ? {} : { itemCount: count(input.itemCount) }),
+    ...(count(input.byteCount) === undefined ? {} : { byteCount: count(input.byteCount) }),
+    ...(input.nested === undefined ? {} : { nested: input.nested === true }),
+    context: {
+      sessionId: context.sessionId,
+      ...(Number.isSafeInteger(input.context?.requestId)
+        ? { requestId: input.context!.requestId }
+        : {}),
+      ...(typeof input.context?.operationId === "string" &&
+      /^[A-Za-z0-9_-]{1,96}$/.test(input.context.operationId)
+        ? { operationId: input.context.operationId }
+        : {}),
+      ...(typeof input.context?.parentOperationId === "string" &&
+      /^[A-Za-z0-9_-]{1,96}$/.test(input.context.parentOperationId)
+        ? { parentOperationId: input.context.parentOperationId }
+        : {}),
+      ...(typeof input.context?.batchId === "string" &&
+      /^[A-Za-z0-9_-]{1,96}$/.test(input.context.batchId)
+        ? { batchId: input.context.batchId }
+        : {}),
+    },
+  };
+}
+
+/** Returns undefined without reading the clock when a tier is disabled. */
+export function diagnosticTimer(
+  diagnostics: TramaDiagnostics,
+  tier: DiagnosticTier,
+  now: () => number = () => performance.now()
+): (() => number) | undefined {
+  return diagnosticsEnabled(diagnostics, tier) ? startDiagnosticTimer(now) : undefined;
+}
 
 /** Starts one wall-clock timer for diagnostic duration records. */
 export function startDiagnosticTimer(now: () => number = () => Date.now()): () => number {
@@ -269,7 +528,7 @@ export function startDiagnosticTimer(now: () => number = () => Date.now()): () =
 /** Emits observational diagnostics without allowing a hostile sink to affect control flow. */
 export function emitTramaDiagnostic(
   diagnostics: TramaDiagnostics,
-  record: TramaDiagnosticRecord
+  record: TramaDiagnosticInput
 ): void {
   try {
     diagnostics.emit(record);
@@ -334,7 +593,7 @@ export function projectDiagnosticError(error: unknown): SafeDiagnosticError {
 }
 
 /** Concise safe line for collapsed developer-console previews. */
-export function formatDiagnosticLogLine(record: TramaDiagnosticRecord): string | undefined {
+export function formatDiagnosticLogLine(record: TramaDiagnosticInput): string | undefined {
   if (
     record.event === "index_operation" &&
     record.operation === "startup" &&

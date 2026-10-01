@@ -3,6 +3,10 @@ import { SqliteScheduler } from "./scheduler";
 import { closeWorkerDatabase, type WorkerStorageState } from "./worker-lifecycle";
 import {
   SQLITE_PROTOCOL_VERSION,
+  SQLITE_DIAGNOSTICS_CONFIG_TYPE,
+  SQLITE_DIAGNOSTIC_EVENT_TYPE,
+  type SqliteDiagnosticsConfiguration,
+  type SqliteDiagnosticEventMessage,
   type SqliteRequest,
   type SqliteReply,
   type SqliteErrorShape,
@@ -12,6 +16,7 @@ import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/ident
 import { applyLexicalMarkdownBatch } from "./markdown";
 import { validateRequest } from "./request-validation";
 import { WorkerPublicationOperations } from "./worker-publication";
+import type { TramaDiagnostics, TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
 
 type SqliteModule = {
   oo1: { DB: new (name: string, mode: string) => SqliteConnection };
@@ -38,6 +43,105 @@ const scheduler = new SqliteScheduler();
 let sqliteModulePromise: Promise<SqliteModule> | undefined;
 let databaseIdentity = "default";
 let maintenance = false;
+let diagnosticsEnabled = false;
+let diagnosticSessionId = "none";
+let diagnosticRequestId: number | undefined;
+let diagnosticOperationId: string | undefined;
+let diagnosticParentOperationId: string | undefined;
+let diagnosticBatchId: string | undefined;
+let diagnosticMethod: SqliteRequest["method"] | undefined;
+let semanticPhases: Map<string, TramaPerformanceRecord> | undefined;
+const MAX_SEMANTIC_PHASES_PER_REQUEST = 32;
+function emitPerformance(record: Omit<TramaPerformanceRecord, "context">): void {
+  if (!diagnosticsEnabled) return;
+  try {
+    (self as unknown as { postMessage(value: unknown): void }).postMessage({
+      type: SQLITE_DIAGNOSTIC_EVENT_TYPE,
+      record: {
+        ...record,
+        context: {
+          sessionId: diagnosticSessionId,
+          requestId: diagnosticRequestId,
+          operationId: diagnosticOperationId,
+          parentOperationId: diagnosticParentOperationId,
+          batchId: diagnosticBatchId,
+        },
+      },
+    } satisfies SqliteDiagnosticEventMessage);
+  } catch {
+    // Diagnostic transport cannot change the RPC result.
+  }
+}
+const workerDiagnostics: TramaDiagnostics = {
+  enabled: (tier) => tier === "performance" && diagnosticsEnabled,
+  emit(record) {
+    if ("tier" in record && record.tier === "performance") observeSemanticPhase(record);
+  },
+};
+function observeSemanticPhase(phase: TramaPerformanceRecord): void {
+  if (!semanticPhases) return;
+  aggregateSemanticPhase(semanticPhases, phase);
+}
+/** Coalesces repeated bounded semantic spans before crossing the Worker boundary. */
+export function aggregateSemanticPhase(
+  phases: Map<string, TramaPerformanceRecord>,
+  phase: TramaPerformanceRecord
+): void {
+  const key = `${phase.semanticStep}:${phase.phase}:${phase.nested}`;
+  const prior = phases.get(key);
+  if (!prior && phases.size >= MAX_SEMANTIC_PHASES_PER_REQUEST) return;
+  phases.set(
+    key,
+    prior
+      ? {
+          ...prior,
+          durationMs: prior.durationMs + phase.durationMs,
+          sqlMs: (prior.sqlMs ?? 0) + (phase.sqlMs ?? 0),
+          sqlCalls: (prior.sqlCalls ?? 0) + (phase.sqlCalls ?? 0),
+          callbackRows: (prior.callbackRows ?? 0) + (phase.callbackRows ?? 0),
+          copiedBytes: (prior.copiedBytes ?? 0) + (phase.copiedBytes ?? 0),
+        }
+      : phase
+  );
+}
+function observeRetrievalPhase(
+  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  durationMs: number,
+  itemCount: number
+): void {
+  emitPerformance(retrievalPhaseRecord(diagnosticMethod, phase, durationMs, itemCount));
+}
+export function retrievalPhaseRecord(
+  method: SqliteRequest["method"] | undefined,
+  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  durationMs: number,
+  itemCount: number
+): Omit<TramaPerformanceRecord, "context"> {
+  const related = method === "findRelated";
+  return {
+    tier: "performance",
+    facets: ["index", related ? "related" : "retrieve", "worker"],
+    area: related ? "filo" : "index",
+    event: "phase",
+    operation: related ? "related" : "retrieve",
+    phase,
+    durationMs,
+    itemCount,
+  };
+}
+function flushSemanticPhases(): void {
+  const phases = semanticPhases;
+  semanticPhases = undefined;
+  if (!phases) return;
+  for (const phase of phases.values()) emitPerformance(phase);
+}
+function configureDiagnostics(input: Partial<SqliteDiagnosticsConfiguration> | undefined): void {
+  diagnosticsEnabled = input?.performance === true;
+  diagnosticSessionId =
+    typeof input?.sessionId === "string" && input.sessionId.length <= 128
+      ? input.sessionId
+      : "none";
+}
 let bootConfig:
   | {
       corpusFingerprint: string;
@@ -189,7 +293,11 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
   } catch (error) {
     storageFailure("database open", error);
   }
-  storage.database = new MutableSqliteDatabase(storage.connection);
+  storage.database = new MutableSqliteDatabase(
+    storage.connection,
+    workerDiagnostics,
+    observeRetrievalPhase
+  );
   if (bootConfig) {
     try {
       storage.database.boot(
@@ -227,7 +335,11 @@ function resetIncompatibleLocalDatabase(config: {
     if (!storage.opfsPool) throw new Error("OPFS pool is unavailable");
     storage.opfsPool.unlink("/index.sqlite3");
     storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
-    storage.database = new MutableSqliteDatabase(storage.connection);
+    storage.database = new MutableSqliteDatabase(
+      storage.connection,
+      workerDiagnostics,
+      observeRetrievalPhase
+    );
     storage.database.boot(
       config.corpusFingerprint,
       config.dimensions,
@@ -346,7 +458,18 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
   data,
 }: MessageEvent) => {
   if (data?.type === "trama-runtime-handshake") {
-    post({ type: "trama-runtime-handshake", id: data.id, buildId: TRAMA_RUNTIME_BUILD_ID } as any);
+    configureDiagnostics(data.diagnostics);
+    post({
+      type: "trama-runtime-handshake",
+      id: data.id,
+      buildId: TRAMA_RUNTIME_BUILD_ID,
+      diagnosticsConfigured: true,
+    } as any);
+    return;
+  }
+  if (data?.type === SQLITE_DIAGNOSTICS_CONFIG_TYPE) {
+    configureDiagnostics(data.diagnostics);
+    post({ type: SQLITE_DIAGNOSTICS_CONFIG_TYPE, id: data.id, configured: true } as any);
     return;
   }
   let request: SqliteRequest;
@@ -391,7 +514,92 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
   ].includes(request.method);
   if (isMaintenance) maintenance = true;
   void scheduler
-    .enqueue(request.id, (signal) => handle(request, signal))
+    .enqueue(request.id, async (signal) => {
+      const measured =
+        diagnosticsEnabled &&
+        [
+          "applyLexicalBatch",
+          "prepareSemanticWork",
+          "commitSemanticResults",
+          "retrieve",
+          "findRelated",
+          "preparePublication",
+          "finalizePublication",
+          "inspectPublication",
+          "adoptPublication",
+        ].includes(request.method);
+      if (measured) {
+        diagnosticRequestId = request.id;
+        diagnosticMethod = request.method;
+        diagnosticOperationId =
+          typeof request.diagnosticOperationId === "string" &&
+          /^[A-Za-z0-9_-]{1,96}$/.test(request.diagnosticOperationId)
+            ? request.diagnosticOperationId
+            : undefined;
+        diagnosticParentOperationId =
+          typeof request.diagnosticParentOperationId === "string" &&
+          /^[A-Za-z0-9_-]{1,96}$/.test(request.diagnosticParentOperationId)
+            ? request.diagnosticParentOperationId
+            : undefined;
+        diagnosticBatchId =
+          typeof request.diagnosticBatchId === "string" &&
+          /^[A-Za-z0-9_-]{1,96}$/.test(request.diagnosticBatchId)
+            ? request.diagnosticBatchId
+            : undefined;
+      }
+      semanticPhases =
+        measured &&
+        (request.method === "prepareSemanticWork" || request.method === "commitSemanticResults")
+          ? new Map()
+          : undefined;
+      const started = measured ? performance.now() : undefined;
+      try {
+        return await handle(request, signal);
+      } finally {
+        flushSemanticPhases();
+        if (started !== undefined)
+          emitPerformance({
+            tier: "performance",
+            facets: [
+              "index",
+              "worker",
+              "rpc",
+              request.method === "findRelated"
+                ? "related"
+                : request.method === "retrieve"
+                  ? "retrieve"
+                  : request.method === "adoptPublication"
+                    ? "adoption"
+                    : request.method.includes("Publication")
+                      ? "publication"
+                      : request.method.includes("Semantic")
+                        ? "semantic"
+                        : "lexical",
+            ],
+            area: request.method === "findRelated" ? "filo" : "index",
+            event: "phase",
+            operation:
+              request.method === "retrieve"
+                ? "retrieve"
+                : request.method === "findRelated"
+                  ? "related"
+                  : request.method === "adoptPublication"
+                    ? "adoption"
+                    : request.method.includes("Publication")
+                      ? "publication"
+                      : request.method.includes("Semantic")
+                        ? "semantic"
+                        : "lexical",
+            phase: request.method,
+            durationMs: Math.max(0, performance.now() - started),
+          });
+        diagnosticRequestId = undefined;
+        diagnosticOperationId = undefined;
+        diagnosticParentOperationId = undefined;
+        diagnosticBatchId = undefined;
+        diagnosticMethod = undefined;
+      }
+    })
     .then(
       (result) => {
         if (isMaintenance) maintenance = false;

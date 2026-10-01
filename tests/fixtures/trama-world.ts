@@ -1,5 +1,5 @@
 import type { EmbeddingModel, ReadonlyVault } from "@/domain/contracts";
-import type { TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
+import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { LenteSearch } from "@/index/LenteSearch";
 import { RelatedNotes } from "@/index/RelatedNotes";
@@ -138,7 +138,7 @@ export class TramaTestWorld {
         sqliteClient: createTestSqliteClient(identity),
         publicationDirectory: "Trama/index",
       },
-      { emit: (record) => this.diagnostics.push(record) }
+      { enabled: () => true, emit: (record) => this.diagnostics.push(record) }
     );
     this.publicationManager = new PublicationManager(
       this.index,

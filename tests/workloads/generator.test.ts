@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { WORKLOAD_DIMENSIONS } from "./config";
+import { readFileSync } from "node:fs";
+import { WORKLOAD_DIMENSIONS } from "../../test-vaults/benchmark/config";
 import {
   deterministicProviderChallengeSha256,
   DETERMINISTIC_PROVIDER_BEHAVIOR_VERSION,
@@ -10,7 +11,7 @@ import {
   referenceBaselineV1,
   sourceDigestsV1,
   WORKLOAD_CONTRACT_VERSION,
-} from "./contract-v1";
+} from "../../test-vaults/benchmark/contract-v1";
 import {
   createWorkload,
   deterministicEmbeddingVector,
@@ -19,9 +20,15 @@ import {
   workloadDigest,
   workloadQueryVectorDigest,
   workloadSourceDigest,
-} from "./generator";
+} from "../../test-vaults/benchmark/generator";
 
 describe("deterministic Trama workload generator", () => {
+  it("keeps the committed small-vault Markdown byte-identical to the v1 workload", () => {
+    for (const note of createWorkload("trama-small").notes)
+      expect(readFileSync(`test-vaults/benchmark/trama-small/${note.path}`, "utf8")).toBe(
+        note.content
+      );
+  });
   it("pins v1 source bytes independently of production chunking", () => {
     expect(WORKLOAD_CONTRACT_VERSION).toBe("trama-workload-contract-v1");
     for (const id of ["trama-small", "trama-10k", "trama-large"] as const) {
@@ -54,7 +61,7 @@ describe("deterministic Trama workload generator", () => {
       REFERENCE_SOURCE_MANIFEST_PATHS.map((path) => [path, Buffer.from(`fixture:${path}`)])
     );
     files.set(
-      "tests/workloads/contract-v1.ts",
+      "test-vaults/benchmark/contract-v1.ts",
       Buffer.from(
         `export const REFERENCE_SOURCE_MANIFEST_SHA256 = "${REFERENCE_SOURCE_MANIFEST_SHA256}";`,
         "utf8"
@@ -68,7 +75,7 @@ describe("deterministic Trama workload generator", () => {
     expect(observed).toMatch(/^[0-9a-f]{64}$/);
     expect(() =>
       computeReferenceSourceManifestSha256((path) =>
-        path === "tests/workloads/contract-v1.ts"
+        path === "test-vaults/benchmark/contract-v1.ts"
           ? Buffer.from(
               `export const REFERENCE_SOURCE_MANIFEST_SHA256 = "${REFERENCE_SOURCE_MANIFEST_SHA256}";\nexport const REFERENCE_SOURCE_MANIFEST_SHA256 = "${REFERENCE_SOURCE_MANIFEST_SHA256}";`
             )

@@ -1,8 +1,12 @@
 # Audited/generated SQLite WASM sources and build outputs are verified by checksums,
 # not reformatted by the repository style check.
 .cache/sqlite-wasm/**
+.cache/**
+.artifacts/**
 vendor/sqlite-wasm/**
 main.js
 sqlite-worker.mjs
 sqlite3.mjs
 sqlite3.wasm
+test-vaults/benchmark/trama-small/**
+test-vaults/**/.obsidian/**

@@ -118,6 +118,26 @@ export class IndexManager implements VaultRetrievalPort {
     this.retrieval = new RetrievalService(this.runtime, this.embedding);
   }
 
+  configureDiagnostics(): Promise<void> {
+    return this.runtime.client?.configureDiagnostics() ?? Promise.resolve();
+  }
+
+  /** Temporary, bounded in-memory capture; settings remain unchanged. */
+  capturePerformance(
+    work: (
+      records: readonly import("@/diagnostics/TramaDiagnostics").TramaPerformanceRecord[]
+    ) => Promise<void>,
+    onRecord?: (record: import("@/diagnostics/TramaDiagnostics").TramaPerformanceRecord) => void
+  ): Promise<readonly import("@/diagnostics/TramaDiagnostics").TramaPerformanceRecord[]> {
+    if (!this.runtime.diagnostics.capturePerformance)
+      return Promise.reject(new Error("Performance capture is unavailable"));
+    return this.runtime.diagnostics.capturePerformance(
+      () => this.runtime.client?.configureDiagnostics(true) ?? Promise.resolve(),
+      work,
+      onRecord
+    );
+  }
+
   fingerprint(): IndexFingerprint {
     return this.fingerprintValue;
   }

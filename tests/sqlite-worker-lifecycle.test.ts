@@ -12,8 +12,22 @@ describe("SQLite Worker storage lifecycle", () => {
     Object.defineProperty(platformError, "name", { value: undefined });
     vi.stubGlobal("self", { onmessage: undefined });
     try {
-      const { storageFailureDetail, workerFailureLocation, workerFailureReply } =
-        await import("@/index/sqlite/worker");
+      const {
+        storageFailureDetail,
+        workerFailureLocation,
+        workerFailureReply,
+        retrievalPhaseRecord,
+      } = await import("@/index/sqlite/worker");
+      expect(retrievalPhaseRecord("findRelated", "centroid", 1, 2)).toMatchObject({
+        operation: "related",
+        area: "filo",
+        facets: ["index", "related", "worker"],
+      });
+      expect(retrievalPhaseRecord("retrieve", "fusion", 1, 2)).toMatchObject({
+        operation: "retrieve",
+        area: "index",
+        facets: ["index", "retrieve", "worker"],
+      });
       expect(() => storageFailureDetail(platformError)).not.toThrow();
       expect(storageFailureDetail(platformError)).toBe("unknown failure");
 
@@ -77,6 +91,40 @@ describe("SQLite Worker storage lifecycle", () => {
           "execute"
         )
       ).toMatchObject({ method: "boot", phase: "open" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("coalesces semantic phase events to a bounded request summary", async () => {
+    vi.stubGlobal("self", { onmessage: undefined });
+    try {
+      const { aggregateSemanticPhase } = await import("@/index/sqlite/worker");
+      const phases = new Map();
+      const phase = {
+        tier: "performance" as const,
+        facets: ["index", "semantic", "worker"] as const,
+        area: "index" as const,
+        event: "phase" as const,
+        operation: "semantic" as const,
+        semanticStep: "commit" as const,
+        phase: "transactionSetupResultInserts" as const,
+        durationMs: 1,
+        sqlMs: 0.5,
+        sqlCalls: 1,
+        callbackRows: 1,
+        copiedBytes: 8,
+        nested: true,
+      };
+      for (let i = 0; i < 128; i++) aggregateSemanticPhase(phases, phase);
+      expect(phases.size).toBe(1);
+      expect([...phases.values()][0]).toMatchObject({
+        durationMs: 128,
+        sqlCalls: 128,
+        callbackRows: 128,
+        copiedBytes: 1024,
+        nested: true,
+      });
     } finally {
       vi.unstubAllGlobals();
     }

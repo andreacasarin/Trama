@@ -1,4 +1,5 @@
 import { EndpointApproval, EndpointPolicy } from "@/security/EndpointPolicy";
+import type { DiagnosticMode } from "@/diagnostics/TramaDiagnostics";
 import {
   DEFAULT_PUBLICATION_DIRECTORY,
   normalizePublicationDirectory as normalizeStoredPublicationDirectory,
@@ -31,7 +32,7 @@ export interface FiloSettings {
   readonly excludedPaths: readonly string[];
 }
 export interface TramaSettings {
-  readonly schemaVersion: 5;
+  readonly schemaVersion: 6;
   readonly publicationDirectory: string;
   readonly automaticMaintenance: boolean;
   readonly chat: ChatSettings;
@@ -39,7 +40,7 @@ export interface TramaSettings {
   readonly lente: LenteSettings;
   readonly filo: FiloSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
-  readonly detailedDebug: boolean;
+  readonly diagnosticsMode: DiagnosticMode;
 }
 
 type ReasoningEffort = "none" | "low" | "medium" | "high";
@@ -105,7 +106,7 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
-  schemaVersion: 5,
+  schemaVersion: 6,
   publicationDirectory: DEFAULT_PUBLICATION_DIRECTORY,
   automaticMaintenance: false,
   chat: Object.freeze({
@@ -127,7 +128,7 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
     excludedPaths: Object.freeze([]),
   }),
   approvedOrigins: Object.freeze([]),
-  detailedDebug: false,
+  diagnosticsMode: "off",
 });
 
 /** Owns the versioned, non-secret settings persisted through Obsidian plugin data. */
@@ -138,7 +139,7 @@ export class SettingsStore {
     if (
       !data ||
       typeof data !== "object" ||
-      (data as { schemaVersion?: unknown }).schemaVersion !== 5
+      ![5, 6].includes((data as { schemaVersion?: number }).schemaVersion ?? -1)
     ) {
       this.value = DEFAULT_SETTINGS;
       return this.value;
@@ -194,7 +195,7 @@ export class SettingsStore {
       excludedPaths: Object.freeze(normalizeExcludedPaths(rawFilo.excludedPaths)),
     };
     this.value = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       publicationDirectory,
       automaticMaintenance: input.automaticMaintenance === true,
       chat: Object.freeze(chat),
@@ -204,7 +205,14 @@ export class SettingsStore {
       approvedOrigins: Object.freeze(
         approvals.map((v) => ({ scheme: v.scheme, host: v.host.toLowerCase(), port: v.port }))
       ),
-      detailedDebug: input.detailedDebug === true,
+      diagnosticsMode:
+        (data as { schemaVersion: number }).schemaVersion === 5
+          ? (data as { detailedDebug?: unknown }).detailedDebug === true
+            ? "detailed"
+            : "off"
+          : input.diagnosticsMode === "performance" || input.diagnosticsMode === "detailed"
+            ? input.diagnosticsMode
+            : "off",
     } as TramaSettings;
     return this.value;
   }
@@ -283,7 +291,7 @@ export class SettingsStore {
     const lente = this.validateLente(next.lente);
     const publicationDirectory = this.strictPublicationDirectory(next.publicationDirectory);
     return {
-      schemaVersion: 5,
+      schemaVersion: 6,
       publicationDirectory,
       automaticMaintenance: next.automaticMaintenance === true,
       chat: Object.freeze({
@@ -297,7 +305,10 @@ export class SettingsStore {
         excludedPaths: Object.freeze(normalizeExcludedPaths(next.filo.excludedPaths)),
       }),
       approvedOrigins: Object.freeze(approvals.map((v) => Object.freeze({ ...v }))),
-      detailedDebug: next.detailedDebug === true,
+      diagnosticsMode:
+        next.diagnosticsMode === "performance" || next.diagnosticsMode === "detailed"
+          ? next.diagnosticsMode
+          : "off",
     };
   }
   private strictPublicationDirectory(value: unknown): string {

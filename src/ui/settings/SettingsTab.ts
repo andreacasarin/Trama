@@ -393,16 +393,22 @@ export class TramaSettingsTab extends PluginSettingTab {
         cls: "setting-item-description",
       });
     new Setting(this.containerEl)
-      .setName("Detailed debugging")
+      .setName("Diagnostics")
       .setDesc(
-        "Warning: detailed console diagnostics include sensitive rich chat data (full prompts, selected-note contents, requests/SSE events, tool arguments/results/errors) plus index metadata (paths, counts, timings, generation/status). No diagnostic file is created."
+        "Off records nothing. Performance logs bounded timings and counts without note or chat contents. Detailed also logs sensitive prompts, note contents, provider requests, tool arguments/results, and errors. Console only; no diagnostic file is created."
       )
-      .addToggle((toggle) => {
-        toggle.setValue(settings.detailedDebug);
-        toggle.onChange(
-          (detailedDebug) =>
+      .addDropdown((dropdown) => {
+        dropdown.addOption("off", "Off");
+        dropdown.addOption("performance", "Performance");
+        dropdown.addOption("detailed", "Detailed");
+        dropdown.setValue(settings.diagnosticsMode);
+        dropdown.onChange(
+          (diagnosticsMode) =>
             void this.run(() =>
-              this.controller.saveSettings?.((current) => ({ ...current, detailedDebug }))
+              this.controller.saveSettings?.((current) => ({
+                ...current,
+                diagnosticsMode: diagnosticsMode as "off" | "performance" | "detailed",
+              }))
             )
         );
       });

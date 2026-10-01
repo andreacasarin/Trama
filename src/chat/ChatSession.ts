@@ -10,8 +10,9 @@ import {
 } from "@/domain/contracts";
 import {
   emitTramaDiagnostic,
+  diagnosticTimer,
+  diagnosticsEnabled,
   NOOP_TRAMA_DIAGNOSTICS,
-  startDiagnosticTimer,
   TramaDiagnostics,
 } from "@/diagnostics/TramaDiagnostics";
 import { ToolRegistry, ToolResult } from "@/tools/ToolRegistry";
@@ -117,7 +118,10 @@ export class ChatSession {
     private readonly vault: Pick<ReadonlyVault, "readNote">,
     diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
   ) {
-    this.diagnostics = { emit: (record) => emitTramaDiagnostic(diagnostics, record) };
+    this.diagnostics = {
+      enabled: (tier) => diagnosticsEnabled(diagnostics, tier),
+      emit: (record) => emitTramaDiagnostic(diagnostics, record),
+    };
   }
 
   private readonly diagnostics: TramaDiagnostics;
@@ -153,22 +157,24 @@ export class ChatSession {
 
     const controller = new AbortController();
     const identity = ++this.generation;
-    const elapsedMs = startDiagnosticTimer();
+    const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
     this.active = controller;
     this.activeElapsedMs = elapsedMs;
-    this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
       const notes = await this.readAttachments(paths, controller.signal, identity);
       if (!this.isCurrent(identity)) return this.state;
       const references = attachmentBlock(notes);
       if (references.length > CHAT_LIMITS.maxAttachmentContent) {
-        this.diagnostics.emit({
-          area: "chat",
-          event: "limit_reached",
-          generation: identity,
-          message: "Attached notes exceed the 32,000-character context limit.",
-        });
+        if (diagnosticsEnabled(this.diagnostics, "detailed"))
+          this.diagnostics.emit({
+            area: "chat",
+            event: "limit_reached",
+            generation: identity,
+            message: "Attached notes exceed the 32,000-character context limit.",
+          });
         return this.preflightFailure(
           identity,
           "limit_exceeded",
@@ -206,13 +212,15 @@ export class ChatSession {
         userMessageIndex,
         requestUserMessage
       );
-      if (this.isCurrent(identity) && !state.running && !state.error)
-        this.diagnostics.emit({
-          area: "chat",
-          event: "session_completed",
-          generation: identity,
-          durationMs: elapsedMs(),
-        });
+      if (this.isCurrent(identity) && !state.running && !state.error) {
+        if (diagnosticsEnabled(this.diagnostics, "detailed"))
+          this.diagnostics.emit({
+            area: "chat",
+            event: "session_completed",
+            generation: identity,
+            durationMs: elapsedMs?.() ?? 0,
+          });
+      }
       return state;
     } catch (error) {
       if (
@@ -222,15 +230,16 @@ export class ChatSession {
         return this.cancelled(identity);
       const message = error instanceof Error ? error.message : "Chat turn failed.";
       const code = error instanceof StructuredError ? error.code : "internal";
-      this.diagnostics.emit({
-        area: "chat",
-        event: "error",
-        generation: identity,
-        code,
-        message,
-        error,
-        durationMs: elapsedMs(),
-      });
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        this.diagnostics.emit({
+          area: "chat",
+          event: "error",
+          generation: identity,
+          code,
+          message,
+          error,
+          durationMs: elapsedMs?.() ?? 0,
+        });
       return this.failure(identity, code, message);
     } finally {
       if (this.active === controller) {
@@ -251,12 +260,13 @@ export class ChatSession {
       running: false,
       error: { code: "cancelled", message: "Chat turn cancelled." },
     });
-    this.diagnostics.emit({
-      area: "chat",
-      event: "cancelled",
-      generation: identity,
-      durationMs: this.activeElapsedMs?.() ?? 0,
-    });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.diagnostics.emit({
+        area: "chat",
+        event: "cancelled",
+        generation: identity,
+        durationMs: this.activeElapsedMs?.() ?? 0,
+      });
     this.activeElapsedMs = undefined;
     for (const listener of this.listeners) listener(this.state);
   }
@@ -282,13 +292,14 @@ export class ChatSession {
     let contentSize = 0;
     for (let round = 0; round < CHAT_LIMITS.maxRounds; round++) {
       let streamedText = "";
-      const roundElapsedMs = startDiagnosticTimer();
-      this.diagnostics.emit({
-        area: "chat",
-        event: "model_round_started",
-        generation: identity,
-        round: round + 1,
-      });
+      const roundElapsedMs = diagnosticTimer(this.diagnostics, "detailed");
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        this.diagnostics.emit({
+          area: "chat",
+          event: "model_round_started",
+          generation: identity,
+          round: round + 1,
+        });
       const response = await this.model.complete(
         this.requestHistory(userMessageIndex, requestUserMessage),
         controller.signal,
@@ -296,24 +307,26 @@ export class ChatSession {
         (text) => {
           if (!this.isCurrent(identity)) return;
           streamedText += text;
-          this.diagnostics.emit({
-            area: "chat",
-            event: "stream_delta",
-            generation: identity,
-            text,
-          });
+          if (diagnosticsEnabled(this.diagnostics, "detailed"))
+            this.diagnostics.emit({
+              area: "chat",
+              event: "stream_delta",
+              generation: identity,
+              text,
+            });
           this.updateAssistant(identity, assistantTurnId, streamedText, provenance, "working");
         }
       );
       if (!this.isCurrent(identity)) return this.state;
-      this.diagnostics.emit({
-        area: "chat",
-        event: "model_round_completed",
-        generation: identity,
-        round: round + 1,
-        finishReason: response.finishReason,
-        durationMs: roundElapsedMs(),
-      });
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        this.diagnostics.emit({
+          area: "chat",
+          event: "model_round_completed",
+          generation: identity,
+          round: round + 1,
+          finishReason: response.finishReason,
+          durationMs: roundElapsedMs?.() ?? 0,
+        });
       this.history.push(Object.freeze(response.message));
       if (response.finishReason !== "tool_calls" || !response.message.toolCalls?.length)
         return this.finish(
@@ -388,13 +401,14 @@ export class ChatSession {
     signal: AbortSignal,
     identity: number
   ): Promise<readonly ReadonlyNote[]> {
-    const elapsedMs = startDiagnosticTimer();
-    this.diagnostics.emit({
-      area: "chat",
-      event: "attachment_preflight_started",
-      generation: identity,
-      count: paths.length,
-    });
+    const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.diagnostics.emit({
+        area: "chat",
+        event: "attachment_preflight_started",
+        generation: identity,
+        count: paths.length,
+      });
     const notes: ReadonlyNote[] = [];
     for (
       let offset = 0;
@@ -404,13 +418,14 @@ export class ChatSession {
       const batch = paths.slice(offset, offset + CHAT_LIMITS.maxConcurrentAttachmentReads);
       notes.push(...(await Promise.all(batch.map((path) => this.vault.readNote(path, signal)))));
     }
-    this.diagnostics.emit({
-      area: "chat",
-      event: "attachment_preflight_completed",
-      generation: identity,
-      count: notes.length,
-      durationMs: elapsedMs(),
-    });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.diagnostics.emit({
+        area: "chat",
+        event: "attachment_preflight_completed",
+        generation: identity,
+        count: notes.length,
+        durationMs: elapsedMs?.() ?? 0,
+      });
     return notes;
   }
 
@@ -422,7 +437,7 @@ export class ChatSession {
     const cache = new Map<string, Promise<ToolResult>>();
     return Promise.all(
       calls.map(async (call) => {
-        const elapsedMs = startDiagnosticTimer();
+        const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
         const key = `${call.name}\n${JSON.stringify(call.arguments)}`;
         let result = cache.get(key);
         if (!result) {
@@ -430,16 +445,17 @@ export class ChatSession {
           cache.set(key, result);
         }
         const resolved = await result;
-        this.diagnostics.emit({
-          area: "chat",
-          event: "tool_completed",
-          generation: identity,
-          name: call.name,
-          ok: resolved.ok,
-          call,
-          result: resolved,
-          durationMs: elapsedMs(),
-        });
+        if (diagnosticsEnabled(this.diagnostics, "detailed"))
+          this.diagnostics.emit({
+            area: "chat",
+            event: "tool_completed",
+            generation: identity,
+            name: call.name,
+            ok: resolved.ok,
+            call,
+            result: resolved,
+            durationMs: elapsedMs?.() ?? 0,
+          });
         return resolved;
       })
     );
@@ -509,7 +525,13 @@ export class ChatSession {
     provenance: ProvenanceRecord[],
     message: string
   ): ChatState {
-    this.diagnostics.emit({ area: "chat", event: "limit_reached", generation: identity, message });
+    if (diagnosticsEnabled(this.diagnostics, "detailed"))
+      this.diagnostics.emit({
+        area: "chat",
+        event: "limit_reached",
+        generation: identity,
+        message,
+      });
     return this.finish(identity, assistantTurnId, message, provenance);
   }
 

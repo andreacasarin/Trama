@@ -7,6 +7,7 @@ import {
   inspectSnapshotTables,
   snapshotFor,
 } from "./sqlite-test-client";
+import { createBenchmarkCounters, instrumentSqliteClient } from "./workloads/instrumentation";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -73,6 +74,173 @@ describe("revision cache database", () => {
       maxInputBytes: 1024,
     });
     expect(requests.requests).toHaveLength(1);
+  });
+
+  it("keeps semantic batches and state identical with phase observation enabled", async () => {
+    const phases: { phase: string; sqlCalls: number; callbackRows: number }[] = [];
+    const observed = createTestSqliteClient(
+      {},
+      {
+        persistMutations: false,
+        onSemanticPhase: (phase) => phases.push(phase),
+        onSemanticHandler: () => {
+          throw new Error("observer failed");
+        },
+      }
+    );
+    const plain = createTestSqliteClient({}, { persistMutations: false });
+    const fingerprint = digest("observer-model");
+    const run = async (client: typeof plain) => {
+      await client.call("boot", {
+        corpusFingerprint: digest("observer"),
+        embeddingFingerprint: fingerprint,
+        dimensions: 2,
+      });
+      await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
+      const prepared = await client.call("prepareSemanticWork", {
+        embeddingFingerprint: fingerprint,
+        limit: 1,
+        maxInputBytes: 1024,
+      });
+      const committed = await client.call("commitSemanticResults", {
+        embeddingFingerprint: fingerprint,
+        dimensions: 2,
+        expectedCount: prepared.requests.length,
+        results: prepared.requests.map(
+          (request: { actionKey: string; inputId: number; serialization: string }) => ({
+            ...request,
+            vector: new Float32Array([1, 0]),
+          })
+        ),
+      });
+      const empty = await client.call("prepareSemanticWork", {
+        embeddingFingerprint: fingerprint,
+        limit: 1,
+        maxInputBytes: 1024,
+      });
+      const state = await client.call("getState", {});
+      return { prepared, committed, empty, state };
+    };
+    expect(await run(observed)).toEqual(await run(plain));
+    expect(
+      phases.some(
+        (phase) =>
+          phase.phase === "boundedMissingSelection" &&
+          phase.sqlCalls === 1 &&
+          phase.callbackRows === 1
+      )
+    ).toBe(true);
+    expect(phases.some((phase) => phase.phase === "transaction" && phase.sqlCalls >= 2)).toBe(true);
+  });
+
+  it("does not skip valid semantic results when diagnostics throw during enablement", async () => {
+    const client = createTestSqliteClient(
+      {},
+      {
+        diagnostics: {
+          enabled: () => {
+            throw new Error("diagnostics failed");
+          },
+          emit: () => {
+            throw new Error("diagnostics failed");
+          },
+        },
+      }
+    );
+    const fingerprint = digest("throwing-diagnostics");
+    await client.call("boot", {
+      corpusFingerprint: digest("throwing-diagnostics-corpus"),
+      embeddingFingerprint: fingerprint,
+      dimensions: 2,
+    });
+    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
+    const prepared = await client.call("prepareSemanticWork", {
+      embeddingFingerprint: fingerprint,
+      limit: 1,
+      maxInputBytes: 1024,
+    });
+    const committed = await client.call("commitSemanticResults", {
+      embeddingFingerprint: fingerprint,
+      dimensions: 2,
+      expectedCount: 1,
+      results: [{ ...prepared.requests[0], vector: new Float32Array([1, 0]) }],
+    });
+    expect(committed).toMatchObject({ stored: 1, skipped: 0, hasMore: false });
+  });
+
+  it("counts only copied semantic vectors after cancellation, stale keys, and duplicates", async () => {
+    const counters = createBenchmarkCounters();
+    counters.semanticScenario = "observer-resume";
+    const client = instrumentSqliteClient(
+      createTestSqliteClient(
+        {},
+        {
+          persistMutations: false,
+          onSemanticPhase: (phase) => counters.semanticPhases.push(phase),
+          onSemanticHandler: (_method, elapsedMs) => counters.semanticHandlerMs.push(elapsedMs),
+        }
+      ),
+      counters
+    );
+    const fingerprint = digest("observer-resume-model");
+    await client.call("boot", {
+      corpusFingerprint: digest("observer-resume"),
+      embeddingFingerprint: fingerprint,
+      dimensions: 2,
+    });
+    await applyTestLexicalRun(client, [
+      { path: "one.md", markdown: "alpha", size: 100 },
+      { path: "two.md", markdown: "beta", size: 100 },
+    ]);
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(
+      client.call(
+        "prepareSemanticWork",
+        { embeddingFingerprint: fingerprint, limit: 1, maxInputBytes: 1024 },
+        cancelled.signal
+      )
+    ).rejects.toMatchObject({ error: { code: "cancelled" } });
+    expect(counters.semanticPhases).toHaveLength(0);
+    const first = await client.call("prepareSemanticWork", {
+      embeddingFingerprint: fingerprint,
+      limit: 1,
+      maxInputBytes: 1024,
+    });
+    expect(first.requests).toHaveLength(1);
+    expect(first.hasMore).toBe(true);
+    const valid = { ...first.requests[0], vector: new Float32Array([1, 0]) };
+    const committed = await client.call("commitSemanticResults", {
+      embeddingFingerprint: fingerprint,
+      dimensions: 2,
+      expectedCount: 3,
+      results: [valid, valid, { ...valid, actionKey: "stale" }],
+    });
+    expect(committed).toMatchObject({ stored: 1, skipped: 1, hasMore: true });
+    const copy = counters.semanticCalls.at(-1)!;
+    expect(copy.vectorPayloadBytes).toBe(24);
+    expect(copy.blobCopyBytes).toBe(8);
+    expect(copy.phases.find((phase) => phase.phase === "knownBlobCopy")?.samples).toBe(1);
+    expect(copy.phases.find((phase) => phase.phase === "transaction")?.sqlCalls).toBe(12);
+    expect(
+      copy.phases.filter((phase) => !phase.nested).reduce((sum, phase) => sum + phase.sqlCalls, 0)
+    ).toBe(15);
+    const second = await client.call("prepareSemanticWork", {
+      embeddingFingerprint: fingerprint,
+      limit: 1,
+      maxInputBytes: 1024,
+      promoteUnrestricted: false,
+    });
+    expect(second.requests).toHaveLength(1);
+    expect(second.requests[0].actionKey).not.toBe(first.requests[0].actionKey);
+    const resumed = await client.call("commitSemanticResults", {
+      embeddingFingerprint: fingerprint,
+      dimensions: 2,
+      expectedCount: 1,
+      results: [{ ...second.requests[0], vector: new Float32Array([0, 1]) }],
+    });
+    expect(resumed).toMatchObject({ stored: 1, skipped: 0, hasMore: false });
+    expect((await client.call("getState", {})).semanticHeadCount).toBe(2);
   });
 
   it("keeps lexical and old semantic heads while pruning pending publication material", async () => {

@@ -95,6 +95,7 @@ describe("Trama feature journeys", () => {
           : { message: { role: "assistant", content: "Found it." }, finishReason: "stop" },
     };
     const state = await new ChatSession(model, world.tools, world.vault, {
+      enabled: () => true,
       emit: (record) => world.diagnostics.push(record),
     }).send({ content: "Find my garden notes", attachmentPaths: ["Atlas/Garden.md"] });
 

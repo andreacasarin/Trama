@@ -1,5 +1,6 @@
 import { StructuredError, type EmbeddingModel } from "@/domain/contracts";
 import { EMBEDDING_PREPROCESSING_VERSION } from "@/index/Identity";
+import { diagnosticsEnabled } from "@/diagnostics/TramaDiagnostics";
 import {
   SQLITE_MAX_SEMANTIC_BATCH_ITEMS,
   SQLITE_MAX_SEMANTIC_INPUT_BYTES,
@@ -95,12 +96,18 @@ export class SemanticCoordinator {
     let promoted = 0;
     let hasMore = true;
     const operation = "incremental";
-    const started = Date.now();
+    const started = diagnosticsEnabled(this.runtime.diagnostics, "detailed")
+      ? Date.now()
+      : undefined;
+    const overallTimer = this.runtime.performanceTimer();
     const initialRevision = this.journal.revision;
     try {
       if (!this.runtime.loaded) await this.runtime.load();
       if (this.runtime.unavailable || !this.runtime.state)
         throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+      const overallOperationId = overallTimer
+        ? this.runtime.ensureClient().diagnosticOperationId()
+        : undefined;
       const embeddingFingerprint = await this.runtime.embeddingFingerprintId();
       const providerLimits = this.embedding.batchLimits ?? {};
       const maxInputBytes = Math.min(
@@ -141,7 +148,10 @@ export class SemanticCoordinator {
       for (;;) {
         if (batches >= maxBatches) break;
         check(signal);
-        const work = (await this.runtime.ensureClient().call(
+        const prepareTimer = this.runtime.performanceTimer();
+        const prepareClient = this.runtime.ensureClient();
+        const prepareOperationId = prepareTimer ? prepareClient.diagnosticOperationId() : undefined;
+        const work = (await prepareClient.call(
           "prepareSemanticWork",
           {
             embeddingFingerprint,
@@ -150,13 +160,29 @@ export class SemanticCoordinator {
             maxInputBytes,
             promoteUnrestricted: promotedLexicalGeneration === undefined,
           },
-          signal
+          signal,
+          {
+            diagnosticOperationId: prepareOperationId,
+            diagnosticParentOperationId: overallOperationId,
+            diagnosticBatchId: prepareOperationId,
+          }
         )) as SqliteSemanticWorkBatch;
+        this.runtime.emitPhase(
+          "semantic",
+          "prepareRpc",
+          prepareTimer,
+          work.requests.length,
+          undefined,
+          prepareOperationId,
+          overallOperationId,
+          prepareOperationId
+        );
         promoted += work.promoted;
         hasMore = work.hasMore;
         promotedLexicalGeneration = work.generation.lexicalGeneration;
         if (!work.requests.length) break;
         const missing = work.requests;
+        const providerTimer = this.runtime.performanceTimer();
         const vectors = await this.embedding.embed(
           missing.map((item) => item.serialization),
           signal,
@@ -173,6 +199,16 @@ export class SemanticCoordinator {
               false
             )
         );
+        this.runtime.emitPhase(
+          "semantic",
+          "provider",
+          providerTimer,
+          missing.length,
+          undefined,
+          prepareOperationId,
+          overallOperationId,
+          prepareOperationId
+        );
         check(signal);
         if (
           vectors.length !== missing.length ||
@@ -183,22 +219,53 @@ export class SemanticCoordinator {
             "Embedding dimensions changed during preparation.",
             false
           );
-        const result = (await this.runtime.ensureClient().call(
+        const conversionTimer = this.runtime.performanceTimer();
+        const converted = missing.map((item, index) => ({
+          actionKey: item.actionKey,
+          inputId: item.inputId,
+          serialization: item.serialization,
+          vector: new Float32Array(vectors[index]),
+        }));
+        if (conversionTimer)
+          this.runtime.emitPhase(
+            "semantic",
+            "vectorConversion",
+            conversionTimer,
+            converted.length,
+            converted.reduce((bytes, item) => bytes + item.vector.byteLength, 0),
+            prepareOperationId,
+            overallOperationId,
+            prepareOperationId
+          );
+        const commitTimer = this.runtime.performanceTimer();
+        const commitClient = this.runtime.ensureClient();
+        const commitOperationId = commitTimer ? commitClient.diagnosticOperationId() : undefined;
+        const result = (await commitClient.call(
           "commitSemanticResults",
           {
             embeddingFingerprint,
             preprocessing: EMBEDDING_PREPROCESSING_VERSION,
             dimensions: this.embedding.dimensions,
             expectedCount: missing.length,
-            results: missing.map((item, index) => ({
-              actionKey: item.actionKey,
-              inputId: item.inputId,
-              serialization: item.serialization,
-              vector: new Float32Array(vectors[index]),
-            })),
+            results: converted,
           },
-          signal
+          signal,
+          {
+            diagnosticOperationId: commitOperationId,
+            diagnosticParentOperationId: overallOperationId,
+            diagnosticBatchId: prepareOperationId,
+          }
         )) as SqliteSemanticCommitResult;
+        this.runtime.emitPhase(
+          "semantic",
+          "commitRpc",
+          commitTimer,
+          result.stored,
+          undefined,
+          commitOperationId,
+          overallOperationId,
+          prepareOperationId
+        );
         stored += result.stored;
         skipped += result.skipped;
         promoted += result.promoted;
@@ -237,15 +304,24 @@ export class SemanticCoordinator {
         skipped,
       };
       if (result.converged) this.runtime.notifySuccessfulOperation(result);
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "completed",
-        phase: "build-vector",
-        durationMs: Date.now() - started,
-        counts: { stored, skipped, promoted },
-      });
+      this.runtime.emitPhase(
+        "semantic",
+        "overall",
+        overallTimer,
+        stored,
+        undefined,
+        overallOperationId
+      );
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation,
+          stage: "completed",
+          phase: "build-vector",
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          counts: { stored, skipped, promoted },
+        });
       return result;
     } catch (error) {
       // State is refreshed after failure/cancellation so callers retain the

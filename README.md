@@ -128,15 +128,19 @@ bounded by the existing tool-round and read limits rather than eagerly loading
 an entire link graph. Trama does not use Remote MCP or hosted tools; embeddings
 continue using LM Studio's existing `/v1/embeddings` endpoint.
 
-The settings page also includes **Detailed debugging**, which is off by default.
-When enabled, Trama writes one `[Trama]` console stream using the current
-committed setting; no diagnostic file is created. Rich chat diagnostics can
-contain full sensitive prompts, selected-note contents, requests, SSE events,
-tool arguments/results, and errors. Index and Filo diagnostics are metadata-only:
-they may include paths, counts, timings, change-counter/status information, and safe
-errors, but never note or chunk text, vectors, hashes, exact embedding inputs, or
-serialized index data. Enable the setting only when you are comfortable with the
-console-visible chat data.
+The settings page offers **Off**, **Performance**, and **Detailed** diagnostics.
+Off is the default. Performance writes bounded timing and count events to the
+developer console without note text, prompts, provider bodies, tool data,
+vectors, hashes, or serialized index data. Detailed includes the existing rich
+chat diagnostics, which may contain full prompts, selected-note contents,
+requests, SSE events, tool arguments/results, and errors. No diagnostic file is
+created. Worker phase durations are inclusive wall times; nested phases overlap
+their parent, so add SQL calls and callback rows only across top-level phases.
+Diagnostic operation IDs are unique per Worker incarnation; semantic and publication
+phases share parent/batch IDs across main-thread and Worker spans. Temporary
+Performance capture waits for Worker configuration acknowledgements and restores
+the selected mode afterward. Its 512-record collector fails on overflow; a
+streaming consumer can aggregate every record without retaining the stream.
 
 ## Development
 
@@ -190,27 +194,38 @@ npm run build
 
 ### Optional performance workloads
 
-Performance measurements are opt-in and use deterministic synthetic Markdown passed
-through the production chunker. Results are written to the ignored
-`.artifacts/trama-benchmark/` directory; no vault is read or modified. See the
-[lifecycle benchmark contract](docs/lifecycle-benchmark-contract.md) and
-[run and comparison guide](docs/lifecycle-benchmark-baseline.md).
+Performance measurements are opt-in. `npm run benchmark` generates a dedicated
+Obsidian vault under the ignored `.artifacts/test-vaults/benchmark/` directory, installs
+the current plugin build there, and runs the marker-gated benchmark command through
+Obsidian's CLI. Start Obsidian first, register the reported generated vault, enable the
+CLI and the Trama community plugin for that vault, then rerun. A pending run reuses
+the same generated vault path. The command refuses
+unmarked vaults and always targets the generated vault by name. See the
+[Obsidian benchmark guide](docs/obsidian-benchmark.md).
 
 ```sh
+npm ci
+npm run benchmark:prepare
+# Open the printed generated vault in Obsidian and enable Trama and the CLI.
 npm run benchmark
 ```
 
-The command defaults to the `trama-small` profile. Select the larger deterministic
-profiles with `TRAMA_BENCHMARK_PROFILE=trama-10k npm run benchmark` or
-`TRAMA_BENCHMARK_PROFILE=trama-large npm run benchmark`. For a single observation,
-use `TRAMA_BENCHMARK_REPETITIONS=1 TRAMA_BENCHMARK_TIMEOUT_MS=900000`
-with either profile. Each profile reports lexical
-rebuild, semantic preparation, unchanged-update time, mutation timings, search latency,
-observed process RSS, package bytes, deterministic feature-path results, and publication
-bytes. Complete evidence is written to
-`.artifacts/trama-benchmark/<profile>.json`. Metrics unavailable to the in-memory Node
-harness are explicitly reported as `unsupported`. It never reads a real Obsidian vault.
-CI renders the metrics as a GitHub Actions job summary.
+`benchmark:prepare` builds and installs the generated vault without issuing
+Obsidian commands. Open `Trama Benchmark Vault` once: its name and folder stay
+the same across runs and profiles. After a report, preparation archives the old
+generated corpus and creates a new run in place, preserving Obsidian settings.
+
+The command defaults to `trama-small`; select `trama-10k` or `trama-large` with
+`TRAMA_BENCHMARK_PROFILE`. Set `TRAMA_BENCHMARK_TIMEOUT_MS` for the run deadline.
+The generated vault's hidden report is archived under
+`.artifacts/benchmarks/`. Stable source material lives in `test-vaults/demo/` and
+`test-vaults/benchmark/`, outside the production release. For realistic screenshots
+and walkthroughs, run `npm run demo:prepare` after building; it installs the demo
+copy in `.artifacts/test-vaults/demo/Trama Test Vault`. See the
+[demo guide](docs/demo-vault.md). The older Node runner remains available as
+`npm run benchmark:legacy-node` until Obsidian small/10k/25k parity is established;
+its [v1 contract](docs/lifecycle-benchmark-contract.md) and
+[local evidence](docs/lifecycle-benchmark-baseline.md) are historical Node evidence.
 
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
 limitations include the cost of exact SQLite vector scans and maintaining FTS5 on large

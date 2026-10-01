@@ -95,9 +95,12 @@ export function readChangeCounter(context: SqliteContext): number {
   return Number(row.change_counter);
 }
 
-export function readGenerationToken(context: SqliteContext): SqliteGenerationToken {
+export function readGenerationToken(
+  context: SqliteContext,
+  db = context.db
+): SqliteGenerationToken {
   const row = rows(
-    context.db,
+    db,
     "SELECT change_counter AS changeCounter,lexical_generation AS lexicalGeneration,semantic_generation AS semanticGeneration FROM index_state WHERE id=1"
   )[0];
   if (!row) throw sqliteError("incompatible_state", "SQLite state is not initialized");

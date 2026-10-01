@@ -1,6 +1,51 @@
 import { performance } from "node:perf_hooks";
 import type { IndexProgress } from "@/domain/contracts";
 import type { SqliteWorkerClient } from "@/index/sqlite/client";
+import type { SemanticPhaseObservation } from "../sqlite-test-client";
+
+export interface SemanticCallObservation {
+  readonly scenario: string;
+  readonly method: "prepareSemanticWork" | "commitSemanticResults";
+  readonly ordinal: number;
+  readonly rpcMs: number;
+  readonly handlerMs: number;
+  readonly boundaryUnattributedMs: number;
+  readonly surroundingJsEstimateMs: number;
+  readonly phases: readonly (SemanticPhaseObservation & { readonly samples: number })[];
+  readonly requestCount: number;
+  readonly inputBytes: number;
+  readonly vectorPayloadBytes: number;
+  readonly blobCopyBytes: number;
+  readonly hasMore: boolean;
+  readonly promoted: number;
+  readonly stored: number;
+  readonly skipped: number;
+  readonly progressCallbacks: number;
+}
+
+function summarizePhases(phases: readonly SemanticPhaseObservation[]) {
+  const grouped = new Map<string, SemanticPhaseObservation & { samples: number }>();
+  for (const phase of phases) {
+    const key = `${phase.operation}:${phase.phase}:${phase.nested}`;
+    const prior = grouped.get(key);
+    grouped.set(
+      key,
+      prior
+        ? {
+            ...prior,
+            wallMs: prior.wallMs + phase.wallMs,
+            sqlMs: prior.sqlMs + phase.sqlMs,
+            sqlCalls: prior.sqlCalls + phase.sqlCalls,
+            callbackRows: prior.callbackRows + phase.callbackRows,
+            copiedBytes: prior.copiedBytes + phase.copiedBytes,
+            jsEstimateMs: prior.jsEstimateMs + phase.jsEstimateMs,
+            samples: prior.samples + 1,
+          }
+        : { ...phase, samples: 1 }
+    );
+  }
+  return [...grouped.values()];
+}
 
 export interface BenchmarkMemorySampler {
   readonly peak: number;
@@ -81,6 +126,15 @@ export interface BenchmarkCounters {
   transactionSqlCalls: number | "unsupported";
   progressCallbacks: number;
   progressByPhase: Record<string, number>;
+  semanticScenario: string;
+  semanticPhases: SemanticPhaseObservation[];
+  semanticHandlerMs: number[];
+  semanticCalls: SemanticCallObservation[];
+  providerElapsedMs: number[];
+  providerInputDigests: string[];
+  vectorConversionMs: number;
+  vectorConversionBytes: number;
+  vectorConversionCount: number;
 }
 
 export function createBenchmarkCounters(): BenchmarkCounters {
@@ -111,6 +165,15 @@ export function createBenchmarkCounters(): BenchmarkCounters {
     transactionSqlCalls: "unsupported",
     progressCallbacks: 0,
     progressByPhase: {},
+    semanticScenario: "outside-lifecycle",
+    semanticPhases: [],
+    semanticHandlerMs: [],
+    semanticCalls: [],
+    providerElapsedMs: [],
+    providerInputDigests: [],
+    vectorConversionMs: 0,
+    vectorConversionBytes: 0,
+    vectorConversionCount: 0,
   };
 }
 
@@ -190,12 +253,18 @@ export function instrumentSqliteClient(
     if (method === "getState" || method === "boot") counters.stateCalls++;
     if (method === "prepareSemanticWork") counters.semanticPrepareCalls++;
     if (method === "commitSemanticResults") counters.semanticCommitCalls++;
+    const semantic = method === "prepareSemanticWork" || method === "commitSemanticResults";
+    const phaseStart = counters.semanticPhases.length;
+    const handlerStart = counters.semanticHandlerMs.length;
+    const progressStart = counters.progressCallbacks;
     const started = performance.now();
+    let rpcMs = 0;
     let result: unknown;
     try {
       result = await original(method, payload, signal, options);
     } finally {
-      if (diagnostics) (counters.rpcElapsedMs[method] ??= []).push(performance.now() - started);
+      rpcMs = performance.now() - started;
+      if (diagnostics) (counters.rpcElapsedMs[method] ??= []).push(rpcMs);
       sampleMemory?.();
     }
     if (method === "applyLexicalBatch") {
@@ -218,6 +287,55 @@ export function instrumentSqliteClient(
     } else if (method === "commitSemanticResults") {
       if (diagnostics)
         counters.semanticStoredRows += Number((result as { stored?: unknown }).stored ?? 0);
+    }
+    if (diagnostics && semantic) {
+      const work = result as {
+        requests?: readonly { serialization: string }[];
+        hasMore?: boolean;
+        promoted?: number;
+        stored?: number;
+        skipped?: number;
+      };
+      const sent = payload.results as
+        readonly { serialization: string; vector: Float32Array }[] | undefined;
+      const requests = work.requests ?? sent ?? [];
+      const vectorPayloadBytes = sent?.reduce((sum, item) => sum + item.vector.byteLength, 0) ?? 0;
+      const phases = summarizePhases(counters.semanticPhases.slice(phaseStart));
+      const handlerMs = counters.semanticHandlerMs[handlerStart] ?? 0;
+      counters.semanticCalls.push({
+        scenario: counters.semanticScenario,
+        method,
+        ordinal:
+          counters.semanticCalls.filter(
+            (call) => call.scenario === counters.semanticScenario && call.method === method
+          ).length + 1,
+        rpcMs,
+        handlerMs,
+        boundaryUnattributedMs: Math.max(0, rpcMs - handlerMs),
+        surroundingJsEstimateMs: Math.max(
+          0,
+          handlerMs -
+            counters.semanticPhases
+              .slice(phaseStart)
+              .filter((phase) => !phase.nested)
+              .reduce((sum, phase) => sum + phase.wallMs, 0)
+        ),
+        phases,
+        requestCount: requests.length,
+        inputBytes: requests.reduce(
+          (sum, item) => sum + Buffer.byteLength(item.serialization, "utf8"),
+          0
+        ),
+        vectorPayloadBytes,
+        blobCopyBytes: phases.find((phase) => phase.phase === "knownBlobCopy")?.copiedBytes ?? 0,
+        hasMore: Boolean(work.hasMore),
+        promoted: Number(work.promoted ?? 0),
+        stored: Number(work.stored ?? 0),
+        skipped: Number(work.skipped ?? 0),
+        progressCallbacks: counters.progressCallbacks - progressStart,
+      });
+      counters.semanticPhases.length = 0;
+      counters.semanticHandlerMs.length = 0;
     }
     if (method === "preparePublication") {
       if (diagnostics) {

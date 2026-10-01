@@ -10,6 +10,7 @@ export default tseslint.config(
       "sqlite3.mjs",
       "sqlite3.wasm",
       "coverage/**",
+      ".artifacts/**",
       ".cache/sqlite-wasm/**",
     ],
   },

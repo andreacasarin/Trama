@@ -21,7 +21,7 @@ describe("Settings module", () => {
         const store = new SettingsStore();
         const loaded = store.load({ schemaVersion: 5, chat: {}, embedding: {} });
 
-        expect(loaded.schemaVersion).toBe(5);
+        expect(loaded.schemaVersion).toBe(6);
         expect(loaded.publicationDirectory).toBe("Trama/index");
         expect(loaded.chat.temperature).toBe(0.7);
         expect(loaded.chat).not.toHaveProperty("maxOutputTokens");
@@ -32,7 +32,7 @@ describe("Settings module", () => {
         });
         expect(loaded.filo).toEqual({ excludedPaths: [] });
         expect(loaded.automaticMaintenance).toBe(false);
-        expect(loaded.detailedDebug).toBe(false);
+        expect(loaded.diagnosticsMode).toBe("off");
       });
 
       it("sanitizes Lente and Filo settings while keeping defaults immutable", () => {
@@ -91,11 +91,21 @@ describe("Settings module", () => {
           chat: persisted.chat,
           embedding: persisted.embedding,
           approvedOrigins: persisted.approvedOrigins,
-          detailedDebug: false,
+          diagnosticsMode: "off",
         });
         expect(new SettingsStore().load({ ...persisted, detailedDebug: true })).toMatchObject({
-          detailedDebug: true,
+          diagnosticsMode: "detailed",
         });
+        expect(
+          new SettingsStore().load({
+            ...persisted,
+            schemaVersion: 6,
+            diagnosticsMode: "performance",
+          })
+        ).toMatchObject({ diagnosticsMode: "performance" });
+        expect(
+          new SettingsStore().load({ ...persisted, schemaVersion: 6, diagnosticsMode: "invalid" })
+        ).toMatchObject({ diagnosticsMode: "off" });
       });
 
       it("ignores the removed detailedVoceDebug key without migration", () => {
@@ -103,7 +113,7 @@ describe("Settings module", () => {
           schemaVersion: 5,
           detailedVoceDebug: true,
         });
-        expect(loaded.detailedDebug).toBe(false);
+        expect(loaded.diagnosticsMode).toBe("off");
         expect(loaded).not.toHaveProperty("detailedVoceDebug");
       });
 
@@ -174,10 +184,10 @@ describe("Settings module", () => {
           chat: { ...DEFAULT_SETTINGS.chat, endpoint: "http://127.0.0.1:1234" },
           embedding: { ...DEFAULT_SETTINGS.embedding, endpoint: "http://127.0.0.1:4321/v1" },
         });
-        expect(settings.schemaVersion).toBe(5);
+        expect(settings.schemaVersion).toBe(6);
         expect(settings.chat.endpoint).toContain("/v1");
         expect(settings.embedding.endpoint).toContain("/v1");
-        expect(settings.detailedDebug).toBe(false);
+        expect(settings.diagnosticsMode).toBe("off");
       });
       it("rejects invalid staged chat controls without silently clearing them", () => {
         const store = new SettingsStore();

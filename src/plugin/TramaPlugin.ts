@@ -1,5 +1,7 @@
 import { Notice, Plugin } from "obsidian";
-import { formatDiagnosticLogLine, TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
+import { readBenchmarkManifest } from "@/benchmark/Manifest";
+import { runObsidianBenchmark } from "@/benchmark/ObsidianBenchmark";
+import { createTramaDiagnostics, formatDiagnosticLogLine } from "@/diagnostics/TramaDiagnostics";
 import { compareCodeUnits } from "@/index/Identity";
 import { IndexManager, type IndexPathMutation } from "@/index/IndexManager";
 import type { MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
@@ -23,6 +25,7 @@ import { IndexStatusController } from "@/ui/index/IndexStatus";
 /** Composes the shared assistant and owns its lifecycle and vault-event boundary. */
 export class TramaPlugin extends Plugin {
   private runtimeLoaded = false;
+  private benchmarkMode = false;
   private readonly settingsStore = new SettingsStore();
   private embeddingModel?: LmStudioEmbeddingModel;
   private index?: IndexManager;
@@ -42,30 +45,30 @@ export class TramaPlugin extends Plugin {
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
 
-  private readonly diagnostics: TramaDiagnostics = {
-    emit: (record) => {
-      if (!this.settingsStore.get().detailedDebug) return;
-      try {
-        const operation =
-          record.event === "index_operation"
-            ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
-            : "";
-        const stage = "stage" in record ? ` ${record.stage}` : "";
-        const duration =
-          "durationMs" in record && typeof record.durationMs === "number"
-            ? ` ${Math.round(record.durationMs)} ms`
-            : "";
-        // eslint-disable-next-line no-console
-        console.info(
-          formatDiagnosticLogLine(record) ??
-            `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
-          record
-        );
-      } catch {
-        // Console diagnostics are observational.
-      }
+  private readonly diagnostics = createTramaDiagnostics(
+    () => this.settingsStore.get().diagnosticsMode,
+    (record) => {
+      const operation =
+        record.event === "index_operation"
+          ? ` ${record.operation}${record.phase ? `/${record.phase}` : ""}`
+          : "";
+      const stage = "stage" in record ? ` ${record.stage}` : "";
+      const duration =
+        "durationMs" in record && typeof record.durationMs === "number"
+          ? ` ${Math.round(record.durationMs)} ms`
+          : "";
+      // eslint-disable-next-line no-console
+      console.info(
+        formatDiagnosticLogLine(record) ??
+          `[Trama] ${record.area}:${record.event}${operation}${stage}${duration}`,
+        record
+      );
     },
-  };
+    {
+      sessionId:
+        globalThis.crypto?.randomUUID?.() ?? `trama-${Math.random().toString(36).slice(2)}`,
+    }
+  );
 
   private readonly sqliteRuntime = new SqliteRuntime(() => this.manifest);
   private readonly modelRuntime = new ModelRuntime({
@@ -97,6 +100,45 @@ export class TramaPlugin extends Plugin {
     }
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
+
+    // A valid generated benchmark vault must stay cold until its command starts.
+    // The marker is read through the adapter because hidden root files are not
+    // necessarily represented in Obsidian's TFile catalog.
+    const benchmarkManifest = await readBenchmarkManifest(
+      app.vault.adapter,
+      app.vault.getName?.() ?? ""
+    );
+    if (
+      benchmarkManifest &&
+      typeof app.vault.adapter.getBasePath === "function" &&
+      app.vault.adapter.getBasePath() === benchmarkManifest.expectedPath
+    ) {
+      this.benchmarkMode = true;
+      const { TramaSettingsTab } = await import("@/ui/settings/SettingsTab");
+      this.addSettingTab(new TramaSettingsTab(app, this));
+      this.addCommand({
+        id: "run-obsidian-benchmark",
+        name: "Run generated-vault benchmark",
+        callback: () => {
+          void runObsidianBenchmark(
+            app,
+            benchmarkManifest,
+            this.manifest.version,
+            this.sqliteRuntime,
+            this.diagnostics
+          )
+            .then((report) => {
+              new Notice(`Trama benchmark ${report.status}: ${report.runId}`);
+            })
+            .catch((error) => {
+              new Notice(
+                `Trama benchmark refused: ${error instanceof Error ? error.message : String(error)}`
+              );
+            });
+        },
+      });
+      return;
+    }
 
     this.visibleMarkdownCatalog = () =>
       app.vault
@@ -160,6 +202,7 @@ export class TramaPlugin extends Plugin {
     this.modelRuntime.session = undefined;
     this.modelRuntime.lenteSearch = undefined;
     this.embeddingModel = undefined;
+    this.benchmarkMode = false;
     this.runtimeLoaded = false;
     const disposal = maintenance?.dispose() ?? Promise.resolve();
     void Promise.all([load ?? Promise.resolve(), disposal])
@@ -194,6 +237,8 @@ export class TramaPlugin extends Plugin {
     const saved = this.settingsStore.stage(settings);
     if (typeof this.saveData === "function") await this.saveData(saved);
     this.settingsStore.commit(saved);
+    if (this.benchmarkMode) return;
+    if (before.diagnosticsMode !== saved.diagnosticsMode) await this.index?.configureDiagnostics();
 
     const chatChanged =
       before.chat.endpoint !== saved.chat.endpoint ||

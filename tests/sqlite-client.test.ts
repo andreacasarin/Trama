@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { SqliteWorkerClient } from "@/index/sqlite/client";
 import { SQLITE_PROTOCOL_VERSION } from "@/index/sqlite/protocol";
 import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
+import { createTramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 
 class FakeWorker {
   readonly messages: { value: any; transfer?: readonly ArrayBuffer[] }[] = [];
@@ -40,6 +41,248 @@ class FakeWorker {
 }
 
 describe("SqliteWorkerClient", () => {
+  it("correlates concurrent calls and rejects a prior Worker incarnation", async () => {
+    const records: any[] = [];
+    const diagnostics = createTramaDiagnostics(
+      () => "performance",
+      (record) => records.push(record),
+      { sessionId: "session-c" }
+    );
+    const worker = new FakeWorker();
+    const client = new SqliteWorkerClient(worker, undefined, diagnostics);
+    const first = client.diagnosticOperationId();
+    const second = client.diagnosticOperationId();
+    const parent = client.diagnosticOperationId();
+    expect(first).not.toBe(second);
+    await Promise.all([
+      client.call("getState", {}, undefined, {
+        diagnosticOperationId: first,
+        diagnosticParentOperationId: parent,
+        diagnosticBatchId: first,
+      }),
+      client.call("getState", {}, undefined, {
+        diagnosticOperationId: second,
+        diagnosticParentOperationId: parent,
+        diagnosticBatchId: first,
+      }),
+    ]);
+    expect(worker.messages.map((message) => message.value.diagnosticOperationId)).toEqual([
+      first,
+      second,
+    ]);
+    expect(worker.messages.map((message) => message.value.diagnosticParentOperationId)).toEqual([
+      parent,
+      parent,
+    ]);
+    expect(worker.messages.map((message) => message.value.diagnosticBatchId)).toEqual([
+      first,
+      first,
+    ]);
+    const replacementWorker = new FakeWorker();
+    const replacement = new SqliteWorkerClient(replacementWorker, undefined, diagnostics);
+    const fresh = replacement.diagnosticOperationId();
+    const freshParent = replacement.diagnosticOperationId();
+    expect(fresh).not.toBe(first);
+    const event = (operationId: string, parentOperationId: string, batchId: string) => ({
+      type: "trama-diagnostic",
+      record: {
+        tier: "performance",
+        facets: ["index", "worker"],
+        area: "index",
+        event: "phase",
+        operation: "semantic",
+        phase: "prepareSemanticWork",
+        durationMs: 1,
+        context: { sessionId: "session-c", requestId: 1, operationId, parentOperationId, batchId },
+      },
+    });
+    replacementWorker.emit("message", { data: event(first, parent, first) });
+    expect(records).toHaveLength(0);
+    replacementWorker.emit("message", { data: event(fresh, parent, first) });
+    expect(records).toHaveLength(0);
+    replacementWorker.emit("message", { data: event(fresh, freshParent, fresh) });
+    expect(records).toHaveLength(1);
+    expect(records[0].context.operationId).toBe(fresh);
+    expect(records[0].context).toMatchObject({ parentOperationId: freshParent, batchId: fresh });
+  });
+  it("acknowledges capture configuration before work and restores the Worker afterward", async () => {
+    const worker = new FakeWorker();
+    worker.postMessage = ((value: any) => {
+      worker.messages.push({ value });
+      if (value.type === "trama-diagnostics-config")
+        queueMicrotask(() =>
+          worker.emit("message", { data: { type: value.type, id: value.id, configured: true } })
+        );
+    }) as any;
+    const diagnostics = createTramaDiagnostics(
+      () => "off",
+      () => undefined,
+      { sessionId: "capture-c" }
+    );
+    const client = new SqliteWorkerClient(worker, undefined, diagnostics);
+    await diagnostics.capturePerformance!(
+      () => client.configureDiagnostics(true),
+      async () => {
+        expect(worker.messages[0].value.diagnostics.performance).toBe(true);
+        expect(diagnostics.enabled("performance")).toBe(true);
+      }
+    );
+    expect(worker.messages[1].value.diagnostics.performance).toBe(false);
+  });
+  it("serializes distinct captured states instead of coalescing restoration with a new entry", async () => {
+    const worker = new FakeWorker();
+    worker.postMessage = ((value: any) => {
+      worker.messages.push({ value });
+    }) as any;
+    let mode: "off" | "performance" | "detailed" = "performance";
+    const diagnostics = createTramaDiagnostics(
+      () => mode,
+      () => undefined,
+      { sessionId: "race" }
+    );
+    const client = new SqliteWorkerClient(worker, undefined, diagnostics);
+    const first = client.configureDiagnostics(true);
+    mode = "off";
+    const restore = client.configureDiagnostics(true);
+    mode = "detailed";
+    const next = client.configureDiagnostics(true);
+    await Promise.resolve();
+    expect(worker.messages).toHaveLength(1);
+    const ack = (index: number) =>
+      worker.emit("message", {
+        data: {
+          type: "trama-diagnostics-config",
+          id: worker.messages[index].value.id,
+          configured: true,
+        },
+      });
+    expect(worker.messages[0].value.diagnostics).toMatchObject({
+      performance: true,
+      detailed: false,
+    });
+    ack(0);
+    await first;
+    await Promise.resolve();
+    expect(worker.messages[1].value.diagnostics).toMatchObject({
+      performance: false,
+      detailed: false,
+    });
+    ack(1);
+    await restore;
+    await Promise.resolve();
+    expect(worker.messages[2].value.diagnostics).toMatchObject({
+      performance: true,
+      detailed: true,
+    });
+    ack(2);
+    await next;
+  });
+  it("configures diagnostics before boot, transports correlated events, and reconfigures before later calls", async () => {
+    const worker = new FakeWorker();
+    const original = worker.postMessage.bind(worker);
+    worker.postMessage = ((value: any, transfer?: readonly ArrayBuffer[]) => {
+      if (value.type === "trama-runtime-handshake") {
+        worker.messages.push({ value });
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
+          })
+        );
+        return;
+      }
+      if (value.type === "trama-diagnostics-config") {
+        worker.messages.push({ value });
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              type: value.type,
+              id: value.id,
+              configured: true,
+            },
+          })
+        );
+        return;
+      }
+      original(value, transfer);
+    }) as any;
+    let mode: "off" | "performance" = "performance";
+    const records: unknown[] = [];
+    const diagnostics = createTramaDiagnostics(
+      () => mode,
+      (record) => records.push(record),
+      { sessionId: "session-1" }
+    );
+    const client = new SqliteWorkerClient(worker, undefined, diagnostics);
+    await client.handshake(TRAMA_RUNTIME_BUILD_ID);
+    expect(worker.messages[0].value.diagnostics).toEqual({
+      performance: true,
+      detailed: false,
+      sessionId: "session-1",
+    });
+    await client.call("boot", { corpusFingerprint: "a", dimensions: 2 });
+    worker.emit("message", {
+      data: {
+        type: "trama-diagnostic",
+        record: {
+          tier: "performance",
+          facets: ["index", "worker"],
+          area: "index",
+          event: "phase",
+          operation: "semantic",
+          phase: "firstInputLookup",
+          durationMs: 2,
+          context: { sessionId: "session-1", requestId: 2 },
+        },
+      },
+    });
+    expect(records).toHaveLength(1);
+    worker.emit("message", {
+      data: {
+        type: "trama-diagnostic",
+        record: {
+          tier: "performance",
+          facets: ["index"],
+          area: "index",
+          event: "phase",
+          operation: "semantic",
+          phase: "firstInputLookup",
+          durationMs: 2,
+          context: { sessionId: "stale", requestId: 2 },
+        },
+      },
+    });
+    expect(records).toHaveLength(1);
+    mode = "off";
+    const configured = client.configureDiagnostics();
+    const next = client.call("getState", {});
+    await configured;
+    await next;
+    expect(worker.messages.at(-2)?.value.type).toBe("trama-diagnostics-config");
+    expect(worker.messages.at(-1)?.value.method).toBe("getState");
+    const restarted = new FakeWorker();
+    restarted.postMessage = ((value: any) => {
+      restarted.messages.push({ value });
+      if (value.type === "trama-runtime-handshake")
+        queueMicrotask(() =>
+          restarted.emit("message", {
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
+          })
+        );
+    }) as any;
+    const replacement = new SqliteWorkerClient(restarted, undefined, diagnostics);
+    await replacement.handshake(TRAMA_RUNTIME_BUILD_ID);
+    expect(restarted.messages[0].value.diagnostics.performance).toBe(false);
+  });
   it("owns request ids and copies caller transferables", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);
@@ -62,7 +305,12 @@ describe("SqliteWorkerClient", () => {
         handshakeSent = true;
         queueMicrotask(() =>
           worker.emit("message", {
-            data: { type: value.type, id: value.id, buildId: TRAMA_RUNTIME_BUILD_ID },
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
           })
         );
         return;

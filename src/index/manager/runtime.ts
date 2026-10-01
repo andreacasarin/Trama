@@ -7,10 +7,14 @@ import {
 } from "@/domain/contracts";
 import {
   NOOP_TRAMA_DIAGNOSTICS,
+  diagnosticTimer,
+  diagnosticsEnabled,
   emitTramaDiagnostic,
   projectDiagnosticError,
-  type TramaDiagnosticRecord,
+  type TramaDiagnosticInput,
   type TramaDiagnostics,
+  type TramaPerformanceRecord,
+  type PerformancePhase,
 } from "@/diagnostics/TramaDiagnostics";
 import {
   corpusIdentityInput,
@@ -77,7 +81,7 @@ export class IndexRuntime {
           );
         }
       }
-      this.client = new SqliteWorkerClient(worker);
+      this.client = new SqliteWorkerClient(worker, undefined, this.diagnostics);
     }
     return this.client;
   }
@@ -165,9 +169,11 @@ export class IndexRuntime {
   }
 
   private async loadPersisted(emit: boolean): Promise<boolean> {
-    const started = Date.now();
-    const observable = emit || this.diagnostics !== NOOP_TRAMA_DIAGNOSTICS;
-    if (observable)
+    const observable =
+      diagnosticsEnabled(this.diagnostics, "detailed") &&
+      (emit || this.diagnostics !== NOOP_TRAMA_DIAGNOSTICS);
+    const started = observable ? Date.now() : undefined;
+    if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
       this.emit({
         area: "index",
         event: "index_operation",
@@ -177,19 +183,20 @@ export class IndexRuntime {
       });
     try {
       const actualBuildId = await this.ensureClient().handshake(TRAMA_RUNTIME_BUILD_ID);
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "startup",
-        stage: "completed",
-        phase: "handshake",
-        runtime: {
-          expectedBuildId: TRAMA_RUNTIME_BUILD_ID,
-          actualBuildId,
-          protocolVersion: SQLITE_PROTOCOL_VERSION,
-          schemaVersion: INDEX_SCHEMA_VERSION,
-        },
-      });
+      if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
+        this.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "startup",
+          stage: "completed",
+          phase: "handshake",
+          runtime: {
+            expectedBuildId: TRAMA_RUNTIME_BUILD_ID,
+            actualBuildId,
+            protocolVersion: SQLITE_PROTOCOL_VERSION,
+            schemaVersion: INDEX_SCHEMA_VERSION,
+          },
+        });
       const sqliteIdentity = await (this.options.sqliteIdentity ?? "default-vault");
       const state = (await this.ensureClient().call("boot", {
         corpusFingerprint: await this.corpusFingerprintId(),
@@ -206,14 +213,14 @@ export class IndexRuntime {
           : "locally-reconciled";
       this.unavailable = false;
       this.loadError = undefined;
-      if (observable)
+      if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "completed",
           phase: "boot",
-          durationMs: Date.now() - started,
+          durationMs: started === undefined ? 0 : Date.now() - started,
           generation: this.generationId(),
           counts: { notes: this.state!.noteCount, chunks: this.state!.chunkCount },
         });
@@ -221,13 +228,13 @@ export class IndexRuntime {
     } catch (error) {
       this.unavailable = true;
       this.loadError = error;
-      if (observable)
+      if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
         this.emit({
           area: "index",
           event: "index_operation",
           operation: "load",
           stage: "failed",
-          durationMs: Date.now() - started,
+          durationMs: started === undefined ? 0 : Date.now() - started,
           error: projectDiagnosticError(error),
         });
       return false;
@@ -276,14 +283,15 @@ export class IndexRuntime {
         /* preserve read error */
       }
       if (available) throw error;
-      this.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "skipped-unavailable-note",
-        path,
-        error: projectDiagnosticError(error),
-      });
+      if (diagnosticsEnabled(this.diagnostics, "detailed"))
+        this.emit({
+          area: "index",
+          event: "index_operation",
+          operation,
+          stage: "skipped-unavailable-note",
+          path,
+          error: projectDiagnosticError(error),
+        });
       return undefined;
     }
   }
@@ -297,13 +305,51 @@ export class IndexRuntime {
     }
   }
 
-  emit(record: TramaDiagnosticRecord): void {
+  emit(record: TramaDiagnosticInput): void {
     emitTramaDiagnostic(this.diagnostics, record);
+  }
+
+  performanceTimer(): (() => number) | undefined {
+    return diagnosticTimer(this.diagnostics, "performance");
+  }
+
+  emitPhase(
+    operation: TramaPerformanceRecord["operation"],
+    phase: PerformancePhase,
+    timer: (() => number) | undefined,
+    itemCount?: number,
+    byteCount?: number,
+    operationId?: string,
+    parentOperationId?: string,
+    batchId?: string
+  ): void {
+    if (!timer) return;
+    this.emit({
+      tier: "performance",
+      facets: ["index", operation],
+      area: "index",
+      event: "phase",
+      operation,
+      phase,
+      durationMs: timer(),
+      ...(itemCount === undefined ? {} : { itemCount }),
+      ...(byteCount === undefined ? {} : { byteCount }),
+      ...(operationId || parentOperationId || batchId
+        ? {
+            context: {
+              sessionId: this.diagnostics.context?.sessionId ?? "none",
+              operationId,
+              parentOperationId,
+              batchId,
+            },
+          }
+        : {}),
+    });
   }
 
   reportProgress(progress: IndexProgress, emitDiagnostic = true): void {
     const next = Object.freeze({ ...progress });
-    if (emitDiagnostic)
+    if (emitDiagnostic && diagnosticsEnabled(this.diagnostics, "detailed"))
       this.emit({
         area: "index",
         event: "index_operation",

@@ -38,17 +38,22 @@ do not interpret matching dimensions alone as provider equivalence.
 The source-manifest provenance identifies base revision
 `17455e78f3654a2033999e786dad527f8a463e3c`, tree status `uncommitted contract
 implementation`, and manifest SHA-256
-`2e174de794a0c437c3a9b3a927dcda61af48faaabf3931e700d4e34108382eec`. The manifest
+`f23e819ce17c8e00e892ad4d16fad19129ca889a418dd6cc6cb4e42933d3c0d1`. The manifest
 covers these relative paths, sorted by UTF-8 byte order: `scripts/benchmark/run.mjs`,
 `tests/sqlite-test-client.ts`, `tests/workloads/benchmark-lifecycle.ts`,
-`tests/workloads/config.ts`, `tests/workloads/contract-v1.ts`,
-`tests/workloads/evidence.test.ts`, `tests/workloads/generator.ts`,
+`test-vaults/benchmark/config.ts`, `test-vaults/benchmark/contract-v1.ts`,
+`tests/workloads/evidence.test.ts`, `test-vaults/benchmark/generator.ts`,
 `tests/workloads/instrumentation.ts`, and `tests/workloads/trama-benchmark.ts`. For
 each path, SHA-256 receives the 8-byte little-endian path byte length, UTF-8 path
 bytes, 8-byte little-endian source byte length, and source bytes, in that order. To
 avoid a self-referential hash, normalize only the literal in the declaration
 `export const REFERENCE_SOURCE_MANIFEST_SHA256 = "…";` in `contract-v1.ts` to 64
 zeroes before hashing; hash all other bytes unchanged.
+
+Those hash and path values describe the historical Node evidence. The retained
+legacy runner now re-exports its output oracle from `src/benchmark/Oracle.ts` for
+the browser-safe Obsidian runner; its current source manifest includes that file
+and is pinned to `01f909a7145b1891e94cd945b1116f7997dddefa80b379ee206f6dde9cc62474`.
 
 The suite-level `beforeAll` runner gate recomputes this source manifest before any
 workload is created or benchmark test executes. A successful observation is reused by
@@ -63,12 +68,29 @@ for oracle maintenance and is not an ordinary baseline procedure. A partial benc
 failure after the gate can retain the matching manifest metadata with its partial
 lifecycle evidence.
 
-Optional diagnostics add RPC latency distributions, phase counts, and instrumented
-counters. They may be absent when diagnostics are disabled; their absence must not
-change core evidence or correctness. `prepareSemanticWork` is the measured RPC
-boundary for preparing semantic work. It includes worker/RPC and implementation costs
-and must not be described as pure SQL selection time. SQL statement/transaction counts
-are unsupported by the current harness.
+Optional diagnostics add RPC latency distributions, phase counts, instrumented
+counters, and `semanticAttribution`. They may be absent when diagnostics are disabled;
+their absence must not change core evidence or correctness. `semanticAttribution`
+contains scenario-tagged prepare/commit calls from the stable lifecycle and separate
+small-fixture progression probes. The probes run after the stable lifecycle, on a
+different SQLite client, and do not contribute to stable scenarios, counts, memory
+window, provider totals, or oracle. Productive first/middle/final and empty positions
+are classified within each tagged scenario, not across the global RPC sample list.
+
+Each call records RPC and in-process handler elapsed time, their nonnegative difference,
+request count and UTF-8 input bytes, submitted vector payload bytes and bytes actually
+copied by `vectorBytes` after validation and deduplication,
+progress callbacks, continuation and result counts. Phase observations record elapsed
+wall time, SQLite `exec` call count, callback row count, elapsed time within `exec`
+(including binding, execution, row callbacks, and materialization), and a remaining
+JavaScript estimate. Transaction statements are counted. Nested phases overlap their
+parent transaction wall time and must not be summed indiscriminately. Handler time
+minus top-level phase wall time estimates surrounding work; RPC minus handler time is
+unattributed test-client/queue boundary time, not browser transport. Provider duration
+and input digests, and number-array to `Float32Array` conversion time/bytes/count,
+are diagnostic-only. The Node client invokes the handler in-process; it does not
+measure browser Worker messaging or OPFS behavior. These are elapsed wall-clock spans,
+not isolated SQLite engine CPU or exact per-operation allocation measurements.
 
 The published/adopted semantic-state comparison covers semantic eligible count, head
 count, lag count, missing count, compatible vector count, and readiness. It also
@@ -95,10 +117,10 @@ real Obsidian, and real inference-provider behavior are outside this Node fixtur
 support.
 
 Generated success, error, timeout, and diagnostic reports are local-only under
-`.artifacts/trama-benchmark/`. The runner writes the current report to
-`.artifacts/trama-benchmark/<profile>.json`, replacing that profile's prior output.
+`.artifacts/benchmarks/`. The runner writes the current report to
+`.artifacts/benchmarks/<profile>.json`, replacing that profile's prior output.
 For a local sample set, copy reports before they are overwritten to the next unused
-`.artifacts/trama-benchmark/archive/lifecycle-v1/<profile>/run-N.json` path. Harness
+`.artifacts/benchmarks/archive/lifecycle-v1/<profile>/run-N.json` path. Harness
 code, versioned oracles, and contract documentation are tracked; generated reports
 are not retained in the repository.
 

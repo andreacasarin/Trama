@@ -1,4 +1,28 @@
 /** Closed, versioned protocol for the mutable SQLite index. */
+import type { TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
+
+export const SQLITE_DIAGNOSTICS_CONFIG_TYPE = "trama-diagnostics-config" as const;
+export const SQLITE_DIAGNOSTIC_EVENT_TYPE = "trama-diagnostic" as const;
+export interface SqliteDiagnosticsConfiguration {
+  readonly performance: boolean;
+  readonly detailed: boolean;
+  readonly sessionId: string;
+}
+export interface SqliteDiagnosticsConfigRequest {
+  readonly type: typeof SQLITE_DIAGNOSTICS_CONFIG_TYPE;
+  readonly id: number;
+  readonly diagnostics: SqliteDiagnosticsConfiguration;
+}
+export interface SqliteDiagnosticsConfigAck {
+  readonly type: typeof SQLITE_DIAGNOSTICS_CONFIG_TYPE;
+  readonly id: number;
+  readonly configured: true;
+}
+export interface SqliteDiagnosticEventMessage {
+  readonly type: typeof SQLITE_DIAGNOSTIC_EVENT_TYPE;
+  readonly record: TramaPerformanceRecord;
+}
+
 export const SQLITE_PROTOCOL_VERSION = 9 as const;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
@@ -297,6 +321,10 @@ export type SqliteRequest<M extends SqliteMethod = SqliteMethod> = {
   readonly id: number;
   readonly method: M;
   readonly payload: SqliteRequestPayloads[M];
+  /** Diagnostics only; ignored by request validation and SQLite execution. */
+  readonly diagnosticOperationId?: string;
+  readonly diagnosticParentOperationId?: string;
+  readonly diagnosticBatchId?: string;
 };
 export interface SqliteErrorShape {
   readonly code:

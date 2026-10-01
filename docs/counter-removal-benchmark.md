@@ -10,8 +10,8 @@ The baseline is the verified T1 tree before any T2 production edits. The after s
 
 Milliseconds, in independent run order. Report files preserve the full raw evidence, including latency distributions, byte/memory measurements, counters, environment, and correctness:
 
-- Baseline: `.artifacts/trama-benchmark/baseline/run-1.json` through `run-3.json`
-- After: `.artifacts/trama-benchmark/after/run-1.json` through `run-3.json`
+- Baseline: `.artifacts/benchmarks/baseline/run-1.json` through `run-3.json`
+- After: `.artifacts/benchmarks/after/run-1.json` through `run-3.json`
 
 | Scenario                      |  Baseline runs 1 / 2 / 3 |     After runs 1 / 2 / 3 | Median change |
 | ----------------------------- | -----------------------: | -----------------------: | ------------: |

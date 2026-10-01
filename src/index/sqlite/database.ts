@@ -25,6 +25,11 @@ import { SqliteLexicalRunStore } from "./lexical-runs";
 import { SqlitePublicationStore } from "./publication";
 import { literalTerms, SqliteRetrieval } from "./retrieval";
 import { SqliteSemanticStore } from "./semantic";
+import {
+  diagnosticsEnabled,
+  NOOP_TRAMA_DIAGNOSTICS,
+  type TramaDiagnostics,
+} from "@/diagnostics/TramaDiagnostics";
 import { SqliteStateStore } from "./state";
 
 export type { SqliteConnection } from "./core";
@@ -42,7 +47,15 @@ export class MutableSqliteDatabase {
   private readonly semantic: SqliteSemanticStore;
   private readonly retrieval: SqliteRetrieval;
 
-  constructor(db: SqliteConnection) {
+  constructor(
+    db: SqliteConnection,
+    diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS,
+    retrievalPhaseObserver?: (
+      phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+      durationMs: number,
+      itemCount: number
+    ) => void
+  ) {
     this.context = new SqliteContext(db);
     this.state = new SqliteStateStore(this.context);
     this.publication = new SqlitePublicationStore(this.context, this.state);
@@ -60,8 +73,10 @@ export class MutableSqliteDatabase {
       this.lexicalStaging,
       this.state
     );
-    this.semantic = new SqliteSemanticStore(this.context, this.state);
-    this.retrieval = new SqliteRetrieval(this.context);
+    this.semantic = new SqliteSemanticStore(this.context, this.state, diagnostics);
+    this.retrieval = new SqliteRetrieval(this.context, retrievalPhaseObserver, () =>
+      diagnosticsEnabled(diagnostics, "performance")
+    );
   }
 
   hasActiveLexicalRuns(): boolean {

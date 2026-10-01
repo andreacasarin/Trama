@@ -46,6 +46,20 @@ function model(fetcher: typeof fetch, options: Record<string, unknown> = {}) {
 describe("LM Studio adapters module", () => {
   describe("LmStudioChatModel", () => {
     describe("complete()", () => {
+      it("does not expose payloads or change completion when diagnostic enablement throws", async () => {
+        const emitted = vi.fn();
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(streamResponse(completed()));
+        const result = await model(fetcher, {
+          diagnostics: {
+            enabled: () => {
+              throw new Error("diagnostics failed");
+            },
+            emit: emitted,
+          },
+        }).complete([{ role: "user", content: "private" }], new AbortController().signal);
+        expect(result.finishReason).toBe("stop");
+        expect(emitted).not.toHaveBeenCalled();
+      });
       it(`posts stateless Responses requests with the exact path and omission contract (${ISSUE})`, async () => {
         const fetcher = vi.fn<typeof fetch>().mockResolvedValue(streamResponse(completed()));
         await model(fetcher).complete(
@@ -74,7 +88,10 @@ describe("LM Studio adapters module", () => {
           );
         const records: TramaDiagnosticRecord[] = [];
         const result = await model(fetcher, {
-          diagnostics: { emit: (record: TramaDiagnosticRecord) => records.push(record) },
+          diagnostics: {
+            enabled: () => true,
+            emit: (record: TramaDiagnosticRecord) => records.push(record),
+          },
         }).complete([{ role: "user", content: "hello" }], new AbortController().signal);
 
         expect(records).toEqual([
@@ -119,7 +136,10 @@ describe("LM Studio adapters module", () => {
 
         await expect(
           model(fetcher, {
-            diagnostics: { emit: (record: TramaDiagnosticRecord) => records.push(record) },
+            diagnostics: {
+              enabled: () => true,
+              emit: (record: TramaDiagnosticRecord) => records.push(record),
+            },
           }).complete([], new AbortController().signal)
         ).rejects.toMatchObject({ code: "internal" });
 
@@ -131,6 +151,7 @@ describe("LM Studio adapters module", () => {
         await expect(
           model(fetcher, {
             diagnostics: {
+              enabled: () => true,
               emit: () => {
                 throw new Error("diagnostics unavailable");
               },

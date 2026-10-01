@@ -5,7 +5,7 @@ import {
   type IndexFreshness,
   type ProvenanceRecord,
 } from "@/domain/contracts";
-import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
+import { diagnosticsEnabled, projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
 import { indexIdentity, normalizeVaultPath as normalizePath } from "@/index/Identity";
 import { searchVault, type VaultRetrievalPort } from "@/index/VaultSearch";
 import type { SqliteHit } from "@/index/sqlite/protocol";
@@ -72,7 +72,11 @@ export class RetrievalService implements VaultRetrievalPort {
     vector?: readonly number[],
     lexicalProfile: "voce" | "lente" = "voce"
   ): Promise<readonly RetrievalResult[]> {
-    const started = Date.now();
+    const started = diagnosticsEnabled(this.runtime.diagnostics, "detailed")
+      ? Date.now()
+      : undefined;
+    const overallTimer = this.runtime.performanceTimer();
+    let retrievalOperationId: string | undefined;
     const requestSignal = signal ?? new AbortController().signal;
     try {
       check(requestSignal);
@@ -80,6 +84,7 @@ export class RetrievalService implements VaultRetrievalPort {
         throw new StructuredError("busy", "Index maintenance is in progress.", true);
       if (!this.runtime.hasUsableIndex())
         throw new StructuredError("unavailable", "Lexical index is unavailable.", true);
+      if (overallTimer) retrievalOperationId = this.runtime.ensureClient().diagnosticOperationId();
       let effectiveMode = mode;
       const semanticReady = this.runtime.capabilities().semantic.searchable;
       if (mode === "hybrid" && !semanticReady) effectiveMode = "lexical";
@@ -91,9 +96,18 @@ export class RetrievalService implements VaultRetrievalPort {
         );
       let queryVector = vector ? new Float32Array(vector) : undefined;
       if (effectiveMode !== "lexical" && !queryVector) {
+        const embeddingTimer = this.runtime.performanceTimer();
         try {
           const values = await this.embedding.embed([query], requestSignal);
           queryVector = new Float32Array(values[0] ?? []);
+          this.runtime.emitPhase(
+            "retrieve",
+            "queryEmbedding",
+            embeddingTimer,
+            1,
+            undefined,
+            retrievalOperationId
+          );
         } catch {
           if (requestSignal.aborted)
             throw new StructuredError("cancelled", "Search cancelled.", true);
@@ -109,7 +123,9 @@ export class RetrievalService implements VaultRetrievalPort {
       }
       const candidateLimit = lexicalProfile === "lente" ? 160 : mode === "related" ? 128 : 80;
       const resultLimit = Math.max(0, Math.min(256, Math.floor(limit)));
-      const hits = (await this.runtime.ensureClient().call(
+      const retrievalTimer = this.runtime.performanceTimer();
+      const retrievalClient = this.runtime.ensureClient();
+      const hits = (await retrievalClient.call(
         "retrieve",
         {
           ...(effectiveMode === "semantic" ? {} : { query }),
@@ -121,20 +137,31 @@ export class RetrievalService implements VaultRetrievalPort {
           ...(lexicalProfile === "lente" ? { resultShape: "notes" as const } : {}),
           ...(currentPath ? { currentPath } : {}),
         },
-        requestSignal
+        requestSignal,
+        { diagnosticOperationId: retrievalOperationId }
       )) as readonly SqliteHit[];
+      this.runtime.emitPhase(
+        mode === "related" ? "related" : "retrieve",
+        effectiveMode,
+        retrievalTimer,
+        hits.length,
+        undefined,
+        retrievalOperationId
+      );
       const changeCounter = this.runtime.changeCounter();
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "search",
-        stage: "completed",
-        phase: mode,
-        durationMs: Date.now() - started,
-        generation: indexIdentity(changeCounter),
-        counts: { results: hits.length },
-      });
-      return hits.map((hit) => ({
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "search",
+          stage: "completed",
+          phase: mode,
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          generation: indexIdentity(changeCounter),
+          counts: { results: hits.length },
+        });
+      const shapingTimer = this.runtime.performanceTimer();
+      const shaped = hits.map((hit) => ({
         path: hit.path,
         startLine: hit.startLine,
         endLine: hit.endLine,
@@ -147,16 +174,34 @@ export class RetrievalService implements VaultRetrievalPort {
         ...(hit.lexicalScore === undefined ? {} : { lexicalScore: hit.lexicalScore }),
         fusedScore: hit.fusedScore ?? hit.score,
       }));
+      this.runtime.emitPhase(
+        "retrieve",
+        "resultShaping",
+        shapingTimer,
+        shaped.length,
+        undefined,
+        retrievalOperationId
+      );
+      this.runtime.emitPhase(
+        mode === "related" ? "related" : "retrieve",
+        "overall",
+        overallTimer,
+        shaped.length,
+        undefined,
+        retrievalOperationId
+      );
+      return shaped;
     } catch (error) {
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation: "search",
-        stage: requestSignal.aborted ? "cancelled" : "failed",
-        phase: mode,
-        durationMs: Date.now() - started,
-        error: projectDiagnosticError(error),
-      });
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation: "search",
+          stage: requestSignal.aborted ? "cancelled" : "failed",
+          phase: mode,
+          durationMs: started === undefined ? 0 : Date.now() - started,
+          error: projectDiagnosticError(error),
+        });
       throw error;
     }
   }
@@ -194,13 +239,16 @@ export class RetrievalService implements VaultRetrievalPort {
         "Semantic vectors are not ready. Update the semantic index first.",
         true
       );
-    const hits = (await this.runtime
-      .ensureClient()
-      .call(
-        "findRelated",
-        { path: normalizePath(path), limit: Math.min(128, limit) },
-        signal
-      )) as readonly SqliteHit[];
+    const timer = this.runtime.performanceTimer();
+    const client = this.runtime.ensureClient();
+    const operationId = timer ? client.diagnosticOperationId() : undefined;
+    const hits = (await client.call(
+      "findRelated",
+      { path: normalizePath(path), limit: Math.min(128, limit) },
+      signal,
+      { diagnosticOperationId: operationId }
+    )) as readonly SqliteHit[];
+    this.runtime.emitPhase("related", "related", timer, hits.length, undefined, operationId);
     return hits.map((hit) => ({
       path: hit.path,
       score: hit.score,

@@ -12,7 +12,7 @@ import {
   type SqliteNoteSummary,
   type SqliteState,
 } from "@/index/sqlite/protocol";
-import { projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
+import { diagnosticsEnabled, projectDiagnosticError } from "@/diagnostics/TramaDiagnostics";
 import type { IndexSyncResult, IndexVaultDocument } from "./contracts";
 import { IndexJournal } from "./journal";
 import { check, IndexRuntime } from "./runtime";
@@ -142,6 +142,7 @@ export class LexicalSnapshotService {
     signal: AbortSignal,
     operation: "full" | "incremental" | "rebuild" | "update" = "full"
   ): Promise<LexicalSnapshot> {
+    const timer = this.runtime.performanceTimer();
     const paths = [...(await this.runtime.vault.listMarkdownPaths(signal))]
       .map(normalizePath)
       .filter((path) => this.runtime.isIndexEligible(path))
@@ -187,6 +188,7 @@ export class LexicalSnapshotService {
         false
       );
     }
+    this.runtime.emitPhase("lexical", "snapshotRead", timer, summaries.length);
     return { paths, summaries, documents, revision: this.journal.revision };
   }
 
@@ -287,7 +289,10 @@ export class LexicalSnapshotService {
     let completed = 0;
     for (const group of batches) {
       check(signal);
-      const result = (await this.runtime.ensureClient().call(
+      const batchTimer = this.runtime.performanceTimer();
+      const batchClient = this.runtime.ensureClient();
+      const batchOperationId = batchTimer ? batchClient.diagnosticOperationId() : undefined;
+      const result = (await batchClient.call(
         "applyLexicalBatch",
         {
           runId,
@@ -300,8 +305,17 @@ export class LexicalSnapshotService {
             }))
           ),
         },
-        signal
+        signal,
+        { diagnosticOperationId: batchOperationId }
       )) as SqliteLexicalBatchResult;
+      this.runtime.emitPhase(
+        "lexical",
+        "batch",
+        batchTimer,
+        group.length,
+        undefined,
+        batchOperationId
+      );
       changed ||= result.changed;
       completed += group.length;
       this.runtime.reportProgress(
@@ -343,14 +357,15 @@ export class LexicalSnapshotService {
     try {
       await this.abortLexicalRun(runId, new AbortController().signal);
     } catch (error) {
-      this.runtime.emit({
-        area: "index",
-        event: "index_operation",
-        operation,
-        stage: "cleanup-failed",
-        phase: "cleanup",
-        error: projectDiagnosticError(error),
-      });
+      if (diagnosticsEnabled(this.runtime.diagnostics, "detailed"))
+        this.runtime.emit({
+          area: "index",
+          event: "index_operation",
+          operation,
+          stage: "cleanup-failed",
+          phase: "cleanup",
+          error: projectDiagnosticError(error),
+        });
     }
   }
 
