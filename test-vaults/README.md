@@ -27,7 +27,10 @@ after registering the prepared benchmark vault. Preparation never copies persona
 notes or provider settings. Existing generated demo edits are not overwritten.
 
 The runnable benchmark is always `.artifacts/test-vaults/benchmark/Trama Benchmark Vault`.
-Register it once; UUIDs identify reports and run storage, not vault folders.
+Register it once; UUIDs identify reports and fixture-provider models, not vault folders.
+Both generated vaults load standard Trama with all commands and tabs. Benchmark
+runs use its normal persistent index and filesystem publication with Performance
+logging and a temporary local HTTP model fixture; there is no benchmark-only startup.
 Prior generated corpora are preserved in `.artifacts/test-vaults/archive/` and
 are not used by subsequent runs.
 

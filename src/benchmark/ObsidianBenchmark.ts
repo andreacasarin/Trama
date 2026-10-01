@@ -1,127 +1,47 @@
-import type { ChatModel, EmbeddingModel } from "@/domain/contracts";
-import { ChatSession } from "@/chat/ChatSession";
-import type { TramaDiagnostics, TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
-import { bytesToHex, sha256Hex } from "@/index/Identity";
-import { IndexManager } from "@/index/IndexManager";
-import { LenteSearch } from "@/index/LenteSearch";
-import { RelatedNotes } from "@/index/RelatedNotes";
-import { PublicationManager } from "@/index/publications/PublicationManager";
-import {
-  PublicationStore,
-  type PublicationDataAdapter,
-} from "@/index/publications/PublicationStore";
-import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
-import { ToolRegistry, VaultSearchTool } from "@/tools/ToolRegistry";
+import type { ChatSession } from "@/chat/ChatSession";
+import type { TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
+import type { IndexManager } from "@/index/IndexManager";
+import type { RelatedNotes } from "@/index/RelatedNotes";
+import type { PublicationManager } from "@/index/publications/PublicationManager";
+import type { LenteSearchPort } from "@/plugin/ModelRuntime";
+import type { TramaSettings } from "@/settings/Settings";
 import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
-import type { SqliteRuntime } from "@/plugin/SqliteRuntime";
-import {
-  BENCHMARK_REPORT,
-  readBenchmarkManifest,
-  type BenchmarkManifest,
-  type BenchmarkMutation,
-} from "./Manifest";
+import { BENCHMARK_REPORT, readBenchmarkManifest, type BenchmarkManifest } from "./Manifest";
 import { expectedOutputsV1ByProfile } from "./Oracle";
 
-const DIMENSIONS = 768;
-const SEED = 0x5eed_768;
-const ENDPOINT = "http://benchmark.invalid/v1";
-const MODEL = "fixture";
 const ORACLE_COUNTS = {
   "trama-small": { initial: 128, final: 125 },
   "trama-10k": { initial: 10000, final: 9993 },
   "trama-large": { initial: 25000, final: 24993 },
 } as const;
 
-function nextRandom(state: { value: number }): number {
-  let value = state.value | 0;
-  value ^= value << 13;
-  value ^= value >>> 17;
-  value ^= value << 5;
-  state.value = value | 0;
-  return (value >>> 0) / 0x1_0000_0000;
+/** References to the already-composed production runtime, not benchmark substitutes. */
+export interface BenchmarkRuntime {
+  readonly index: IndexManager;
+  readonly publication: PublicationManager;
+  readonly related: RelatedNotes;
+  readonly session: ChatSession;
+  getLenteSearch(): LenteSearchPort;
+  getSettings(): TramaSettings;
+  saveSettings(settings: TramaSettings): Promise<void>;
+  rebuild(): Promise<void>;
+  update(): Promise<void>;
+  publish(): Promise<void>;
+  checkPublication(): Promise<void>;
+  stop(): Promise<void>;
 }
 
-/** Same v1 xorshift/Float32 vector fixture, with browser SHA-256. */
-export async function benchmarkVector(key: string, forcedTie = false): Promise<Float32Array> {
-  const hash = await sha256Hex(key);
-  const state = { value: (SEED ^ Number.parseInt(hash.slice(0, 8), 16)) | 0 };
-  const vector = new Float32Array(DIMENSIONS);
-  let norm = 0;
-  for (let i = 0; i < DIMENSIONS; i++) {
-    const value = forcedTie ? (i === 0 ? 1 : 0) : nextRandom(state) * 2 - 1;
-    vector[i] = value;
-    norm += value * value;
-  }
-  const scale = 1 / Math.sqrt(norm);
-  for (let i = 0; i < DIMENSIONS; i++) vector[i] *= scale;
-  return vector;
-}
-
-export async function benchmarkFixtureVector(text: string): Promise<Float32Array> {
-  const queryKey =
-    text === 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)'
-      ? "query:hostile"
-      : text === "anchor alpha"
-        ? "query:semantic"
-        : text === "naïve café 東京"
-          ? "query:unicode"
-          : text === "tie"
-            ? "fixed-tie"
-            : text === "large"
-              ? "query:large"
-              : text === ""
-                ? "query:empty"
-                : text;
-  return benchmarkVector(
-    queryKey,
-    queryKey === "fixed-tie" || /notes\/0000[45]\/note-[45]\.md/.test(text)
-  );
-}
-
-class FixtureEmbedding implements EmbeddingModel {
-  readonly dimensions = DIMENSIONS;
-  calls = 0;
-  texts = 0;
-  async embed(texts: readonly string[], signal: AbortSignal): Promise<readonly number[][]> {
-    if (signal.aborted) throw new Error("Operation cancelled");
-    this.calls++;
-    this.texts += texts.length;
-    return Promise.all(
-      texts.map(async (text) => {
-        return Array.from(await benchmarkFixtureVector(text));
-      })
-    );
-  }
-}
-
-class MemoryPublicationAdapter implements PublicationDataAdapter {
-  private readonly files = new Map<string, ArrayBuffer>();
-  async exists(path: string): Promise<boolean> {
-    return this.files.has(path);
-  }
-  async readBinary(path: string): Promise<ArrayBuffer> {
-    const bytes = this.files.get(path);
-    if (!bytes) throw new Error("Publication missing");
-    return bytes.slice(0);
-  }
-  async writeBinary(path: string, bytes: ArrayBuffer): Promise<void> {
-    this.files.set(path, bytes.slice(0));
-  }
-  async mkdir(): Promise<void> {
-    /* in-memory */
-  }
-  async rename(from: string, to: string): Promise<void> {
-    const bytes = await this.readBinary(from);
-    this.files.set(to, bytes);
-    this.files.delete(from);
-  }
-  async remove(path: string): Promise<void> {
-    this.files.delete(path);
-  }
+interface PhaseAggregate {
+  count: number;
+  durationMs: number;
+  sqlMs: number;
+  sqlCalls: number;
+  byteCount: number;
+  itemCount: number;
 }
 
 export interface BenchmarkReport {
-  readonly version: "trama-obsidian-report-v1";
+  readonly version: "trama-obsidian-report-v2";
   readonly status: "completed" | "error" | "timeout";
   readonly runId: string;
   readonly profile: BenchmarkManifest["profile"];
@@ -129,11 +49,12 @@ export interface BenchmarkReport {
   readonly appVersion: string;
   readonly pluginVersion: string;
   readonly buildIdentity: string;
-  readonly runtime: "worker-wasm-opfs";
-  readonly storage: "fresh-opfs-identity";
+  readonly runtime: "standard-trama-worker-wasm-opfs";
+  readonly storage: "vault-opfs-identity";
   readonly transport: "browser-worker";
-  readonly publication: "in-memory";
-  readonly diagnosticsMode: "scoped-performance";
+  readonly providerTransport: "loopback-http-fixture";
+  readonly publication: "vault-filesystem";
+  readonly diagnosticsMode: "performance";
   readonly sourceDigest: string;
   readonly workloadContractVersion: "trama-workload-contract-v1";
   readonly oracleVersion: "expected-outputs-v1";
@@ -141,89 +62,46 @@ export interface BenchmarkReport {
   readonly queryVectorSha256: string;
   readonly memory: { readonly rssBytes: "unsupported"; readonly heapBytes: "unsupported" };
   readonly boundaries: readonly string[];
-  readonly scenarios: Readonly<
-    Record<string, { durationMs: number; changed?: boolean; converged?: boolean }>
-  >;
-  readonly phases: Readonly<
-    Record<
-      string,
-      {
-        count: number;
-        durationMs: number;
-        sqlMs: number;
-        sqlCalls: number;
-        byteCount: number;
-        itemCount: number;
-      }
-    >
-  >;
+  readonly scenarios: Readonly<Record<string, { completed: boolean }>>;
+  readonly phases: Readonly<Record<string, PhaseAggregate>>;
   readonly correctness: Readonly<Record<string, boolean>>;
   readonly provider: { readonly calls: number; readonly texts: number };
   readonly error?: string;
 }
 
-interface BenchmarkApp {
-  vault: any;
-  version?: string;
-}
-
-function identity(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return bytesToHex(bytes);
-}
-
-function aggregatePhase(
-  aggregates: Record<
-    string,
-    {
-      count: number;
-      durationMs: number;
-      sqlMs: number;
-      sqlCalls: number;
-      byteCount: number;
-      itemCount: number;
-    }
-  >,
-  record: TramaPerformanceRecord
-): void {
-  const key = `${record.operation}.${record.phase}`;
-  const value = (aggregates[key] ??= {
-    count: 0,
-    durationMs: 0,
-    sqlMs: 0,
-    sqlCalls: 0,
-    byteCount: 0,
-    itemCount: 0,
-  });
-  value.count++;
-  value.durationMs += record.durationMs;
-  value.sqlMs += record.sqlMs ?? 0;
-  value.sqlCalls += record.sqlCalls ?? 0;
-  value.byteCount += record.byteCount ?? 0;
-  value.itemCount += record.itemCount ?? 0;
-}
-
-/** Run only from the cold, validated benchmark branch in the plugin. */
+/** Fixed workload driver over normal Trama operations; timing comes from production diagnostics. */
 export async function runObsidianBenchmark(
-  app: BenchmarkApp,
+  app: { vault: any; version?: string },
   manifest: BenchmarkManifest,
   pluginVersion: string,
-  sqlite: SqliteRuntime,
-  diagnostics: TramaDiagnostics
+  runtime: BenchmarkRuntime
 ): Promise<BenchmarkReport> {
   const adapter = app.vault.adapter;
   const ensureMarked = async () => {
     const fresh = await readBenchmarkManifest(adapter, app.vault.getName());
     if (
       !fresh ||
-      typeof adapter.getBasePath !== "function" ||
-      adapter.getBasePath() !== manifest.expectedPath ||
+      adapter.getBasePath?.() !== manifest.expectedPath ||
       JSON.stringify(fresh) !== JSON.stringify(manifest)
     )
       throw new Error("Benchmark vault marker changed; refusing mutation.");
   };
   await ensureMarked();
+  const settings = runtime.getSettings();
+  const endpoint = settings.embedding.endpoint;
+  if (
+    !/^http:\/\/127\.0\.0\.1:[0-9]+\/v1$/.test(endpoint) ||
+    settings.chat.endpoint !== endpoint ||
+    settings.embedding.modelId !== `trama-benchmark-fixture-${manifest.runId}` ||
+    settings.chat.modelId !== settings.embedding.modelId ||
+    settings.embedding.dimensions !== 768 ||
+    settings.diagnosticsMode !== "performance" ||
+    settings.automaticMaintenance ||
+    settings.filo.excludedPaths.length > 0
+  )
+    throw new Error(
+      "Run npm run benchmark to configure the marked vault's fixture provider and Performance logging."
+    );
   const initialPaths = app.vault.getMarkdownFiles().map((file: { path: string }) => file.path);
   const expectedPaths = Array.from({ length: manifest.noteCount }, (_, index) =>
     index === 0
@@ -240,232 +118,169 @@ export async function runObsidianBenchmark(
   )
     throw new Error("Generated benchmark vault note inventory changed; refusing mutation.");
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), manifest.timeoutMs);
+  const timeout = setTimeout(() => {
+    controller.abort();
+    void runtime.stop();
+    runtime.session.cancel();
+  }, manifest.timeoutMs);
   const signal = controller.signal;
-  const phases: Record<
-    string,
-    {
-      count: number;
-      durationMs: number;
-      sqlMs: number;
-      sqlCalls: number;
-      byteCount: number;
-      itemCount: number;
-    }
-  > = {};
-  const scenarios: Record<string, { durationMs: number; changed?: boolean; converged?: boolean }> =
-    {};
+  const phases: Record<string, PhaseAggregate> = {};
+  const scenarios: Record<string, { completed: boolean }> = {};
   const correctness: Record<string, boolean> = {};
-  const embedding = new FixtureEmbedding();
-  const publicationStorage = new MemoryPublicationAdapter();
-  const vault = new ObsidianIndexVault(
-    app.vault,
-    (path) => path.endsWith(".md") && !path.startsWith(".")
-  );
-  const makeManager = () =>
-    new IndexManager(
-      vault,
-      embedding,
-      ENDPOINT,
-      MODEL,
-      {
-        workerFactory: () => sqlite.createWorker(app),
-        sqliteIdentity: Promise.resolve(identity()),
-      },
-      diagnostics
-    );
-  const manager = makeManager();
-  let adoptedManager: IndexManager | undefined;
-  const publication = new PublicationManager(manager, new PublicationStore(publicationStorage));
-  const measure = async <T extends { changed?: boolean; converged?: boolean }>(
-    name: string,
-    work: () => Promise<T>
-  ): Promise<T> => {
-    if (signal.aborted) throw new Error("Benchmark timed out.");
-    const started = performance.now();
-    const result = await work();
-    if (signal.aborted) throw new Error("Benchmark timed out.");
-    scenarios[name] = {
-      durationMs: performance.now() - started,
-      ...(result.changed === undefined ? {} : { changed: result.changed }),
-      ...(result.converged === undefined ? {} : { converged: result.converged }),
-    };
-    return result;
+  let provider = { calls: 0, texts: 0 };
+  let providerVerified = false;
+  const stats = async (requestSignal = signal): Promise<{ calls: number; texts: number }> => {
+    const response = await fetch(`${endpoint}/benchmark-stats`, { signal: requestSignal });
+    if (!response.ok) throw new Error("Benchmark fixture provider is unavailable.");
+    const value = await response.json();
+    if (
+      value.runId !== manifest.runId ||
+      !Number.isSafeInteger(value.calls) ||
+      !Number.isSafeInteger(value.texts)
+    )
+      throw new Error("Benchmark fixture provider identity mismatch.");
+    providerVerified = true;
+    provider = { calls: value.calls, texts: value.texts };
+    return provider;
   };
-  const mutate = async (mutation: BenchmarkMutation) => {
+  const scenario = async (name: string, work: () => Promise<unknown>) => {
+    if (signal.aborted) throw new Error("Benchmark timed out.");
     await ensureMarked();
-    if (mutation.kind === "add") {
-      const parts = mutation.path.split("/");
-      if (parts.length > 1)
-        await app.vault.createFolder(parts.slice(0, -1).join("/")).catch(() => undefined);
-      await app.vault.create(mutation.path, mutation.content);
-      manager.recordPathMutation({ type: "upsert", path: mutation.path });
-    } else if (mutation.kind === "modify") {
-      const file = app.vault.getFileByPath(mutation.path);
-      if (!file) throw new Error("Benchmark mutation target missing.");
-      await app.vault.modify(file, mutation.content);
-      manager.recordPathMutation({ type: "upsert", path: mutation.path });
-    } else if (mutation.kind === "delete") {
-      const file = app.vault.getFileByPath(mutation.path);
-      if (!file) throw new Error("Benchmark mutation target missing.");
-      await app.vault.delete(file);
-      manager.recordPathMutation({ type: "delete", path: mutation.path });
-    } else {
-      const file = app.vault.getFileByPath(mutation.path);
-      if (!file || !mutation.to) throw new Error("Benchmark rename target missing.");
-      await app.vault.rename(file, mutation.to);
-      manager.recordPathMutation({ type: "rename", from: mutation.path, to: mutation.to });
-    }
+    await work();
+    if (signal.aborted) throw new Error("Benchmark timed out.");
+    scenarios[name] = { completed: true };
   };
   let status: BenchmarkReport["status"] = "completed";
   let error: string | undefined;
   try {
-    await manager.capturePerformance(
+    await stats();
+    await runtime.index.capturePerformance(
       async () => {
-        await measure("fullBuild", async () => {
-          const result = await manager.build(signal);
-          return result;
-        });
-        const initial = await manager.getState();
+        await scenario("fullRebuild", () => runtime.rebuild());
+        const initial = await runtime.index.getState();
         correctness.initialNoteCount = initial?.noteCount === manifest.noteCount;
         correctness.initialOccurrenceCount =
           initial?.chunkCount === ORACLE_COUNTS[manifest.profile].initial;
-        await measure("immediateNoop", () => manager.reconcileQueuedChanges(signal));
-        await measure("unchangedFullReconciliation", () => manager.synchronize(signal));
-        await measure("semanticUncached", () => manager.prepareSemantic(signal));
-        const providerBeforeCached = embedding.texts;
-        await measure("semanticCached", () => manager.prepareSemantic(signal));
-        correctness.semanticCachedNoProviderWork = embedding.texts === providerBeforeCached;
+        const beforeCached = await stats();
+        await scenario("cachedUpdate", () => runtime.update());
+        correctness.semanticCachedNoProviderWork = (await stats()).texts === beforeCached.texts;
         for (const mutation of manifest.mutations) {
-          await mutate(mutation);
-          const name = `scoped${mutation.kind[0].toUpperCase()}${mutation.kind.slice(1)}`;
-          await measure(name, () => manager.reconcileQueuedChanges(signal));
-          if (mutation.kind === "modify")
-            await measure("semanticPartial", () => manager.prepareSemantic(signal));
+          await scenario(
+            `scoped${mutation.kind[0].toUpperCase()}${mutation.kind.slice(1)}`,
+            async () => {
+              if (mutation.kind === "add") {
+                await app.vault.createFolder("mutations");
+                await app.vault.create(mutation.path, mutation.content);
+              } else {
+                const file = app.vault.getFileByPath(mutation.path);
+                if (!file) throw new Error("Benchmark mutation target missing.");
+                if (mutation.kind === "modify") await app.vault.modify(file, mutation.content);
+                else if (mutation.kind === "delete") await app.vault.delete(file);
+                else await app.vault.rename(file, mutation.to);
+              }
+              // The normal VaultEventRouter owns the journal; never inject benchmark mutations.
+              await runtime.update();
+            }
+          );
         }
-        const published = await measure("publish", async () => {
-          const result = await publication.publish();
-          return { changed: result.published, converged: result.published };
-        });
-        correctness.publicationCompleted = published.changed === true;
-        const bytes = await publication.store.read();
-        correctness.publicationBytesPresent = !!bytes && bytes.byteLength > 0;
+        await scenario("publish", () => runtime.publish());
+        const bytes = await runtime.publication.store.read();
+        correctness.publicationCompleted = !!bytes;
+        correctness.publicationBytesPresent = !!bytes?.byteLength;
         if (!bytes) throw new Error("Publication bytes missing.");
-        adoptedManager = makeManager();
-        const adoptedIndex = adoptedManager;
-        await measure("publicationAdopt", async () => {
-          await adoptedIndex.load();
-          const inspection = await adoptedIndex.inspectPublication(bytes);
-          await adoptedIndex.adoptPublication(bytes, inspection.publicationId, inspection);
-          return { changed: true, converged: true };
-        });
-        const state = await adoptedIndex.getState();
+        await scenario("publicationCheck", () => runtime.checkPublication());
+        const state = await runtime.index.getState();
         correctness.finalNoteCount = state?.noteCount === manifest.noteCount;
         correctness.finalOccurrenceCount =
           state?.chunkCount === ORACLE_COUNTS[manifest.profile].final;
         correctness.semanticEligibleCount = state?.semanticEligibleCount === manifest.noteCount;
         correctness.semanticHeadCount = state?.semanticHeadCount === manifest.noteCount;
-        correctness.compatibleVectorCount =
-          state?.compatibleVectorCount === ORACLE_COUNTS[manifest.profile].final;
+        // Live storage retains reusable entries; convergence/missing-count gates verify current coverage.
+        correctness.compatibleVectorCoverage =
+          (state?.compatibleVectorCount ?? 0) >= ORACLE_COUNTS[manifest.profile].final;
         correctness.semanticReady = state?.semanticReady === true;
         correctness.semanticConverged =
           state?.semanticLagCount === 0 && state?.semanticMissingCount === 0;
         const query = 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)';
         const expected = expectedOutputsV1ByProfile[manifest.profile];
-        const lente = new LenteSearch(
-          adoptedIndex,
-          { getMtime: (path) => app.vault.getFileByPath(path)?.stat?.mtime ?? null },
-          diagnostics
-        );
-        let lexicalBatch!: Awaited<ReturnType<LenteSearch["search"]>>;
-        const lexical = await measure("lexicalRetrieval", async () => {
-          lexicalBatch = await lente.search(query, { searchMethod: "keyword" });
-          return { changed: lexicalBatch.results.length > 0 };
-        });
-        let hybridBatch!: Awaited<ReturnType<LenteSearch["search"]>>;
-        const hybrid = await measure("hybridRetrieval", async () => {
-          hybridBatch = await lente.search(query);
-          return { changed: hybridBatch.results.length > 0 };
-        });
-        let relatedBatch!: Awaited<ReturnType<RelatedNotes["find"]>>;
-        const related = await measure("relatedRetrieval", async () => {
-          relatedBatch = await new RelatedNotes(adoptedIndex, diagnostics).find(
-            "00-special/a.md",
-            signal,
-            7,
-            true
-          );
-          return { changed: relatedBatch.results.length > 0 };
-        });
-        correctness.lexicalResultsPresent = lexical.changed === true;
-        correctness.hybridResultsPresent = hybrid.changed === true;
-        correctness.relatedResultsPresent = related.changed === true;
         const identities = (results: readonly { path: string; ordinal: number }[]) =>
           results.map((result) => ({ path: result.path, occurrenceOrdinal: result.ordinal }));
-        correctness.lexicalOracleMatches =
-          JSON.stringify(identities(lexicalBatch.results)) ===
-          JSON.stringify(expected.probes.lexical);
-        correctness.hybridOracleMatches =
-          JSON.stringify(identities(hybridBatch.canonicalResults ?? [])) ===
-          JSON.stringify(expected.probes.hybrid);
-        correctness.relatedOracleMatches =
-          JSON.stringify(relatedBatch.results.map((result) => ({ path: result.path }))) ===
-          JSON.stringify(expected.probes.filo);
-        let voceBatch!: Awaited<ReturnType<VaultSearchTool["execute"]>>;
-        await measure("voceRetrieval", async () => {
-          voceBatch = await new VaultSearchTool(adoptedIndex).execute({ query }, signal);
-          return { changed: voceBatch.provenance.length > 0 };
+        await scenario("lexicalRetrieval", async () => {
+          await runtime.saveSettings({
+            ...runtime.getSettings(),
+            lente: { ...settings.lente, searchMethod: "keyword" },
+          });
+          const batch = await runtime.getLenteSearch().search(query, { signal });
+          correctness.lexicalOracleMatches =
+            JSON.stringify(identities(batch.results)) === JSON.stringify(expected.probes.lexical);
         });
-        correctness.voceOracleMatches =
-          JSON.stringify(voceBatch.provenance.map((result) => ({ path: result.path }))) ===
-          JSON.stringify(expected.probes.voce);
-        let round = 0;
-        const chatModel: ChatModel = {
-          complete: async () =>
-            round++ === 0
-              ? {
-                  message: {
-                    role: "assistant",
-                    content: "",
-                    toolCalls: [{ id: "search", name: "vault_search", arguments: { query } }],
-                  },
-                  finishReason: "tool_calls",
-                }
-              : { message: { role: "assistant", content: "done" }, finishReason: "stop" },
-        };
-        await measure("chatToolTurn", async () => {
-          const result = await new ChatSession(
-            chatModel,
-            new ToolRegistry([new VaultSearchTool(adoptedIndex)]),
-            {
-              readNote: async (path) => {
-                const file = app.vault.getFileByPath(path);
-                if (!file) throw new Error("Benchmark chat note missing.");
-                return { path, content: await app.vault.read(file) };
-              },
-            },
-            diagnostics
-          ).send({ content: "Find relevant notes", attachmentPaths: [] });
-          correctness.chatToolTurnCompleted = result.turns.some(
-            (turn) => turn.role === "assistant" && turn.status === "complete"
-          );
-          return { changed: correctness.chatToolTurnCompleted };
+        await runtime.saveSettings({
+          ...runtime.getSettings(),
+          lente: { ...settings.lente, searchMethod: "hybrid" },
         });
+        await scenario("hybridRetrieval", async () => {
+          const batch = await runtime.getLenteSearch().search(query, { signal });
+          correctness.hybridOracleMatches =
+            JSON.stringify(identities(batch.canonicalResults ?? [])) ===
+            JSON.stringify(expected.probes.hybrid);
+        });
+        await scenario("relatedRetrieval", async () => {
+          const batch = await runtime.related.find("00-special/a.md", signal, 7, true);
+          correctness.relatedOracleMatches =
+            JSON.stringify(batch.results.map(({ path }) => ({ path }))) ===
+            JSON.stringify(expected.probes.filo);
+        });
+        await scenario("chatToolTurn", async () => {
+          const result = await runtime.session.send({
+            content: "Find relevant notes",
+            attachmentPaths: [],
+          });
+          const answer = result.turns[result.turns.length - 1];
+          correctness.chatToolTurnCompleted =
+            answer?.role === "assistant" &&
+            answer.status === "complete" &&
+            answer.content === "done";
+          correctness.voceOracleMatches =
+            JSON.stringify(
+              answer?.role === "assistant"
+                ? (answer.provenance?.map(({ path }) => ({ path })) ?? [])
+                : []
+            ) === JSON.stringify(expected.probes.voce);
+        });
+        provider = await stats();
       },
-      (record) => aggregatePhase(phases, record)
+      (record: TramaPerformanceRecord) => {
+        const key = `${record.operation}.${record.phase}`;
+        const value = (phases[key] ??= {
+          count: 0,
+          durationMs: 0,
+          sqlMs: 0,
+          sqlCalls: 0,
+          byteCount: 0,
+          itemCount: 0,
+        });
+        value.count++;
+        value.durationMs += record.durationMs;
+        value.sqlMs += record.sqlMs ?? 0;
+        value.sqlCalls += record.sqlCalls ?? 0;
+        value.byteCount += record.byteCount ?? 0;
+        value.itemCount += record.itemCount ?? 0;
+      }
     );
-    if (Object.values(correctness).some((value) => !value))
-      throw new Error("Benchmark correctness gate failed.");
+    const failed = Object.keys(correctness).filter((gate) => !correctness[gate]);
+    if (failed.length) throw new Error(`Benchmark correctness gate failed: ${failed.join(", ")}`);
   } catch (caught) {
     status = signal.aborted ? "timeout" : "error";
     error = caught instanceof Error ? caught.message : String(caught);
   } finally {
     clearTimeout(timeout);
-    adoptedManager?.disposeImmediately();
-    manager.disposeImmediately();
+    if (status !== "completed" && providerVerified)
+      await stats(AbortSignal.timeout(1000)).catch(() => undefined);
+    await ensureMarked();
+    await runtime.saveSettings({ ...runtime.getSettings(), lente: settings.lente });
   }
   const report: BenchmarkReport = {
-    version: "trama-obsidian-report-v1",
+    version: "trama-obsidian-report-v2",
     status,
     runId: manifest.runId,
     profile: manifest.profile,
@@ -473,11 +288,12 @@ export async function runObsidianBenchmark(
     appVersion: app.version ?? "unknown",
     pluginVersion,
     buildIdentity: SQLITE_BUILD_IDENTITY,
-    runtime: "worker-wasm-opfs",
-    storage: "fresh-opfs-identity",
+    runtime: "standard-trama-worker-wasm-opfs",
+    storage: "vault-opfs-identity",
     transport: "browser-worker",
-    publication: "in-memory",
-    diagnosticsMode: "scoped-performance",
+    providerTransport: "loopback-http-fixture",
+    publication: "vault-filesystem",
+    diagnosticsMode: "performance",
     sourceDigest: manifest.sourceDigest,
     workloadContractVersion: "trama-workload-contract-v1",
     oracleVersion: "expected-outputs-v1",
@@ -485,7 +301,8 @@ export async function runObsidianBenchmark(
     queryVectorSha256: manifest.queryVectorSha256,
     memory: { rssBytes: "unsupported", heapBytes: "unsupported" },
     boundaries: [
-      "publication filesystem adapter excluded",
+      "publication filesystem adapter included",
+      "loopback provider transport included",
       "host generation excluded",
       "Obsidian startup excluded",
       "memory unsupported",
@@ -493,13 +310,12 @@ export async function runObsidianBenchmark(
     scenarios,
     phases,
     correctness,
-    provider: { calls: embedding.calls, texts: embedding.texts },
+    provider,
     ...(error ? { error } : {}),
   };
   await ensureMarked();
   await adapter.write(BENCHMARK_REPORT, `${JSON.stringify(report, null, 2)}\n`);
   if (status === "completed") {
-    // Exactly one terminal event; the host also verifies the report identity.
     // eslint-disable-next-line no-console
     console.info("[Trama] benchmark_completed", { runId: report.runId, report: BENCHMARK_REPORT });
   }

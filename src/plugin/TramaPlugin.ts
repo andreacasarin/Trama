@@ -25,7 +25,6 @@ import { IndexStatusController } from "@/ui/index/IndexStatus";
 /** Composes the shared assistant and owns its lifecycle and vault-event boundary. */
 export class TramaPlugin extends Plugin {
   private runtimeLoaded = false;
-  private benchmarkMode = false;
   private readonly settingsStore = new SettingsStore();
   private embeddingModel?: LmStudioEmbeddingModel;
   private index?: IndexManager;
@@ -101,45 +100,6 @@ export class TramaPlugin extends Plugin {
     const app = (this as unknown as { app?: any }).app;
     if (!app?.vault || !app.workspace || !app.metadataCache) return;
 
-    // A valid generated benchmark vault must stay cold until its command starts.
-    // The marker is read through the adapter because hidden root files are not
-    // necessarily represented in Obsidian's TFile catalog.
-    const benchmarkManifest = await readBenchmarkManifest(
-      app.vault.adapter,
-      app.vault.getName?.() ?? ""
-    );
-    if (
-      benchmarkManifest &&
-      typeof app.vault.adapter.getBasePath === "function" &&
-      app.vault.adapter.getBasePath() === benchmarkManifest.expectedPath
-    ) {
-      this.benchmarkMode = true;
-      const { TramaSettingsTab } = await import("@/ui/settings/SettingsTab");
-      this.addSettingTab(new TramaSettingsTab(app, this));
-      this.addCommand({
-        id: "run-obsidian-benchmark",
-        name: "Run generated-vault benchmark",
-        callback: () => {
-          void runObsidianBenchmark(
-            app,
-            benchmarkManifest,
-            this.manifest.version,
-            this.sqliteRuntime,
-            this.diagnostics
-          )
-            .then((report) => {
-              new Notice(`Trama benchmark ${report.status}: ${report.runId}`);
-            })
-            .catch((error) => {
-              new Notice(
-                `Trama benchmark refused: ${error instanceof Error ? error.message : String(error)}`
-              );
-            });
-        },
-      });
-      return;
-    }
-
     this.visibleMarkdownCatalog = () =>
       app.vault
         .getMarkdownFiles()
@@ -178,6 +138,56 @@ export class TramaPlugin extends Plugin {
       stopMaintenance: () => this.maintenance?.stop(),
     });
     this.registerVaultEvents(app.vault);
+    // A marker adds a driver command, never an alternate startup/runtime path.
+    const benchmarkManifest = await readBenchmarkManifest(
+      app.vault.adapter,
+      app.vault.getName?.() ?? ""
+    );
+    if (benchmarkManifest && app.vault.adapter.getBasePath?.() === benchmarkManifest.expectedPath) {
+      let running = false;
+      this.addCommand({
+        id: "run-obsidian-benchmark",
+        name: "Run generated-vault benchmark",
+        callback: () => {
+          if (running) return;
+          running = true;
+          void this.runGeneratedVaultBenchmark(app, benchmarkManifest)
+            .then((report) => new Notice(`Trama benchmark ${report.status}: ${report.runId}`))
+            .catch(
+              (error) =>
+                new Notice(
+                  `Trama benchmark refused: ${error instanceof Error ? error.message : String(error)}`
+                )
+            )
+            .finally(() => {
+              running = false;
+            });
+        },
+      });
+    }
+  }
+
+  private async runGeneratedVaultBenchmark(
+    app: any,
+    manifest: import("@/benchmark/Manifest").BenchmarkManifest
+  ) {
+    await this.indexLoad;
+    if (!this.index || !this.publicationManager || !this.relatedNotes || !this.modelRuntime.session)
+      throw new Error("Trama runtime is not initialized.");
+    return runObsidianBenchmark(app, manifest, this.manifest.version, {
+      index: this.index,
+      publication: this.publicationManager,
+      related: this.relatedNotes,
+      session: this.modelRuntime.session,
+      getLenteSearch: () => this.modelRuntime.lenteSearch!,
+      getSettings: () => this.getSettings(),
+      saveSettings: (settings) => this.saveSettings(settings),
+      rebuild: () => this.rebuildIndex(),
+      update: () => this.updateIndex(),
+      publish: () => this.publishIndex(),
+      checkPublication: () => this.checkPublication(),
+      stop: () => this.stopIndex(),
+    });
   }
 
   override onunload(): void {
@@ -202,7 +212,6 @@ export class TramaPlugin extends Plugin {
     this.modelRuntime.session = undefined;
     this.modelRuntime.lenteSearch = undefined;
     this.embeddingModel = undefined;
-    this.benchmarkMode = false;
     this.runtimeLoaded = false;
     const disposal = maintenance?.dispose() ?? Promise.resolve();
     void Promise.all([load ?? Promise.resolve(), disposal])
@@ -237,7 +246,6 @@ export class TramaPlugin extends Plugin {
     const saved = this.settingsStore.stage(settings);
     if (typeof this.saveData === "function") await this.saveData(saved);
     this.settingsStore.commit(saved);
-    if (this.benchmarkMode) return;
     if (before.diagnosticsMode !== saved.diagnosticsMode) await this.index?.configureDiagnostics();
 
     const chatChanged =

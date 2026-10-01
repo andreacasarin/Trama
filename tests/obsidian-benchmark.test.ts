@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { lstat, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseBenchmarkManifest, readBenchmarkManifest } from "@/benchmark/Manifest";
-import { benchmarkFixtureVector, benchmarkVector } from "@/benchmark/ObsidianBenchmark";
+// @ts-expect-error Node fixture server has no emitted declaration.
+import { fixtureVector } from "../scripts/benchmark/fixture-provider.mjs";
 import { expectedOutputsV1ByProfile as browserOracles } from "@/benchmark/Oracle";
 // Filesystem projections keep safety tests away from the real persistent vault.
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -26,6 +27,7 @@ const {
   validateReport,
   verifyCliTarget,
   REQUIRED_BENCHMARK_GATES,
+  REQUIRED_BENCHMARK_PHASES,
 } =
   // @ts-expect-error No declaration is emitted for the standalone host script.
   await import("../scripts/benchmark/obsidian.mjs");
@@ -247,23 +249,6 @@ describe("Obsidian benchmark safety and parity", () => {
     ).toBeNull();
   });
 
-  it("matches the v1 provider vectors including fixed ties", async () => {
-    for (const text of [
-      "",
-      "anchor alpha",
-      "naïve café 東京",
-      "provider fixture challenge",
-      "line one\nline two",
-    ]) {
-      expect(Array.from(await benchmarkVector(text))).toEqual(
-        Array.from(deterministicEmbeddingVector(text))
-      );
-    }
-    expect(Array.from(await benchmarkVector("fixed-tie", true))).toEqual(
-      Array.from(deterministicEmbeddingVector("fixed-tie", "tie"))
-    );
-  });
-
   it("matches source, query, note and mutation provider fixtures", async () => {
     expect(browserOracles).toEqual(expectedOutputsV1ByProfile);
     const workload = createWorkload("trama-small");
@@ -274,13 +259,13 @@ describe("Obsidian benchmark safety and parity", () => {
       ...workload.mutations.flatMap((mutation) => (mutation.note ? [mutation.note] : [])),
     ]) {
       for (const chunk of note.chunks) {
-        expect(Array.from(await benchmarkFixtureVector(chunk.embeddingInput))).toEqual(
-          Array.from(chunk.vector)
-        );
+        expect(
+          Array.from(fixtureVector(chunk.embeddingInput, deterministicEmbeddingVector))
+        ).toEqual(Array.from(chunk.vector));
       }
     }
     for (const query of workload.queries)
-      expect(Array.from(await benchmarkFixtureVector(query.text))).toEqual(
+      expect(Array.from(fixtureVector(query.text, deterministicEmbeddingVector))).toEqual(
         Array.from(query.vector)
       );
   });
@@ -309,26 +294,35 @@ describe("Obsidian benchmark safety and parity", () => {
       "plugins:restrict",
     ]);
     const report = {
-      version: "trama-obsidian-report-v1",
+      version: "trama-obsidian-report-v2",
       runId: marker.runId,
       profile: marker.profile,
       host: "obsidian-desktop",
-      runtime: "worker-wasm-opfs",
-      storage: "fresh-opfs-identity",
+      runtime: "standard-trama-worker-wasm-opfs",
+      storage: "vault-opfs-identity",
       transport: "browser-worker",
-      publication: "in-memory",
-      diagnosticsMode: "scoped-performance",
+      providerTransport: "loopback-http-fixture",
+      publication: "vault-filesystem",
+      diagnosticsMode: "performance",
       workloadContractVersion: "trama-workload-contract-v1",
       oracleVersion: "expected-outputs-v1",
       memory: { rssBytes: "unsupported" },
-      boundaries: ["publication filesystem adapter excluded"],
+      boundaries: ["publication filesystem adapter included"],
       sourceDigest: marker.sourceDigest,
       providerChallengeSha256: marker.providerChallengeSha256,
       queryVectorSha256: marker.queryVectorSha256,
       status: "completed",
       correctness: Object.fromEntries(REQUIRED_BENCHMARK_GATES.map((gate: string) => [gate, true])),
+      phases: Object.fromEntries(
+        REQUIRED_BENCHMARK_PHASES.map((phase: string) => [phase, { count: 1, durationMs: 0 }])
+      ),
     };
     expect(validateReport(report, marker)).toEqual(report);
+    expect(() => validateReport({ ...report, phases: {} }, marker)).toThrow("phase timings");
+    expect(() =>
+      validateReport({ ...report, version: "trama-obsidian-report-v1" }, marker)
+    ).toThrow();
+    expect(() => validateReport({ ...report, publication: "in-memory" }, marker)).toThrow();
     expect(() => validateReport({ ...report, status: "timeout" }, marker)).toThrow();
     expect(() => validateReport({ ...report, correctness: { all: false } }, marker)).toThrow();
   });

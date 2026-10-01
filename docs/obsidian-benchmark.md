@@ -1,8 +1,8 @@
 # Obsidian benchmark
 
 For screenshots and interactive demos, use [Trama Test Vault](demo-vault.md)
-instead. Its realistic notes and normal UI are intentionally separate from the
-fixed benchmark fixture and cold startup below.
+instead. Both vaults load normal Trama with Voce, Filo, Lente, settings, and all
+standard commands. Only their note content and benchmark inputs differ.
 
 ## Generate before running
 
@@ -84,18 +84,39 @@ small. Example:
 TRAMA_BENCHMARK_PROFILE=trama-10k TRAMA_BENCHMARK_TIMEOUT_MS=900000 npm run benchmark
 ```
 
-The plugin reads the versioned `.trama-benchmark-vault` through Obsidian's adapter,
-checks the vault name and fixture identity, and starts without loading the normal
-index or scheduling maintenance. The command rechecks the marker before mutations
-and before report output. Each run uses a fresh random OPFS identity, the production
-Worker/WASM runtime, actual Obsidian Vault APIs, deterministic local embeddings,
-scoped Performance diagnostics, and in-memory publication. No provider network call
-is made. The report schema is `trama-obsidian-report-v1`, separate from the older
-Node `trama-benchmark-report-v2` schema. It identifies the Obsidian app and plugin
-versions, build, storage/transport/publication boundaries, fixture digests,
-scenario outcomes, phase aggregates, and correctness gates. RSS and heap memory are
-explicitly `unsupported`. Publication filesystem adapter time, fixture generation,
-and app startup are excluded. A successful report appears as
+The plugin always follows its standard startup path. A valid, exact-path
+`.trama-benchmark-vault` marker adds the benchmark driver command; it never
+disables normal commands, views, settings updates, or vault-event routing.
+The driver rechecks the marker before operations and before report output.
+
+The host starts a temporary deterministic fixture server on `127.0.0.1` at a
+random port, with a run-specific model ID and verified server identity. It configures ordinary Trama settings to
+use that endpoint for embedding and chat, enables Performance logging, and leaves
+automatic maintenance off (the default) so explicit operations are repeatable.
+The normal HTTP embedding adapter and streaming Responses adapter handle all
+requests. No real model provider is contacted. The server closes when the run
+ends; those fixture endpoints are not usable for interactive AI afterward.
+
+The driver invokes the loaded plugin's normal Rebuild, Update, Publish, publication
+Check, Lente, Filo, and chat/tool operations. Vault events populate the normal
+mutation journal. There is no second index, fake chat session, in-memory publication,
+or fresh benchmark-only OPFS identity. Rebuild establishes the measured initial
+state in the vault's normal persistent OPFS store. Publication uses the real
+`Trama/index` filesystem destination. All phase timing is emitted by production
+code; the driver only aggregates those events and records scenario completion.
+Phase records can be nested and must not all be summed as independent elapsed time.
+Publication Check measures checking the current publication, not forced adoption
+into a second empty index.
+Live cache entries may include reusable historical vectors. Correctness gates
+require complete current semantic heads, zero lag/missing vectors, and sufficient
+compatible vector coverage, not a snapshot-only cache count.
+
+The report schema is `trama-obsidian-report-v2`. It labels the standard runtime,
+persistent vault storage, loopback HTTP fixture transport, and filesystem publication.
+These measurements must not be compared directly with the old Obsidian v1
+in-memory-publication reports or the historical Node reports. RSS and heap memory
+are explicitly `unsupported`. Filesystem publication and provider HTTP transport
+are included; fixture generation and app startup are excluded. A successful report appears as
 `.trama-benchmark-report.json` inside the generated vault and as a run-ID archive
 under `.artifacts/benchmarks/`. The hidden vault report is the runtime-to-host
 handoff; reports and compiled generator caches are collected

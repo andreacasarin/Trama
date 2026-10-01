@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { build } from "esbuild";
 import { installPlugin } from "../install-plugin.mjs";
+import { startFixtureProvider } from "./fixture-provider.mjs";
 
 const runFile = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -24,7 +25,7 @@ const vaultRoot = path.join(root, ".artifacts/test-vaults/benchmark");
 export const benchmarkVaultName = "Trama Benchmark Vault";
 const profiles = new Set(["trama-small", "trama-10k", "trama-large"]);
 const markerVersion = "trama-obsidian-vault-v1";
-const reportVersion = "trama-obsidian-report-v1";
+const reportVersion = "trama-obsidian-report-v2";
 const profile = process.env.TRAMA_BENCHMARK_PROFILE ?? "trama-small";
 const timeoutMs = Number(process.env.TRAMA_BENCHMARK_TIMEOUT_MS ?? "900000");
 
@@ -74,6 +75,16 @@ export async function validateGeneratedVault(vaultPath, expectedName) {
   for (const candidate of [vaultRoot, vaultPath])
     if ((await lstat(candidate)).isSymbolicLink())
       throw new Error("Refusing a symlinked benchmark vault path.");
+  async function validateTree(directory) {
+    for (const name of await readdir(directory)) {
+      const file = path.join(directory, name);
+      const stat = await lstat(file);
+      if (stat.isSymbolicLink() || (await realpath(file)) !== file)
+        throw new Error("Refusing a symlinked benchmark install path inside the generated vault.");
+      if (stat.isDirectory()) await validateTree(file);
+    }
+  }
+  await validateTree(vaultPath);
   for (const name of [".obsidian", ".trama-benchmark-vault"]) {
     const candidate = path.join(vaultPath, name);
     if ((await lstat(candidate)).isSymbolicLink() || (await realpath(candidate)) !== candidate)
@@ -97,6 +108,7 @@ async function validateInstallPath(vaultPath, vaultName) {
     ".obsidian/plugins",
     ".obsidian/plugins/trama",
     ".obsidian/community-plugins.json",
+    ".obsidian/plugins/trama/data.json",
   ]) {
     const candidate = path.join(vaultPath, relative);
     const entry = await pathEntry(candidate);
@@ -149,9 +161,14 @@ export async function checkCorpus(vaultPath, workload, initialOnly = false) {
   }
   for (const name of await readdir(vaultPath)) {
     if (
-      [".obsidian", ".trama-benchmark-vault", ".trama-benchmark-report.json", ".DS_Store"].includes(
-        name
-      )
+      [
+        ".obsidian",
+        ".trama",
+        "Trama",
+        ".trama-benchmark-vault",
+        ".trama-benchmark-report.json",
+        ".DS_Store",
+      ].includes(name)
     )
       continue;
     if (!["00-special", "notes", "mutations"].includes(name))
@@ -300,7 +317,7 @@ export const REQUIRED_BENCHMARK_GATES = [
   "finalOccurrenceCount",
   "semanticEligibleCount",
   "semanticHeadCount",
-  "compatibleVectorCount",
+  "compatibleVectorCoverage",
   "semanticReady",
   "semanticConverged",
   "lexicalOracleMatches",
@@ -308,6 +325,17 @@ export const REQUIRED_BENCHMARK_GATES = [
   "relatedOracleMatches",
   "voceOracleMatches",
   "chatToolTurnCompleted",
+];
+
+export const REQUIRED_BENCHMARK_PHASES = [
+  "lexical.batch",
+  "semantic.overall",
+  "retrieve.lexical",
+  "retrieve.hybrid",
+  "retrieve.queryEmbedding",
+  "related.related",
+  "publication.overall",
+  "publication.inspectPublication",
 ];
 
 export function validateReport(report, marker) {
@@ -319,15 +347,16 @@ export function validateReport(report, marker) {
     throw new Error("Benchmark report identity/version mismatch.");
   if (
     report.host !== "obsidian-desktop" ||
-    report.runtime !== "worker-wasm-opfs" ||
-    report.storage !== "fresh-opfs-identity" ||
+    report.runtime !== "standard-trama-worker-wasm-opfs" ||
+    report.storage !== "vault-opfs-identity" ||
     report.transport !== "browser-worker" ||
-    report.publication !== "in-memory" ||
-    report.diagnosticsMode !== "scoped-performance" ||
+    report.providerTransport !== "loopback-http-fixture" ||
+    report.publication !== "vault-filesystem" ||
+    report.diagnosticsMode !== "performance" ||
     report.workloadContractVersion !== "trama-workload-contract-v1" ||
     report.oracleVersion !== "expected-outputs-v1" ||
     report.memory?.rssBytes !== "unsupported" ||
-    !report.boundaries?.includes("publication filesystem adapter excluded")
+    !report.boundaries?.includes("publication filesystem adapter included")
   )
     throw new Error("Benchmark report host/runtime boundary mismatch.");
   if (
@@ -344,6 +373,19 @@ export function validateReport(report, marker) {
     Object.values(report.correctness).some((value) => value !== true)
   )
     throw new Error("Benchmark correctness gate failed.");
+  if (
+    REQUIRED_BENCHMARK_PHASES.some((key) => {
+      const phase = report.phases?.[key];
+      return (
+        !phase ||
+        !Number.isSafeInteger(phase.count) ||
+        phase.count < 1 ||
+        !Number.isFinite(phase.durationMs) ||
+        phase.durationMs < 0
+      );
+    })
+  )
+    throw new Error("Benchmark production phase timings missing or invalid.");
   return report;
 }
 
@@ -384,42 +426,80 @@ async function main() {
     );
     return;
   }
+  const { generator } = await loadWorkload(profile);
+  const provider = await startFixtureProvider(marker.runId, generator.deterministicEmbeddingVector);
   try {
-    await verifyCliTarget(vaultPath, vaultName);
-  } catch {
-    throw new Error(
-      `Trama was installed in the generated vault, but Obsidian CLI cannot prove its target. Open/register exactly ${vaultPath}, enable Command line interface in Obsidian Settings > General, and rerun. No plugin command was sent.`
+    await validateInstallPath(vaultPath, vaultName);
+    const settingsFile = path.join(vaultPath, ".obsidian/plugins/trama/data.json");
+    const existing = (await exists(settingsFile))
+      ? JSON.parse(await readFile(settingsFile, "utf8"))
+      : {};
+    await writeFile(
+      settingsFile,
+      `${JSON.stringify(
+        {
+          ...existing,
+          schemaVersion: 6,
+          diagnosticsMode: "performance",
+          automaticMaintenance: false,
+          publicationDirectory: "Trama/index",
+          filo: { excludedPaths: [] },
+          embedding: {
+            ...existing.embedding,
+            endpoint: provider.endpoint,
+            modelId: provider.modelId,
+            dimensions: 768,
+            batchSize: 32,
+          },
+          chat: {
+            ...existing.chat,
+            endpoint: provider.endpoint,
+            modelId: provider.modelId,
+          },
+        },
+        null,
+        2
+      )}\n`
     );
-  }
-  await verifyCliTarget(vaultPath, vaultName);
-  const restricted = (await cli(vaultName, "plugins:restrict")).stdout.trim();
-  if (!/\boff\b/i.test(restricted) || /\bon\b/i.test(restricted))
-    throw new Error(
-      "The generated vault has restricted mode enabled or its state could not be read. Turn on community plugins in that exact vault and rerun."
-    );
-  await verifyCliTarget(vaultPath, vaultName);
-  await cli(vaultName, "plugin:enable", ["id=trama"]);
-  await verifyCliTarget(vaultPath, vaultName);
-  await cli(vaultName, "plugin:reload", ["id=trama"]);
-  await verifyCliTarget(vaultPath, vaultName);
-  await cli(vaultName, "command", ["id=trama:run-obsidian-benchmark"]);
-  const reportPath = path.join(vaultPath, ".trama-benchmark-report.json");
-  const deadline = Date.now() + timeoutMs + 30_000;
-  while (Date.now() < deadline) {
-    if (await exists(reportPath)) {
-      const report = JSON.parse(await readFile(reportPath, "utf8"));
-      const archivePath = path.join(outputRoot, `obsidian-${profile}-${marker.runId}.json`);
-      await mkdir(path.dirname(archivePath), { recursive: true });
-      await writeFile(archivePath, `${JSON.stringify(report, null, 2)}\n`);
-      validateReport(report, marker);
-      process.stdout.write(`Benchmark completed: ${archivePath}\n`);
-      return;
+    try {
+      await verifyCliTarget(vaultPath, vaultName);
+    } catch {
+      throw new Error(
+        `Trama was installed in the generated vault, but Obsidian CLI cannot prove its target. Open/register exactly ${vaultPath}, enable Command line interface in Obsidian Settings > General, and rerun. No plugin command was sent.`
+      );
     }
-    await delay(1000);
+    await verifyCliTarget(vaultPath, vaultName);
+    const restricted = (await cli(vaultName, "plugins:restrict")).stdout.trim();
+    if (!/\boff\b/i.test(restricted) || /\bon\b/i.test(restricted))
+      throw new Error(
+        "The generated vault has restricted mode enabled or its state could not be read. Turn on community plugins in that exact vault and rerun."
+      );
+    await verifyCliTarget(vaultPath, vaultName);
+    await cli(vaultName, "plugin:enable", ["id=trama"]);
+    await verifyCliTarget(vaultPath, vaultName);
+    await cli(vaultName, "plugin:reload", ["id=trama"]);
+    await verifyCliTarget(vaultPath, vaultName);
+    await cli(vaultName, "command", ["id=trama:run-obsidian-benchmark"]);
+    const reportPath = path.join(vaultPath, ".trama-benchmark-report.json");
+    const deadline = Date.now() + timeoutMs + 30_000;
+    while (Date.now() < deadline) {
+      if (await exists(reportPath)) {
+        const report = JSON.parse(await readFile(reportPath, "utf8"));
+        const archivePath = path.join(outputRoot, `obsidian-${profile}-${marker.runId}.json`);
+        await mkdir(path.dirname(archivePath), { recursive: true });
+        await writeFile(archivePath, `${JSON.stringify(report, null, 2)}\n`);
+        validateReport(report, marker);
+        process.stdout.write(`Benchmark completed: ${archivePath}\n`);
+        return;
+      }
+      await delay(1000);
+    }
+    throw new Error(
+      `Benchmark timed out waiting for ${reportPath}. Confirm the dedicated vault is registered and Trama is enabled there.`
+    );
+  } finally {
+    await provider.close();
   }
-  throw new Error(
-    `Benchmark timed out waiting for ${reportPath}. Confirm the dedicated vault is registered and Trama is enabled there.`
-  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))

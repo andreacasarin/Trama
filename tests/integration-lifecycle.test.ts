@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { request } from "node:http";
 import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
+import { LenteSearch } from "@/index/LenteSearch";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
 import { createTestSqliteClient } from "./sqlite-test-client";
+import { createWorkload, deterministicEmbeddingVector } from "../test-vaults/benchmark/generator";
+// @ts-expect-error Standalone Node fixture server has no emitted declaration.
+import { startFixtureProvider } from "../scripts/benchmark/fixture-provider.mjs";
 import {
   sourceDigestsV1,
   deterministicProviderChallengeSha256,
   queryVectorSha256V1,
+  expectedOutputsV1ByProfile,
 } from "../test-vaults/benchmark/contract-v1";
 
 function deferred<T>() {
@@ -50,7 +56,7 @@ function projectedApp() {
       return ref;
     },
     adapter: {
-      exists: async (path: string) => adapterFiles.has(path),
+      exists: async (path: string) => adapterFiles.has(path) || adapterBinary.has(path),
       read: async (path: string) => adapterFiles.get(path) ?? "",
       mkdir: async () => undefined,
       getResourcePath: function (path: string) {
@@ -139,8 +145,9 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.restoreAllMocks();
   });
 
-  it("keeps a valid generated benchmark vault cold with settings and command only", async () => {
+  it("loads normal Trama in the benchmark vault and runs the fixed lifecycle through it", async () => {
     const app = projectedApp();
+    const workload = createWorkload("trama-small");
     const marker = {
       version: "trama-obsidian-vault-v1",
       runId: "d802aace-b48f-4ce1-a0c3-e6d9224c9001",
@@ -154,40 +161,169 @@ describe("TramaPlugin lifecycle integration", () => {
       providerChallengeSha256: deterministicProviderChallengeSha256,
       queryVectorSha256: queryVectorSha256V1,
       timeoutMs: 300000,
-      mutations: [
-        { kind: "add", path: "mutations/added.md", content: "added" },
-        { kind: "modify", path: "notes/00006/note-6.md", content: "modified" },
-        { kind: "delete", path: "notes/00007/note-7.md" },
-        { kind: "rename", path: "notes/00008/note-8.md", to: "mutations/renamed.md" },
-      ],
+      mutations: workload.mutations
+        .filter((mutation) => mutation.kind !== "unchanged")
+        .map((mutation) => ({
+          kind: mutation.kind,
+          path: mutation.path,
+          ...(mutation.to ? { to: mutation.to } : {}),
+          ...(mutation.kind === "add" || mutation.kind === "modify"
+            ? { content: mutation.note!.content }
+            : {}),
+        })),
     };
+    const notes = new Map(workload.notes.map((note) => [note.path, note.content]));
+    app.vault.getMarkdownFiles = () =>
+      [...notes.keys()].map((path) => ({ path, name: path.split("/").pop()!, stat: { mtime: 0 } }));
+    app.vault.getFileByPath = (path) =>
+      app.vault.getMarkdownFiles().find((file) => file.path === path);
+    app.vault.read = async (file) => notes.get(file.path)!;
+    const emit = (event: string, ...args: any[]) => {
+      for (const listener of app.listeners)
+        if (listener.active && listener.event === event) listener.callback(...args);
+    };
+    Object.assign(app.vault, {
+      createFolder: async (path: string) => {
+        emit("create", { path, children: [] });
+      },
+      create: async (path: string, content: string) => {
+        notes.set(path, content);
+        emit("create", { path });
+      },
+      modify: async (file: { path: string }, content: string) => {
+        notes.set(file.path, content);
+        emit("modify", file);
+      },
+      delete: async (file: { path: string }) => {
+        notes.delete(file.path);
+        emit("delete", file);
+      },
+      rename: async (file: { path: string }, to: string) => {
+        const from = file.path;
+        notes.set(to, notes.get(from)!);
+        notes.delete(from);
+        emit("rename", { path: to }, from);
+      },
+    });
     (app.vault as any).getName = () => marker.vaultName;
     (app.vault.adapter as any).getBasePath = () => marker.expectedPath;
     const originalRead = app.vault.adapter.read;
     app.vault.adapter.read = async (path) =>
       path === ".trama-benchmark-vault" ? JSON.stringify(marker) : originalRead(path);
-    const plugin = projectedPlugin(app);
-    await plugin.onload();
-    expect((plugin as any).index).toBeUndefined();
-    expect((plugin as any).indexLoad).toBeUndefined();
-    expect((plugin as any).maintenance).toBeUndefined();
-    expect((plugin.addSettingTab as ReturnType<typeof vi.fn>).mock.calls).toEqual([
-      [expect.any(TramaSettingsTab)],
-    ]);
-    expect(plugin.registerView).not.toHaveBeenCalled();
-    expect(plugin.registerEvent).not.toHaveBeenCalled();
-    expect(
-      (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(([command]) => command.id)
-    ).toEqual(["run-obsidian-benchmark"]);
-    await plugin.saveSettings({
+    const provider = await startFixtureProvider(marker.runId, deterministicEmbeddingVector);
+    // Split a UTF-8 character between HTTP chunks: transport framing must not alter fixtures.
+    const body = Buffer.from(JSON.stringify({ model: provider.modelId, input: ["東京"] }));
+    const split = body.indexOf(Buffer.from("東京")) + 1;
+    const unicodeResponse = new Promise<string>((resolve, reject) => {
+      const req = request(`${provider.endpoint}/embeddings`, { method: "POST" }, (res) => {
+        let response = "";
+        res.setEncoding("utf8");
+        res.on("data", (part) => {
+          response += part;
+        });
+        res.on("end", () => resolve(response));
+        res.on("error", reject);
+      });
+      req.on("error", reject);
+      req.write(body.subarray(0, split));
+      setTimeout(() => req.end(body.subarray(split)), 20);
+    });
+    const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
       diagnosticsMode: "performance",
-      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "new-model" },
+      embedding: {
+        ...DEFAULT_SETTINGS.embedding,
+        endpoint: provider.endpoint,
+        modelId: provider.modelId,
+      },
+      chat: {
+        ...DEFAULT_SETTINGS.chat,
+        endpoint: provider.endpoint,
+        modelId: provider.modelId,
+      },
     });
-    expect(plugin.getSettings().diagnosticsMode).toBe("performance");
-    expect((plugin as any).index).toBeUndefined();
-    expect((plugin as any).modelRuntime.session).toBeUndefined();
-  });
+    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      expect(JSON.parse(await unicodeResponse).data[0].embedding).toEqual(
+        Array.from(deterministicEmbeddingVector("東京"))
+      );
+      await plugin.onload();
+      await (plugin as any).indexLoad;
+      const index = (plugin as any).index;
+      expect(index).toBeDefined();
+      expect((plugin as any).maintenance).toBeDefined();
+      expect((plugin.addSettingTab as ReturnType<typeof vi.fn>).mock.calls).toEqual([
+        [expect.any(TramaSettingsTab)],
+      ]);
+      expect(plugin.registerView).toHaveBeenCalledTimes(3);
+      expect(plugin.registerEvent).toHaveBeenCalled();
+      expect(
+        (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(([command]) => command.id)
+      ).toEqual(
+        expect.arrayContaining(["open-lente", "open-voce", "open-filo", "run-obsidian-benchmark"])
+      );
+      const rebuild = vi.spyOn(plugin, "rebuildIndex");
+      const fetchProbe = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(JSON.stringify({ runId: "another-run", calls: 0, texts: 0 }), {
+          status: 200,
+        })
+      );
+      try {
+        const refused = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
+        expect(refused.status).toBe("error");
+        expect(refused.error).toContain("provider identity mismatch");
+        expect(rebuild).not.toHaveBeenCalled();
+      } finally {
+        fetchProbe.mockRestore();
+      }
+      const failedUpdate = vi
+        .spyOn(plugin, "updateIndex")
+        .mockRejectedValueOnce(new Error("fixture update failure"));
+      try {
+        const failed = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
+        expect(failed.status).toBe("error");
+        expect(failed.error).toBe("fixture update failure");
+        expect(failed.provider.texts).toBeGreaterThan(0);
+        expect(plugin.getSettings().lente).toEqual(DEFAULT_SETTINGS.lente);
+      } finally {
+        failedUpdate.mockRestore();
+      }
+      const searches = vi.spyOn(LenteSearch.prototype, "search");
+      const report = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
+      expect(searches).toHaveBeenCalledTimes(2);
+      for (const [, options] of searches.mock.calls)
+        expect(options?.signal).toBeInstanceOf(AbortSignal);
+      const query = 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)';
+      const hybrid = await (plugin as any).modelRuntime.lenteSearch.search(query);
+      expect(
+        hybrid.canonicalResults.map((hit: any) => ({
+          path: hit.path,
+          occurrenceOrdinal: hit.ordinal,
+        }))
+      ).toEqual(expectedOutputsV1ByProfile["trama-small"].probes.hybrid);
+      expect(report.status, report.error).toBe("completed");
+      expect(report.version).toBe("trama-obsidian-report-v2");
+      expect(Object.values(report.correctness).every((value) => value === true)).toBe(true);
+      expect(report.publication).toBe("vault-filesystem");
+      expect(report.phases["lexical.batch"].count).toBeGreaterThan(0);
+      expect(report.phases["semantic.overall"].count).toBeGreaterThan(0);
+      expect(report.provider.texts).toBeGreaterThan(0);
+      expect((plugin as any).index).toBe(index);
+      expect((plugin as any).modelRuntime.session).toBeDefined();
+      expect(
+        log.mock.calls.filter(([line]) => line === "[Trama] benchmark_completed")
+      ).toHaveLength(1);
+      const calls = rebuild.mock.calls.length;
+      app.vault.adapter.read = async (path) =>
+        path === ".trama-benchmark-vault" ? "{}" : originalRead(path);
+      await expect((plugin as any).runGeneratedVaultBenchmark(app, marker)).rejects.toThrow(
+        "marker changed"
+      );
+      expect(rebuild).toHaveBeenCalledTimes(calls);
+    } finally {
+      await provider.close();
+    }
+  }, 60_000);
 
   it("keeps the committed runtime untouched when settings persistence rejects", async () => {
     const app = projectedApp();
