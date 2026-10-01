@@ -22,6 +22,23 @@ These commands recreate missing ignored artifacts from committed sources. Obsidi
 does not need to be running during preparation. Rerun them after code changes;
 if the vault is already open, reload Trama (or reopen the vault) to load the new build.
 
+To create both test vaults on a fresh checkout, or update Trama in existing copies:
+
+```sh
+npm run install:plugin -- --test-vaults
+```
+
+This builds once and installs only into the two fixed, marked generated vaults.
+It reuses the demo and benchmark preparation scripts for missing copies. Existing
+vaults keep their notes, settings, index data, and benchmark run; they are not
+regenerated. Existing copies and destination paths pass marker/path/symlink checks
+before preparation or installation starts. It ignores `OBSIDIAN_VAULT_PATH` and
+sends no Obsidian commands or model requests. On a fresh checkout, run `npm ci`
+first, then this single command. Register the generated folders in Obsidian once
+and enable community plugins in those vaults only. Reload Trama or reopen each
+test vault to activate an updated build. A newly created benchmark vault uses
+the default small profile unless `TRAMA_BENCHMARK_PROFILE` is set.
+
 Open `.artifacts/test-vaults/demo/Trama Test Vault` as a vault in Obsidian. Enable
 community plugins and Trama **in that vault only**. The normal commands are
 `Trama: Open Lente`, `Trama: Open Voce`, and `Trama: Open Filo`. This vault has a

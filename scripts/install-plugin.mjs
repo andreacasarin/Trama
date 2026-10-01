@@ -2,9 +2,12 @@ import {
   access,
   copyFile,
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  realpath,
   rename,
   rm,
   writeFile,
@@ -126,8 +129,77 @@ export async function installPlugin({
   return pluginDirectory;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const vaultArgument = process.argv[2] ?? process.env.OBSIDIAN_VAULT_PATH;
-  const installed = await installPlugin({ vaultPath: vaultArgument });
-  process.stdout.write(`Installed ${PLUGIN_ID} in ${installed}\n`);
+async function rejectSymlinks(file) {
+  const stat = await lstat(file);
+  if (stat.isSymbolicLink() || (await realpath(file)) !== file)
+    throw new Error("Refusing a symlink in a test vault.");
+  if (stat.isDirectory())
+    for (const name of await readdir(file)) await rejectSymlinks(path.join(file, name));
 }
+
+async function testVaultExists(vaultPath) {
+  const relative = path.relative(projectRoot, vaultPath);
+  let candidate = projectRoot;
+  for (const segment of ["", ...relative.split(path.sep)]) {
+    candidate = path.join(candidate, segment);
+    let stat;
+    try {
+      stat = await lstat(candidate);
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || (await realpath(candidate)) !== candidate)
+      throw new Error("Refusing a symlinked test vault path.");
+    if (!stat.isDirectory()) throw new Error("Expected a test vault directory.");
+  }
+  return true;
+}
+
+export async function installTestVaults(install = installPlugin) {
+  const { demoVaultPath, validateDemoVault, prepareDemoVault } =
+    await import("./benchmark/demo.mjs");
+  const { benchmarkVaultName, validateGeneratedVault, prepareVault, installBenchmarkPlugin } =
+    await import("./benchmark/obsidian.mjs");
+  const benchmarkPath = path.join(
+    projectRoot,
+    ".artifacts/test-vaults/benchmark",
+    benchmarkVaultName
+  );
+  // Check existing vaults and missing-path ancestors before preparing or updating either.
+  const demoExists = await testVaultExists(demoVaultPath);
+  const benchmarkExists = await testVaultExists(benchmarkPath);
+  if (demoExists) await validateDemoVault();
+  if (benchmarkExists) {
+    await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
+    await rejectSymlinks(benchmarkPath);
+  }
+  if (!demoExists) await prepareDemoVault(); // Already installs Trama.
+  if (!benchmarkExists) await prepareVault();
+  await validateDemoVault();
+  await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
+  await rejectSymlinks(benchmarkPath);
+  if (demoExists) await install({ vaultPath: demoVaultPath, preserveExistingFiles: true });
+  await installBenchmarkPlugin(benchmarkPath, benchmarkVaultName, install);
+  return [demoVaultPath, benchmarkPath].map((vaultPath) =>
+    path.join(vaultPath, ".obsidian/plugins", PLUGIN_ID)
+  );
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args[0]?.startsWith("--") && args[0] !== "--test-vaults"))
+    throw new Error('Usage: npm run install:plugin -- --test-vaults (or "/path/to/vault")');
+  const installed =
+    args[0] === "--test-vaults"
+      ? await installTestVaults()
+      : [await installPlugin({ vaultPath: args[0] ?? process.env.OBSIDIAN_VAULT_PATH })];
+  for (const directory of installed)
+    process.stdout.write(`Installed ${PLUGIN_ID} in ${directory}\n`);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`)
+  main().catch((error) => {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });

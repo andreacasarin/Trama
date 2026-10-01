@@ -59,7 +59,8 @@ export function registerPluginUi(
         dependencies.status,
         dependencies.relatedNotes,
         (kind) => dependencies.status.run(kind),
-        dependencies.stopMaintenance
+        dependencies.stopMaintenance,
+        () => dependencies.getSettings().embedding.modelId.trim().length > 0
       )
   );
   plugin.registerView(

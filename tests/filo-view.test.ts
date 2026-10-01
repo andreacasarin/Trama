@@ -1,9 +1,61 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "obsidian";
 import { FiloView } from "@/ui/filo/FiloView";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 describe("Filo semantic index display", () => {
+  it("asks for model configuration instead of incompatible-vector updates and reacts to configuration", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    status.setCapabilities({
+      availability: "available",
+      lexical: { state: "ready", activity: "idle", searchable: true },
+      semantic: { state: "incompatible", activity: "idle", searchable: false },
+      freshness: "locally-reconciled",
+    });
+    const labels: string[] = [];
+    const root = {
+      empty: () => labels.splice(0),
+      createEl: (_tag: string, options: { text?: string }) => {
+        labels.push(options.text ?? "");
+        return { addEventListener: () => undefined };
+      },
+      createDiv: (options: { text?: string }) => labels.push(options.text ?? ""),
+    };
+    let configured = false;
+    const find = vi.fn();
+    const view = new FiloView(
+      new WorkspaceLeaf(),
+      status,
+      { find },
+      async () => undefined,
+      () => undefined,
+      () => configured
+    );
+    (view as any).root = root;
+    (view as any).activePath = "one.md";
+    (view as any).status = status.getStatus();
+    (view as any).render();
+    expect(labels).toContain(
+      "Select an embedding model in Trama settings, then update the index to discover related notes."
+    );
+    expect(labels).not.toContain("Update index");
+    expect(labels.some((label) => label.includes("incompatible"))).toBe(false);
+    (view as any).app = { workspace: { getActiveFile: () => ({ path: "one.md" }) } };
+    (view as any).refreshRelated();
+    expect(find).not.toHaveBeenCalled();
+
+    configured = true;
+    (view as any).render();
+    expect(labels).toContain(
+      "Stored semantic vectors are incompatible. Update the index to refresh them."
+    );
+    expect(labels).toContain("Update index");
+  });
   it("shows semantic progress and Cancel instead of the idle Update prompt", async () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,

@@ -18,6 +18,13 @@ copy, installs the plugin, and prints its exact folder path. It sends no Obsidia
 CLI commands and performs no benchmark measurements. You do not need a separate
 `npm run build` for this command.
 
+To create missing test vaults or update the plugin in both existing copies, use
+`npm run install:plugin -- --test-vaults` (after `npm ci` on a fresh checkout).
+It builds once and reuses the existing preparation scripts only for missing vaults.
+Existing copies keep their settings, index data, and current benchmark corpus/run.
+It does not run the benchmark or reload Obsidian. See
+[the demo vault instructions](demo-vault.md) for safety and registration details.
+
 1. Open the printed folder as a vault through Obsidian's vault switcher.
 2. Enable community plugins and Trama in **that generated vault only**.
 3. Enable Obsidian's CLI in Settings > General and leave Obsidian running.

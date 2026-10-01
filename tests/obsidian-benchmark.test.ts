@@ -41,6 +41,12 @@ import {
   queryVectorSha256V1,
   sourceDigestsV1,
 } from "../test-vaults/benchmark/contract-v1";
+// @ts-expect-error Standalone Node installer has no emitted declaration.
+import { installTestVaults } from "../scripts/install-plugin.mjs";
+// @ts-expect-error Standalone Node preparation script has no emitted declaration.
+import * as demoHost from "../scripts/benchmark/demo.mjs";
+// @ts-expect-error Standalone Node preparation script has no emitted declaration.
+import * as benchmarkHost from "../scripts/benchmark/obsidian.mjs";
 
 const marker = {
   version: "trama-obsidian-vault-v1",
@@ -63,7 +69,7 @@ const marker = {
   ],
 };
 
-function projectedVault() {
+function projectedVault(includeDemo = false) {
   const vaultPath = benchmarkVaultPath("trama-small", marker.runId);
   const files = new Map<string, string>([
     [
@@ -72,6 +78,18 @@ function projectedVault() {
     ],
     [path.join(vaultPath, ".obsidian/community-plugins.json"), "[]"],
   ]);
+  const demoPath = path.resolve(".artifacts/test-vaults/demo/Trama Test Vault");
+  if (includeDemo) {
+    files.set(
+      path.join(demoPath, ".trama-demo-vault"),
+      JSON.stringify({
+        version: "trama-demo-vault-v1",
+        vaultName: "Trama Test Vault",
+        expectedPath: demoPath,
+      })
+    );
+    files.set(path.join(demoPath, ".obsidian/plugins/trama/data.json"), "{}");
+  }
   const symlinks = new Set<string>();
   const directories = () => {
     const result = new Set<string>();
@@ -113,11 +131,95 @@ function projectedVault() {
       ),
     ] as never;
   });
-  return { vaultPath, files, symlinks };
+  return { vaultPath, demoPath, files, symlinks };
 }
 
 describe("Obsidian benchmark safety and parity", () => {
   beforeEach(() => vi.resetAllMocks());
+  it("reuses preparation only for missing vaults, including a fresh checkout", async () => {
+    for (const [missingDemo, missingBenchmark] of [
+      [true, true],
+      [true, false],
+      [false, true],
+    ]) {
+      const { vaultPath, demoPath, files } = projectedVault(true);
+      const original = new Map(files);
+      for (const file of files.keys())
+        if (
+          (missingDemo && file.startsWith(`${demoPath}/`)) ||
+          (missingBenchmark && file.startsWith(`${vaultPath}/`))
+        )
+          files.delete(file);
+      const restoreFiles = (directory: string) => {
+        for (const [file, contents] of original)
+          if (file.startsWith(`${directory}/`)) files.set(file, contents);
+      };
+      const prepareDemo = vi.spyOn(demoHost, "prepareDemoVault").mockImplementation(async () => {
+        restoreFiles(demoPath);
+        return { vaultPath: demoPath };
+      });
+      const prepareBenchmark = vi
+        .spyOn(benchmarkHost, "prepareVault")
+        .mockImplementation(async () => {
+          restoreFiles(vaultPath);
+          return { vaultPath };
+        });
+      const install = vi.fn(async ({ vaultPath }: { vaultPath: string }) =>
+        path.join(vaultPath, ".obsidian/plugins/trama")
+      );
+      try {
+        await expect(installTestVaults(install)).resolves.toHaveLength(2);
+        expect(prepareDemo).toHaveBeenCalledTimes(missingDemo ? 1 : 0);
+        expect(prepareBenchmark).toHaveBeenCalledTimes(missingBenchmark ? 1 : 0);
+        expect(install.mock.calls.map(([args]) => args.vaultPath)).toEqual(
+          missingDemo ? [vaultPath] : [demoPath, vaultPath]
+        );
+      } finally {
+        prepareDemo.mockRestore();
+        prepareBenchmark.mockRestore();
+      }
+    }
+  });
+
+  it("refuses a symlinked ancestor before preparing missing vaults", async () => {
+    const { demoPath, files, symlinks } = projectedVault(true);
+    for (const file of files.keys()) if (file.startsWith(`${demoPath}/`)) files.delete(file);
+    symlinks.add(path.resolve(".artifacts/test-vaults"));
+    const install = vi.fn();
+    await expect(installTestVaults(install)).rejects.toThrow("symlinked test vault path");
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it("updates both marked test vaults and preflights both before installation", async () => {
+    const { vaultPath, demoPath, files, symlinks } = projectedVault(true);
+    const install = vi.fn(async ({ vaultPath }: { vaultPath: string }) =>
+      path.join(vaultPath, ".obsidian/plugins/trama")
+    );
+    await expect(installTestVaults(install)).resolves.toEqual([
+      path.join(demoPath, ".obsidian/plugins/trama"),
+      path.join(vaultPath, ".obsidian/plugins/trama"),
+    ]);
+    expect(install.mock.calls.map(([args]) => args)).toEqual([
+      { vaultPath: demoPath, preserveExistingFiles: true },
+      { vaultPath, preserveExistingFiles: true },
+    ]);
+    install.mockClear();
+    const markerFile = path.join(vaultPath, ".trama-benchmark-vault");
+    const validMarker = files.get(markerFile)!;
+    files.set(markerFile, "{}");
+    await expect(installTestVaults(install)).rejects.toThrow("invalid benchmark vault");
+    expect(install).not.toHaveBeenCalled();
+    files.set(markerFile, validMarker);
+    const linkedFile = path.join(vaultPath, ".obsidian/plugins/trama/main.js");
+    files.set(linkedFile, "linked");
+    symlinks.add(linkedFile);
+    await expect(installTestVaults(install)).rejects.toThrow("symlink");
+    expect(install).not.toHaveBeenCalled();
+    symlinks.delete(linkedFile);
+    files.set(path.join(demoPath, ".trama-demo-vault"), "{}");
+    await expect(installTestVaults(install)).rejects.toThrow("invalid demo vault");
+    expect(install).not.toHaveBeenCalled();
+  });
   it("accepts only the exact versioned generated-vault marker", async () => {
     expect(parseBenchmarkManifest(JSON.stringify(marker), marker.vaultName)).toEqual(marker);
     for (const altered of [
