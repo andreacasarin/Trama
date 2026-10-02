@@ -25,9 +25,9 @@ export const SEMANTIC_MISSING_INPUTS_SQL = `WITH candidates AS MATERIALIZED (
     row_number() OVER (ORDER BY inputId) AS itemNumber
   FROM candidates
 )
-SELECT inputId,serialization,inputDigest
+SELECT inputId,serialization,inputDigest,inputBytes
 FROM bounded
-WHERE itemNumber<=? AND inputBytes<=?
+WHERE itemNumber<=? AND (itemNumber=1 OR inputBytes<=?)
 ORDER BY inputId`;
 
 const semanticPromotion = (affected: string) => `UPDATE notes AS n

@@ -130,6 +130,7 @@ describe("revision cache database", () => {
           phase.callbackRows === 1
       )
     ).toBe(true);
+    expect(phases.some((phase) => phase.phase === "firstInputLookup")).toBe(false);
     expect(phases.some((phase) => phase.phase === "transaction" && phase.sqlCalls >= 2)).toBe(true);
   });
 
@@ -427,6 +428,14 @@ describe("revision cache database", () => {
     const corpusFingerprint = digest("semantic-candidate-bound");
     const embeddingFingerprint = digest("semantic-candidate-model");
     await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
+    const empty = await client.call("prepareSemanticWork", {
+      embeddingFingerprint,
+      limit: 128,
+      maxInputBytes: 4 * 1024 * 1024,
+    });
+    expect(empty.requests).toEqual([]);
+    expect(empty.hasMore).toBe(false);
+
     const markdown = Array.from({ length: 129 }, (_, index) => `unique-${index}`).join("\n\n");
     await applyTestLexicalRun(client, [{ path: "candidate-bound.md", markdown, size: 80 }]);
 
@@ -451,6 +460,14 @@ describe("revision cache database", () => {
     );
 
     const firstBytes = new TextEncoder().encode(first.requests[0].serialization).byteLength;
+    const zeroLimit = await client.call("prepareSemanticWork", {
+      embeddingFingerprint,
+      limit: 0,
+      maxInputBytes: firstBytes - 1,
+    });
+    expect(zeroLimit.requests).toEqual([]);
+    expect(zeroLimit.hasMore).toBe(true);
+
     const byteBound = await client.call("prepareSemanticWork", {
       embeddingFingerprint,
       limit: 128,
@@ -469,7 +486,7 @@ describe("revision cache database", () => {
       error: {
         code: "limit_exceeded",
         retryable: false,
-        message: expect.stringMatching(/^Semantic input is \d+ bytes; maximum is \d+ bytes\.$/),
+        message: `Semantic input is ${firstBytes} bytes; maximum is ${firstBytes - 1} bytes.`,
       },
     });
   });

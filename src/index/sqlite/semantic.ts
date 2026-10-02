@@ -45,24 +45,6 @@ function embeddingActionKey(
   );
 }
 
-const FIRST_INPUT_SQL = `SELECT length(CAST(ei.serialized_input AS BLOB)) AS inputBytes
-       FROM embedding_inputs ei
-       WHERE EXISTS (
-         SELECT 1
-         FROM chunk_occurrences o
-         JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
-         WHERE o.embedding_input_digest=ei.action_key
-       )
-         AND NOT EXISTS (
-           SELECT 1
-           FROM embedding_cache ec
-           WHERE ec.input_digest=ei.action_key
-             AND ec.embedding_fingerprint=?
-             AND ec.preprocessing=?
-         )
-       ORDER BY ei.input_id
-       LIMIT 1`;
-
 export class SqliteSemanticStore {
   private activePhase?: {
     operation: "prepare" | "commit";
@@ -180,20 +162,6 @@ export class SqliteSemanticStore {
             this.promoteUnrestricted(embeddingFingerprint, preprocessing)
           )
         : this.promoteUnrestricted(embeddingFingerprint, preprocessing);
-    const firstBind = [embeddingFingerprint, preprocessing];
-    const first = measured
-      ? this.phase(
-          "prepare",
-          "firstInputLookup",
-          () => rows(this.db, FIRST_INPUT_SQL, firstBind)[0]
-        )
-      : rows(this.db, FIRST_INPUT_SQL, firstBind)[0];
-    const firstInputBytes = Number(first?.inputBytes ?? 0);
-    if (limit > 0 && firstInputBytes > boundedInputBytes)
-      throw sqliteError(
-        "limit_exceeded",
-        `Semantic input is ${firstInputBytes} bytes; maximum is ${boundedInputBytes} bytes.`
-      );
     const selectBind = [
       embeddingFingerprint,
       preprocessing,
@@ -206,6 +174,12 @@ export class SqliteSemanticStore {
           rows(this.db, SEMANTIC_MISSING_INPUTS_SQL, selectBind)
         )
       : rows(this.db, SEMANTIC_MISSING_INPUTS_SQL, selectBind);
+    const firstInputBytes = Number(selected[0]?.inputBytes ?? 0);
+    if (limit > 0 && firstInputBytes > boundedInputBytes)
+      throw sqliteError(
+        "limit_exceeded",
+        `Semantic input is ${firstInputBytes} bytes; maximum is ${boundedInputBytes} bytes.`
+      );
     const requests = measured
       ? this.phase("prepare", "resultAssembly", () =>
           selected.map((row) => ({
