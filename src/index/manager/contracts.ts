@@ -72,6 +72,14 @@ export type IndexPathMutation =
 
 export type IndexOperationName = "build" | "update" | "rebuild" | "prepare";
 
+export class SemanticProviderError extends Error {
+  constructor(cause: unknown) {
+    super("Embedding provider request failed");
+    this.name = "SemanticProviderError";
+    Object.defineProperty(this, "cause", { value: cause, configurable: true });
+  }
+}
+
 export interface IndexOperationResult {
   readonly operation: IndexOperationName;
   readonly changed: boolean;

@@ -21,6 +21,8 @@ import { sqliteError } from "@/index/sqlite/protocol";
 import { applyLexicalMarkdownBatch, hashMarkdown } from "@/index/sqlite/markdown";
 import type { SqliteLexicalScope } from "@/index/sqlite/protocol";
 import { schemaSql } from "@/index/sqlite/schema";
+import { SQLITE_SCHEMA_9_BUILD_IDENTITY } from "@/build/identity";
+import type { CacheShardPool } from "@/index/sqlite/cache-shards";
 
 interface TestStorage {
   snapshot?: Uint8Array;
@@ -122,7 +124,6 @@ export async function inspectBenchmarkSnapshot(bytes: ArrayBuffer | Uint8Array):
                    o.body AS body,o.embedding_input AS embeddingInput
             FROM notes n JOIN chunk_occurrences o
               ON o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
-            JOIN active_lexical a ON a.occurrence_id=o.occurrence_id
             ORDER BY n.path COLLATE BINARY,o.ordinal`,
       rowMode: "object",
       callback: (row: (typeof rows)[number]) =>
@@ -211,14 +212,14 @@ export async function malformedSchema8Snapshot(
   );
   if (defect === "missing-vector") raw.exec("ALTER TABLE embedding_cache DROP COLUMN vector");
   if (defect === "wrong-fts") {
-    raw.exec("DROP TABLE active_lexical_fts");
+    raw.exec("DROP TABLE lexical_notes_fts");
     raw.exec(
-      "CREATE VIRTUAL TABLE active_lexical_fts USING fts5(body,path_text,filename,content='active_lexical',content_rowid='wrong_id',tokenize='unicode61')"
+      "CREATE VIRTUAL TABLE lexical_notes_fts USING fts5(body,path_text,filename,title,headings,content='lexical_notes',content_rowid='wrong_id',tokenize='unicode61')"
     );
   }
   if (defect === "wrong-index") {
-    raw.exec("DROP INDEX active_lexical_note");
-    raw.exec("CREATE INDEX active_lexical_note ON active_lexical(revision_id,note_id)");
+    raw.exec("DROP INDEX lexical_notes_revision");
+    raw.exec("CREATE INDEX lexical_notes_revision ON lexical_notes(revision_id,note_id)");
   }
   const bytes = new Uint8Array(sqlite.capi.sqlite3_js_db_export(raw.pointer));
   raw.close();
@@ -243,12 +244,30 @@ export async function inspectIndexStateColumns(bytes: ArrayBuffer | Uint8Array):
 export async function snapshotWithUserVersion(
   bytes: ArrayBuffer | Uint8Array,
   version: number,
-  options: { readonly dropIndexState?: boolean } = {}
+  options: {
+    readonly dropIndexState?: boolean;
+    readonly legacySchema9?: boolean;
+    readonly legacySchema10?: boolean;
+  } = {}
 ): Promise<Uint8Array> {
   if (!Number.isSafeInteger(version) || version < 0) throw new Error("Invalid SQLite user version");
   const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
   try {
     opened.raw.exec(`PRAGMA user_version=${version}`);
+    if (options.legacySchema9) {
+      opened.raw
+        .exec(`DROP TRIGGER lexical_notes_ai; DROP TRIGGER lexical_notes_ad; DROP TRIGGER lexical_notes_au;
+        DROP TABLE lexical_notes_fts; DROP INDEX lexical_notes_revision; DROP TABLE lexical_notes;
+        UPDATE index_state SET schema_version=9,protocol_version=9,build_identity='${SQLITE_SCHEMA_9_BUILD_IDENTITY}'`);
+    }
+    if (options.legacySchema10) {
+      opened.raw
+        .exec(`DROP TABLE IF EXISTS cache_artifact_receipts; DROP TABLE IF EXISTS cache_legacy_sources;
+        DROP INDEX IF EXISTS embedding_cache_lookup;
+        ALTER TABLE embedding_cache DROP COLUMN created_at;
+        ALTER TABLE embedding_cache DROP COLUMN task_kind;
+        UPDATE index_state SET schema_version=10,protocol_version=9,build_identity='trama-sqlite-schema-10-protocol-9-heads-fts5-vector-float32-cosine-opfs-sah-v1'`);
+    }
     if (options.dropIndexState) opened.raw.exec("DROP TABLE index_state");
     return await serialized(opened);
   } finally {
@@ -311,13 +330,63 @@ async function serialized(opened: OpenDatabase): Promise<Uint8Array> {
   return new Uint8Array(sqlite.capi.sqlite3_js_db_export(opened.raw.pointer));
 }
 
-export async function inspectSnapshotTables(bytes: ArrayBuffer): Promise<{
+function createCachePool(sqlite: any): CacheShardPool {
+  const files = new Map<string, any>();
+  class PoolDb extends sqlite.oo1.DB {
+    private readonly name: string;
+    constructor(name: string, mode: string) {
+      super(":memory:", mode);
+      this.name = name;
+      const bytes = files.get(name);
+      if (bytes instanceof Uint8Array) {
+        const pointer = sqlite.wasm.allocFromTypedArray(bytes);
+        const flags =
+          sqlite.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite.capi.SQLITE_DESERIALIZE_RESIZEABLE;
+        sqlite.capi.sqlite3_deserialize(
+          this.pointer,
+          "main",
+          pointer,
+          bytes.byteLength,
+          bytes.byteLength,
+          flags
+        );
+      }
+      files.set(name, this);
+    }
+    close() {
+      files.set(this.name, new Uint8Array(sqlite.capi.sqlite3_js_db_export(this.pointer)));
+      super.close();
+    }
+  }
+  return {
+    OpfsSAHPoolDb: PoolDb as unknown as CacheShardPool["OpfsSAHPoolDb"],
+    exportFile(name) {
+      const value = files.get(name);
+      if (value instanceof Uint8Array) return value.slice();
+      if (!value) throw new Error("missing cache candidate");
+      return new Uint8Array(sqlite.capi.sqlite3_js_db_export(value.pointer));
+    },
+    importDb(name, bytes) {
+      files.set(name, (bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes).slice());
+      return 0;
+    },
+    unlink(name) {
+      const value = files.get(name);
+      if (!value) return false;
+      if (!(value instanceof Uint8Array)) value.close();
+      files.delete(name);
+      return true;
+    },
+  };
+}
+
+export async function inspectSnapshotTables(bytes: ArrayBuffer | Uint8Array): Promise<{
   revisions: number;
   occurrences: number;
   inputs: number;
   cache: number;
 }> {
-  const opened = await open(new Uint8Array(bytes));
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
   try {
     const count = (table: string) => {
       let value = 0;
@@ -400,6 +469,8 @@ export function createTestSqliteClient(
   let openedPromise: Promise<OpenDatabase> | undefined;
   const current = () =>
     (openedPromise ??= open(durable.snapshot, options.onSemanticPhase, options.diagnostics));
+  const cachePoolPromise = loadTestSqlite().then(createCachePool);
+  const legacyCandidates = new Map<string, OpenDatabase>();
   const persist = async (opened: OpenDatabase) => {
     durable.snapshot = await serialized(opened);
   };
@@ -424,7 +495,17 @@ export function createTestSqliteClient(
       method === "preparePublication" ||
       method === "finalizePublication" ||
       method === "inspectPublication" ||
-      method === "adoptPublication";
+      method === "adoptPublication" ||
+      method === "prepareCacheShard" ||
+      method === "ingestCacheShard" ||
+      method === "extractLegacyCacheShard" ||
+      method === "markLegacyCacheSource" ||
+      method === "maintainCache" ||
+      method === "recordCacheShard" ||
+      method === "recordCacheRetirements" ||
+      method === "listCacheRetirements" ||
+      method === "completeCacheRetirement" ||
+      method === "resetLocalDatabase";
     if (isMaintenance) {
       if (maintenance) throw sqliteError("busy", "SQLite maintenance is in progress", true);
       maintenance = true;
@@ -459,8 +540,100 @@ export function createTestSqliteClient(
             );
           }
           break;
+        case "resetLocalDatabase": {
+          const state = opened.database.getState();
+          opened.database.close();
+          durable.snapshot = undefined;
+          openedPromise = open(undefined, options.onSemanticPhase, options.diagnostics);
+          opened = await openedPromise;
+          result = opened.database.boot(
+            state.corpusFingerprint,
+            state.dimensions,
+            state.embeddingFingerprint,
+            state.buildIdentity
+          );
+          break;
+        }
         case "getState":
           return opened.database.getState();
+        case "prepareCacheShard":
+          result = await opened.database.prepareCacheShard(
+            await cachePoolPromise,
+            value.afterActionKey,
+            value.taskKind,
+            value.profile,
+            value.sourceDigests,
+            value.presentDigests,
+            value.maxPayloadBytes,
+            value.now
+          );
+          break;
+        case "ingestCacheShard":
+          result = await opened.database.ingestCacheShard(
+            await cachePoolPromise,
+            value.bytes,
+            value.digest
+          );
+          break;
+        case "extractLegacyCacheShard": {
+          let candidate = legacyCandidates.get(value.digest);
+          if (!candidate) {
+            if (!value.bytes)
+              throw sqliteError("invalid_request", "Legacy cache source bytes are missing");
+            candidate = await open(new Uint8Array(value.bytes));
+            const state = opened.database.getState();
+            candidate.database.validateSnapshot(
+              state.corpusFingerprint,
+              state.dimensions,
+              state.embeddingFingerprint,
+              state.buildIdentity
+            );
+            legacyCandidates.set(value.digest, candidate);
+          }
+          result = await candidate.database.prepareCacheShard(
+            await cachePoolPromise,
+            value.afterActionKey
+          );
+          if (!result) {
+            candidate.database.close();
+            legacyCandidates.delete(value.digest);
+          }
+          break;
+        }
+        case "hasLegacyCacheSource":
+          result = opened.database.hasLegacyCacheSource(value.digest);
+          break;
+        case "markLegacyCacheSource":
+          opened.database.markLegacyCacheSource(value.digest);
+          result = { marked: true };
+          break;
+        case "maintainCache":
+          result = opened.database.maintainCache(value.now);
+          break;
+        case "recordCacheShard":
+          opened.database.recordCacheShard(
+            value.digest,
+            value.profile,
+            value.taskKind,
+            value.actionKeys
+          );
+          result = { recorded: true };
+          break;
+        case "recordCacheRetirements":
+          await opened.database.recordCacheRetirements(
+            value.sourceDigests,
+            value.replacementDigests,
+            value.now
+          );
+          result = { recorded: true };
+          break;
+        case "listCacheRetirements":
+          result = opened.database.listCacheRetirements();
+          break;
+        case "completeCacheRetirement":
+          opened.database.completeCacheRetirement(value.sourceDigest, value.now);
+          result = { completed: true };
+          break;
         case "markIncomplete":
           result = opened.database.markIncomplete();
           break;
@@ -504,6 +677,21 @@ export function createTestSqliteClient(
             value.embeddingFingerprint,
             value.preprocessing
           );
+          break;
+        case "lookupQueryVector":
+          result = await opened.database.lookupQueryVector(value.query, value.embeddingFingerprint);
+          break;
+        case "storeQueryVector":
+          await opened.database.storeQueryVector(
+            value.query,
+            value.embeddingFingerprint,
+            value.dimensions,
+            value.vector
+          );
+          result = { stored: true };
+          break;
+        case "selectEmbeddingProfile":
+          result = opened.database.selectEmbeddingProfile(value.fingerprint);
           break;
         case "clearSemanticCache":
           result = opened.database.clearSemanticCache();

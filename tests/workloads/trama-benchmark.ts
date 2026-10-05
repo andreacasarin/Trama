@@ -450,7 +450,11 @@ class BenchmarkEmbedding implements EmbeddingModel {
 class MemoryPublicationAdapter implements PublicationDataAdapter {
   readonly binary = new Map<string, ArrayBuffer>();
   async exists(path: string): Promise<boolean> {
-    return this.binary.has(path);
+    const prefix = `${path}/`;
+    return (
+      this.binary.has(path) ||
+      [...this.binary.keys()].some((candidate) => candidate.startsWith(prefix))
+    );
   }
   async readBinary(path: string): Promise<ArrayBuffer> {
     const value = this.binary.get(path);
@@ -471,6 +475,15 @@ class MemoryPublicationAdapter implements PublicationDataAdapter {
   }
   async remove(path: string): Promise<void> {
     this.binary.delete(path);
+  }
+  async list(path: string): Promise<{ files: readonly string[]; folders: readonly string[] }> {
+    const prefix = `${path}/`;
+    return {
+      files: [...this.binary.keys()]
+        .filter((candidate) => candidate.startsWith(prefix))
+        .map((candidate) => candidate.slice(prefix.length)),
+      folders: [],
+    };
   }
 }
 
@@ -630,6 +643,7 @@ export async function runTramaBenchmark(
   const scenarios: Record<string, BenchmarkScenario> = {};
   let indexingStarted = 0;
   let restarted: IndexManager | undefined;
+  let indexDisposed = false;
   try {
     const measure = async <T extends { changed?: boolean; converged?: boolean } | void>(
       name: string,
@@ -704,10 +718,23 @@ export async function runTramaBenchmark(
       rssAfter = memorySampler.stop();
       return { changed: result.published, converged: result.published };
     });
-    const publicationBytes = await publication.store.read();
-    const publicationOutput = publicationBytes
-      ? await inspectBenchmarkSnapshot(publicationBytes)
-      : undefined;
+    const sourcePublishedState = await index.getState();
+    const cacheShards = await publication.store.listCacheShards();
+    let publicationBytes = 0;
+    let cacheShardsValid = cacheShards.length > 0;
+    for (const shard of cacheShards) {
+      const bytes = await publication.store.readCacheShard(shard.path);
+      publicationBytes += bytes.byteLength;
+      cacheShardsValid &&=
+        bytes.byteLength > 0 &&
+        bytes.byteLength <= 4_194_304 &&
+        createHash("sha256").update(new Uint8Array(bytes)).digest("hex") === shard.digest;
+    }
+    await index.dispose();
+    indexDisposed = true;
+    const sourcePublishedOutput = await inspectBenchmarkSnapshot(
+      await snapshotFor(initialIdentity)
+    );
     const restartedIdentity = {};
     const restartedManager = manager(
       vault,
@@ -728,12 +755,25 @@ export async function runTramaBenchmark(
       restartedManager,
       new PublicationStore(publicationAdapter, { directory: "Trama/index" })
     );
+    let importedCompatibleVectorCount: number | undefined;
     const adopted = await measure("publicationAdopt", async () => {
       await restartedManager.load();
       const result = await restartedPublication.adoptCurrent();
-      return { changed: result.adopted, converged: result.adopted };
+      const imported = await restartedManager.getState();
+      importedCompatibleVectorCount = imported?.compatibleVectorCount;
+      const synchronized = await restartedManager.synchronize(signal);
+      const semantic = await restartedManager.prepareSemantic(signal);
+      const recovered = await restartedManager.getState();
+      const cacheCountMatches =
+        imported?.compatibleVectorCount === sourcePublishedState?.compatibleVectorCount;
+      const converged =
+        result.adopted &&
+        cacheCountMatches &&
+        synchronized.converged &&
+        semantic.converged &&
+        recovered?.semanticReady === true;
+      return { changed: result.adopted, converged };
     });
-    const adoptedOutput = await inspectBenchmarkSnapshot(await snapshotFor(restartedIdentity));
 
     const query = workload.queries.find((candidate) => candidate.id === "hostile")!;
     const lente = new LenteSearch(restartedManager, {
@@ -810,7 +850,39 @@ export async function runTramaBenchmark(
       });
     });
 
-    const finalState = await restartedManager.getState();
+    const recoveredState = await restartedManager.getState();
+    const providerTextsBeforeWarmRestart = counters.providerTexts;
+    await restartedManager.dispose();
+    restarted = undefined;
+    const warmRestart = manager(
+      vault,
+      new BenchmarkEmbedding(
+        workload,
+        counters,
+        sampleMemory,
+        diagnostics,
+        options.onProviderBatch
+      ),
+      restartedIdentity,
+      counters,
+      sampleMemory,
+      diagnostics
+    );
+    restarted = warmRestart;
+    await warmRestart.load();
+    const warmState = await warmRestart.getState();
+    const warmSemantic = await warmRestart.prepareSemantic(signal);
+    await new LenteSearch(warmRestart, {
+      getMtime: (path) => vault.mtimes.get(path) ?? null,
+    }).search(query.text);
+    const finalState = await warmRestart.getState();
+    const warmRestartRetainedIndex =
+      warmState?.noteCount === recoveredState?.noteCount &&
+      warmState?.chunkCount === recoveredState?.chunkCount &&
+      warmState?.semanticHeadCount === recoveredState?.semanticHeadCount &&
+      warmSemantic.converged &&
+      finalState?.semanticReady === true;
+    const warmRestartNoProviderWork = counters.providerTexts === providerTextsBeforeWarmRestart;
     const rpcLatencyMs = Object.fromEntries(
       Object.entries(counters.rpcElapsedMs).map(([method, values]) => [
         method,
@@ -849,6 +921,8 @@ export async function runTramaBenchmark(
       published,
       adopted,
     ].every((result) => result?.converged !== false);
+    await warmRestart.dispose();
+    restarted = undefined;
     const finalOutput = await inspectBenchmarkSnapshot(await snapshotFor(restartedIdentity));
     const digestCounts = (value: typeof initialOutput) =>
       createHash("sha256").update(JSON.stringify(value.perPathOccurrenceCounts)).digest("hex");
@@ -857,22 +931,11 @@ export async function runTramaBenchmark(
         path: result.path,
         ...(result.ordinal === undefined ? {} : { occurrenceOrdinal: result.ordinal }),
       }));
-    const adoptedPublicSemanticState = finalState && {
-      semanticEligibleCount: finalState.semanticEligibleCount,
-      semanticHeadCount: finalState.semanticHeadCount,
-      semanticLagCount: finalState.semanticLagCount,
-      semanticMissingCount: finalState.semanticMissingCount,
-      compatibleVectorCount: finalState.compatibleVectorCount,
-      semanticReady: finalState.semanticReady,
-    };
     const publishedMatchesAdopted = Boolean(
-      publicationOutput &&
-      JSON.stringify(publicationOutput.perPathOccurrenceCounts) ===
+      cacheShardsValid &&
+      JSON.stringify(sourcePublishedOutput.perPathOccurrenceCounts) ===
         JSON.stringify(finalOutput.perPathOccurrenceCounts) &&
-      publicationOutput.occurrenceContentSha256 === finalOutput.occurrenceContentSha256 &&
-      JSON.stringify(publicationOutput.semanticState) ===
-        JSON.stringify(finalOutput.semanticState) &&
-      JSON.stringify(publicationOutput.semanticState) === JSON.stringify(adoptedPublicSemanticState)
+      sourcePublishedOutput.occurrenceContentSha256 === finalOutput.occurrenceContentSha256
     );
     const expected = expectedOutputsV1ByProfile[workload.profile.id];
     const sourceDigest = workloadSourceDigest(workload);
@@ -899,14 +962,7 @@ export async function runTramaBenchmark(
         perPathOccurrenceCountsSha256: digestCounts(finalOutput),
         occurrenceContentSha256: finalOutput.occurrenceContentSha256,
       },
-      semantic: publicationOutput?.semanticState ?? {
-        semanticEligibleCount: 0,
-        semanticHeadCount: 0,
-        semanticLagCount: 0,
-        semanticMissingCount: 0,
-        compatibleVectorCount: 0,
-        semanticReady: false,
-      },
+      semantic: finalOutput.semanticState,
       probes: {
         lexical: identities(latestLexical?.results ?? []),
         hybrid: identities(latestLente?.canonicalResults ?? []),
@@ -932,7 +988,7 @@ export async function runTramaBenchmark(
       lifecycle: {
         initialState: "fresh empty SQLite index, fixture vault populated, no publication present",
         completion:
-          "semantic cache converged, scoped mutations reconciled, publication adopted, and pinned outputs match",
+          "semantic cache shards imported, the vault rebuilt locally, cached semantic work promoted, and pinned outputs match",
         resetBoundary:
           "each invocation creates a new vault, SQLite client identity, publication adapter, and deterministic embedding fixture",
       },
@@ -984,7 +1040,7 @@ export async function runTramaBenchmark(
       },
       bytes: {
         package: packageBytes(),
-        publication: publicationBytes?.byteLength ?? "unsupported",
+        publication: publicationBytes || "unsupported",
       },
       memory: {
         processRssBefore: rssBefore,
@@ -1002,7 +1058,10 @@ export async function runTramaBenchmark(
           initialState?.noteCount === workload.notes.length &&
           initialState.chunkCount === workload.profile.targetChunks,
         semanticUncachedConverged: uncached?.converged === true,
-        semanticCachedNoProviderWork: scenarios.semanticCached.providerTexts === 0,
+        semanticCachedNoProviderWork:
+          scenarios.semanticCached.providerTexts === 0 &&
+          scenarios.publicationAdopt.providerTexts === 0 &&
+          warmRestartNoProviderWork,
         semanticPartialConverged: partial?.converged === true,
         semanticResultsPresent: semanticScores.length > 0,
         semanticScoresFinite: semanticScores.every((score) => Number.isFinite(score)),
@@ -1010,10 +1069,12 @@ export async function runTramaBenchmark(
           finalState?.noteCount === vault.notes.size && finalState.chunkCount === expectedChunks,
         allMutationsConverged: allConverged,
         publicationPublished: published?.changed === true,
-        publicationAdopted: adopted?.changed === true,
+        publicationAdopted:
+          adopted?.changed === true &&
+          recoveredState?.compatibleVectorCount === sourcePublishedState?.compatibleVectorCount,
         publishedOutputMatchesAdopted: publishedMatchesAdopted,
         initialOutputSnapshotInspected: initialOutput.occurrenceCount === initialState?.chunkCount,
-        finalOutputSnapshotInspected: adoptedOutput.occurrenceCount === finalState?.chunkCount,
+        finalOutputSnapshotInspected: finalOutput.occurrenceCount === finalState?.chunkCount,
         sourceDigestPinned: sourceDigest === sourceDigestsV1[workload.profile.id],
         outputOracleMatches: JSON.stringify(actualOracle) === JSON.stringify(expected),
         occurrenceContentMatches:
@@ -1023,7 +1084,9 @@ export async function runTramaBenchmark(
         mutationArithmeticMatches:
           finalOutput.occurrenceCount === expectedFinalOccurrenceCount &&
           finalOutput.noteCount === expectedFinalNoteCount,
-        publishedSemanticMatchesAdopted: publishedMatchesAdopted,
+        publishedSemanticMatchesAdopted:
+          importedCompatibleVectorCount === sourcePublishedState?.compatibleVectorCount &&
+          warmRestartRetainedIndex,
         providerIdentityMatches:
           deterministicProviderChallengeDigest() === deterministicProviderChallengeSha256,
         queryVectorIdentityMatches: workloadQueryVectorDigest(workload) === queryVectorSha256V1,
@@ -1073,7 +1136,7 @@ export async function runTramaBenchmark(
   } finally {
     memorySampler.stop();
     clearTimeout(timeout);
-    await index.dispose().catch(() => undefined);
+    if (!indexDisposed) await index.dispose().catch(() => undefined);
     await restarted?.dispose().catch(() => undefined);
   }
 }

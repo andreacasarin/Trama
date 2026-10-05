@@ -241,30 +241,61 @@ describe("semantic index module", () => {
   it("does not read or hash notes after a failed SQLite boot", async () => {
     const reads: string[] = [];
     const vault = {
-      listMarkdownPaths: async () => ["note.md"],
+      ...fixture({ "note.md": "alpha" }),
       readMarkdown: async (path: string) => {
         reads.push(path);
         return { path, content: "alpha" };
       },
-      isMarkdownAvailable: async () => true,
     };
-    const base = createTestSqliteClient({});
-    const methods: string[] = [];
-    const client = new SqliteWorkerClient(undefined, async (method, payload, requestSignal) => {
-      methods.push(method);
-      if (method === "boot") throw sqliteError("storage_unavailable", "SQLite boot failed", true);
-      return base.call(method, payload, requestSignal);
-    });
+    const worker = new HandshakeWorker();
+    worker.postMessage = ((value: any, transfer?: readonly ArrayBuffer[]) => {
+      worker.messages.push({ value, transfer });
+      if (value.type === "trama-runtime-handshake") {
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
+          })
+        );
+      } else {
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              v: SQLITE_PROTOCOL_VERSION,
+              id: value.id,
+              ok: false,
+              error: {
+                code: "storage_unavailable",
+                message: "SQLite boot failed",
+                retryable: true,
+              },
+            },
+          })
+        );
+      }
+    }) as any;
+    const client = new SqliteWorkerClient(worker);
     const setup = new IndexManager(vault, embeddings(), "http://127.0.0.1:1234/v1", "embed", {
       sqliteClient: client,
     });
 
     await expect(setup.load()).resolves.toBe(false);
+    expect(worker.terminated).toBe(true);
+    expect((client as any).closed).toBe(true);
+    expect(client.pendingCount).toBe(0);
+    expect((setup as any).runtime.client).toBeUndefined();
+    expect((setup as any).runtime.loadError).toMatchObject({
+      error: { code: "storage_unavailable", message: "SQLite boot failed", retryable: true },
+    });
     await expect(setup.synchronize(signal)).rejects.toMatchObject({
       error: { code: "storage_unavailable", message: "SQLite boot failed", retryable: true },
     });
     expect(reads).toEqual([]);
-    expect(methods).toEqual(["boot"]);
+    expect(worker.messages.map(({ value }) => value.method).filter(Boolean)).toEqual(["boot"]);
   });
 
   it("surfaces a safe actionable error when the SQLite Worker cannot start", async () => {
@@ -410,6 +441,57 @@ describe("semantic index module", () => {
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
     );
     expect(setup.model.embed).toHaveBeenCalledTimes(1);
+    setup.model.embed.mockClear();
+    setup.model.embed.mockRejectedValueOnce(new Error("provider offline"));
+    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
+    expect(setup.model.embed).not.toHaveBeenCalled();
+  });
+
+  it("keeps the full 80-per-channel hybrid candidate pool for Lente", async () => {
+    const contents = Object.fromEntries([
+      ...Array.from({ length: 90 }, (_, index) => [
+        `lexical-${String(index).padStart(3, "0")}.md`,
+        "needle lexical result",
+      ]),
+      ...Array.from({ length: 90 }, (_, index) => [
+        `semantic-${String(index).padStart(3, "0")}.md`,
+        "semantic-only-token result",
+      ]),
+    ]);
+    const model = {
+      dimensions: 2,
+      embed: vi.fn(async (texts: readonly string[]) =>
+        texts.map((text) =>
+          text === "needle" || text.includes("semantic-only-token") ? [1, 0] : [0, 1]
+        )
+      ),
+    };
+    const setup = manager(contents, {}, model);
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+
+    const result = await new LenteSearch(setup.manager, { getMtime: () => 1 }).search("needle");
+    const expectedPaths = Array.from({ length: 80 }, (_, index) => [
+      `semantic-${String(index).padStart(3, "0")}.md`,
+      `lexical-${String(index).padStart(3, "0")}.md`,
+    ]).flat();
+
+    expect(result.mode).toBe("hybrid");
+    expect(result.canonicalResults).toHaveLength(160);
+    expect(result.canonicalResults?.map(({ path }) => path)).toEqual(expectedPaths);
+    expect(new Set(result.canonicalResults?.map(({ path }) => path)).size).toBe(160);
+    for (let index = 0; index < 80; index++) {
+      expect(result.canonicalResults?.[index * 2]).toMatchObject({
+        semanticScore: expect.any(Number),
+        fusedScore: 1 / (60 + index + 1),
+      });
+      expect(result.canonicalResults?.[index * 2 + 1]).toMatchObject({
+        lexicalScore: expect.any(Number),
+        fusedScore: 1 / (60 + index + 1),
+      });
+    }
   });
 
   it("reports semantic preparation against the whole missing-vector count", async () => {

@@ -159,8 +159,13 @@ async function testVaultExists(vaultPath) {
 export async function installTestVaults(install = installPlugin) {
   const { demoVaultPath, validateDemoVault, prepareDemoVault } =
     await import("./benchmark/demo.mjs");
-  const { benchmarkVaultName, validateGeneratedVault, prepareVault, installBenchmarkPlugin } =
-    await import("./benchmark/obsidian.mjs");
+  const {
+    benchmarkVaultName,
+    upgradeLegacyGeneratedVault,
+    validateGeneratedVault,
+    prepareVault,
+    installBenchmarkPlugin,
+  } = await import("./benchmark/obsidian.mjs");
   const benchmarkPath = path.join(
     projectRoot,
     ".artifacts/test-vaults/benchmark",
@@ -171,6 +176,7 @@ export async function installTestVaults(install = installPlugin) {
   const benchmarkExists = await testVaultExists(benchmarkPath);
   if (demoExists) await validateDemoVault();
   if (benchmarkExists) {
+    await upgradeLegacyGeneratedVault(benchmarkPath, benchmarkVaultName);
     await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
     await rejectSymlinks(benchmarkPath);
   }
@@ -194,6 +200,14 @@ async function main() {
     args[0] === "--test-vaults"
       ? await installTestVaults()
       : [await installPlugin({ vaultPath: args[0] ?? process.env.OBSIDIAN_VAULT_PATH })];
+  if (args[0] === "--test-vaults") {
+    process.stdout.write("\nGenerated test vaults (add both folders to Obsidian):\n");
+    process.stdout.write(`Demo: ${path.resolve(installed[0], "../../..")}\n`);
+    process.stdout.write(`Benchmark: ${path.resolve(installed[1], "../../..")}\n`);
+    process.stdout.write(
+      "Enable Community plugins and Trama in both vaults. In the benchmark vault, open Settings > General, enable Command line interface, and follow its registration prompt for benchmarks.\n\n"
+    );
+  }
   for (const directory of installed)
     process.stdout.write(`Installed ${PLUGIN_ID} in ${directory}\n`);
 }

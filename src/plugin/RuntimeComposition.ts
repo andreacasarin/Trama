@@ -1,4 +1,5 @@
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
+import { diagnosticTimer, emitTramaDiagnostic } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { MaintenanceScheduler, type MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
 import {
@@ -131,14 +132,46 @@ export function composeRuntime(
       },
       publish: async () => {
         warningOrigin = "publication";
-        const result = await publication.publish();
-        if (result.published && !result.warning) host.onPublicationSuccess(manager);
-        return result;
+        const elapsed = diagnosticTimer(host.diagnostics, "performance");
+        try {
+          const result = await publication.publish();
+          if (result.published && !result.warning) host.onPublicationSuccess(manager);
+          return result;
+        } finally {
+          if (elapsed)
+            emitTramaDiagnostic(host.diagnostics, {
+              tier: "performance",
+              facets: ["index", "publication"],
+              area: "index",
+              event: "phase",
+              operation: "publication",
+              phase: "overall",
+              durationMs: elapsed(),
+            });
+        }
       },
       adoptCurrent: async () => {
         warningOrigin = "check";
         try {
-          return await publication.adoptCurrent();
+          const elapsed = diagnosticTimer(host.diagnostics, "performance");
+          let result: AdoptionResult;
+          try {
+            result = await publication.adoptCurrent();
+          } finally {
+            if (elapsed)
+              emitTramaDiagnostic(host.diagnostics, {
+                tier: "performance",
+                facets: ["index", "adoption"],
+                area: "index",
+                event: "phase",
+                operation: "adoption",
+                phase: "overall",
+                durationMs: elapsed(),
+              });
+          }
+          const cached = await manager.promoteCachedSemantic(new AbortController().signal);
+          host.onIndexOperation(manager, cached.changed);
+          return result;
         } finally {
           warningOrigin = "publication";
         }
@@ -168,18 +201,26 @@ export function composeRuntime(
       host.onInitialState(manager, loaded);
       const usable = loaded && manager.capabilities().availability !== "unavailable";
       if (usable && host.isCurrent(manager)) {
-        const result = await scheduler.checkPublication();
-        if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
-        // Catch vault changes missed while stopped; adoption and replacement already own convergence.
-        if (
-          host.isAutomaticMaintenanceEnabled() &&
-          host.isCurrent(manager) &&
-          !result.adopted &&
-          !result.replacementRequired
-        ) {
-          manager.requestFullRecovery();
-          scheduler.invalidate(result.ignored === "missing");
-        }
+        // Local SQLite lexical state is ready before synchronized cache ingestion
+        // starts. Shards add vectors but never replace local note heads or FTS.
+        void scheduler.checkPublication().then((result) => {
+          if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
+          if (
+            settings.automaticMaintenance &&
+            host.isCurrent(manager) &&
+            manager.hasPendingSemanticWork()
+          )
+            scheduler.invalidate(false);
+          if (
+            host.isAutomaticMaintenanceEnabled() &&
+            host.isCurrent(manager) &&
+            !result.adopted &&
+            !result.replacementRequired
+          ) {
+            manager.requestFullRecovery();
+            scheduler.invalidate(result.ignored === "missing");
+          }
+        });
       }
       return loaded;
     })

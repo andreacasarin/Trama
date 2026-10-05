@@ -178,7 +178,8 @@ function parseBlocks(
 
 function splitBlock(
   block: Omit<MarkdownBlock, "embeddingInput">,
-  maxInput: number
+  maxInput: number,
+  embeddingHeadingContext: readonly string[]
 ): MarkdownBlock[] {
   const lines = block.body.split("\n");
   const result: MarkdownBlock[] = [];
@@ -192,14 +193,14 @@ function splitBlock(
       body,
       startLine: currentStart,
       endLine,
-      embeddingInput: serializeEmbeddingInput(block.headingContext, body),
+      embeddingInput: serializeEmbeddingInput(embeddingHeadingContext, body),
     });
     current = [];
   };
   const addLine = (line: string, lineNumber: number) => {
     if (!line && !current.length) return;
     const candidate = [...current, line].join("\n");
-    if (serializeEmbeddingInput(block.headingContext, candidate).length <= maxInput) {
+    if (serializeEmbeddingInput(embeddingHeadingContext, candidate).length <= maxInput) {
       if (!current.length) currentStart = lineNumber;
       current.push(line);
       return;
@@ -209,7 +210,7 @@ function splitBlock(
     for (const character of Array.from(line)) {
       const candidatePiece = piece + character;
       if (
-        serializeEmbeddingInput(block.headingContext, candidatePiece).length > maxInput &&
+        serializeEmbeddingInput(embeddingHeadingContext, candidatePiece).length > maxInput &&
         piece
       ) {
         currentStart = lineNumber;
@@ -221,7 +222,7 @@ function splitBlock(
     if (piece) {
       currentStart = lineNumber;
       current = [piece];
-      if (serializeEmbeddingInput(block.headingContext, piece).length >= maxInput)
+      if (serializeEmbeddingInput(embeddingHeadingContext, piece).length >= maxInput)
         flush(lineNumber);
     }
   };
@@ -237,10 +238,12 @@ export function chunkMarkdownBlocks(
 ): readonly MarkdownBlock[] {
   if (!Number.isSafeInteger(maxInput) || maxInput < 1) throw new Error("Invalid chunk size");
   const blocks = parseBlocks(source, signal);
-  for (const block of blocks)
-    if (serializeEmbeddingInput(block.headingContext, "").length > maxInput)
-      throw new Error("Chunk size is smaller than the serialized heading context");
-  const result = blocks.flatMap((block) => splitBlock(block, maxInput));
+  const result = blocks.flatMap((block) => {
+    let context = block.headingContext;
+    while (context.length && serializeEmbeddingInput(context, "").length > maxInput)
+      context = context.slice(1);
+    return splitBlock(block, maxInput, context);
+  });
   if (result.some((block) => block.embeddingInput.length > maxInput))
     throw new Error("Chunk splitter exceeded its serialized input bound");
   return result;

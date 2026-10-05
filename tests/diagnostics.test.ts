@@ -155,6 +155,45 @@ describe("diagnostic timing", () => {
       },
     });
   });
+
+  it("allows only the bounded publication snapshot phase names", () => {
+    const records: any[] = [];
+    const diagnostics = createTramaDiagnostics(
+      () => "performance",
+      (record) => records.push(record),
+      { sessionId: "publication-phases" }
+    );
+    const phases = [
+      "snapshotValidation",
+      "snapshotLiveExport",
+      "snapshotCandidateImport",
+      "snapshotBootPrune",
+      "snapshotCandidateExport",
+      "snapshotLiveReopen",
+      "snapshotIntegrityCheck",
+      "snapshotForeignKeyCheck",
+      "snapshotPointerOwnership",
+      "snapshotFtsCoverage",
+      "snapshotSemanticCoverage",
+      "snapshotVectorValidation",
+      "lexicalInputPreparation",
+      "lexicalSqlMutation",
+    ];
+    for (const phase of phases)
+      diagnostics.emit({
+        tier: "performance",
+        facets: ["index", "publication", "worker"],
+        area: "index",
+        event: "phase",
+        operation: "publication",
+        phase: phase as any,
+        durationMs: 1,
+        nested: true,
+      });
+    expect(records.map((record) => record.phase)).toEqual(phases);
+    expect(records.every((record) => record.nested)).toBe(true);
+    expect(JSON.stringify(records)).not.toContain("payload");
+  });
   it("measures elapsed milliseconds from a shared clock and clamps clock regressions", () => {
     let now = 100;
     const elapsedMs = startDiagnosticTimer(() => now);

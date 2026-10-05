@@ -16,6 +16,7 @@ import {
 } from "./core";
 import type { LexicalRunRegistry } from "./lexical-context";
 import { LEXICAL_RENAME_LOOKUP_SQL } from "./hot-queries";
+import { lexicalNoteText, pruneUnreferencedRevisions } from "./lexical-full-note";
 
 export class SqliteLexicalBatchStore {
   constructor(
@@ -52,7 +53,7 @@ export class SqliteLexicalBatchStore {
     let semanticChanged = 0;
     // This TEMP table is operation-local and is dropped after the transaction.
     this.context.db.exec(
-      "CREATE TEMP TABLE lexical_batch_notes(note_id INTEGER PRIMARY KEY,revision_id INTEGER NOT NULL,path_text TEXT NOT NULL,filename TEXT NOT NULL)"
+      "CREATE TEMP TABLE lexical_batch_notes(note_id INTEGER PRIMARY KEY,revision_id INTEGER NOT NULL,path_text TEXT NOT NULL,filename TEXT NOT NULL,title TEXT NOT NULL,headings TEXT NOT NULL,body TEXT NOT NULL)"
     );
     try {
       transaction(this.context.db, () => {
@@ -105,42 +106,48 @@ export class SqliteLexicalBatchStore {
               bind: [noteId, input.revisionDigest, EXTRACTION_VERSION, CHUNK_ALGORITHM_VERSION],
             });
             revisionId = Number(rows(this.context.db, "SELECT last_insert_rowid() AS id")[0].id);
-            for (const block of input.blocks) {
-              this.context.db.exec({
-                sql: "INSERT INTO chunk_occurrences(revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,heading_context,embedding_input,embedding_input_digest,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                bind: [
-                  revisionId,
-                  noteId,
-                  `${input.revisionDigest}:${block.ordinal}`,
-                  block.ordinal,
-                  block.kind,
-                  block.startLine,
-                  block.endLine,
-                  block.displayText,
-                  JSON.stringify(block.headingContext),
-                  block.embeddingInput,
-                  block.embeddingInputDigest,
-                  block.displayText,
-                ],
-              });
-              this.context.db.exec({
-                sql: "INSERT INTO embedding_inputs(embedding_fingerprint,serialized_input,preprocessing,action_key) VALUES(?,?,?,?) ON CONFLICT(action_key) DO NOTHING",
-                bind: [
-                  "input-v1",
-                  block.embeddingInput,
-                  "serialized-v1",
-                  block.embeddingInputDigest,
-                ],
-              });
-            }
+            const occurrenceRows = JSON.stringify(
+              input.blocks.map((block) => [
+                block.ordinal,
+                `${input.revisionDigest}:${block.ordinal}`,
+                block.kind,
+                block.startLine,
+                block.endLine,
+                block.displayText,
+                JSON.stringify(block.headingContext),
+                block.embeddingInput,
+                block.embeddingInputDigest,
+              ])
+            );
+            this.context.db.exec({
+              sql: `INSERT INTO chunk_occurrences(revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,heading_context,embedding_input,embedding_input_digest,body)
+                    SELECT ?,?,json_extract(j.value,'$[1]'),CAST(json_extract(j.value,'$[0]') AS INTEGER),
+                           json_extract(j.value,'$[2]'),json_extract(j.value,'$[3]'),json_extract(j.value,'$[4]'),
+                           json_extract(j.value,'$[5]'),json_extract(j.value,'$[6]'),json_extract(j.value,'$[7]'),
+                           json_extract(j.value,'$[8]'),json_extract(j.value,'$[5]')
+                    FROM json_each(?) AS j
+                    ORDER BY CAST(j.key AS INTEGER)`,
+              bind: [revisionId, noteId, occurrenceRows],
+            });
+            this.context.db.exec({
+              sql: `INSERT INTO embedding_inputs(embedding_fingerprint,serialized_input,preprocessing,action_key)
+                    SELECT ?,json_extract(j.value,'$[7]'),?,json_extract(j.value,'$[8]')
+                    FROM json_each(?) AS j
+                    ORDER BY CAST(j.key AS INTEGER)
+                    ON CONFLICT(action_key) DO NOTHING`,
+              bind: ["input-v1", "serialized-v1", occurrenceRows],
+            });
           }
           this.context.db.exec({
-            sql: "INSERT INTO lexical_batch_notes(note_id,revision_id,path_text,filename) VALUES(?,?,?,?)",
+            sql: "INSERT INTO lexical_batch_notes(note_id,revision_id,path_text,filename,title,headings,body) VALUES(?,?,?,?,?,?,?)",
             bind: [
               noteId,
               revisionId,
               input.path,
               input.path.slice(input.path.lastIndexOf("/") + 1).replace(/\.md$/i, ""),
+              lexicalNoteText(input).title,
+              lexicalNoteText(input).headings,
+              lexicalNoteText(input).body,
             ],
           });
           changed++;
@@ -148,25 +155,6 @@ export class SqliteLexicalBatchStore {
           if (note?.semantic_revision_id != null) semanticChanged++;
         }
         if (changed || renamed) {
-          this.context.db.exec({
-            sql: `INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename)
-                  SELECT 'delete',a.occurrence_id,a.body,a.path_text,a.filename
-                  FROM active_lexical a JOIN lexical_batch_notes b ON b.note_id=a.note_id`,
-          });
-          this.context.db.exec({
-            sql: "DELETE FROM active_lexical WHERE note_id IN (SELECT note_id FROM lexical_batch_notes)",
-          });
-          this.context.db.exec({
-            sql: `INSERT INTO active_lexical(occurrence_id,note_id,revision_id,path_text,filename,body)
-                  SELECT o.occurrence_id,o.note_id,o.revision_id,b.path_text,b.filename,o.display_text
-                  FROM chunk_occurrences o JOIN lexical_batch_notes b
-                    ON b.note_id=o.note_id AND b.revision_id=o.revision_id`,
-          });
-          this.context.db.exec({
-            sql: `INSERT INTO active_lexical_fts(rowid,body,path_text,filename)
-                  SELECT a.occurrence_id,a.body,a.path_text,a.filename
-                  FROM active_lexical a JOIN lexical_batch_notes b ON b.note_id=a.note_id`,
-          });
           this.context.db.exec({
             sql: `UPDATE notes
                   SET lexical_revision_id=(SELECT revision_id FROM lexical_batch_notes b WHERE b.note_id=notes.note_id),
@@ -182,6 +170,16 @@ export class SqliteLexicalBatchStore {
                   WHERE id=1`,
             bind: [semanticChanged],
           });
+          this.context.db.exec({
+            sql: `INSERT INTO lexical_notes(note_id,revision_id,path_text,filename,title,headings,body)
+                  SELECT b.note_id,b.revision_id,b.path_text,b.filename,b.title,b.headings,b.body
+                  FROM lexical_batch_notes b WHERE 1
+                  ON CONFLICT(note_id) DO UPDATE SET
+                    revision_id=excluded.revision_id,path_text=excluded.path_text,
+                    filename=excluded.filename,title=excluded.title,
+                    headings=excluded.headings,body=excluded.body`,
+          });
+          pruneUnreferencedRevisions(this.context.db);
         }
       });
       run.renamesApplied = true;
@@ -237,23 +235,14 @@ export class SqliteLexicalBatchStore {
       }
       if (changed) {
         this.context.db.exec({
-          sql: `INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename)
-                SELECT 'delete',a.occurrence_id,a.body,a.path_text,a.filename
-                FROM active_lexical a JOIN lexical_run_renames r ON r.note_id=a.note_id`,
-        });
-        this.context.db.exec({
           sql: "UPDATE notes SET path=(SELECT to_path FROM lexical_run_renames r WHERE r.note_id=notes.note_id) WHERE note_id IN (SELECT note_id FROM lexical_run_renames)",
         });
         this.context.db.exec({
-          sql: `UPDATE active_lexical
-                SET path_text=(SELECT to_path FROM lexical_run_renames r WHERE r.note_id=active_lexical.note_id),
-                    filename=(SELECT filename FROM lexical_run_renames r WHERE r.note_id=active_lexical.note_id)
+          sql: `UPDATE lexical_notes
+                SET path_text=(SELECT to_path FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id),
+                    filename=(SELECT filename FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id),
+                    title=(SELECT filename FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id)
                 WHERE note_id IN (SELECT note_id FROM lexical_run_renames)`,
-        });
-        this.context.db.exec({
-          sql: `INSERT INTO active_lexical_fts(rowid,body,path_text,filename)
-                SELECT a.occurrence_id,a.body,a.path_text,a.filename
-                FROM active_lexical a JOIN lexical_run_renames r ON r.note_id=a.note_id`,
         });
       }
     } finally {

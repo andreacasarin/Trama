@@ -19,7 +19,7 @@ export const expectedOutputsV1ByProfile = {
       semanticHeadCount: 24,
       semanticLagCount: 0,
       semanticMissingCount: 0,
-      compatibleVectorCount: 125,
+      compatibleVectorCount: 131,
       semanticReady: true,
     },
     probes: {
@@ -29,31 +29,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/😀.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "mutations/renamed.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "00-special/Ä.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "00-special/a.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00004/note-4.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00005/note-5.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00006/note-6.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -104,35 +80,43 @@ export const expectedOutputsV1ByProfile = {
           path: "notes/00020/note-20.md",
           occurrenceOrdinal: 3,
         },
-      ],
-      hybrid: [
         {
-          path: "mutations/renamed.md",
-          occurrenceOrdinal: 2,
+          path: "notes/00021/note-21.md",
+          occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00006/note-6.md",
-          occurrenceOrdinal: 1,
+          path: "notes/00022/note-22.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00023/note-23.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "00-special/😀.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "00-special/Ä.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "00-special/a.md",
           occurrenceOrdinal: 3,
         },
+      ],
+      hybrid: [
         {
           path: "notes/00012/note-12.md",
           occurrenceOrdinal: 3,
         },
         {
+          path: "mutations/renamed.md",
+          occurrenceOrdinal: 2,
+        },
+        {
           path: "notes/00013/note-13.md",
           occurrenceOrdinal: 0,
-        },
-        {
-          path: "00-special/😀.md",
-          occurrenceOrdinal: 5,
-        },
-        {
-          path: "notes/00003/note-3.md",
-          occurrenceOrdinal: 5,
         },
         {
           path: "notes/00014/note-14.md",
@@ -140,10 +124,6 @@ export const expectedOutputsV1ByProfile = {
         },
         {
           path: "notes/00010/note-10.md",
-          occurrenceOrdinal: 4,
-        },
-        {
-          path: "00-special/Ä.md",
           occurrenceOrdinal: 4,
         },
         {
@@ -163,24 +143,28 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00011/note-11.md",
-          occurrenceOrdinal: 3,
+          path: "notes/00003/note-3.md",
+          occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00004/note-4.md",
-          occurrenceOrdinal: 0,
+          path: "notes/00011/note-11.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/00021/note-21.md",
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00005/note-5.md",
-          occurrenceOrdinal: 0,
+          path: "notes/00006/note-6.md",
+          occurrenceOrdinal: 1,
         },
         {
           path: "notes/00020/note-20.md",
           occurrenceOrdinal: 2,
+        },
+        {
+          path: "00-special/a.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/00019/note-19.md",
@@ -199,54 +183,70 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
+          path: "00-special/😀.md",
+          occurrenceOrdinal: 5,
+        },
+        {
+          path: "00-special/Ä.md",
+          occurrenceOrdinal: 4,
+        },
+        {
+          path: "notes/00004/note-4.md",
+          occurrenceOrdinal: 0,
+        },
+        {
           path: "mutations/added.md",
           occurrenceOrdinal: 1,
+        },
+        {
+          path: "notes/00005/note-5.md",
+          occurrenceOrdinal: 0,
         },
       ],
       filo: [
         {
+          path: "notes/00015/note-15.md",
+        },
+        {
+          path: "notes/00006/note-6.md",
+        },
+        {
+          path: "notes/00016/note-16.md",
+        },
+        {
           path: "notes/00009/note-9.md",
         },
         {
-          path: "notes/00018/note-18.md",
-        },
-        {
-          path: "notes/00022/note-22.md",
-        },
-        {
-          path: "00-special/😀.md",
-        },
-        {
-          path: "notes/00020/note-20.md",
+          path: "mutations/renamed.md",
         },
         {
           path: "notes/00021/note-21.md",
         },
         {
-          path: "notes/00006/note-6.md",
+          path: "notes/00019/note-19.md",
         },
       ],
       voce: [
         {
-          path: "mutations/renamed.md",
-        },
-        {
-          path: "notes/00006/note-6.md",
-        },
-        {
-          path: "00-special/a.md",
-        },
-        {
           path: "notes/00012/note-12.md",
+        },
+        {
+          path: "mutations/renamed.md",
         },
         {
           path: "notes/00013/note-13.md",
         },
         {
-          path: "00-special/😀.md",
+          path: "notes/00014/note-14.md",
         },
         {
-          path: "notes/00003/note-3.md",
+          path: "notes/00010/note-10.md",
+        },
+        {
+          path: "notes/00009/note-9.md",
+        },
+        {
+          path: "notes/00022/note-22.md",
         },
       ],
     },
@@ -271,7 +271,7 @@ export const expectedOutputsV1ByProfile = {
       semanticHeadCount: 1100,
       semanticLagCount: 0,
       semanticMissingCount: 0,
-      compatibleVectorCount: 9993,
+      compatibleVectorCount: 10003,
       semanticReady: true,
     },
     probes: {
@@ -281,114 +281,118 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/😀.md",
+          path: "notes/00100/note-100.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "mutations/renamed.md",
+          path: "notes/00101/note-101.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/Ä.md",
+          path: "notes/00102/note-102.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/a.md",
+          path: "notes/00103/note-103.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00004/note-4.md",
+          path: "notes/00104/note-104.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00005/note-5.md",
+          path: "notes/00105/note-105.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00006/note-6.md",
+          path: "notes/00106/note-106.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00009/note-9.md",
+          path: "notes/00107/note-107.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00010/note-10.md",
+          path: "notes/00108/note-108.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00011/note-11.md",
+          path: "notes/00109/note-109.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00012/note-12.md",
+          path: "notes/00110/note-110.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00013/note-13.md",
+          path: "notes/00111/note-111.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00014/note-14.md",
+          path: "notes/00112/note-112.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00015/note-15.md",
+          path: "notes/00113/note-113.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00016/note-16.md",
+          path: "notes/00114/note-114.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00017/note-17.md",
+          path: "notes/00115/note-115.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00018/note-18.md",
+          path: "notes/00116/note-116.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00019/note-19.md",
+          path: "notes/00117/note-117.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00020/note-20.md",
+          path: "notes/00118/note-118.md",
           occurrenceOrdinal: 3,
         },
       ],
       hybrid: [
         {
-          path: "notes/00054/note-54.md",
-          occurrenceOrdinal: 5,
-        },
-        {
-          path: "notes/00030/note-30.md",
-          occurrenceOrdinal: 0,
-        },
-        {
-          path: "notes/00012/note-12.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00013/note-13.md",
-          occurrenceOrdinal: 0,
-        },
-        {
-          path: "notes/00039/note-39.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "notes/00116/note-116.md",
           occurrenceOrdinal: 1,
+        },
+        {
+          path: "notes/00100/note-100.md",
+          occurrenceOrdinal: 6,
+        },
+        {
+          path: "notes/00106/note-106.md",
+          occurrenceOrdinal: 4,
+        },
+        {
+          path: "notes/00149/note-149.md",
+          occurrenceOrdinal: 2,
+        },
+        {
+          path: "notes/00171/note-171.md",
+          occurrenceOrdinal: 6,
         },
         {
           path: "notes/00156/note-156.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00149/note-149.md",
-          occurrenceOrdinal: 2,
+          path: "notes/00150/note-150.md",
+          occurrenceOrdinal: 7,
+        },
+        {
+          path: "notes/00146/note-146.md",
+          occurrenceOrdinal: 1,
+        },
+        {
+          path: "notes/00158/note-158.md",
+          occurrenceOrdinal: 0,
         },
         {
           path: "notes/00286/note-286.md",
@@ -403,15 +407,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "00-special/😀.md",
-          occurrenceOrdinal: 3,
+          path: "notes/00163/note-163.md",
+          occurrenceOrdinal: 7,
         },
         {
           path: "notes/00490/note-490.md",
           occurrenceOrdinal: 1,
         },
         {
-          path: "mutations/renamed.md",
+          path: "notes/00101/note-101.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -419,23 +423,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "00-special/Ä.md",
+          path: "notes/00102/note-102.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00061/note-61.md",
-          occurrenceOrdinal: 0,
-        },
-        {
-          path: "notes/00041/note-41.md",
-          occurrenceOrdinal: 2,
         },
         {
           path: "notes/00671/note-671.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "00-special/a.md",
+          path: "notes/00103/note-103.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -443,19 +439,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00004/note-4.md",
+          path: "notes/00104/note-104.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00100/note-100.md",
-          occurrenceOrdinal: 6,
         },
         {
           path: "notes/00779/note-779.md",
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00005/note-5.md",
+          path: "notes/00105/note-105.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -463,23 +455,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00006/note-6.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00088/note-88.md",
-          occurrenceOrdinal: 7,
-        },
-        {
-          path: "notes/00059/note-59.md",
-          occurrenceOrdinal: 7,
-        },
-        {
           path: "notes/00998/note-998.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00009/note-9.md",
+          path: "notes/00107/note-107.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -487,87 +467,63 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00010/note-10.md",
+          path: "notes/00108/note-108.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00074/note-74.md",
-          occurrenceOrdinal: 0,
         },
         {
           path: "notes/00558/note-558.md",
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00011/note-11.md",
+          path: "notes/00109/note-109.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00150/note-150.md",
-          occurrenceOrdinal: 7,
-        },
-        {
-          path: "notes/00171/note-171.md",
-          occurrenceOrdinal: 6,
-        },
-        {
-          path: "notes/00106/note-106.md",
-          occurrenceOrdinal: 4,
+          path: "notes/00110/note-110.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/00322/note-322.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00014/note-14.md",
+          path: "notes/00111/note-111.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00057/note-57.md",
-          occurrenceOrdinal: 9,
+          path: "notes/00054/note-54.md",
+          occurrenceOrdinal: 5,
+        },
+        {
+          path: "notes/00112/note-112.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/00429/note-429.md",
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00015/note-15.md",
+          path: "notes/00113/note-113.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00101/note-101.md",
-          occurrenceOrdinal: 1,
-        },
-        {
-          path: "notes/00158/note-158.md",
-          occurrenceOrdinal: 0,
         },
         {
           path: "notes/00653/note-653.md",
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00016/note-16.md",
+          path: "notes/00114/note-114.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00146/note-146.md",
-          occurrenceOrdinal: 1,
         },
         {
           path: "notes/00710/note-710.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00017/note-17.md",
+          path: "notes/00115/note-115.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00018/note-18.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00019/note-19.md",
+          path: "notes/00117/note-117.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -575,11 +531,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00020/note-20.md",
+          path: "notes/00118/note-118.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00021/note-21.md",
+          path: "notes/00119/note-119.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -587,7 +543,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00022/note-22.md",
+          path: "notes/00120/note-120.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -595,19 +551,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00023/note-23.md",
+          path: "notes/00121/note-121.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00081/note-81.md",
-          occurrenceOrdinal: 1,
         },
         {
           path: "notes/00425/note-425.md",
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00024/note-24.md",
+          path: "notes/00122/note-122.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -615,7 +567,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00025/note-25.md",
+          path: "notes/00123/note-123.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -623,7 +575,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00026/note-26.md",
+          path: "notes/00124/note-124.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -631,31 +583,23 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00027/note-27.md",
+          path: "notes/00125/note-125.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00130/note-130.md",
-          occurrenceOrdinal: 0,
         },
         {
           path: "notes/01003/note-1003.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00028/note-28.md",
+          path: "notes/00126/note-126.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00087/note-87.md",
-          occurrenceOrdinal: 8,
         },
         {
           path: "notes/00369/note-369.md",
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00029/note-29.md",
+          path: "notes/00127/note-127.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -663,11 +607,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
+          path: "notes/00128/note-128.md",
+          occurrenceOrdinal: 3,
+        },
+        {
           path: "notes/00759/note-759.md",
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00031/note-31.md",
+          path: "notes/00129/note-129.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -675,7 +623,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00032/note-32.md",
+          path: "notes/00130/note-130.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -683,7 +631,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00033/note-33.md",
+          path: "notes/00131/note-131.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -691,7 +639,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00034/note-34.md",
+          path: "notes/00132/note-132.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -699,7 +647,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00035/note-35.md",
+          path: "notes/00133/note-133.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -707,7 +655,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00036/note-36.md",
+          path: "notes/00134/note-134.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -715,7 +663,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00037/note-37.md",
+          path: "notes/00135/note-135.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -723,7 +671,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00038/note-38.md",
+          path: "notes/00136/note-136.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -731,11 +679,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
+          path: "notes/00137/note-137.md",
+          occurrenceOrdinal: 3,
+        },
+        {
           path: "notes/00941/note-941.md",
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00040/note-40.md",
+          path: "notes/00138/note-138.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -743,11 +695,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
+          path: "notes/00139/note-139.md",
+          occurrenceOrdinal: 3,
+        },
+        {
           path: "notes/00302/note-302.md",
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00042/note-42.md",
+          path: "notes/00140/note-140.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -755,7 +711,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00043/note-43.md",
+          path: "notes/00141/note-141.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -763,11 +719,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00044/note-44.md",
+          path: "notes/00142/note-142.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00045/note-45.md",
+          path: "notes/00030/note-30.md",
+          occurrenceOrdinal: 0,
+        },
+        {
+          path: "notes/00143/note-143.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -775,7 +735,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00046/note-46.md",
+          path: "notes/00144/note-144.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -783,7 +743,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00047/note-47.md",
+          path: "notes/00145/note-145.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -791,11 +751,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00048/note-48.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00049/note-49.md",
+          path: "notes/00147/note-147.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -803,7 +759,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00050/note-50.md",
+          path: "notes/00148/note-148.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -811,31 +767,31 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00051/note-51.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "notes/00783/note-783.md",
           occurrenceOrdinal: 1,
-        },
-        {
-          path: "notes/00052/note-52.md",
-          occurrenceOrdinal: 3,
         },
         {
           path: "notes/00946/note-946.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00053/note-53.md",
+          path: "notes/00151/note-151.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00055/note-55.md",
+          path: "notes/00152/note-152.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00056/note-56.md",
+          path: "notes/00039/note-39.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00153/note-153.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00154/note-154.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -843,11 +799,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00531/note-531.md",
+          path: "notes/00155/note-155.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00058/note-58.md",
+          path: "notes/00531/note-531.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -855,11 +811,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00816/note-816.md",
+          path: "notes/00157/note-157.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00060/note-60.md",
+          path: "notes/00816/note-816.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -867,7 +823,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00062/note-62.md",
+          path: "notes/00159/note-159.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00160/note-160.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -875,7 +835,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00063/note-63.md",
+          path: "notes/00161/note-161.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -883,7 +843,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00064/note-64.md",
+          path: "notes/00162/note-162.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -891,19 +851,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00065/note-65.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00066/note-66.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00163/note-163.md",
+          path: "notes/00088/note-88.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00067/note-67.md",
+          path: "notes/00164/note-164.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00165/note-165.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -911,7 +867,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00068/note-68.md",
+          path: "notes/00166/note-166.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -919,11 +875,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00069/note-69.md",
+          path: "notes/00167/note-167.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00070/note-70.md",
+          path: "notes/00168/note-168.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -931,7 +887,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00071/note-71.md",
+          path: "notes/00169/note-169.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -939,7 +895,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00072/note-72.md",
+          path: "notes/00170/note-170.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -947,23 +903,27 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00073/note-73.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "notes/00811/note-811.md",
           occurrenceOrdinal: 7,
+        },
+        {
+          path: "notes/00172/note-172.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/01087/note-1087.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00075/note-75.md",
+          path: "notes/00173/note-173.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00076/note-76.md",
+          path: "notes/00061/note-61.md",
+          occurrenceOrdinal: 0,
+        },
+        {
+          path: "notes/00174/note-174.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -971,7 +931,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00077/note-77.md",
+          path: "notes/00175/note-175.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -979,7 +939,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00078/note-78.md",
+          path: "notes/00176/note-176.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -987,7 +947,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00079/note-79.md",
+          path: "notes/00177/note-177.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -995,54 +955,54 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00080/note-80.md",
+          path: "notes/00178/note-178.md",
           occurrenceOrdinal: 3,
         },
       ],
       filo: [
         {
-          path: "notes/00508/note-508.md",
+          path: "notes/00065/note-65.md",
         },
         {
-          path: "notes/00807/note-807.md",
+          path: "notes/00023/note-23.md",
         },
         {
-          path: "notes/00633/note-633.md",
+          path: "notes/00152/note-152.md",
         },
         {
-          path: "notes/00406/note-406.md",
+          path: "notes/00772/note-772.md",
         },
         {
-          path: "notes/00437/note-437.md",
+          path: "notes/00439/note-439.md",
         },
         {
-          path: "notes/00308/note-308.md",
+          path: "notes/00978/note-978.md",
         },
         {
-          path: "notes/00999/note-999.md",
+          path: "notes/00547/note-547.md",
         },
       ],
       voce: [
         {
-          path: "notes/00054/note-54.md",
-        },
-        {
-          path: "notes/00030/note-30.md",
-        },
-        {
-          path: "notes/00012/note-12.md",
-        },
-        {
-          path: "notes/00013/note-13.md",
-        },
-        {
-          path: "notes/00039/note-39.md",
-        },
-        {
           path: "notes/00116/note-116.md",
         },
         {
+          path: "notes/00100/note-100.md",
+        },
+        {
+          path: "notes/00106/note-106.md",
+        },
+        {
+          path: "notes/00149/note-149.md",
+        },
+        {
+          path: "notes/00171/note-171.md",
+        },
+        {
           path: "notes/00156/note-156.md",
+        },
+        {
+          path: "notes/00150/note-150.md",
         },
       ],
     },
@@ -1067,7 +1027,7 @@ export const expectedOutputsV1ByProfile = {
       semanticHeadCount: 2750,
       semanticLagCount: 0,
       semanticMissingCount: 0,
-      compatibleVectorCount: 24993,
+      compatibleVectorCount: 25003,
       semanticReady: true,
     },
     probes: {
@@ -1077,90 +1037,90 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/😀.md",
+          path: "notes/00250/note-250.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "mutations/renamed.md",
+          path: "notes/00251/note-251.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/Ä.md",
+          path: "notes/00252/note-252.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "00-special/a.md",
+          path: "notes/00253/note-253.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00004/note-4.md",
+          path: "notes/00254/note-254.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00005/note-5.md",
+          path: "notes/00255/note-255.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00006/note-6.md",
+          path: "notes/00256/note-256.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00009/note-9.md",
+          path: "notes/00257/note-257.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00010/note-10.md",
+          path: "notes/00258/note-258.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00011/note-11.md",
+          path: "notes/00259/note-259.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00012/note-12.md",
+          path: "notes/00260/note-260.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00013/note-13.md",
+          path: "notes/00261/note-261.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00014/note-14.md",
+          path: "notes/00262/note-262.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00015/note-15.md",
+          path: "notes/00263/note-263.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00016/note-16.md",
+          path: "notes/00264/note-264.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00017/note-17.md",
+          path: "notes/00265/note-265.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00018/note-18.md",
+          path: "notes/00266/note-266.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00019/note-19.md",
+          path: "notes/00267/note-267.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00020/note-20.md",
+          path: "notes/00268/note-268.md",
           occurrenceOrdinal: 3,
         },
       ],
       hybrid: [
         {
-          path: "notes/00054/note-54.md",
-          occurrenceOrdinal: 5,
+          path: "notes/00286/note-286.md",
+          occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00030/note-30.md",
-          occurrenceOrdinal: 0,
+          path: "notes/00322/note-322.md",
+          occurrenceOrdinal: 7,
         },
         {
           path: "notes/02162/note-2162.md",
@@ -1175,7 +1135,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "00-special/😀.md",
+          path: "notes/00250/note-250.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1183,7 +1143,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "mutations/renamed.md",
+          path: "notes/00251/note-251.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1191,7 +1151,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "00-special/Ä.md",
+          path: "notes/00252/note-252.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1199,19 +1159,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "00-special/a.md",
+          path: "notes/00253/note-253.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00286/note-286.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00004/note-4.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00039/note-39.md",
+          path: "notes/00254/note-254.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1219,7 +1171,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00005/note-5.md",
+          path: "notes/00255/note-255.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1227,7 +1179,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00006/note-6.md",
+          path: "notes/00256/note-256.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1235,19 +1187,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00009/note-9.md",
+          path: "notes/00257/note-257.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00116/note-116.md",
-          occurrenceOrdinal: 1,
         },
         {
           path: "notes/00384/note-384.md",
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00010/note-10.md",
+          path: "notes/00258/note-258.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1255,7 +1203,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00011/note-11.md",
+          path: "notes/00259/note-259.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1263,23 +1211,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00012/note-12.md",
+          path: "notes/00260/note-260.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00156/note-156.md",
-          occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00149/note-149.md",
-          occurrenceOrdinal: 2,
         },
         {
           path: "notes/00671/note-671.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00013/note-13.md",
+          path: "notes/00261/note-261.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1287,7 +1227,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00014/note-14.md",
+          path: "notes/00262/note-262.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1295,7 +1235,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00015/note-15.md",
+          path: "notes/00263/note-263.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1303,7 +1243,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00016/note-16.md",
+          path: "notes/00264/note-264.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1311,7 +1251,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00017/note-17.md",
+          path: "notes/00265/note-265.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1319,7 +1259,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00018/note-18.md",
+          path: "notes/00266/note-266.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1327,7 +1267,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00019/note-19.md",
+          path: "notes/00267/note-267.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1335,7 +1275,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00020/note-20.md",
+          path: "notes/00268/note-268.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1343,7 +1283,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00021/note-21.md",
+          path: "notes/00269/note-269.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1351,7 +1291,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00022/note-22.md",
+          path: "notes/00270/note-270.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1359,7 +1299,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00023/note-23.md",
+          path: "notes/00271/note-271.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1367,7 +1307,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00024/note-24.md",
+          path: "notes/00272/note-272.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1375,7 +1315,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00025/note-25.md",
+          path: "notes/00273/note-273.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1383,7 +1323,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00026/note-26.md",
+          path: "notes/00274/note-274.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1391,7 +1331,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00027/note-27.md",
+          path: "notes/00275/note-275.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1399,7 +1339,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00028/note-28.md",
+          path: "notes/00276/note-276.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1407,23 +1347,23 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00029/note-29.md",
+          path: "notes/00277/note-277.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00100/note-100.md",
-          occurrenceOrdinal: 6,
         },
         {
           path: "notes/02697/note-2697.md",
           occurrenceOrdinal: 2,
         },
         {
+          path: "notes/00278/note-278.md",
+          occurrenceOrdinal: 3,
+        },
+        {
           path: "notes/02259/note-2259.md",
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00031/note-31.md",
+          path: "notes/00279/note-279.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1431,7 +1371,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00032/note-32.md",
+          path: "notes/00280/note-280.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1439,7 +1379,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00033/note-33.md",
+          path: "notes/00281/note-281.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1447,7 +1387,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00034/note-34.md",
+          path: "notes/00282/note-282.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1455,7 +1395,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00035/note-35.md",
+          path: "notes/00283/note-283.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1463,7 +1403,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00036/note-36.md",
+          path: "notes/00284/note-284.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1471,7 +1411,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00037/note-37.md",
+          path: "notes/00285/note-285.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1479,35 +1419,31 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00038/note-38.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "notes/01111/note-1111.md",
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00322/note-322.md",
-          occurrenceOrdinal: 7,
-        },
-        {
-          path: "notes/00040/note-40.md",
+          path: "notes/00287/note-287.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00150/note-150.md",
-          occurrenceOrdinal: 7,
+          path: "notes/00288/note-288.md",
+          occurrenceOrdinal: 3,
         },
         {
           path: "notes/01667/note-1667.md",
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00041/note-41.md",
+          path: "notes/00289/note-289.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00042/note-42.md",
+          path: "notes/00054/note-54.md",
+          occurrenceOrdinal: 5,
+        },
+        {
+          path: "notes/00290/note-290.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1515,7 +1451,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00043/note-43.md",
+          path: "notes/00291/note-291.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1523,7 +1459,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00044/note-44.md",
+          path: "notes/00292/note-292.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1531,19 +1467,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00045/note-45.md",
+          path: "notes/00293/note-293.md",
           occurrenceOrdinal: 3,
-        },
-        {
-          path: "notes/00158/note-158.md",
-          occurrenceOrdinal: 0,
         },
         {
           path: "notes/00710/note-710.md",
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00046/note-46.md",
+          path: "notes/00294/note-294.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1551,7 +1483,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00047/note-47.md",
+          path: "notes/00295/note-295.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1559,7 +1491,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00048/note-48.md",
+          path: "notes/00296/note-296.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1567,11 +1499,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00049/note-49.md",
+          path: "notes/00297/note-297.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00050/note-50.md",
+          path: "notes/00156/note-156.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00298/note-298.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1579,11 +1515,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00051/note-51.md",
+          path: "notes/00299/note-299.md",
           occurrenceOrdinal: 3,
         },
         {
-          path: "notes/00052/note-52.md",
+          path: "notes/00149/note-149.md",
+          occurrenceOrdinal: 2,
+        },
+        {
+          path: "notes/00300/note-300.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1591,7 +1531,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00053/note-53.md",
+          path: "notes/00301/note-301.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/00116/note-116.md",
+          occurrenceOrdinal: 1,
+        },
+        {
+          path: "notes/00302/note-302.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1599,7 +1547,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 2,
         },
         {
-          path: "notes/00055/note-55.md",
+          path: "notes/00303/note-303.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1607,7 +1555,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00056/note-56.md",
+          path: "notes/00304/note-304.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1615,7 +1563,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00057/note-57.md",
+          path: "notes/00305/note-305.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1623,7 +1571,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00058/note-58.md",
+          path: "notes/00306/note-306.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1631,7 +1579,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00059/note-59.md",
+          path: "notes/00307/note-307.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1639,7 +1587,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00060/note-60.md",
+          path: "notes/00308/note-308.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1647,7 +1595,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00061/note-61.md",
+          path: "notes/00309/note-309.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1655,7 +1603,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00062/note-62.md",
+          path: "notes/00310/note-310.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1663,7 +1611,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00063/note-63.md",
+          path: "notes/00311/note-311.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1671,7 +1619,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00064/note-64.md",
+          path: "notes/00312/note-312.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1679,7 +1627,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00065/note-65.md",
+          path: "notes/00313/note-313.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1687,7 +1635,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00066/note-66.md",
+          path: "notes/00314/note-314.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1695,7 +1643,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00067/note-67.md",
+          path: "notes/00315/note-315.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1703,7 +1651,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 4,
         },
         {
-          path: "notes/00068/note-68.md",
+          path: "notes/00316/note-316.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1711,7 +1659,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 9,
         },
         {
-          path: "notes/00069/note-69.md",
+          path: "notes/00317/note-317.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1719,7 +1667,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00070/note-70.md",
+          path: "notes/00318/note-318.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1727,7 +1675,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 7,
         },
         {
-          path: "notes/00071/note-71.md",
+          path: "notes/00319/note-319.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1735,7 +1683,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00072/note-72.md",
+          path: "notes/00320/note-320.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1743,7 +1691,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 1,
         },
         {
-          path: "notes/00073/note-73.md",
+          path: "notes/00321/note-321.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1751,15 +1699,11 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 0,
         },
         {
-          path: "notes/00074/note-74.md",
-          occurrenceOrdinal: 3,
-        },
-        {
           path: "notes/00863/note-863.md",
           occurrenceOrdinal: 5,
         },
         {
-          path: "notes/00075/note-75.md",
+          path: "notes/00323/note-323.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1767,7 +1711,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 8,
         },
         {
-          path: "notes/00076/note-76.md",
+          path: "notes/00324/note-324.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1775,7 +1719,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00077/note-77.md",
+          path: "notes/00325/note-325.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1783,7 +1727,7 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00078/note-78.md",
+          path: "notes/00326/note-326.md",
           occurrenceOrdinal: 3,
         },
         {
@@ -1791,7 +1735,15 @@ export const expectedOutputsV1ByProfile = {
           occurrenceOrdinal: 6,
         },
         {
-          path: "notes/00079/note-79.md",
+          path: "notes/00327/note-327.md",
+          occurrenceOrdinal: 3,
+        },
+        {
+          path: "notes/01574/note-1574.md",
+          occurrenceOrdinal: 7,
+        },
+        {
+          path: "notes/00328/note-328.md",
           occurrenceOrdinal: 3,
         },
       ],
@@ -1800,30 +1752,30 @@ export const expectedOutputsV1ByProfile = {
           path: "notes/01445/note-1445.md",
         },
         {
-          path: "notes/00508/note-508.md",
+          path: "notes/00023/note-23.md",
         },
         {
-          path: "notes/01332/note-1332.md",
+          path: "notes/01291/note-1291.md",
         },
         {
-          path: "notes/01825/note-1825.md",
+          path: "notes/01503/note-1503.md",
         },
         {
-          path: "notes/02052/note-2052.md",
+          path: "notes/02360/note-2360.md",
         },
         {
-          path: "notes/01125/note-1125.md",
+          path: "notes/00152/note-152.md",
         },
         {
-          path: "notes/00807/note-807.md",
+          path: "notes/00772/note-772.md",
         },
       ],
       voce: [
         {
-          path: "notes/00054/note-54.md",
+          path: "notes/00286/note-286.md",
         },
         {
-          path: "notes/00030/note-30.md",
+          path: "notes/00322/note-322.md",
         },
         {
           path: "notes/00003/note-3.md",
@@ -1832,13 +1784,13 @@ export const expectedOutputsV1ByProfile = {
           path: "notes/02162/note-2162.md",
         },
         {
-          path: "00-special/😀.md",
+          path: "notes/00250/note-250.md",
         },
         {
           path: "notes/02376/note-2376.md",
         },
         {
-          path: "mutations/renamed.md",
+          path: "notes/00251/note-251.md",
         },
       ],
     },

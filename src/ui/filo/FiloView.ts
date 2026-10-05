@@ -45,7 +45,7 @@ export class FiloView extends ItemView {
     private relatedSource: RelatedSource | RelatedNotes | undefined,
     private readonly runIndex: (kind: "index" | "reindex") => Promise<void>,
     private readonly cancelIndex: () => void,
-    private readonly isEmbeddingConfigured: () => boolean = () => true
+    private readonly hasLocalSemanticProfile: () => boolean = () => true
   ) {
     super(leaf);
     this.status = statusSource.getStatus();
@@ -126,7 +126,7 @@ export class FiloView extends ItemView {
     const path = this.currentPath();
     if (path !== this.activePath) this.expandedPaths.clear();
     this.activePath = path;
-    if (!path || !this.relatedSource || !this.isEmbeddingConfigured() || !this.semanticReady()) {
+    if (!path || !this.relatedSource || !this.hasLocalSemanticProfile() || !this.semanticReady()) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
       this.requestKey = undefined;
@@ -200,10 +200,10 @@ export class FiloView extends ItemView {
       });
       return;
     }
-    if (!this.isEmbeddingConfigured()) {
+    if (!this.hasLocalSemanticProfile()) {
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
-        text: "Select an embedding model in Trama settings, then update the index to discover related notes.",
+        text: "No compatible semantic vectors are available locally. Select a local profile or connect its provider, then update the index.",
       });
       return;
     }

@@ -17,6 +17,26 @@ export function closeWorkerDatabase<Database extends { close(): void }, Connecti
   database?.close();
 }
 
+export type OpfsDatabasePool = Pick<OpfsSAHPoolUtilLike, "unlink">;
+
+/** Replaces only the live index file within the same identity-scoped pool. */
+export function resetWorkerDatabase<
+  Database extends { close(): void },
+  Connection,
+  Pool extends OpfsDatabasePool,
+>(
+  state: WorkerStorageState<Database, Connection, Pool>,
+  pool: Pool,
+  open: () => { readonly connection: Connection; readonly database: Database }
+): Database {
+  closeWorkerDatabase(state);
+  pool.unlink("/index.sqlite3");
+  const replacement = open();
+  state.connection = replacement.connection;
+  state.database = replacement.database;
+  return replacement.database;
+}
+
 export interface OpfsSAHPoolUtilLike {
   exportFile(name: string): Uint8Array | ArrayBuffer;
   importDb(name: string, bytes: Uint8Array | ArrayBuffer): number;

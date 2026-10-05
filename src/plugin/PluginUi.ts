@@ -24,6 +24,7 @@ interface PluginUiDependencies {
   readonly contextNoteSuggestions: () => readonly string[];
   readonly getLenteSearch: () => LenteSearchPort | undefined;
   readonly getSettings: () => TramaSettings;
+  readonly hasLocalSemanticProfile: () => boolean;
   readonly stopMaintenance: () => void;
 }
 
@@ -60,7 +61,7 @@ export function registerPluginUi(
         dependencies.relatedNotes,
         (kind) => dependencies.status.run(kind),
         dependencies.stopMaintenance,
-        () => dependencies.getSettings().embedding.modelId.trim().length > 0
+        dependencies.hasLocalSemanticProfile
       )
   );
   plugin.registerView(

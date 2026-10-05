@@ -6,6 +6,7 @@ import {
 } from "@/index/MaintenanceScheduler";
 import type { SemanticPrepareResult } from "@/index/IndexManager";
 import type { PublicationResult, AdoptionResult } from "@/index/publications/PublicationManager";
+import { SemanticProviderError } from "@/index/manager/contracts";
 
 function fixture(semanticConfigured = true) {
   let now = 0;
@@ -106,6 +107,45 @@ function deferred<T>() {
 }
 
 describe("MaintenanceScheduler", () => {
+  it("publishes lexical work on provider failure without suspending or retaining an eager retry", async () => {
+    const f = fixture();
+    f.lexical.mockResolvedValueOnce({ changed: true, converged: true });
+    f.semantic.mockRejectedValueOnce(new SemanticProviderError(new Error("offline")));
+    const update = f.controller.update();
+    await expect(update).rejects.toBeInstanceOf(SemanticProviderError);
+    expect(f.publish).toHaveBeenCalledOnce();
+    expect(f.controller.snapshot.suspended).toBe(false);
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.timers.size).toBe(0);
+  });
+
+  it("continues later lexical edits after an automatic semantic provider failure", async () => {
+    const f = fixture();
+    f.controller.setAutomaticEnabled(true);
+    f.lexical.mockResolvedValue({ changed: true, converged: true });
+    f.semantic.mockRejectedValueOnce(new SemanticProviderError(new Error("offline")));
+    f.controller.invalidate();
+    await f.advance(3_000);
+    await vi.waitFor(() => expect(f.controller.snapshot.lane).toBe("idle"));
+    expect(f.publish).toHaveBeenCalledOnce();
+    expect(f.controller.snapshot.suspended).toBe(false);
+    expect(f.controller.snapshot.pending).toBe(false);
+
+    f.semantic.mockResolvedValue({
+      operation: "prepare",
+      changed: false,
+      converged: true,
+      stored: 0,
+      skipped: 0,
+      state: {} as never,
+    });
+    f.controller.invalidate();
+    await f.advance(3_000);
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+    expect(f.lexical).toHaveBeenCalledTimes(2);
+    expect(f.controller.snapshot.suspended).toBe(false);
+  });
+
   it("escalates quiet delays 3→9→20 seconds once per invalidated automatic attempt", async () => {
     const f = fixture();
     f.controller.setAutomaticEnabled(true);
@@ -401,6 +441,186 @@ describe("MaintenanceScheduler", () => {
     expect(f.controller.snapshot.pending).toBe(true);
     await f.controller.update();
     expect(f.controller.snapshot.suspended).toBe(false);
+  });
+
+  it("pauses automatic maintenance during exclusive reset and reschedules after success", async () => {
+    const f = fixture();
+    const reset = deferred<void>();
+    f.controller.setAutomaticEnabled(true);
+    f.controller.invalidate();
+    expect(f.timers.size).toBe(1);
+
+    const resetting = f.controller.resetExclusive(() => reset.promise);
+    await f.settle();
+    expect(f.controller.snapshot).toMatchObject({ lane: "update", phase: "reset", pending: true });
+    expect(f.timers.size).toBe(0);
+    await expect(f.controller.update()).rejects.toMatchObject({ code: "busy", retryable: true });
+    await expect(f.controller.checkPublication()).rejects.toMatchObject({
+      code: "busy",
+      retryable: true,
+    });
+    await expect(f.controller.publishCurrent()).rejects.toMatchObject({
+      code: "busy",
+      retryable: true,
+    });
+
+    reset.resolve();
+    await resetting;
+    expect(f.controller.snapshot).toMatchObject({ lane: "idle", pending: true, suspended: false });
+    expect(f.timers.size).toBe(1);
+    await f.advance(3_000);
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.publish).toHaveBeenCalledOnce();
+  });
+
+  it("allows pending edits but keeps reset recovery idle while automation is disabled", async () => {
+    const f = fixture();
+    f.controller.invalidate();
+    await f.controller.resetExclusive(async () => undefined);
+    expect(f.controller.snapshot).toMatchObject({ lane: "idle", pending: true });
+    expect(f.timers.size).toBe(0);
+    expect(f.lexical).not.toHaveBeenCalled();
+    expect(f.publish).not.toHaveBeenCalled();
+
+    await f.controller.update();
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.lexical).toHaveBeenCalled();
+  });
+
+  it("refuses reset while active or queued explicit maintenance exists", async () => {
+    const f = fixture();
+    const lexical = deferred<{ changed: boolean; converged: boolean }>();
+    f.lexical.mockImplementationOnce(() => lexical.promise);
+    const active = f.controller.update();
+    await f.settle();
+    const queued = f.controller.rebuild();
+    await expect(f.controller.resetExclusive(async () => undefined)).rejects.toMatchObject({
+      code: "busy",
+      retryable: true,
+    });
+    lexical.resolve({ changed: true, converged: true });
+    await Promise.all([active, queued]);
+  });
+
+  it("waits for active adoption, cancels its queued publication, and excludes new lanes", async () => {
+    const f = fixture();
+    const adoption = deferred<AdoptionResult>();
+    const reset = deferred<void>();
+    f.adopt.mockImplementationOnce(() => adoption.promise);
+    const checking = f.controller.checkPublication();
+    await f.settle();
+    expect(f.controller.snapshot.lane).toBe("adoption");
+
+    const publication = f.controller.publishCurrent();
+    let resetStarted = false;
+    const resetting = f.controller.resetExclusive(async () => {
+      resetStarted = true;
+      await reset.promise;
+    });
+    expect(resetStarted).toBe(false);
+    expect(f.controller.snapshot.lane).toBe("adoption");
+    await expect(f.controller.update()).rejects.toMatchObject({ code: "busy" });
+    await expect(f.controller.checkPublication()).rejects.toMatchObject({ code: "busy" });
+    await expect(f.controller.resetExclusive(async () => undefined)).rejects.toMatchObject({
+      code: "busy",
+      retryable: true,
+    });
+
+    adoption.resolve({ adopted: true });
+    await expect(checking).resolves.toMatchObject({ adopted: true });
+    await f.settle();
+    expect(resetStarted).toBe(true);
+    expect(f.controller.snapshot).toMatchObject({ lane: "update", phase: "reset" });
+    await expect(publication).resolves.toBeUndefined();
+    expect(f.publish).not.toHaveBeenCalled();
+    expect(f.lexical).not.toHaveBeenCalled();
+
+    reset.resolve();
+    await resetting;
+    expect(f.controller.snapshot.lane).toBe("idle");
+  });
+
+  it("waits for active explicit maintenance before clearing stores", async () => {
+    const f = fixture();
+    const lexical = deferred<{ changed: boolean; converged: boolean }>();
+    const reset = deferred<void>();
+    f.lexical.mockImplementationOnce(() => lexical.promise);
+    const update = f.controller.update();
+    await f.settle();
+    let resetStarted = false;
+    const resetting = f.controller.resetExclusive(async () => {
+      resetStarted = true;
+      await reset.promise;
+    });
+    expect(resetStarted).toBe(false);
+    expect(f.controller.snapshot.lane).toBe("update");
+    lexical.resolve({ changed: true, converged: true });
+    await update;
+    await f.settle();
+    expect(resetStarted).toBe(true);
+    expect(f.controller.snapshot.phase).toBe("reset");
+    reset.resolve();
+    await resetting;
+  });
+
+  it("does not start a reserved reset after disposal while waiting for adoption", async () => {
+    const f = fixture();
+    const adoption = deferred<AdoptionResult>();
+    f.adopt.mockImplementationOnce(() => adoption.promise);
+    const checking = f.controller.checkPublication();
+    await f.settle();
+    let resetStarted = false;
+    const resetting = f.controller.resetExclusive(async () => {
+      resetStarted = true;
+    });
+    const disposal = f.controller.dispose();
+    adoption.resolve({ adopted: true });
+    await checking;
+    await expect(resetting).rejects.toMatchObject({ code: "busy", retryable: true });
+    await disposal;
+    expect(resetStarted).toBe(false);
+  });
+
+  it("leaves reset incomplete and suspended when either clear step fails", async () => {
+    const f = fixture();
+    await expect(
+      f.controller.resetExclusive(async () => {
+        throw new Error("publication clear failed");
+      })
+    ).rejects.toThrow("publication clear failed");
+    expect(f.controller.snapshot).toMatchObject({
+      lane: "idle",
+      pending: false,
+      suspended: true,
+      error: expect.any(Error),
+    });
+    expect(f.timers.size).toBe(0);
+    expect(f.lexical).not.toHaveBeenCalled();
+    expect(f.publish).not.toHaveBeenCalled();
+  });
+
+  it("does not re-arm after a failed reset until a retry completes both clears", async () => {
+    const f = fixture();
+    f.controller.setAutomaticEnabled(true);
+    f.controller.invalidate();
+    await expect(
+      f.controller.resetExclusive(async () => {
+        throw new Error("publication clear failed");
+      })
+    ).rejects.toThrow("publication clear failed");
+
+    f.controller.setAutomaticEnabled(false);
+    f.controller.setAutomaticEnabled(true);
+    expect(f.timers.size).toBe(0);
+    await f.advance(60_000);
+    expect(f.lexical).not.toHaveBeenCalled();
+    await expect(f.controller.update()).rejects.toMatchObject({ code: "busy", retryable: true });
+
+    await f.controller.resetExclusive(async () => undefined);
+    expect(f.timers.size).toBe(1);
+    await f.advance(3_000);
+    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.lexical).toHaveBeenCalled();
   });
 
   it("dispose waits for deferred semantic work and cancels queued explicit and adoption requests", async () => {

@@ -4,6 +4,8 @@ import type {
   IndexSyncResult,
 } from "@/index/IndexManager";
 import type { PublicationResult, AdoptionResult } from "@/index/publications/PublicationManager";
+import { StructuredError } from "@/domain/contracts";
+import { SemanticProviderError } from "./manager/contracts";
 
 const AUTOMATIC_MAINTENANCE_BASE_MS = 3_000;
 const AUTOMATIC_MAINTENANCE_MULTIPLIER = 3;
@@ -79,6 +81,9 @@ export class MaintenanceScheduler {
   private explicitSequence = 0;
   private idleWaiters: Array<() => void> = [];
   private queuedFenceCancels = new Set<() => void>();
+  private exclusiveReset = false;
+  private resetStopped = false;
+  private resetIncomplete = false;
 
   constructor(
     private readonly port: MaintenancePort,
@@ -103,6 +108,10 @@ export class MaintenanceScheduler {
     if (this.automatic === enabled) return;
     this.automatic = enabled;
     if (enabled) {
+      if (this.resetIncomplete) {
+        this.emit();
+        return;
+      }
       this.suspended = false;
       this.error = undefined;
       this.schedule();
@@ -133,9 +142,61 @@ export class MaintenanceScheduler {
     return this.enqueue("rebuild");
   }
 
+  /** Clears persistent index stores while excluding maintenance and explicit work. */
+  async resetExclusive(run: () => Promise<void>): Promise<void> {
+    if (this.disposed || this.exclusiveReset || this.explicit.length > 0)
+      throw new StructuredError("busy", "Index maintenance is active; retry reset.", true);
+
+    this.exclusiveReset = true;
+    this.resetStopped = false;
+    this.clearTimer();
+    for (const cancel of this.queuedFenceCancels) cancel();
+    this.queuedFenceCancels.clear();
+    const activeCompletion = this.activeCompletion;
+    if (activeCompletion) await activeCompletion;
+    if (this.disposed) {
+      this.exclusiveReset = false;
+      throw new StructuredError("busy", "Index maintenance is active; retry reset.", true);
+    }
+    this.beginActive();
+    this.lane = "update";
+    this.phase = "reset";
+    this.error = undefined;
+    this.emit();
+    let completed = false;
+    try {
+      await run();
+      this.pending = true;
+      this.publicationRequired = true;
+      this.lastEditAt = this.clock.now();
+      this.firstOutstandingAt ??= this.lastEditAt;
+      this.invalidatedCurrentAttempt = false;
+      this.resetIncomplete = false;
+      if (!this.resetStopped) this.suspended = false;
+      completed = true;
+    } catch (error) {
+      this.error = error;
+      this.suspended = true;
+      this.resetIncomplete = true;
+      throw error;
+    } finally {
+      this.exclusiveReset = false;
+      this.lane = "idle";
+      this.phase = undefined;
+      this.emit();
+      for (const resolve of this.idleWaiters.splice(0)) resolve();
+      this.finishActive();
+      if (completed && !this.disposed) this.schedule();
+    }
+  }
+
   /** Publishes the current converged index without repeating lexical or semantic work. */
   async publishCurrent(): Promise<void> {
     if (this.disposed) return;
+    if (this.resetIncomplete)
+      throw new StructuredError("busy", "Index reset is incomplete; retry reset first.", true);
+    if (this.exclusiveReset)
+      throw new StructuredError("busy", "Index reset is in progress; retry later.", true);
     this.suspended = false;
     this.error = undefined;
     let cancelled = false;
@@ -166,6 +227,11 @@ export class MaintenanceScheduler {
   stop(): void {
     this.suspended = true;
     this.clearTimer();
+    if (this.exclusiveReset) {
+      this.resetStopped = true;
+      this.emit();
+      return;
+    }
     this.active?.abort();
     for (const cancel of this.queuedFenceCancels) cancel();
     this.queuedFenceCancels.clear();
@@ -188,6 +254,10 @@ export class MaintenanceScheduler {
   /** Check adopts a compatible file or converges and replaces a non-newer incompatible one. */
   async checkPublication(): Promise<AdoptionResult> {
     if (this.disposed) return { adopted: false, ignored: "missing" };
+    if (this.resetIncomplete)
+      throw new StructuredError("busy", "Index reset is incomplete; retry reset first.", true);
+    if (this.exclusiveReset)
+      throw new StructuredError("busy", "Index reset is in progress; retry later.", true);
     let cancelled = false;
     const cancel = () => {
       cancelled = true;
@@ -216,6 +286,14 @@ export class MaintenanceScheduler {
 
   private enqueue(kind: "update" | "rebuild"): Promise<void> {
     if (this.disposed) return Promise.resolve();
+    if (this.resetIncomplete)
+      return Promise.reject(
+        new StructuredError("busy", "Index reset is incomplete; retry reset first.", true)
+      );
+    if (this.exclusiveReset)
+      return Promise.reject(
+        new StructuredError("busy", "Index reset is in progress; retry later.", true)
+      );
     this.suspended = false;
     this.error = undefined;
     this.pending = true;
@@ -234,6 +312,8 @@ export class MaintenanceScheduler {
     if (
       !this.automatic ||
       this.suspended ||
+      this.exclusiveReset ||
+      this.resetIncomplete ||
       !this.pending ||
       this.lane !== "idle" ||
       this.explicit.length
@@ -258,7 +338,7 @@ export class MaintenanceScheduler {
   }
 
   private async drain(automatic = false): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.exclusiveReset) return;
     if (this.lane !== "idle") return;
     let request = this.explicit.shift();
     if (!request && (!automatic || !this.automatic || this.suspended || !this.pending)) {
@@ -414,9 +494,22 @@ export class MaintenanceScheduler {
       }
     } catch (error) {
       if (!controller.signal.aborted) {
-        this.error = error;
-        this.suspended = true;
-        request?.reject(error);
+        if (error instanceof SemanticProviderError) {
+          try {
+            if (!this.invalidatedCurrentAttempt) await this.publish();
+            if (!this.invalidatedCurrentAttempt) this.clearPending();
+            this.error = error;
+            this.suspended = false;
+          } catch (publicationError) {
+            this.error = publicationError;
+            this.suspended = true;
+          }
+          request?.reject(error);
+        } else {
+          this.error = error;
+          this.suspended = true;
+          request?.reject(error);
+        }
       }
     } finally {
       this.active = undefined;
@@ -426,7 +519,7 @@ export class MaintenanceScheduler {
       if (!this.error || controller.signal.aborted) request?.resolve();
       for (const resolve of this.idleWaiters.splice(0)) resolve();
       this.finishActive();
-      if (!this.disposed) {
+      if (!this.disposed && !this.exclusiveReset) {
         if (this.explicit.length) void this.drain();
         else this.schedule();
       }
@@ -465,11 +558,12 @@ export class MaintenanceScheduler {
     cancelled: T,
     run: () => Promise<T>
   ): Promise<T> {
-    while (this.lane !== "idle") {
+    while (this.lane !== "idle" || this.exclusiveReset) {
       if (this.disposed) return cancelled;
+      if (this.exclusiveReset) return cancelled;
       await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
     }
-    if (this.disposed) return cancelled;
+    if (this.disposed || this.exclusiveReset) return cancelled;
     this.beginActive();
     this.lane = lane;
     this.phase = phase;
@@ -482,7 +576,7 @@ export class MaintenanceScheduler {
       this.emit();
       for (const resolve of this.idleWaiters.splice(0)) resolve();
       this.finishActive();
-      if (!this.disposed) {
+      if (!this.disposed && !this.exclusiveReset) {
         if (this.explicit.length) void this.drain();
         else this.schedule();
       }

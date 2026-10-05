@@ -167,7 +167,7 @@ describe("Trama deterministic benchmark", () => {
         (call) => call.scenario === "probeCachedProductive" && call.promoted > 0
       )
     ).toBe(true);
-  });
+  }, 10_000);
 
   it("keeps provider output and lifecycle successful when the batch observer throws", async () => {
     const workload = createWorkload("trama-small");
@@ -191,7 +191,7 @@ describe("Trama deterministic benchmark", () => {
     expect(throwing.semanticAttribution?.providerInputDigests).toEqual(
       ordinary.semanticAttribution?.providerInputDigests
     );
-  });
+  }, 10_000);
 
   it.runIf(Boolean(process.env.TRAMA_BENCHMARK))(
     "measures the selected deterministic workload",

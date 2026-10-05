@@ -1,387 +1,948 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
-import { lstat, readFile, readdir, realpath, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { parseBenchmarkManifest, readBenchmarkManifest } from "@/benchmark/Manifest";
-// @ts-expect-error Node fixture server has no emitted declaration.
-import { fixtureVector } from "../scripts/benchmark/fixture-provider.mjs";
-import { expectedOutputsV1ByProfile as browserOracles } from "@/benchmark/Oracle";
-// Filesystem projections keep safety tests away from the real persistent vault.
-vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return {
-    ...actual,
-    lstat: vi.fn(actual.lstat),
-    readFile: vi.fn(actual.readFile),
-    readdir: vi.fn(actual.readdir),
-    realpath: vi.fn(actual.realpath),
-    writeFile: vi.fn(actual.writeFile),
-  };
-});
-// The host harness is Node ESM and intentionally outside the plugin TypeScript bundle.
-const {
+import { describe, expect, it, vi } from "vitest";
+import { readFile } from "node:fs/promises";
+import { createSimpleBenchmarkCorpus } from "../test-vaults/benchmark/generator";
+import {
+  BENCHMARK_EXPECTED_PATH,
+  BENCHMARK_CORPUS_SHA256,
+  BENCHMARK_MARKER_VERSION,
+  BENCHMARK_NOTE_COUNT,
+  BENCHMARK_VAULT_NAME,
+  parseBenchmarkManifest,
+} from "@/benchmark/Manifest";
+import { runObsidianBenchmark } from "@/benchmark/ObsidianBenchmark";
+import { sha256Hex } from "@/index/Identity";
+import { chunkMarkdownBlocks } from "@/index/chunking";
+import {
   benchmarkCliArgs,
-  benchmarkVaultPath,
-  checkCorpus,
-  installBenchmarkPlugin,
-  validateReport,
+  benchmarkDispatchEval,
+  benchmarkIdleFailures,
+  benchmarkVaultName,
+  attachBenchmarkDebugger,
+  assertBenchmarkDispatchReceipt,
+  childErrorObservation,
+  parseReadinessStdout,
+  reloadBenchmarkWindow,
+  runBenchmarkOnce,
+  validateMarkedVaultRoot,
   verifyCliTarget,
-  REQUIRED_BENCHMARK_GATES,
-  REQUIRED_BENCHMARK_PHASES,
-} =
-  // @ts-expect-error No declaration is emitted for the standalone host script.
-  await import("../scripts/benchmark/obsidian.mjs");
-import {
-  createWorkload,
-  deterministicEmbeddingVector,
-  workloadQueryVectorDigest,
-  workloadSourceDigest,
-} from "../test-vaults/benchmark/generator";
-import {
-  deterministicProviderChallengeSha256,
-  expectedOutputsV1ByProfile,
-  queryVectorSha256V1,
-  sourceDigestsV1,
-} from "../test-vaults/benchmark/contract-v1";
-// @ts-expect-error Standalone Node installer has no emitted declaration.
-import { installTestVaults } from "../scripts/install-plugin.mjs";
-// @ts-expect-error Standalone Node preparation script has no emitted declaration.
-import * as demoHost from "../scripts/benchmark/demo.mjs";
-// @ts-expect-error Standalone Node preparation script has no emitted declaration.
-import * as benchmarkHost from "../scripts/benchmark/obsidian.mjs";
+  verifyBenchmarkIdle,
+  waitForBenchmarkCommand,
+  withFixtureEmbeddingSettings,
+  // @ts-expect-error The Node host runner is JavaScript and intentionally has no runtime type surface.
+} from "../scripts/benchmark/obsidian.mjs";
 
-const marker = {
-  version: "trama-obsidian-vault-v1",
-  runId: "d802aace-b48f-4ce1-a0c3-e6d9224c9001",
-  vaultName: "Trama Benchmark Vault",
-  expectedPath:
-    "/Users/andreacasarin/Documents/Code/trama/.artifacts/test-vaults/benchmark/Trama Benchmark Vault",
-  profile: "trama-small",
-  noteCount: 24,
-  targetChunks: 128,
-  sourceDigest: sourceDigestsV1["trama-small"],
-  providerChallengeSha256: deterministicProviderChallengeSha256,
-  queryVectorSha256: queryVectorSha256V1,
-  timeoutMs: 300000,
-  mutations: [
-    { kind: "add", path: "mutations/added.md", content: "added" },
-    { kind: "modify", path: "notes/00006/note-6.md", content: "modified" },
-    { kind: "delete", path: "notes/00007/note-7.md" },
-    { kind: "rename", path: "notes/00008/note-8.md", to: "mutations/renamed.md" },
-  ],
-};
-
-function projectedVault(includeDemo = false) {
-  const vaultPath = benchmarkVaultPath("trama-small", marker.runId);
-  const files = new Map<string, string>([
-    [
-      path.join(vaultPath, ".trama-benchmark-vault"),
-      JSON.stringify({ ...marker, expectedPath: vaultPath }),
-    ],
-    [path.join(vaultPath, ".obsidian/community-plugins.json"), "[]"],
-  ]);
-  const demoPath = path.resolve(".artifacts/test-vaults/demo/Trama Test Vault");
-  if (includeDemo) {
-    files.set(
-      path.join(demoPath, ".trama-demo-vault"),
-      JSON.stringify({
-        version: "trama-demo-vault-v1",
-        vaultName: "Trama Test Vault",
-        expectedPath: demoPath,
-      })
-    );
-    files.set(path.join(demoPath, ".obsidian/plugins/trama/data.json"), "{}");
-  }
-  const symlinks = new Set<string>();
-  const directories = () => {
-    const result = new Set<string>();
-    for (const file of files.keys()) {
-      for (
-        let parent = path.dirname(file);
-        parent !== path.dirname(parent);
-        parent = path.dirname(parent)
-      )
-        result.add(parent);
-    }
-    return result;
-  };
-  vi.mocked(realpath).mockImplementation(async (file) => String(file) as never);
-  vi.mocked(lstat).mockImplementation(async (file) => {
-    const name = String(file);
-    if (!files.has(name) && !directories().has(name))
-      throw Object.assign(new Error("missing"), { code: "ENOENT" });
-    return {
-      isSymbolicLink: () => symlinks.has(name),
-      isDirectory: () => directories().has(name),
-    } as never;
-  });
-  vi.mocked(readFile).mockImplementation(async (file) => {
-    const content = files.get(String(file));
-    if (content === undefined) throw new Error("missing");
-    return content as never;
-  });
-  vi.mocked(writeFile).mockImplementation(async (file, content) => {
-    files.set(String(file), String(content));
-  });
-  vi.mocked(readdir).mockImplementation(async (directory) => {
-    const prefix = `${directory}/`;
-    return [
-      ...new Set(
-        [...files.keys()]
-          .filter((file) => file.startsWith(prefix))
-          .map((file) => file.slice(prefix.length).split("/")[0])
-      ),
-    ] as never;
-  });
-  return { vaultPath, demoPath, files, symlinks };
-}
-
-describe("Obsidian benchmark safety and parity", () => {
-  beforeEach(() => vi.resetAllMocks());
-  it("reuses preparation only for missing vaults, including a fresh checkout", async () => {
-    for (const [missingDemo, missingBenchmark] of [
-      [true, true],
-      [true, false],
-      [false, true],
-    ]) {
-      const { vaultPath, demoPath, files } = projectedVault(true);
-      const original = new Map(files);
-      for (const file of files.keys())
-        if (
-          (missingDemo && file.startsWith(`${demoPath}/`)) ||
-          (missingBenchmark && file.startsWith(`${vaultPath}/`))
-        )
-          files.delete(file);
-      const restoreFiles = (directory: string) => {
-        for (const [file, contents] of original)
-          if (file.startsWith(`${directory}/`)) files.set(file, contents);
-      };
-      const prepareDemo = vi.spyOn(demoHost, "prepareDemoVault").mockImplementation(async () => {
-        restoreFiles(demoPath);
-        return { vaultPath: demoPath };
-      });
-      const prepareBenchmark = vi
-        .spyOn(benchmarkHost, "prepareVault")
-        .mockImplementation(async () => {
-          restoreFiles(vaultPath);
-          return { vaultPath };
-        });
-      const install = vi.fn(async ({ vaultPath }: { vaultPath: string }) =>
-        path.join(vaultPath, ".obsidian/plugins/trama")
-      );
-      try {
-        await expect(installTestVaults(install)).resolves.toHaveLength(2);
-        expect(prepareDemo).toHaveBeenCalledTimes(missingDemo ? 1 : 0);
-        expect(prepareBenchmark).toHaveBeenCalledTimes(missingBenchmark ? 1 : 0);
-        expect(install.mock.calls.map(([args]) => args.vaultPath)).toEqual(
-          missingDemo ? [vaultPath] : [demoPath, vaultPath]
-        );
-      } finally {
-        prepareDemo.mockRestore();
-        prepareBenchmark.mockRestore();
-      }
-    }
+describe("simple Obsidian benchmark", () => {
+  it("builds the same exact 3,000-note, 400-character corpus each time", () => {
+    const first = createSimpleBenchmarkCorpus();
+    const second = createSimpleBenchmarkCorpus();
+    expect(first).toEqual(second);
+    expect(first.notes).toHaveLength(3000);
+    expect(first.notes.every((note) => note.content.length === 400)).toBe(true);
+    expect(first.notes.every((note) => chunkMarkdownBlocks(note.content).length === 2)).toBe(true);
+    expect(first.notes[0]?.path).toBe("notes/0000.md");
+    expect(first.notes[0]?.content).toContain("D5 lexical sentinel unique phrase");
+    expect(first.notes[1]?.content).toBe(first.notes[2]?.content);
+    expect(first.sha256).toBe(BENCHMARK_CORPUS_SHA256);
   });
 
-  it("refuses a symlinked ancestor before preparing missing vaults", async () => {
-    const { demoPath, files, symlinks } = projectedVault(true);
-    for (const file of files.keys()) if (file.startsWith(`${demoPath}/`)) files.delete(file);
-    symlinks.add(path.resolve(".artifacts/test-vaults"));
-    const install = vi.fn();
-    await expect(installTestVaults(install)).rejects.toThrow("symlinked test vault path");
-    expect(install).not.toHaveBeenCalled();
-  });
-
-  it("updates both marked test vaults and preflights both before installation", async () => {
-    const { vaultPath, demoPath, files, symlinks } = projectedVault(true);
-    const install = vi.fn(async ({ vaultPath }: { vaultPath: string }) =>
-      path.join(vaultPath, ".obsidian/plugins/trama")
-    );
-    await expect(installTestVaults(install)).resolves.toEqual([
-      path.join(demoPath, ".obsidian/plugins/trama"),
-      path.join(vaultPath, ".obsidian/plugins/trama"),
-    ]);
-    expect(install.mock.calls.map(([args]) => args)).toEqual([
-      { vaultPath: demoPath, preserveExistingFiles: true },
-      { vaultPath, preserveExistingFiles: true },
-    ]);
-    install.mockClear();
-    const markerFile = path.join(vaultPath, ".trama-benchmark-vault");
-    const validMarker = files.get(markerFile)!;
-    files.set(markerFile, "{}");
-    await expect(installTestVaults(install)).rejects.toThrow("invalid benchmark vault");
-    expect(install).not.toHaveBeenCalled();
-    files.set(markerFile, validMarker);
-    const linkedFile = path.join(vaultPath, ".obsidian/plugins/trama/main.js");
-    files.set(linkedFile, "linked");
-    symlinks.add(linkedFile);
-    await expect(installTestVaults(install)).rejects.toThrow("symlink");
-    expect(install).not.toHaveBeenCalled();
-    symlinks.delete(linkedFile);
-    files.set(path.join(demoPath, ".trama-demo-vault"), "{}");
-    await expect(installTestVaults(install)).rejects.toThrow("invalid demo vault");
-    expect(install).not.toHaveBeenCalled();
-  });
-  it("accepts only the exact versioned generated-vault marker", async () => {
-    expect(parseBenchmarkManifest(JSON.stringify(marker), marker.vaultName)).toEqual(marker);
-    for (const altered of [
-      { ...marker, version: "other" },
-      { ...marker, vaultName: "main" },
-      { ...marker, profile: "other" },
-      { ...marker, expectedPath: `/repo/test-vaults/benchmark/${marker.vaultName}` },
-      { ...marker, expectedPath: `/repo/.artifacts/trama-benchmark/${marker.vaultName}` },
-      { ...marker, mutations: [{ kind: "delete", path: "../main.md" }] },
-      { ...marker, timeoutMs: 0 },
-    ])
-      expect(parseBenchmarkManifest(JSON.stringify(altered), marker.vaultName)).toBeNull();
+  it("accepts only the marked 3,000-note corpus at the exact vault path", () => {
+    const marker = {
+      version: BENCHMARK_MARKER_VERSION,
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+      vaultName: BENCHMARK_VAULT_NAME,
+      expectedPath: BENCHMARK_EXPECTED_PATH,
+      noteCount: BENCHMARK_NOTE_COUNT,
+    };
+    expect(parseBenchmarkManifest(JSON.stringify(marker), BENCHMARK_VAULT_NAME)).toEqual(marker);
     expect(
-      await readBenchmarkManifest({ read: async () => JSON.stringify(marker) }, marker.vaultName)
-    ).toEqual(marker);
-    expect(
-      await readBenchmarkManifest(
-        {
-          read: async () => {
-            throw new Error("missing");
-          },
-        },
-        marker.vaultName
+      parseBenchmarkManifest(
+        JSON.stringify({ ...marker, expectedPath: "/personal/vault" }),
+        BENCHMARK_VAULT_NAME
       )
+    ).toBeNull();
+    expect(
+      parseBenchmarkManifest(JSON.stringify({ ...marker, noteCount: 24 }), BENCHMARK_VAULT_NAME)
     ).toBeNull();
   });
 
-  it("matches source, query, note and mutation provider fixtures", async () => {
-    expect(browserOracles).toEqual(expectedOutputsV1ByProfile);
-    const workload = createWorkload("trama-small");
-    expect(workloadSourceDigest(workload)).toBe(sourceDigestsV1["trama-small"]);
-    expect(workloadQueryVectorDigest(workload)).toBe(queryVectorSha256V1);
-    for (const note of [
-      ...workload.notes,
-      ...workload.mutations.flatMap((mutation) => (mutation.note ? [mutation.note] : [])),
-    ]) {
-      for (const chunk of note.chunks) {
-        expect(
-          Array.from(fixtureVector(chunk.embeddingInput, deterministicEmbeddingVector))
-        ).toEqual(Array.from(chunk.vector));
-      }
-    }
-    for (const query of workload.queries)
-      expect(Array.from(fixtureVector(query.text, deterministicEmbeddingVector))).toEqual(
-        Array.from(query.vector)
-      );
+  it("refreshes only the fixture embedding endpoint and model while preserving other settings", () => {
+    const settings = {
+      schemaVersion: 6,
+      diagnosticsMode: "performance",
+      automaticMaintenance: false,
+      embedding: {
+        endpoint: "http://127.0.0.1:50665/v1",
+        modelId: "trama-benchmark-fixture-old",
+        dimensions: 768,
+        batchSize: 32,
+        custom: "preserved",
+      },
+      chat: { endpoint: "http://127.0.0.1:50665/v1", modelId: "chat-preserved" },
+      unrelated: { value: true },
+    };
+    const updated = withFixtureEmbeddingSettings(settings);
+    expect(updated).toEqual({
+      ...settings,
+      embedding: {
+        ...settings.embedding,
+        endpoint: "http://127.0.0.1:18765/v1",
+        modelId: "trama-benchmark-fixture-v1",
+      },
+    });
+    expect(withFixtureEmbeddingSettings(updated)).toEqual(updated);
+    expect(() => withFixtureEmbeddingSettings({ ...settings, embedding: null })).toThrow(
+      "Benchmark embedding settings must be an object"
+    );
   });
 
-  it("refuses non-benchmark CLI targets and mismatched reports", () => {
-    expect(benchmarkVaultPath("trama-small", marker.runId)).toMatch(
-      /\.artifacts\/test-vaults\/benchmark\/Trama Benchmark Vault$/
+  it("keeps the CLI selector first and the command allowlist narrow", () => {
+    expect(benchmarkCliArgs(benchmarkVaultName, "vault", ["info=path"])).toEqual([
+      "vault=Trama Benchmark Vault",
+      "vault",
+      "info=path",
+    ]);
+    expect(benchmarkCliArgs(benchmarkVaultName, "reload")).toEqual([
+      "vault=Trama Benchmark Vault",
+      "reload",
+    ]);
+    expect(benchmarkCliArgs(benchmarkVaultName, "eval", [`code=${benchmarkDispatchEval}`])).toEqual(
+      ["vault=Trama Benchmark Vault", "eval", `code=${benchmarkDispatchEval}`]
     );
-    expect(() => benchmarkVaultPath("../../main")).toThrow();
-    expect(benchmarkVaultPath("trama-large", randomUUID())).toBe(
-      benchmarkVaultPath("trama-small", marker.runId)
-    );
-    expect(benchmarkVaultPath("trama-small", marker.runId)).not.toContain(".artifacts/benchmarks/");
+    expect(() => benchmarkCliArgs("Personal", "vault", ["info=path"])).toThrow();
+    expect(() => benchmarkCliArgs(benchmarkVaultName, "eval", ["code=app.vault"])).toThrow();
     expect(
-      benchmarkCliArgs(marker.vaultName, "command", ["id=trama:run-obsidian-benchmark"])
-    ).toEqual([`vault=${marker.vaultName}`, "command", "id=trama:run-obsidian-benchmark"]);
-    expect(() => benchmarkCliArgs("main", "command")).toThrow();
-    expect(() => benchmarkCliArgs(marker.vaultName, "vaults", ["verbose"])).toThrow();
-    expect(benchmarkCliArgs(marker.vaultName, "plugin:enable", ["id=trama"])).toEqual([
-      `vault=${marker.vaultName}`,
-      "plugin:enable",
-      "id=trama",
-    ]);
-    expect(benchmarkCliArgs(marker.vaultName, "plugins:restrict")).toEqual([
-      `vault=${marker.vaultName}`,
-      "plugins:restrict",
-    ]);
+      benchmarkCliArgs(benchmarkVaultName, "dev:console", ["level=error", "limit=2000"])
+    ).toEqual(["vault=Trama Benchmark Vault", "dev:console", "level=error", "limit=2000"]);
+    expect(() =>
+      benchmarkCliArgs(benchmarkVaultName, "command", ["id=trama:reset-all-indexes-benchmark"])
+    ).toThrow();
+  });
+
+  it("retains original bounded CLI failure details before wrapping", () => {
+    const original = Object.assign(new Error("obsidian failed for /Users/private/user"), {
+      code: 1,
+      signal: null,
+      killed: false,
+      stdout: "Error: command failed",
+      stderr: "original stderr",
+    });
+    expect(childErrorObservation("debug-attach", original)).toEqual({
+      stage: "debug-attach",
+      error: {
+        name: "Error",
+        message: "obsidian failed for <path>",
+        code: 1,
+        exitCode: 1,
+        signal: null,
+        killed: false,
+        timedOut: false,
+      },
+      stdout: "Error: command failed",
+      stderr: "original stderr",
+    });
+  });
+
+  it("parses only bare JSON or the observed Obsidian arrow-wrapped readiness output", () => {
+    const state = { plugin: true, paths: ["notes/0000.md"] };
+    expect(parseReadinessStdout(JSON.stringify(state))).toEqual(state);
+    expect(parseReadinessStdout(`=> ${JSON.stringify(state)}`)).toEqual(state);
+    expect(() => parseReadinessStdout(`=> ${JSON.stringify(JSON.stringify(state))}`)).toThrow();
+    expect(() => parseReadinessStdout(`=> ${JSON.stringify(state)} trailing output`)).toThrow();
+    expect(() => parseReadinessStdout(`CLI output: => ${JSON.stringify(state)}`)).toThrow();
+  });
+
+  it("requires both synchronous dispatch receipt fields", () => {
+    expect(
+      assertBenchmarkDispatchReceipt(JSON.stringify({ invoked: true, running: true }))
+    ).toEqual({
+      invoked: true,
+      running: true,
+    });
+    expect(() =>
+      assertBenchmarkDispatchReceipt(JSON.stringify({ invoked: true, running: false }))
+    ).toThrow("Benchmark dispatch did not start.");
+    expect(() =>
+      assertBenchmarkDispatchReceipt(JSON.stringify({ invoked: false, running: true }))
+    ).toThrow("Benchmark dispatch did not start.");
+  });
+
+  it("uses only the tiny idle projection and refuses active or unknown state", () => {
+    const idle = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+    };
+    expect(benchmarkIdleFailures(idle)).toEqual([]);
+    expect(benchmarkIdleFailures({ ...idle, running: true })).toContain("running-or-unknown");
+    expect(benchmarkIdleFailures({ ...idle, resetting: undefined })).toContain(
+      "resetting-or-unknown"
+    );
+    expect(benchmarkIdleFailures({ ...idle, lane: undefined })).toContain("lane");
+  });
+
+  it("requires exact benchmark path proof at the CLI boundary", async () => {
+    const stage = "benchmark-dispatch";
+    await expect(
+      validateMarkedVaultRoot(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME)
+    ).resolves.toMatchObject({
+      version: BENCHMARK_MARKER_VERSION,
+      vaultName: BENCHMARK_VAULT_NAME,
+      expectedPath: BENCHMARK_EXPECTED_PATH,
+      noteCount: BENCHMARK_NOTE_COUNT,
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+    });
+    await expect(validateMarkedVaultRoot(BENCHMARK_EXPECTED_PATH, "Personal")).rejects.toThrow(
+      "Refusing a vault outside the exact benchmark output path."
+    );
+    const goodInvoke = vi.fn(async (command: string, parameters: string[]) => {
+      expect([command, parameters]).toEqual(["vault", ["info=path"]]);
+      return { stdout: `${BENCHMARK_EXPECTED_PATH}\n` };
+    });
+    await expect(
+      verifyCliTarget(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, stage, goodInvoke)
+    ).resolves.toBeUndefined();
+
+    const failedInvoke = vi.fn(async () => ({ stdout: "/private/other-vault\n" }));
+    await expect(
+      verifyCliTarget(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, stage, failedInvoke)
+    ).rejects.toThrow(`failed at ${stage}: single-absolute`);
+    expect(failedInvoke).toHaveBeenCalledWith("vault", ["info=path"]);
+  });
+
+  it("saves bounded path-proof stdout and stderr with the failure", async () => {
+    const stdout = "Error: Obsidian CLI is not ready.\n";
+    const stderr = "retry after window load\n";
+    let failure: unknown;
+    try {
+      await verifyCliTarget(
+        BENCHMARK_EXPECTED_PATH,
+        BENCHMARK_VAULT_NAME,
+        "post-reload-idle",
+        async () => ({ stdout, stderr })
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      pathProof: { stage: "post-reload-idle", classification: "known-error-prefix" },
+    });
+    const artifact = (failure as Error & { pathProof: { artifact: string } }).pathProof.artifact;
+    await expect(readFile(artifact, "utf8").then(JSON.parse)).resolves.toMatchObject({
+      stage: "path-proof-post-reload-idle",
+      stdout,
+      stderr,
+    });
+  });
+
+  it("keeps initial readiness plain and leaves capture refresh for the dispatch boundary", async () => {
+    const state = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+    };
+    const order: string[] = [];
+    const verifyPath = vi.fn(async () => order.push("path"));
+    const readReadiness = vi.fn(async (stage: string) => {
+      expect(stage).toBe("initial-idle");
+      order.push("eval");
+      return state;
+    });
+    await verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+      verifyPath,
+      readReadiness,
+    });
+    expect(order).toEqual(["path", "eval"]);
+
+    const refusedReadiness = vi.fn(async () => state);
+    await verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+      verifyPath,
+      readReadiness: refusedReadiness,
+    });
+    expect(refusedReadiness).toHaveBeenCalledOnce();
+  });
+
+  it("retries transient path proofs after reload before evaluating readiness", async () => {
+    const order: string[] = [];
+    const transient = Object.assign(new Error("proof unavailable"), {
+      pathProof: { stage: "post-reload-idle", classification: "known-error-prefix" },
+    });
+    let elapsed = 0;
+    let proofs = 0;
+    const state = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+      timeOrigin: 101,
+    };
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => {
+          order.push("proof");
+          if (proofs++ === 0) throw transient;
+        },
+        readReadiness: async () => {
+          order.push("eval");
+          if (order.filter((entry) => entry === "proof").length !== 2)
+            throw new Error("eval ran before a successful proof");
+          return state;
+        },
+        wait: async (duration: number) => {
+          order.push("wait");
+          elapsed += duration;
+        },
+        now: () => elapsed,
+      })
+    ).resolves.toEqual(state);
+    expect(order).toEqual(["proof", "wait", "proof", "eval"]);
+  });
+
+  it("retries a transient readiness path proof inside the same reload deadline", async () => {
+    const transient = Object.assign(new Error("proof unavailable"), {
+      pathProof: { stage: "post-reload-idle", classification: "empty" },
+    });
+    let elapsed = 0;
+    let reads = 0;
+    const state = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+      timeOrigin: 101,
+    };
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: async () => {
+          if (reads++ === 0) throw transient;
+          return state;
+        },
+        wait: async (duration: number) => {
+          elapsed += duration;
+        },
+        now: () => elapsed,
+      })
+    ).resolves.toEqual(state);
+    expect(reads).toBe(2);
+    expect(elapsed).toBe(1000);
+  });
+
+  it("waits for a new renderer and plugin load, then accepts its known active lane", async () => {
+    const oldIdle = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+      timeOrigin: 100,
+    };
+    const pluginStarting = {
+      ...oldIdle,
+      pluginPresent: false,
+      loadResult: undefined,
+      timeOrigin: 101,
+    };
+    const newLoading = { ...oldIdle, loadResult: null, lane: "adoption", timeOrigin: 102 };
+    const loadedAdoption = { ...oldIdle, lane: "adoption", timeOrigin: 103 };
+    const states = [oldIdle, pluginStarting, newLoading, loadedAdoption];
+    let elapsed = 0;
+    const readReadiness = vi.fn(async () => states.shift());
+    const wait = vi.fn(async (duration: number) => {
+      elapsed += duration;
+    });
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness,
+        wait,
+        now: () => elapsed,
+      })
+    ).resolves.toEqual(loadedAdoption);
+    expect(readReadiness).toHaveBeenCalledTimes(4);
+    expect(wait).toHaveBeenCalledTimes(3);
+    expect(elapsed).toBe(3000);
+  });
+
+  it("keeps wrong, multiline, and CLI-error proofs strict and shares the reload deadline", async () => {
+    const idle = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+      timeOrigin: 101,
+    };
+    for (const classification of ["single-absolute", "multiline", "cli-error"]) {
+      const error = Object.assign(new Error("invalid proof"), {
+        pathProof: { stage: "post-reload-idle", classification },
+      });
+      const readReadiness = vi.fn(async () => idle);
+      const wait = vi.fn(async () => undefined);
+      await expect(
+        verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+          afterTimeOrigin: 100,
+          verifyPath: async () => {
+            throw error;
+          },
+          readReadiness,
+          wait,
+        })
+      ).rejects.toBe(error);
+      expect(readReadiness).not.toHaveBeenCalled();
+      expect(wait).not.toHaveBeenCalled();
+    }
+
+    let elapsed = 0;
+    let attempts = 0;
+    const transient = Object.assign(new Error("temporary proof error"), {
+      pathProof: { stage: "post-reload-idle", classification: "known-error-prefix" },
+    });
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => {
+          attempts += 1;
+          throw transient;
+        },
+        readReadiness: async () => idle,
+        wait: async (duration: number) => {
+          elapsed += duration;
+        },
+        now: () => elapsed,
+      })
+    ).rejects.toThrow("CLI path proof did not succeed before the readiness deadline");
+    expect(elapsed).toBe(90_000);
+    expect(attempts).toBe(90);
+
+    const strictInitialPath = vi.fn(async () => {
+      throw Object.assign(new Error("temporary proof error"), {
+        pathProof: { stage: "initial-idle", classification: "known-error-prefix" },
+      });
+    });
+    const initialReadiness = vi.fn(async () => idle);
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+        verifyPath: strictInitialPath,
+        readReadiness: initialReadiness,
+      })
+    ).rejects.toThrow("temporary proof error");
+    expect(strictInitialPath).toHaveBeenCalledOnce();
+    expect(initialReadiness).not.toHaveBeenCalled();
+  });
+
+  it("refreshes capture once at dispatch and retries only the observed missing-command response", async () => {
+    const responses = [
+      { stdout: "Debugger detached. Console capture stopped.\n", stderr: "" },
+      {
+        stdout: 'Error: Command "dev:debug" not found. It may require a plugin to be enabled.\n',
+        stderr: "",
+      },
+      { stdout: "Debugger attached. Console capture started.\n", stderr: "" },
+    ];
+    const calls: string[] = [];
+    const wait = vi.fn(async () => undefined);
+    let tick = 0;
+    await attachBenchmarkDebugger({
+      invoke: async (_command: string, parameters: string[]) => {
+        calls.push(parameters[0]);
+        return responses.shift();
+      },
+      wait,
+      now: () => tick++ * 1000,
+    });
+    expect(calls).toEqual(["off", "on", "on"]);
+    expect(wait).toHaveBeenCalledOnce();
+
+    const order: string[] = [];
     const report = {
-      version: "trama-obsidian-report-v2",
-      runId: marker.runId,
-      profile: marker.profile,
-      host: "obsidian-desktop",
-      runtime: "standard-trama-worker-wasm-opfs",
-      storage: "vault-opfs-identity",
-      transport: "browser-worker",
-      providerTransport: "loopback-http-fixture",
-      publication: "vault-filesystem",
-      diagnosticsMode: "performance",
-      workloadContractVersion: "trama-workload-contract-v1",
-      oracleVersion: "expected-outputs-v1",
-      memory: { rssBytes: "unsupported" },
-      boundaries: ["publication filesystem adapter included"],
-      sourceDigest: marker.sourceDigest,
-      providerChallengeSha256: marker.providerChallengeSha256,
-      queryVectorSha256: marker.queryVectorSha256,
+      version: "trama-simple-benchmark-report-v1",
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+      noteCount: 3000,
+      runId: "11111111-1111-4111-8111-111111111111",
       status: "completed",
-      correctness: Object.fromEntries(REQUIRED_BENCHMARK_GATES.map((gate: string) => [gate, true])),
-      phases: Object.fromEntries(
-        REQUIRED_BENCHMARK_PHASES.map((phase: string) => [phase, { count: 1, durationMs: 0 }])
+      correctness: Object.fromEntries(
+        [
+          "corpusNoteCount",
+          "corpusPaths",
+          "coldIndex",
+          "cacheCleared",
+          "indexedAllNotes",
+          "semanticReady",
+          "lexicalSentinel",
+          "hybridSentinel",
+          "relatedSentinel",
+          "cacheShardsPublished",
+          "cacheShardHashesValid",
+          "cacheShardCheckStable",
+        ].map((field) => [field, true])
       ),
     };
-    expect(validateReport(report, marker)).toEqual(report);
-    expect(() => validateReport({ ...report, phases: {} }, marker)).toThrow("phase timings");
-    expect(() =>
-      validateReport({ ...report, version: "trama-obsidian-report-v1" }, marker)
-    ).toThrow();
-    expect(() => validateReport({ ...report, publication: "in-memory" }, marker)).toThrow();
-    expect(() => validateReport({ ...report, status: "timeout" }, marker)).toThrow();
-    expect(() => validateReport({ ...report, correctness: { all: false } }, marker)).toThrow();
-  });
-
-  it("aborts when the targeted CLI selector resolves to another path", async () => {
-    const { vaultPath } = projectedVault();
-    const name = marker.vaultName;
-    const calls: string[][] = [];
-    await expect(
-      verifyCliTarget(vaultPath, name, async (target: string, command: string, args: string[]) => {
-        calls.push(benchmarkCliArgs(target, command, args));
-        return { stdout: "/different/vault\n" };
-      })
-    ).rejects.toThrow("did not resolve");
-    expect(calls).toEqual([[`vault=${name}`, "vault", "info=path"]]);
-  });
-
-  it("installs only inside an exact marked vault and rejects symlinked config", async () => {
-    const { vaultPath, files, symlinks } = projectedVault();
-    const name = marker.vaultName;
-    const obsidian = path.join(vaultPath, ".obsidian");
-    const installs: unknown[] = [];
-    await installBenchmarkPlugin(vaultPath, name, async (args: unknown) => {
-      installs.push(args);
+    await runBenchmarkOnce({
+      assertFreshReport: async () => order.push("fresh-report-check"),
+      beforeDispatch: async () => order.push("capture-refresh"),
+      dispatch: async () => {
+        order.push("dispatch");
+        return { exitCode: 0, stdout: "Executed: trama:run-obsidian-benchmark", stderr: "" };
+      },
+      waitForReport: async () => report,
+      captureConsole: async () =>
+        `[Trama] benchmark_started ${report.runId}\n[Trama] benchmark_finished ${report.runId}`,
+      saveConsole: async () => undefined,
     });
-    expect(installs).toEqual([{ vaultPath, preserveExistingFiles: true }]);
-    expect(await readFile(path.join(obsidian, "community-plugins.json"), "utf8")).toBe(
-      '["trama"]\n'
-    );
-    await writeFile(path.join(obsidian, "community-plugins.json"), '["other"]\n');
-    await expect(installBenchmarkPlugin(vaultPath, name, async () => {})).rejects.toThrow(
-      "non-benchmark community plugin"
-    );
-    files.set(path.join(obsidian, "community-plugins.json"), "[]");
-    symlinks.add(path.join(obsidian, "community-plugins.json"));
-    await expect(installBenchmarkPlugin(vaultPath, name, async () => {})).rejects.toThrow(
-      "symlinked benchmark install path"
-    );
+    expect(order).toEqual(["fresh-report-check", "capture-refresh", "dispatch"]);
   });
 
-  it("accepts only known fixture states and never resets edited or unexpected content", async () => {
-    const { vaultPath, files, symlinks } = projectedVault();
-    const workload = createWorkload("trama-small");
-    for (const note of workload.notes) files.set(path.join(vaultPath, note.path), note.content);
-    await expect(checkCorpus(vaultPath, workload, true)).resolves.toBeUndefined();
-    const notePath = path.join(vaultPath, workload.notes[0].path);
-    files.set(notePath, "my handwritten note");
-    await expect(checkCorpus(vaultPath, workload)).rejects.toThrow("edited benchmark file");
-    files.set(notePath, workload.notes[0].content);
-    files.set(path.join(vaultPath, "personal.md"), "unexpected");
-    await expect(checkCorpus(vaultPath, workload)).rejects.toThrow(
-      "Unexpected benchmark vault content"
+  it("waits only for known maintenance lanes, with a fixed idle deadline", async () => {
+    const idle = {
+      pluginPresent: true,
+      loadResult: true,
+      running: false,
+      resetting: false,
+      lane: "idle",
+    };
+    const states = [
+      { ...idle, loadResult: null, lane: "adoption" },
+      { ...idle, lane: "adoption" },
+      idle,
+    ];
+    const wait = vi.fn(async () => undefined);
+    const readReadiness = vi.fn(async () => states.shift());
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+        verifyPath: async () => undefined,
+        readReadiness,
+        wait,
+      })
+    ).resolves.toEqual(idle);
+    expect(readReadiness).toHaveBeenCalledTimes(3);
+    expect(wait).toHaveBeenCalledTimes(2);
+
+    const badStates = [
+      { ...idle, lane: "unknown" },
+      { ...idle, lane: "adoption", running: true },
+      { ...idle, lane: "adoption", resetting: undefined },
+      { ...idle, loadResult: false, lane: "adoption" },
+      { ...idle, loadResult: "unknown", lane: "adoption" },
+    ];
+    for (const state of badStates) {
+      const read = vi.fn(async () => state);
+      await expect(
+        verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+          verifyPath: async () => undefined,
+          readReadiness: read,
+          wait,
+        })
+      ).rejects.toThrow(
+        state.lane === "unknown"
+          ? "unknown maintenance lane"
+          : state.loadResult === "unknown"
+            ? "load-unknown"
+            : "not loaded and idle"
+      );
+      expect(read).toHaveBeenCalledTimes(1);
+    }
+
+    let elapsed = 0;
+    const unchangedEpoch = { ...idle, timeOrigin: 100 };
+    const oldRendererRead = vi.fn(async () => unchangedEpoch);
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: oldRendererRead,
+        wait: async (duration: number) => {
+          elapsed += duration;
+        },
+        now: () => elapsed,
+      })
+    ).rejects.toThrow("renderer did not reload before the readiness deadline");
+    expect(oldRendererRead).toHaveBeenCalledTimes(90);
+    expect(elapsed).toBe(90_000);
+
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: async () => ({ ...idle, timeOrigin: "invalid" }),
+      })
+    ).rejects.toThrow("renderer epoch after reload is invalid");
+
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: async () => ({ ...idle, timeOrigin: 101, loadResult: false }),
+      })
+    ).rejects.toThrow("load-failed");
+
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: async () => ({ ...idle, timeOrigin: 101, loadResult: "unknown" }),
+      })
+    ).rejects.toThrow("load state after reload is invalid");
+
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "post-reload-idle", {
+        afterTimeOrigin: 100,
+        verifyPath: async () => undefined,
+        readReadiness: async () => ({ ...idle, timeOrigin: 101, lane: "unknown" }),
+      })
+    ).rejects.toThrow("unknown maintenance lane");
+
+    elapsed = 0;
+    const readPersistentLane = vi.fn(async () => ({ ...idle, loadResult: null, lane: "adoption" }));
+    await expect(
+      verifyBenchmarkIdle(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, "initial-idle", {
+        verifyPath: async () => undefined,
+        readReadiness: readPersistentLane,
+        wait: async (duration: number) => {
+          elapsed += duration;
+        },
+        now: () => elapsed,
+      })
+    ).rejects.toThrow("last lane: adoption");
+    expect(elapsed).toBe(90_000);
+  });
+
+  it("waits for command registration without changing capture state", async () => {
+    const order: string[] = [];
+    const outputs = [
+      { stdout: "trama:other-command\n", stderr: "" },
+      { stdout: "trama:run-obsidian-benchmark\n", stderr: "" },
+    ];
+    await waitForBenchmarkCommand({
+      listCommands: async () => {
+        order.push("commands");
+        return outputs.shift() ?? "";
+      },
+      wait: async () => undefined,
+      now: (() => {
+        let tick = 0;
+        return () => tick++;
+      })(),
+    });
+    expect(order).toEqual(["commands", "commands"]);
+
+    await expect(
+      waitForBenchmarkCommand({
+        listCommands: async () => ({ stdout: "trama:other-command\n", stderr: "" }),
+        wait: async () => undefined,
+        now: (() => {
+          let tick = 0;
+          return () => tick++ * 1000;
+        })(),
+        timeoutMs: 1500,
+      })
+    ).rejects.toThrow("did not register before the readiness deadline");
+  });
+
+  it("checks post-reload readiness before the single dispatch", async () => {
+    const order: string[] = [];
+    await reloadBenchmarkWindow(BENCHMARK_EXPECTED_PATH, {
+      verifyIdle: async (_vaultPath: string, _vaultName: string, stage: string) => {
+        order.push(stage);
+        return { timeOrigin: stage === "post-restore-idle" ? 100 : 101 };
+      },
+      reload: async () => order.push("reload"),
+      waitForCommand: async () => {
+        order.push("command-registered");
+      },
+    });
+    await runBenchmarkOnce({
+      assertFreshReport: async () => order.push("report-absent"),
+      beforeDispatch: async () => order.push("debug"),
+      dispatch: async () => {
+        order.push("dispatch");
+        return { exitCode: 0, stdout: "Executed: trama:run-obsidian-benchmark", stderr: "" };
+      },
+      waitForReport: async () => undefined,
+      captureConsole: async () => "",
+      saveConsole: async () => undefined,
+    }).catch(() => undefined);
+    expect(order).toEqual([
+      "post-restore-idle",
+      "reload",
+      "command-registered",
+      "post-reload-idle",
+      "report-absent",
+      "debug",
+      "dispatch",
+    ]);
+  });
+
+  it("dispatches once only after stale-report refusal and requires fresh complete evidence", async () => {
+    const order: string[] = [];
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const report = {
+      version: "trama-simple-benchmark-report-v1",
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+      noteCount: 3000,
+      runId,
+      status: "completed",
+      correctness: Object.fromEntries(
+        [
+          "corpusNoteCount",
+          "corpusPaths",
+          "coldIndex",
+          "cacheCleared",
+          "indexedAllNotes",
+          "semanticReady",
+          "lexicalSentinel",
+          "hybridSentinel",
+          "relatedSentinel",
+          "cacheShardsPublished",
+          "cacheShardHashesValid",
+          "cacheShardCheckStable",
+        ].map((field) => [field, true])
+      ),
+    };
+    const operations = {
+      assertFreshReport: async () => order.push("freshness"),
+      dispatch: async () => {
+        order.push("dispatch");
+        return { exitCode: 0, stdout: "Command accepted.", stderr: "" };
+      },
+      waitForReport: async () => {
+        order.push("report");
+        return report;
+      },
+      captureConsole: async () => {
+        order.push("console");
+        return `[Trama] benchmark_started ${runId}\n[Trama] benchmark_finished ${runId}`;
+      },
+      saveConsole: async () => order.push("save"),
+    };
+    await expect(runBenchmarkOnce(operations)).resolves.toBe(report);
+    expect(order).toEqual(["freshness", "dispatch", "report", "console", "save"]);
+    expect(order.filter((operation) => operation === "dispatch")).toHaveLength(1);
+    await expect(
+      runBenchmarkOnce({
+        ...operations,
+        assertFreshReport: async () => {
+          throw new Error("Benchmark report exists before dispatch.");
+        },
+      })
+    ).rejects.toThrow("exists before dispatch");
+    await expect(
+      runBenchmarkOnce({
+        ...operations,
+        waitForReport: async () => ({
+          ...report,
+          correctness: { ...report.correctness, coldIndex: false },
+        }),
+      })
+    ).rejects.toThrow("correctness checks did not all pass");
+    for (const stdout of [
+      "Error: command failed",
+      "Uncaught Error: unavailable",
+      "Command id not found",
+    ]) {
+      const waitForReport = vi.fn(async () => report);
+      await expect(
+        runBenchmarkOnce({
+          ...operations,
+          dispatch: async () => ({ exitCode: 0, stdout, stderr: "" }),
+          waitForReport,
+        })
+      ).rejects.toThrow("explicit dispatch error");
+      expect(waitForReport).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects incomplete or overflowing production performance captures", async () => {
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const report = {
+      version: "trama-simple-benchmark-report-v1",
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+      noteCount: 3000,
+      runId,
+      status: "completed",
+      startedAt: "2026-10-06T10:00:00.000Z",
+      finishedAt: "2026-10-06T10:01:00.000Z",
+      relatedLookup: {
+        results: [{ path: "notes/0002.md", score: 1 }],
+        semanticPartial: false,
+        maintenanceBefore: false,
+        maintenanceAfter: false,
+      },
+      correctness: Object.fromEntries(
+        [
+          "corpusNoteCount",
+          "corpusPaths",
+          "coldIndex",
+          "cacheCleared",
+          "indexedAllNotes",
+          "semanticReady",
+          "lexicalSentinel",
+          "hybridSentinel",
+          "relatedSentinel",
+          "cacheShardsPublished",
+          "cacheShardHashesValid",
+          "cacheShardCheckStable",
+        ].map((field) => [field, true])
+      ),
+      performanceCapture: { complete: false, records: [] },
+    };
+    const operations = {
+      assertFreshReport: async () => undefined,
+      dispatch: async () => ({ exitCode: 0, stdout: "Command accepted.", stderr: "" }),
+      waitForReport: async () => report,
+      captureConsole: async () => `[Trama] benchmark_finished ${runId}`,
+      saveConsole: async () => undefined,
+      savePerformance: async () => ".artifacts/benchmarks/diagnostics/performance.jsonl",
+    };
+    await expect(runBenchmarkOnce(operations)).rejects.toThrow(
+      "missing, incomplete, or over its bound"
     );
-    files.delete(path.join(vaultPath, "personal.md"));
-    symlinks.add(notePath);
-    await expect(checkCorpus(vaultPath, workload)).rejects.toThrow("symlink");
-    symlinks.delete(notePath);
-    files.delete(notePath);
-    await expect(checkCorpus(vaultPath, workload, true)).rejects.toThrow("incomplete");
-    expect(writeFile).not.toHaveBeenCalled();
+
+    await expect(
+      runBenchmarkOnce({
+        ...operations,
+        waitForReport: async () => ({
+          ...report,
+          performanceCapture: {
+            complete: true,
+            records: Array.from({ length: 10_001 }, () => ({ tier: "performance" })),
+          },
+        }),
+      })
+    ).rejects.toThrow("missing, incomplete, or over its bound");
+  });
+
+  it("clears local/shared indexes before the production rebuild and checks fixed sentinels", async () => {
+    const corpusSha256 = BENCHMARK_CORPUS_SHA256;
+    const manifest = {
+      version: BENCHMARK_MARKER_VERSION,
+      corpusSha256,
+      vaultName: BENCHMARK_VAULT_NAME,
+      expectedPath: BENCHMARK_EXPECTED_PATH,
+      noteCount: BENCHMARK_NOTE_COUNT,
+    } as const;
+    const paths = Array.from({ length: 3000 }, (_, index) => ({
+      path: `notes/${String(index).padStart(4, "0")}.md`,
+    }));
+    const order: string[] = [];
+    const state = {
+      noteCount: 3000,
+      semanticReady: true,
+      lexicalGeneration: 3,
+      semanticGeneration: 2,
+      embeddingFingerprint: "profile",
+    };
+    const adapter = {
+      getBasePath: () => BENCHMARK_EXPECTED_PATH,
+      read: async () => JSON.stringify(manifest),
+      write: vi.fn(async () => undefined),
+    };
+    const shardBytes = new TextEncoder().encode("verified cache shard").buffer;
+    const shardDigest = await sha256Hex(shardBytes);
+    const shardFile = {
+      path: `Trama/index/cache-v1/cache-${shardDigest}.sqlite3`,
+      digest: shardDigest,
+    };
+    let shardReads = 0;
+    const report = await runObsidianBenchmark(
+      { vault: { adapter, getName: () => BENCHMARK_VAULT_NAME, getMarkdownFiles: () => paths } },
+      manifest,
+      {
+        index: {
+          getState: async () => (order.includes("rebuild") ? state : undefined),
+          isInMaintenance: () => false,
+        } as any,
+        publication: {
+          store: {
+            listCacheShards: async () => (++shardReads === 1 ? [] : [shardFile]),
+            readCacheShard: async () => shardBytes,
+          },
+        } as any,
+        related: {
+          find: async () => ({ results: [{ path: "notes/0002.md", score: 1 }] }),
+        } as any,
+        clearIndexesAndSharedCache: async () => {
+          order.push("clear");
+        },
+        rebuild: async () => {
+          order.push("rebuild");
+        },
+        publish: async () => {
+          order.push("publish");
+        },
+        checkPublication: async () => {
+          order.push("check");
+        },
+        hasPublicationCheckWarning: () => false,
+        getLenteSearch: () => ({
+          search: async () => ({
+            results: [{ path: "notes/0000.md" }],
+            canonicalResults: [{ path: "notes/0000.md" }],
+          }),
+        }),
+      } as any
+    );
+    expect(order).toEqual(["clear", "rebuild", "publish", "check"]);
+    expect(report.status).toBe("completed");
+    expect(report.relatedLookup).toMatchObject({
+      results: [{ path: "notes/0002.md", score: 1 }],
+      semanticPartial: false,
+      maintenanceBefore: false,
+      maintenanceAfter: false,
+    });
+    expect(report.startedAt).toEqual(expect.any(String));
+    expect(report.finishedAt).toEqual(expect.any(String));
+    expect(report.correctness).toMatchObject({
+      corpusNoteCount: true,
+      corpusPaths: true,
+      coldIndex: true,
+      cacheCleared: true,
+      indexedAllNotes: true,
+      semanticReady: true,
+      lexicalSentinel: true,
+      hybridSentinel: true,
+      relatedSentinel: true,
+      cacheShardsPublished: true,
+      cacheShardHashesValid: true,
+      cacheShardCheckStable: true,
+    });
+  });
+
+  it("refuses a non-exact vault path before clearing or writing", async () => {
+    const marker = {
+      version: BENCHMARK_MARKER_VERSION,
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
+      vaultName: BENCHMARK_VAULT_NAME,
+      expectedPath: BENCHMARK_EXPECTED_PATH,
+      noteCount: BENCHMARK_NOTE_COUNT,
+    } as const;
+    const clear = vi.fn(async () => undefined);
+    const write = vi.fn(async () => undefined);
+    const report = await runObsidianBenchmark(
+      {
+        vault: {
+          adapter: {
+            getBasePath: () => "/another/vault",
+            read: async () => JSON.stringify(marker),
+            write,
+          },
+          getName: () => BENCHMARK_VAULT_NAME,
+          getMarkdownFiles: () => [],
+        },
+      },
+      marker,
+      { clearIndexesAndSharedCache: clear } as any
+    );
+    expect(report.status).toBe("error");
+    expect(clear).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
   });
 });

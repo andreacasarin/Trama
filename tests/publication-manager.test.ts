@@ -1,40 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { sha256Hex } from "@/index/Identity";
 import {
   PublicationManager,
   type PublicationIndexPort,
 } from "@/index/publications/PublicationManager";
 import { type PublicationDataAdapter } from "@/index/publications/PublicationStore";
-import { sqliteError } from "@/index/sqlite/protocol";
-import type {
-  PublicationInspection,
-  PublicationPrepared,
-  SqliteState,
-} from "@/index/sqlite/protocol";
-
-const state = (publicationId?: string): SqliteState => ({
-  schemaVersion: 5,
-  protocolVersion: 4,
-  buildIdentity: "build",
-  dimensions: 2,
-  corpusFingerprint: "corpus",
-  embeddingFingerprint: "embedding",
-  incomplete: false,
-  snapshotLoaded: false,
-  changeCounter: 3,
-  lexicalGeneration: 1,
-  semanticGeneration: 1,
-  noteCount: 1,
-  chunkCount: 1,
-  compatibleVectorCount: 1,
-  vectorCount: 1,
-  vectorCoverage: "complete",
-  semanticReady: true,
-  semanticEligibleCount: 1,
-  semanticHeadCount: 1,
-  semanticLagCount: 0,
-  semanticMissingCount: 0,
-  ...(publicationId ? { publicationId } : {}),
-});
 
 function setup() {
   const files = new Map<string, Uint8Array>();
@@ -49,214 +19,232 @@ function setup() {
     },
     mkdir: async () => undefined,
     rename: async (from, to) => {
-      files.set(to, files.get(from)!);
+      if (files.has(to)) throw new Error("destination exists");
+      const bytes = files.get(from);
+      if (!bytes) throw new Error("missing temp");
+      files.set(to, bytes);
       files.delete(from);
     },
     remove: async (path) => {
       files.delete(path);
     },
-  };
-  let live = state();
-  let stagedId: string | undefined;
-  const bytes = new Uint8Array([9, 8, 7]).buffer;
-  const index: PublicationIndexPort = {
-    async publishPublication<T>(
-      publicationId: string,
-      install: (prepared: PublicationPrepared) => Promise<T>,
-      settle?: (committed: boolean) => Promise<void>
-    ) {
-      stagedId = publicationId;
-      const prepared: PublicationPrepared = {
-        publicationId,
-        state: { ...live, publicationId },
-        bytes,
-        byteSize: bytes.byteLength,
-        durationMs: 1,
-        copyBytes: bytes.byteLength,
-      };
-      const installed = await install(prepared);
-      live = state(publicationId);
-      await settle?.(true);
-      return { prepared, installed };
-    },
-    inspectPublication: vi.fn(async (): Promise<PublicationInspection> => ({
-      valid: true,
-      publicationId: stagedId ?? "remote",
-      state: state(stagedId ?? "remote"),
-      byteSize: bytes.byteLength,
-    })),
-    adoptPublication: vi.fn(async (_bytes, id) => {
-      live = state(id);
-      return live;
+    list: async (path) => ({
+      files: [...files.keys()].filter((name) => name.startsWith(`${path}/`)),
+      folders: [],
     }),
-    getState: vi.fn(async () => live),
   };
-  const publish = vi.spyOn(index, "publishPublication");
-  return { adapter, index, publish, bytes, getLive: () => live };
+  const data = new Uint8Array([9, 8, 7]).buffer;
+  const digestPromise = sha256Hex(data);
+  let exported = false;
+  const ingested = new Set<string>();
+  const index: PublicationIndexPort = {
+    prepareCacheShard: vi.fn(async (after?: string) => {
+      if (exported || after) return undefined;
+      exported = true;
+      return {
+        bytes: data,
+        digest: await digestPromise,
+        nextActionKey: "key-1",
+        rowCount: 1,
+        profile: "a".repeat(64),
+        actionKeys: ["key-1"],
+        payloadBytes: 10,
+      };
+    }),
+    ingestCacheShard: vi.fn(async (_bytes, digest) => {
+      if (ingested.has(digest))
+        return {
+          imported: 0,
+          duplicate: true,
+          profile: "a".repeat(64),
+          taskKind: "document" as const,
+        };
+      ingested.add(digest);
+      return {
+        imported: 1,
+        duplicate: false,
+        profile: "a".repeat(64),
+        taskKind: "document" as const,
+      };
+    }),
+  };
+  return { files, adapter, index, data, digestPromise };
 }
 
-describe("PublicationManager", () => {
-  it("publishes and validates the installed copy", async () => {
+describe("PublicationManager cache shards", () => {
+  it("stages immutable SHA-named cache-only shards and leaves legacy snapshot untouched", async () => {
     const fixture = setup();
-    const metrics: unknown[] = [];
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "publication-1",
-      onMetrics: (value) => metrics.push(value),
-    });
-    const result = await manager.publish();
-    expect(result).toMatchObject({ published: true, publicationId: "publication-1" });
-    expect(metrics).toHaveLength(1);
-    expect(fixture.publish).toHaveBeenCalledTimes(1);
-    expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
-    expect(fixture.getLive().publicationId).toBe("publication-1");
-  });
-
-  it("can finish publication after inspection transfers the read-back buffer", async () => {
-    const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "transferred",
-    });
-    vi.mocked(fixture.index.inspectPublication).mockImplementation(
-      async (bytes, transferOwnership) => {
-        expect(transferOwnership).toBe(true);
-        structuredClone(bytes, { transfer: [bytes] });
-        return {
-          valid: true,
-          publicationId: "transferred",
-          state: state("transferred"),
-          byteSize: 3,
-        };
-      }
-    );
-
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    fixture.files.set("Trama/index/index.sqlite3", new Uint8Array([1, 2]));
     await expect(manager.publish()).resolves.toMatchObject({ published: true });
-    expect([...new Uint8Array((await manager.store.read())!)]).toEqual([9, 8, 7]);
+    const digest = await fixture.digestPromise;
+    expect(fixture.files.has(`Trama/index/cache-v1/cache-${digest}.sqlite3`)).toBe(true);
+    expect([...fixture.files.get("Trama/index/index.sqlite3")!]).toEqual([1, 2]);
+    expect([...fixture.files.keys()].some((path) => path.includes("trama-tmp"))).toBe(false);
   });
 
-  it("adopts a differing ID without republishing", async () => {
+  it("ingests each listed shard additively and relies on receipt idempotence", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-    expect(await manager.adoptCurrent()).toMatchObject({ adopted: true });
-    expect(fixture.index.inspectPublication).toHaveBeenCalledTimes(1);
-    expect(fixture.index.adoptPublication).toHaveBeenCalledTimes(1);
-    expect(fixture.publish).not.toHaveBeenCalled();
+    await manager.publish();
+    const first = await manager.adoptCurrent();
+    const second = await manager.adoptCurrent();
+    expect(first).toMatchObject({ adopted: true });
+    expect(second).toMatchObject({ adopted: false, ignored: "same-id" });
+    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(2);
   });
 
-  it("requests replacement of an incompatible synchronized index", async () => {
-    const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "current-publication",
-    });
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
-      sqliteError("incompatible_state", "incompatible synchronized index")
-    );
-
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      replacementRequired: true,
-    });
-    expect(fixture.publish).not.toHaveBeenCalled();
-    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
-    expect(fixture.getLive().publicationId).toBeUndefined();
-  });
-
-  it("keeps a newer synchronized index and requests a plugin update", async () => {
+  it("reports staging errors without replacing the existing shard", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "newer"));
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
-      sqliteError("upgrade_required", "Update Trama from Obsidian's Community plugins settings")
-    );
-
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      warning: {
-        phase: "inspect",
-        code: "upgrade_required",
-        retryable: false,
-        message: "Update Trama from Obsidian's Community plugins settings",
-      },
-    });
-    expect(fixture.publish).not.toHaveBeenCalled();
-    expect(fixture.index.adoptPublication).not.toHaveBeenCalled();
-  });
-
-  it("does not overwrite a synchronized index that changes during replacement preparation", async () => {
-    const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "current-publication",
-    });
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "incompatible"));
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
-      sqliteError("incompatible_state", "incompatible synchronized index")
-    );
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({ replacementRequired: true });
-
-    const changed = new Uint8Array([1, 2, 3]).buffer;
-    await fixture.adapter.writeBinary!(manager.store.path, changed);
-
-    await expect(manager.publish()).resolves.toMatchObject({
-      published: false,
-      warning: { phase: "replace", code: "busy", retryable: true },
-    });
-    expect(await manager.store.read()).toEqual(changed);
-    expect(fixture.getLive().publicationId).toBeUndefined();
-  });
-
-  it("retries a failed stage from the current local index", async () => {
-    const fixture = setup();
-    let fail = true;
-    const originalWrite = fixture.adapter.writeBinary!;
-    fixture.adapter.writeBinary = async (path, bytes) => {
-      if (fail) {
-        fail = false;
-        throw new Error("offline");
-      }
-      return originalWrite(path, bytes);
-    };
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "publication-2",
-    });
+    const digest = await fixture.digestPromise;
+    const destination = `Trama/index/cache-v1/cache-${digest}.sqlite3`;
+    fixture.files.set(destination, new Uint8Array([1, 2, 3]));
     await expect(manager.publish()).resolves.toMatchObject({
       published: false,
       warning: { phase: "stage" },
     });
-    expect(fixture.getLive().publicationId).toBeUndefined();
-    await expect(manager.publish()).resolves.toMatchObject({
-      published: true,
-      publicationId: "publication-2",
-    });
-    expect(fixture.publish).toHaveBeenCalledTimes(2);
+    expect([...fixture.files.get(destination)!]).toEqual([1, 2, 3]);
   });
 
-  it("rejects an invalid staged SQLite copy before replacing the canonical file", async () => {
-    const fixture = setup();
-    const manager = new PublicationManager(fixture.index, fixture.adapter, {
-      idFactory: () => "publication-3",
-    });
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "old"));
-    const oldBytes = await manager.store.read();
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(new Error("invalid SQLite"));
-    await expect(manager.publish()).resolves.toMatchObject({
-      published: false,
-      warning: { phase: "inspect" },
-    });
-    expect(await manager.store.read()).toEqual(oldBytes);
-    expect(fixture.getLive().publicationId).toBeUndefined();
-  });
-  it("classifies nested permanent publication errors without making them retryable", async () => {
+  it("installs bounded compaction replacements before recording the captured retirement set", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);
-    await manager.store.replace(await manager.store.stage(fixture.bytes, "remote"));
-    vi.mocked(fixture.index.inspectPublication).mockRejectedValueOnce(
-      sqliteError("integrity_failed", "invalid publication", true, "execute")
+    const ordered: string[] = [];
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: [],
+      expiredRows: 0,
+      unusedRows: 0,
+    }));
+    fixture.index.recordCacheShard = vi.fn(async () => {
+      ordered.push("membership");
+    });
+    fixture.index.recordCacheRetirements = vi.fn(async (sources, replacements) => {
+      expect(sources).toHaveLength(8);
+      expect(replacements).toHaveLength(1);
+      expect(
+        fixture.files.has(`${manager.store.cacheDirectory}/cache-${replacements[0]}.sqlite3`)
+      ).toBe(true);
+      ordered.push("retirement");
+    });
+    for (let index = 0; index < 8; index++) {
+      const bytes = new Uint8Array([index + 1]).buffer;
+      await manager.store.installCacheShard(bytes, await sha256Hex(bytes));
+    }
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(fixture.index.maintainCache).toHaveBeenCalledWith(expect.any(Number));
+    expect(ordered).toEqual(["membership", "retirement"]);
+  });
+
+  it("keeps every captured source when a later replacement batch fails and retries idempotently", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: [],
+      expiredRows: 0,
+      unusedRows: 0,
+    }));
+    const recorded = vi.fn(async () => undefined);
+    fixture.index.recordCacheRetirements = recorded;
+    for (let index = 0; index < 8; index++) {
+      const bytes = new Uint8Array([index + 1]).buffer;
+      await manager.store.installCacheShard(bytes, await sha256Hex(bytes));
+    }
+    let failSecondBatch = true;
+    vi.mocked(fixture.index.prepareCacheShard!).mockImplementation(
+      async (cursor, _taskKind, _profile, sources) => {
+        if (sources?.length) {
+          if (cursor && failSecondBatch) throw new Error("replacement export interrupted");
+          if (cursor) return undefined;
+          return {
+            bytes: fixture.data,
+            digest: await fixture.digestPromise,
+            nextActionKey: "replacement-cursor",
+            rowCount: 1,
+            profile: "a".repeat(64),
+            actionKeys: ["replacement-key"],
+            payloadBytes: 10,
+          };
+        }
+        return undefined;
+      }
+    );
+    const originalDigests = (await manager.store.listCacheShards()).map((file) => file.digest);
+    await expect(manager.publish()).resolves.toMatchObject({ published: false });
+    expect(recorded).not.toHaveBeenCalled();
+    expect((await manager.store.listCacheShards()).map((file) => file.digest)).toEqual(
+      expect.arrayContaining(originalDigests)
     );
 
-    await expect(manager.adoptCurrent()).resolves.toMatchObject({
-      adopted: false,
-      warning: { phase: "inspect", retryable: false },
+    failSecondBatch = false;
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(recorded).toHaveBeenCalledTimes(1);
+    expect((await manager.store.listCacheShards()).map((file) => file.digest)).toEqual(
+      expect.arrayContaining(originalDigests)
+    );
+  });
+
+  it("does not retire a shard that arrives after the compaction inventory was captured", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    const fixedNow = 2_000_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+    const arrival = new Uint8Array([99]).buffer;
+    const arrivalDigest = await sha256Hex(arrival);
+    const arrivalPath = `${manager.store.cacheDirectory}/cache-${arrivalDigest}.sqlite3`;
+    let saved: import("@/index/sqlite/cache-shards").CacheRetirement[] = [];
+    let injected = false;
+    let lastCompactionAt = 0;
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt,
+      expiredSourceDigests: [],
+      expiredRows: 0,
+      unusedRows: 0,
+    }));
+    const ingest = fixture.index.ingestCacheShard!;
+    fixture.index.ingestCacheShard = vi.fn(async (bytes, digest) => {
+      if (!injected) {
+        injected = true;
+        fixture.files.set(arrivalPath, new Uint8Array(arrival));
+      }
+      return ingest(bytes, digest);
     });
+    fixture.index.recordCacheRetirements = vi.fn(
+      async (sources: readonly string[], replacements: readonly string[], now: number) => {
+        expect(sources).toHaveLength(8);
+        expect(sources).not.toContain(arrivalDigest);
+        lastCompactionAt = now;
+        saved = sources.map((sourceDigest) => ({
+          sourceDigest,
+          replacementSetId: "captured-set",
+          retireAfter: now + 30 * 24 * 60 * 60 * 1000,
+          replacements,
+        }));
+      }
+    );
+    fixture.index.listCacheRetirements = vi.fn(async () => saved);
+    fixture.index.completeCacheRetirement = vi.fn(async (digest) => {
+      saved = saved.filter((item) => item.sourceDigest !== digest);
+    });
+    for (let index = 0; index < 8; index++) {
+      const bytes = new Uint8Array([index + 1]).buffer;
+      await manager.store.installCacheShard(bytes, await sha256Hex(bytes));
+    }
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(fixture.files.has(arrivalPath)).toBe(true);
+    clock.mockReturnValue(fixedNow + 30 * 24 * 60 * 60 * 1000);
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(fixture.files.has(arrivalPath)).toBe(true);
+    clock.mockRestore();
+  });
+
+  it("does no work when the local cache has no new vectors", async () => {
+    const fixture = setup();
+    vi.mocked(fixture.index.prepareCacheShard!).mockResolvedValue(undefined);
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(fixture.files.size).toBe(0);
   });
 });

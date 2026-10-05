@@ -95,24 +95,35 @@ export class RetrievalService implements VaultRetrievalPort {
           true
         );
       let queryVector = vector ? new Float32Array(vector) : undefined;
+      const queryProfile = this.runtime.state?.embeddingFingerprint;
+      if (effectiveMode !== "lexical" && !queryVector) {
+        if (queryProfile) {
+          const cached = (await this.runtime.ensureClient().call(
+            "lookupQueryVector",
+            {
+              query,
+              embeddingFingerprint: queryProfile,
+            },
+            requestSignal
+          )) as Float32Array | undefined;
+          if (cached) queryVector = new Float32Array(cached);
+        }
+        const canEmbed = await this.runtime.providerMatchesActiveProfile();
+        if (!queryVector && !canEmbed) throw new QueryEmbeddingError();
+      }
       if (effectiveMode !== "lexical" && !queryVector) {
         const embeddingTimer = this.runtime.performanceTimer();
+        let values: readonly number[][];
         try {
-          const values = await this.embedding.embed([query], requestSignal);
-          queryVector = new Float32Array(values[0] ?? []);
-          this.runtime.emitPhase(
-            "retrieve",
-            "queryEmbedding",
-            embeddingTimer,
-            1,
-            undefined,
-            retrievalOperationId
-          );
+          values = await this.embedding.embed([query], requestSignal);
         } catch {
           if (requestSignal.aborted)
             throw new StructuredError("cancelled", "Search cancelled.", true);
           throw new QueryEmbeddingError();
         }
+        queryVector = new Float32Array(values[0] ?? []);
+        if (this.runtime.state?.embeddingFingerprint !== queryProfile)
+          throw new QueryEmbeddingError();
         if (
           queryVector &&
           (queryVector.length !== this.embedding.dimensions ||
@@ -120,8 +131,29 @@ export class RetrievalService implements VaultRetrievalPort {
         ) {
           throw new QueryEmbeddingError();
         }
+        if (queryProfile)
+          await this.runtime.ensureClient().call(
+            "storeQueryVector",
+            {
+              query,
+              embeddingFingerprint: queryProfile,
+              dimensions: queryVector.length,
+              vector: queryVector,
+            },
+            requestSignal
+          );
+        this.runtime.emitPhase(
+          "retrieve",
+          "queryEmbedding",
+          embeddingTimer,
+          1,
+          undefined,
+          retrievalOperationId
+        );
       }
-      const candidateLimit = lexicalProfile === "lente" ? 160 : mode === "related" ? 128 : 80;
+      if (effectiveMode !== "lexical" && this.runtime.state?.embeddingFingerprint !== queryProfile)
+        throw new QueryEmbeddingError();
+      const candidateLimit = mode === "related" ? 128 : 80;
       const resultLimit = Math.max(0, Math.min(256, Math.floor(limit)));
       const retrievalTimer = this.runtime.performanceTimer();
       const retrievalClient = this.runtime.ensureClient();
@@ -130,6 +162,7 @@ export class RetrievalService implements VaultRetrievalPort {
         {
           ...(effectiveMode === "semantic" ? {} : { query }),
           ...(queryVector ? { vector: queryVector } : {}),
+          ...(queryVector && queryProfile ? { expectedEmbeddingFingerprint: queryProfile } : {}),
           limit: resultLimit,
           semanticCandidateLimit: candidateLimit,
           lexicalCandidateLimit: candidateLimit,

@@ -4,10 +4,11 @@ import { FiloView } from "@/ui/filo/FiloView";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 describe("Filo semantic index display", () => {
-  it("asks for model configuration instead of incompatible-vector updates and reacts to configuration", () => {
+  it("asks for a local semantic profile before incompatible-vector updates", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -41,7 +42,7 @@ describe("Filo semantic index display", () => {
     (view as any).status = status.getStatus();
     (view as any).render();
     expect(labels).toContain(
-      "Select an embedding model in Trama settings, then update the index to discover related notes."
+      "No compatible semantic vectors are available locally. Select a local profile or connect its provider, then update the index."
     );
     expect(labels).not.toContain("Update index");
     expect(labels.some((label) => label.includes("incompatible"))).toBe(false);
@@ -60,6 +61,7 @@ describe("Filo semantic index display", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -109,6 +111,7 @@ describe("Filo semantic index display", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -145,6 +148,7 @@ describe("Filo semantic index display", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -192,6 +196,7 @@ describe("Filo semantic index display", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();

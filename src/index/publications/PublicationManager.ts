@@ -7,9 +7,49 @@ import {
   type SqliteState,
 } from "@/index/sqlite/protocol";
 import { PublicationStore, type PublicationDataAdapter } from "./PublicationStore";
+import type { CacheShardResult } from "@/index/sqlite/cache-shards";
 
 export interface PublicationIndexPort {
-  publishPublication<T>(
+  prepareCacheShard?(
+    afterActionKey?: string,
+    taskKind?: "document" | "query",
+    profile?: string,
+    sourceDigests?: readonly string[],
+    presentDigests?: readonly string[],
+    maxPayloadBytes?: number,
+    now?: number
+  ): Promise<CacheShardResult | undefined>;
+  ingestCacheShard?(
+    bytes: ArrayBuffer,
+    digest: string
+  ): Promise<{
+    imported: number;
+    duplicate: boolean;
+    profile: string;
+    taskKind: "document" | "query";
+  }>;
+  extractLegacyCacheShard?(
+    bytes: ArrayBuffer | undefined,
+    digest: string,
+    afterActionKey?: string
+  ): Promise<CacheShardResult | undefined>;
+  hasLegacyCacheSource?(digest: string): Promise<boolean>;
+  markLegacyCacheSource?(digest: string): Promise<void>;
+  maintainCache?(now: number): Promise<unknown>;
+  recordCacheRetirements?(
+    sourceDigests: readonly string[],
+    replacementDigests: readonly string[],
+    now: number
+  ): Promise<void>;
+  listCacheRetirements?(): Promise<import("@/index/sqlite/cache-shards").CacheRetirement[]>;
+  completeCacheRetirement?(sourceDigest: string, now: number): Promise<void>;
+  recordCacheShard?(
+    digest: string,
+    profile: string,
+    taskKind: "document" | "query",
+    actionKeys: readonly string[]
+  ): Promise<void>;
+  publishPublication?<T>(
     publicationId: string,
     install: (
       prepared: PublicationPrepared,
@@ -17,11 +57,11 @@ export interface PublicationIndexPort {
     ) => Promise<T>,
     settle?: (committed: boolean) => Promise<void>
   ): Promise<{ prepared: PublicationPrepared; installed: T }>;
-  inspectPublication(
+  inspectPublication?(
     bytes: ArrayBuffer,
     transferOwnership?: boolean
   ): Promise<PublicationInspection>;
-  adoptPublication(
+  adoptPublication?(
     bytes: ArrayBuffer,
     expectedPublicationId?: string,
     inspection?: PublicationInspection
@@ -29,6 +69,8 @@ export interface PublicationIndexPort {
   getState?(): Promise<SqliteState | undefined>;
   capabilities?(): IndexCapabilities;
 }
+
+const LEGACY_EXTRACTION_MARKER = "e".repeat(64);
 
 export interface PublicationWarning {
   readonly phase: "prepare" | "stage" | "replace" | "finalize" | "inspect" | "adopt";
@@ -76,11 +118,9 @@ export interface PublicationManagerOptions {
  * owned by MaintenanceScheduler; the index port fences mutations once started.
  */
 export class PublicationManager {
-  private readonly idFactory: () => string;
   private readonly onWarning?: (warning: PublicationWarning) => void;
   private readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
   private lastMetrics?: PublicationResourceMetrics;
-  private replacementTargetDigest?: string;
 
   readonly store: PublicationStore;
 
@@ -96,7 +136,6 @@ export class PublicationManager {
             directory: options.directory,
             temporaryToken: options.temporaryToken,
           });
-    this.idFactory = options.idFactory ?? (() => randomPublicationId());
     this.onWarning = options.onWarning;
     this.onMetrics = options.onMetrics;
   }
@@ -106,142 +145,243 @@ export class PublicationManager {
   }
 
   async publish(): Promise<PublicationResult> {
-    return this.publishSerialized();
+    return this.publishCacheShards();
   }
 
   /** Inspect and adopt the exact configured file without publishing directly. */
   async adoptCurrent(): Promise<AdoptionResult> {
-    return this.adoptSerialized();
+    return this.ingestCacheShards();
   }
 
-  private async publishSerialized(): Promise<PublicationResult> {
+  private async publishCacheShards(): Promise<PublicationResult> {
     const started = Date.now();
-    const id = this.idFactory();
-    let phase: PublicationWarning["phase"] = "prepare";
-    let hadPrevious: boolean | undefined;
+    let totalBytes = 0;
     try {
-      const { prepared, installed } = await this.index.publishPublication(
-        id,
-        async (candidate, inspect) => {
-          phase = "stage";
-          const stageStarted = Date.now();
-          const staged = await this.store.stage(candidate.bytes, id);
-          const stageDurationMs = Date.now() - stageStarted;
-          try {
-            phase = "inspect";
-            const inspection = await (inspect ?? this.index.inspectPublication.bind(this.index))(
-              staged.bytes,
-              true
+      if (!this.index.prepareCacheShard)
+        throw new StructuredError("unavailable", "Cache shard export is unavailable.", true);
+      const now = Date.now();
+      const retention = (await this.index.maintainCache?.(now)) as
+        { expiredSourceDigests?: readonly string[]; lastCompactionAt?: number } | undefined;
+      await this.retireReadyShards(now);
+      if (retention) await this.compactIfDue(retention, now);
+      const state = await this.index.getState?.();
+      const profiles: (string | undefined)[] = state?.embeddingProfiles?.length
+        ? state.embeddingProfiles.map((profile) => profile.fingerprint)
+        : [state?.embeddingFingerprint || undefined];
+      const presentDigests = this.store.supportsCacheShardListing()
+        ? (await this.store.listCacheShards()).map((file) => file.digest)
+        : undefined;
+      for (const profile of profiles) {
+        for (const taskKind of ["document", "query"] as const) {
+          let cursor: string | undefined;
+          for (;;) {
+            const shard = await this.index.prepareCacheShard(
+              cursor,
+              taskKind,
+              profile,
+              undefined,
+              presentDigests
             );
-            if (inspection.publicationId !== id)
-              throw new StructuredError("internal", "Publication ID changed in staged copy.", true);
-            phase = "replace";
-            await this.verifyReplacementTarget();
-            const replaceStarted = Date.now();
-            hadPrevious = await this.store.replace(staged, true);
-            phase = "finalize";
-            return { staged, stageDurationMs, replaceDurationMs: Date.now() - replaceStarted };
-          } catch (error) {
-            await this.store.removeTemporary(staged.temporaryPath);
-            throw error;
+            if (!shard) break;
+            if (shard.bytes.byteLength !== 0 && shard.bytes.byteLength > 4_194_304)
+              throw new StructuredError(
+                "invalid_request",
+                "Cache shard exceeds the file size limit.",
+                false
+              );
+            if (!shard.rowCount || !shard.nextActionKey || shard.nextActionKey === cursor)
+              throw new StructuredError(
+                "invalid_request",
+                "Cache shard cursor did not advance.",
+                false
+              );
+            await this.store.installCacheShard(shard.bytes, shard.digest);
+            await this.index.recordCacheShard?.(
+              shard.digest,
+              shard.profile,
+              taskKind,
+              shard.actionKeys
+            );
+            cursor = shard.nextActionKey;
+            totalBytes += shard.bytes.byteLength;
           }
-        },
-        async (committed) => {
-          if (hadPrevious === undefined) return;
-          if (committed) await this.store.finishReplacement();
-          else await this.store.rollbackReplacement(hadPrevious);
         }
-      );
-      const metrics: PublicationResourceMetrics = {
-        publicationId: id,
-        byteSize: installed.staged.byteSize,
-        copyBytes: (prepared.copyBytes ?? 0) + installed.staged.copyBytes,
+      }
+      const metrics = {
+        byteSize: totalBytes,
+        copyBytes: totalBytes,
         durationMs: Date.now() - started,
-        stageDurationMs: installed.stageDurationMs,
-        replaceDurationMs: installed.replaceDurationMs,
       };
       this.lastMetrics = metrics;
-      this.replacementTargetDigest = undefined;
       try {
         this.onMetrics?.(metrics);
       } catch {
-        // Resource reporting is observational and cannot invalidate a commit.
+        /* metrics are observational */
       }
-      return { published: true, publicationId: id, metrics };
+      return { published: true, metrics };
     } catch (error) {
-      return this.failed(phase, error);
+      return this.failed("stage", error);
     }
   }
 
-  private async adoptSerialized(): Promise<AdoptionResult> {
-    let bytes: ArrayBuffer | undefined;
-    try {
-      bytes = await this.store.read();
-    } catch (error) {
-      return { adopted: false, warning: this.warn("inspect", error) };
-    }
-    if (!bytes) {
-      this.replacementTargetDigest = undefined;
-      return { adopted: false, ignored: "missing" };
-    }
-    return this.adoptBytesSerialized(bytes);
-  }
-
-  private async adoptBytesSerialized(bytes: ArrayBuffer): Promise<AdoptionResult> {
-    let inspection: PublicationInspection;
-    try {
-      inspection = await this.index.inspectPublication(bytes);
-    } catch (error) {
-      if (publicationErrorDetails(error).code === "incompatible_state") {
-        this.replacementTargetDigest = await sha256Hex(bytes);
-        return { adopted: false, replacementRequired: true };
-      }
-      return { adopted: false, warning: this.warn("inspect", error) };
-    }
-    this.replacementTargetDigest = undefined;
-    let current: string | undefined;
-    try {
-      current = await this.currentPublicationId();
-    } catch (error) {
-      return { adopted: false, warning: this.warn("inspect", error) };
-    }
-    if (current === inspection.publicationId)
-      return { adopted: false, ignored: "same-id", publicationId: current };
-    try {
-      const state = await this.index.adoptPublication(bytes, inspection.publicationId, inspection);
-      // An adopted candidate is authoritative as loaded data. Never publish or reconcile here.
-      return { adopted: true, publicationId: inspection.publicationId, state };
-    } catch (error) {
-      return {
-        adopted: false,
-        publicationId: inspection.publicationId,
-        warning: this.warn("adopt", error),
-      };
-    }
-  }
-
-  private async currentPublicationId(): Promise<string | undefined> {
-    const state = await this.index.getState?.();
-    if (state?.publicationId) return state.publicationId;
-    return this.index.capabilities?.().publicationId;
-  }
-
-  /** Refuse to overwrite a synchronized target that changed during local convergence. */
-  private async verifyReplacementTarget(): Promise<void> {
-    const expected = this.replacementTargetDigest;
-    if (!expected) return;
-    const current = await this.store.read();
-    if (!current || (await sha256Hex(current)) === expected) return;
-    try {
-      await this.index.inspectPublication(current);
-    } catch (error) {
-      if (publicationErrorDetails(error).code === "upgrade_required") throw error;
-    }
-    throw new StructuredError(
-      "busy",
-      "The synchronized index changed while its replacement was being prepared. Check it again.",
-      true
+  private async retireReadyShards(now: number): Promise<void> {
+    if (!this.index.listCacheRetirements || !this.index.completeCacheRetirement) return;
+    const retirements = await this.index.listCacheRetirements();
+    const listed = new Map(
+      (await this.store.listCacheShards()).map((file) => [file.digest, file.path])
     );
+    const groups = new Map<string, typeof retirements>();
+    for (const retirement of retirements) {
+      const current = groups.get(retirement.replacementSetId) ?? [];
+      current.push(retirement);
+      groups.set(retirement.replacementSetId, current);
+    }
+    for (const group of groups.values()) {
+      if (group.some((item) => item.retireAfter > now)) continue;
+      const replacements = group[0]?.replacements ?? [];
+      let valid = true;
+      for (const digest of replacements) {
+        const path = listed.get(digest);
+        if (!path || (await sha256Hex(await this.store.readCacheShard(path))) !== digest) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) continue;
+      for (const item of group) {
+        if (listed.has(item.sourceDigest)) await this.store.removeCacheShard(item.sourceDigest);
+        await this.index.completeCacheRetirement(item.sourceDigest, now);
+      }
+    }
+  }
+
+  private async compactIfDue(
+    retention: { expiredSourceDigests?: readonly string[]; lastCompactionAt?: number },
+    now: number
+  ): Promise<void> {
+    if (!this.index.ingestCacheShard || !this.index.recordCacheRetirements) return;
+    if (now - (retention.lastCompactionAt ?? 0) < 7 * 24 * 60 * 60 * 1000) return;
+    const files = await this.store.listCacheShards();
+    const small: (typeof files)[number][] = [];
+    const selected = new Set<string>();
+    let capturedBytes = 0;
+    const expired = new Set(retention.expiredSourceDigests ?? []);
+    for (const file of files) {
+      const bytes = await this.store.readCacheShard(file.path);
+      if ((await sha256Hex(bytes)) !== file.digest)
+        throw new StructuredError("internal", "Cache shard name hash mismatch.", false);
+      if (expired.has(file.digest)) {
+        if (capturedBytes + bytes.byteLength <= 16 * 1024 * 1024) {
+          selected.add(file.digest);
+          capturedBytes += bytes.byteLength;
+        }
+      } else if (!expired.size && bytes.byteLength <= 1024 * 1024) {
+        small.push(file);
+      }
+    }
+    if (!expired.size) {
+      if (small.length < 8) return;
+      for (const file of small.slice(0, 8)) selected.add(file.digest);
+      capturedBytes = 0;
+      for (const file of small.slice(0, 8))
+        capturedBytes += (await this.store.readCacheShard(file.path)).byteLength;
+    }
+    if (!selected.size || capturedBytes > 16 * 1024 * 1024) return;
+    const grouped = new Map<
+      string,
+      { profile: string; taskKind: "document" | "query"; digests: string[] }
+    >();
+    for (const file of files) {
+      if (!selected.has(file.digest)) continue;
+      const bytes = await this.store.readCacheShard(file.path);
+      const ingested = await this.index.ingestCacheShard(bytes, file.digest);
+      const key = `${ingested.profile}:${ingested.taskKind}`;
+      const group = grouped.get(key) ?? {
+        profile: ingested.profile,
+        taskKind: ingested.taskKind,
+        digests: [],
+      };
+      group.digests.push(file.digest);
+      grouped.set(key, group);
+    }
+    const replacementDigests = new Set<string>();
+    for (const group of grouped.values()) {
+      let cursor: string | undefined;
+      for (;;) {
+        const shard = await this.index.prepareCacheShard?.(
+          cursor,
+          group.taskKind,
+          group.profile,
+          group.digests,
+          [],
+          3_500_000,
+          now
+        );
+        if (!shard) break;
+        await this.store.installCacheShard(shard.bytes, shard.digest);
+        await this.index.recordCacheShard?.(
+          shard.digest,
+          shard.profile,
+          group.taskKind,
+          shard.actionKeys
+        );
+        replacementDigests.add(shard.digest);
+        cursor = shard.nextActionKey;
+      }
+    }
+    const retireSources = [...selected].filter((digest) => !replacementDigests.has(digest));
+    await this.index.recordCacheRetirements(
+      retireSources,
+      retireSources.length ? [...replacementDigests] : [],
+      now
+    );
+  }
+
+  private async ingestCacheShards(): Promise<AdoptionResult> {
+    if (!this.index.ingestCacheShard) return { adopted: false, ignored: "missing" };
+    try {
+      let imported = 0;
+      const legacyDone = this.index.hasLegacyCacheSource
+        ? await this.index.hasLegacyCacheSource(LEGACY_EXTRACTION_MARKER)
+        : false;
+      const legacy = legacyDone ? undefined : await this.store.read();
+      if (legacy && this.index.extractLegacyCacheShard) {
+        const digest = await sha256Hex(legacy);
+        let cursor: string | undefined;
+        let first = true;
+        for (;;) {
+          const shard = await this.index.extractLegacyCacheShard(
+            first ? legacy : undefined,
+            digest,
+            cursor
+          );
+          first = false;
+          if (!shard) break;
+          if (!shard.rowCount || !shard.nextActionKey || shard.nextActionKey === cursor)
+            throw new StructuredError(
+              "invalid_request",
+              "Legacy cache extraction cursor did not advance.",
+              false
+            );
+          await this.store.installCacheShard(shard.bytes, shard.digest);
+          const result = await this.index.ingestCacheShard(shard.bytes, shard.digest);
+          if (!result.duplicate) imported += result.imported;
+          cursor = shard.nextActionKey;
+        }
+        await this.index.markLegacyCacheSource?.(LEGACY_EXTRACTION_MARKER);
+      }
+      const shards = await this.store.listCacheShards();
+      let seen = 0;
+      for (const shard of shards) {
+        const bytes = await this.store.readCacheShard(shard.path);
+        const result = await this.index.ingestCacheShard(bytes, shard.digest);
+        if (!result.duplicate) imported += result.imported;
+        seen++;
+      }
+      return { adopted: imported > 0, ignored: seen ? "same-id" : "missing" };
+    } catch (error) {
+      return { adopted: false, warning: this.warn("inspect", error) };
+    }
   }
 
   private failed(phase: PublicationWarning["phase"], error: unknown): PublicationResult {
@@ -319,12 +459,4 @@ function publicationErrorDetails(error: unknown): PublicationErrorDetails {
     break;
   }
   return result;
-}
-
-function randomPublicationId(): string {
-  try {
-    return globalThis.crypto.randomUUID();
-  } catch {
-    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  }
 }

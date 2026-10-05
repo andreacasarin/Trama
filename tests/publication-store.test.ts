@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { sha256Hex } from "@/index/Identity";
 import {
   PublicationStore,
   normalizePublicationDirectory,
@@ -30,6 +31,10 @@ function adapter() {
     remove: async (path) => {
       files.delete(path);
     },
+    list: async (path) => ({
+      files: [...files.keys()].filter((name) => name.startsWith(`${path}/`)),
+      folders: [],
+    }),
   };
   return value;
 }
@@ -53,6 +58,54 @@ describe("PublicationStore", () => {
     expect(store.directory).toBe("sync/folder");
     expect(store.path).toBe("sync/folder/index.sqlite3");
     expect(store.temporaryPath("x/y")).toBe("sync/folder/index.sqlite3.trama-tmp-x_y");
+  });
+
+  it("installs immutable digest-named shards after readback hashing and lists only final artifacts", async () => {
+    const storage = adapter();
+    const store = new PublicationStore(storage, {
+      directory: "Trama/index",
+      temporaryToken: () => "fixed",
+    });
+    const bytes = new TextEncoder().encode("shard").buffer;
+    const digest = await sha256Hex(bytes);
+    await expect(store.installCacheShard(bytes, digest)).resolves.toBe(true);
+    await expect(store.installCacheShard(bytes, digest)).resolves.toBe(false);
+    expect(await store.listCacheShards()).toEqual([
+      { path: `Trama/index/cache-v1/cache-${digest}.sqlite3`, digest },
+    ]);
+    storage.files.set(
+      `${store.cacheDirectory}/cache-${"0".repeat(64)}.sqlite3.trama-tmp-x`,
+      new Uint8Array([1])
+    );
+    storage.files.set(`${store.cacheDirectory}/unrecognized.sqlite3`, new Uint8Array([1]));
+    expect(await store.listCacheShards()).toHaveLength(1);
+    expect([...storage.files.get(`Trama/index/cache-v1/cache-${digest}.sqlite3`)!]).toEqual([
+      ...new Uint8Array(bytes),
+    ]);
+  });
+
+  it("treats a missing cache directory as empty without listing it", async () => {
+    const storage = adapter();
+    storage.exists = vi.fn(async (path) => path !== "Trama/index/cache-v1");
+    const list = vi.fn(storage.list);
+    storage.list = list;
+    const store = new PublicationStore(storage);
+
+    await expect(store.listCacheShards()).resolves.toEqual([]);
+    await expect(store.clearCacheShards()).resolves.toBeUndefined();
+    expect(storage.exists).toHaveBeenCalledWith("Trama/index/cache-v1");
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("propagates cache listing errors when the directory exists", async () => {
+    const storage = adapter();
+    storage.exists = async () => true;
+    storage.list = async () => {
+      throw new Error("listing failed");
+    };
+    const store = new PublicationStore(storage);
+
+    await expect(store.clearCacheShards()).rejects.toThrow("listing failed");
   });
 
   it("stages, reads back, and atomically installs through the adapter", async () => {
@@ -142,5 +195,44 @@ describe("PublicationStore", () => {
     storage.files.delete(store.path);
     expect([...new Uint8Array((await store.read()) as ArrayBuffer)]).toEqual([4, 5]);
     expect(storage.files.has(store.backupPath)).toBe(false);
+  });
+
+  it("clears the fixed backup before only the configured publication target", async () => {
+    const storage = adapter();
+    const store = new PublicationStore(storage, { directory: "Trama/custom" });
+    storage.files.set(store.path, new Uint8Array([1]));
+    storage.files.set(store.backupPath, new Uint8Array([2]));
+    storage.files.set("Trama/custom/index.sqlite3.trama-tmp-kept", new Uint8Array([3]));
+    storage.files.set("Trama/other/index.sqlite3", new Uint8Array([4]));
+    const remove = storage.remove!;
+    storage.remove = async (path) => {
+      storage.renamed.push(["remove", path]);
+      await remove(path);
+    };
+
+    await store.clear();
+
+    expect(storage.renamed).toEqual([
+      ["remove", store.backupPath],
+      ["remove", store.path],
+    ]);
+    expect([...storage.files.keys()]).toEqual([
+      "Trama/custom/index.sqlite3.trama-tmp-kept",
+      "Trama/other/index.sqlite3",
+    ]);
+  });
+
+  it("does not clear the target if deleting the recovery backup fails", async () => {
+    const storage = adapter();
+    const store = new PublicationStore(storage, { directory: "Trama/index" });
+    storage.files.set(store.path, new Uint8Array([1]));
+    storage.files.set(store.backupPath, new Uint8Array([2]));
+    storage.remove = async () => {
+      throw new Error("backup locked");
+    };
+
+    await expect(store.clear()).rejects.toThrow("backup locked");
+    expect(storage.files.has(store.path)).toBe(true);
+    expect(storage.files.has(store.backupPath)).toBe(true);
   });
 });

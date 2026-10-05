@@ -8,6 +8,7 @@ import {
   type SqliteState,
 } from "./protocol";
 import { exportOpfsDatabase, type WorkerStorageState } from "./worker-lifecycle";
+import type { SnapshotValidationPhase } from "./publication";
 
 interface PublicationPool {
   readonly OpfsSAHPoolDb: new (name: string, mode: string) => SqliteConnection;
@@ -28,7 +29,17 @@ interface WorkerPublicationHost {
   openDatabase(): Promise<MutableSqliteDatabase>;
   closeConnection(): void;
   runtimeConfig(database: MutableSqliteDatabase): WorkerRuntimeConfig;
+  onPhase?(phase: PublicationPhase, durationMs: number): void;
 }
+
+type PublicationPhase =
+  | "snapshotValidation"
+  | "snapshotLiveExport"
+  | "snapshotCandidateImport"
+  | "snapshotBootPrune"
+  | "snapshotCandidateExport"
+  | "snapshotLiveReopen"
+  | SnapshotValidationPhase;
 
 /** Owns Worker-side snapshot inspection, publication, and atomic adoption. */
 export class WorkerPublicationOperations {
@@ -39,38 +50,73 @@ export class WorkerPublicationOperations {
     this.rejectActiveLexicalRun(database);
     const state = database.getState();
     const expected = this.host.runtimeConfig(database);
-    database.validateSnapshot(
-      state.corpusFingerprint,
-      state.dimensions,
-      state.embeddingFingerprint
-    );
+    const validationStarted = this.phaseStarted();
+    try {
+      database.validateSnapshot(
+        state.corpusFingerprint,
+        state.dimensions,
+        state.embeddingFingerprint,
+        undefined,
+        this.validationObserver()
+      );
+    } finally {
+      this.recordPhase("snapshotValidation", validationStarted);
+    }
     const started = Date.now();
-    const original = this.liveBytes();
+    const liveExportStarted = this.phaseStarted();
+    let original: ArrayBuffer;
+    try {
+      original = this.liveBytes();
+    } finally {
+      this.recordPhase("snapshotLiveExport", liveExportStarted);
+    }
     this.host.closeConnection();
     const pool = this.pool();
     const name = this.candidateName(publicationId);
     let candidate: MutableSqliteDatabase | undefined;
     try {
-      pool.importDb(name, original);
-      candidate = this.openCandidate(name);
+      const candidateImportStarted = this.phaseStarted();
+      try {
+        pool.importDb(name, original);
+        candidate = this.openCandidate(name);
+      } finally {
+        this.recordPhase("snapshotCandidateImport", candidateImportStarted);
+      }
       // Boot the imported copy before pruning so cache cleanup uses the active
       // embedding fingerprint and dimensions. The live database remains closed
       // while the candidate is prepared and is reopened in finally below.
-      candidate.boot(
-        expected.corpus,
-        expected.dimensions,
-        expected.embedding,
-        expected.buildIdentity
-      );
-      candidate.pruneForPublication();
-      candidate.setPublicationId(publicationId);
-      candidate.validateSnapshot(
-        expected.corpus,
-        expected.dimensions,
-        expected.embedding,
-        expected.buildIdentity
-      );
-      const bytes = exportOpfsDatabase(pool, name);
+      const bootPruneStarted = this.phaseStarted();
+      try {
+        candidate.boot(
+          expected.corpus,
+          expected.dimensions,
+          expected.embedding,
+          expected.buildIdentity
+        );
+        candidate.pruneForPublication();
+        candidate.setPublicationId(publicationId);
+      } finally {
+        this.recordPhase("snapshotBootPrune", bootPruneStarted);
+      }
+      const candidateValidationStarted = this.phaseStarted();
+      try {
+        candidate.validateSnapshot(
+          expected.corpus,
+          expected.dimensions,
+          expected.embedding,
+          expected.buildIdentity,
+          this.validationObserver()
+        );
+      } finally {
+        this.recordPhase("snapshotValidation", candidateValidationStarted);
+      }
+      const candidateExportStarted = this.phaseStarted();
+      let bytes: ArrayBuffer;
+      try {
+        bytes = exportOpfsDatabase(pool, name);
+      } finally {
+        this.recordPhase("snapshotCandidateExport", candidateExportStarted);
+      }
       if (bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)
         throw sqliteError("integrity_failed", "SQLite publication exceeds the safety limit");
       return {
@@ -84,7 +130,12 @@ export class WorkerPublicationOperations {
     } finally {
       candidate?.close();
       pool.unlink(name);
-      await this.host.openDatabase();
+      const liveReopenStarted = this.phaseStarted();
+      try {
+        await this.host.openDatabase();
+      } finally {
+        this.recordPhase("snapshotLiveReopen", liveReopenStarted);
+      }
     }
   }
 
@@ -124,14 +175,25 @@ export class WorkerPublicationOperations {
     const name = `/index.sqlite3.inspect-${Date.now()}`;
     let candidate: MutableSqliteDatabase | undefined;
     try {
-      pool.importDb(name, bytes);
-      candidate = this.openCandidate(name);
-      candidate.validateSnapshot(
-        payload.corpusFingerprint ?? expected.corpus,
-        payload.dimensions ?? expected.dimensions,
-        payload.embeddingFingerprint ?? expected.embedding,
-        payload.buildIdentity ?? expected.buildIdentity
-      );
+      const candidateImportStarted = this.phaseStarted();
+      try {
+        pool.importDb(name, bytes);
+        candidate = this.openCandidate(name);
+      } finally {
+        this.recordPhase("snapshotCandidateImport", candidateImportStarted);
+      }
+      const validationStarted = this.phaseStarted();
+      try {
+        candidate.validateSnapshot(
+          payload.corpusFingerprint ?? expected.corpus,
+          payload.dimensions ?? expected.dimensions,
+          payload.embeddingFingerprint ?? expected.embedding,
+          payload.buildIdentity ?? expected.buildIdentity,
+          this.validationObserver()
+        );
+      } finally {
+        this.recordPhase("snapshotValidation", validationStarted);
+      }
       const state = candidate.getState();
       if (!state.publicationId)
         throw sqliteError("incompatible_state", "Publication ID is missing");
@@ -139,7 +201,12 @@ export class WorkerPublicationOperations {
     } finally {
       candidate?.close();
       pool.unlink(name);
-      await this.host.openDatabase();
+      const liveReopenStarted = this.phaseStarted();
+      try {
+        await this.host.openDatabase();
+      } finally {
+        this.recordPhase("snapshotLiveReopen", liveReopenStarted);
+      }
     }
   }
 
@@ -214,6 +281,26 @@ export class WorkerPublicationOperations {
 
   private openCandidate(name: string): MutableSqliteDatabase {
     return new MutableSqliteDatabase(new (this.pool().OpfsSAHPoolDb)(name, "c"));
+  }
+
+  private phaseStarted(): number | undefined {
+    return this.host.onPhase ? performance.now() : undefined;
+  }
+
+  private recordPhase(phase: PublicationPhase, started: number | undefined): void {
+    if (started === undefined) return;
+    try {
+      this.host.onPhase?.(phase, Math.max(0, performance.now() - started));
+    } catch {
+      // Diagnostics cannot change publication results.
+    }
+  }
+
+  private validationObserver():
+    ((phase: SnapshotValidationPhase, durationMs: number) => void) | undefined {
+    return this.host.onPhase
+      ? (phase, durationMs) => this.host.onPhase?.(phase, durationMs)
+      : undefined;
   }
 
   private rejectActiveLexicalRun(database: MutableSqliteDatabase): void {

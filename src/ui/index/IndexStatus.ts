@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 import {
   emitTramaDiagnostic,
   diagnosticsEnabled,
@@ -74,6 +74,8 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
 interface StatusActions {
   update(): Promise<void>;
   rebuild(): Promise<void>;
+  reset(): Promise<void>;
+  clearShared?(): Promise<void>;
   stop(): void;
 }
 interface StatusTiming {
@@ -122,6 +124,17 @@ export class IndexStatusController {
       },
     });
     this.plugin.addCommand({
+      id: "clear-indexes-and-shared-cache",
+      name: "Clear indexes and shared cache",
+      callback: () => {
+        void this.actions.clearShared?.().catch((error) => {
+          new Notice(
+            `Trama index clear failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      },
+    });
+    this.plugin.addCommand({
       id: "rebuild-index",
       name: "Rebuild index",
       callback: () => void this.run("reindex"),
@@ -129,6 +142,17 @@ export class IndexStatusController {
         if (!this.status.canReindex) return false;
         if (!checking) void this.run("reindex");
         return true;
+      },
+    });
+    this.plugin.addCommand({
+      id: "reset-all-indexes",
+      name: "Reset all indexes",
+      callback: () => {
+        void this.actions.reset().catch((error) => {
+          new Notice(
+            `Trama index reset failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
       },
     });
     this.plugin.addCommand({
@@ -302,13 +326,15 @@ export class IndexStatusController {
     this.operationChannel = snapshot.phase === "semantic" ? "semantic" : "lexical";
     const kind = this.operationChannel === "semantic" ? "preparing" : "building";
     const label =
-      snapshot.phase === "publication"
-        ? "Publishing index…"
-        : snapshot.phase === "semantic"
-          ? "Updating semantic index…"
-          : snapshot.lane === "rebuild"
-            ? "Rebuilding index…"
-            : "Updating index…";
+      snapshot.phase === "reset"
+        ? "Resetting local and published indexes…"
+        : snapshot.phase === "publication"
+          ? "Publishing index…"
+          : snapshot.phase === "semantic"
+            ? "Updating semantic index…"
+            : snapshot.lane === "rebuild"
+              ? "Rebuilding index…"
+              : "Updating index…";
     this.set(kind, this.status.hasLastGood, label, false);
   }
 

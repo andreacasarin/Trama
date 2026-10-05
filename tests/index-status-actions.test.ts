@@ -2,16 +2,51 @@ import { describe, expect, it, vi } from "vitest";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
+const notices = vi.hoisted(() => [] as string[]);
+vi.mock("obsidian", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("obsidian")>()),
+  Notice: class {
+    constructor(message: string) {
+      notices.push(message);
+    }
+  },
+}));
+
 describe("index maintenance actions", () => {
-  it("exposes only Update, Rebuild, and Stop commands", async () => {
-    const commands: { id: string; name: string }[] = [];
+  it("routes Clear indexes and shared cache through the shared action", () => {
+    const commands: { id: string; callback?: () => void }[] = [];
+    const clearShared = vi.fn(async () => undefined);
+    const status = new IndexStatusController(
+      {
+        addCommand: (command: { id: string; callback?: () => void }) => commands.push(command),
+      } as any,
+      {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        reset: async () => undefined,
+        clearShared,
+        stop: () => undefined,
+      }
+    );
+    status.register();
+    commands.find(({ id }) => id === "clear-indexes-and-shared-cache")?.callback?.();
+    expect(clearShared).toHaveBeenCalledOnce();
+  });
+
+  it("exposes Update, Rebuild, Reset, and Stop commands", async () => {
+    const commands: { id: string; name: string; callback?: () => void }[] = [];
     const update = vi.fn(async () => undefined);
     const rebuild = vi.fn(async () => undefined);
+    const reset = vi.fn(async () => undefined);
     const status = new IndexStatusController(
-      { addCommand: (command: { id: string; name: string }) => commands.push(command) } as any,
+      {
+        addCommand: (command: { id: string; name: string; callback?: () => void }) =>
+          commands.push(command),
+      } as any,
       {
         update,
         rebuild,
+        reset,
         stop: () => undefined,
       }
     );
@@ -20,12 +55,40 @@ describe("index maintenance actions", () => {
 
     expect(commands.map(({ name }) => name)).toEqual([
       "Update index",
+      "Clear indexes and shared cache",
       "Rebuild index",
+      "Reset all indexes",
       "Stop index maintenance",
     ]);
     await status.run("reindex");
     expect(rebuild).toHaveBeenCalledOnce();
+    commands.find(({ id }) => id === "reset-all-indexes")?.callback?.();
+    expect(reset).toHaveBeenCalledOnce();
     expect(commands.map(({ id }) => id)).not.toContain("prepare-semantic-index");
+  });
+
+  it("handles reset rejection and shows the failure detail", async () => {
+    notices.length = 0;
+    const commands: { id: string; callback?: () => void }[] = [];
+    const status = new IndexStatusController(
+      {
+        addCommand: (command: { id: string; callback?: () => void }) => commands.push(command),
+      } as any,
+      {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        reset: () => Promise.reject(new Error("Index maintenance is active; retry reset.")),
+        stop: () => undefined,
+      }
+    );
+    status.register();
+
+    commands.find(({ id }) => id === "reset-all-indexes")?.callback?.();
+    await vi.waitFor(() =>
+      expect(notices).toEqual([
+        "Trama index reset failed: Index maintenance is active; retry reset.",
+      ])
+    );
   });
 
   it("retains lexical ETA when chunk and write progress alternate", () => {
@@ -35,6 +98,7 @@ describe("index maintenance actions", () => {
       {
         update: async () => undefined,
         rebuild: async () => undefined,
+        reset: async () => undefined,
         stop: () => undefined,
       },
       undefined,
@@ -97,6 +161,7 @@ describe("index maintenance actions", () => {
       {
         update,
         rebuild: async () => undefined,
+        reset: async () => undefined,
         stop: () => undefined,
       },
       { enabled: () => true, emit: (event) => events.push(event) }
@@ -119,6 +184,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -130,6 +196,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -162,6 +229,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -184,6 +252,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -200,6 +269,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setReady();
@@ -214,6 +284,7 @@ describe("index maintenance actions", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
+      reset: async () => undefined,
       stop: () => undefined,
     });
     status.setCapabilities({
@@ -237,6 +308,7 @@ describe("index maintenance actions", () => {
       const status = new IndexStatusController({} as any, {
         update: async () => undefined,
         rebuild: async () => undefined,
+        reset: async () => undefined,
         stop: () => undefined,
       });
       status.setCapabilities({

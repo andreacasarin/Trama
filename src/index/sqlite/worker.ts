@@ -1,6 +1,10 @@
 import { MutableSqliteDatabase, type SqliteConnection } from "./database";
 import { SqliteScheduler } from "./scheduler";
-import { closeWorkerDatabase, type WorkerStorageState } from "./worker-lifecycle";
+import {
+  closeWorkerDatabase,
+  resetWorkerDatabase,
+  type WorkerStorageState,
+} from "./worker-lifecycle";
 import {
   SQLITE_PROTOCOL_VERSION,
   SQLITE_DIAGNOSTICS_CONFIG_TYPE,
@@ -13,9 +17,10 @@ import {
   sqliteError,
 } from "./protocol";
 import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
-import { applyLexicalMarkdownBatch } from "./markdown";
+import { applyLexicalMarkdownBatch, type LexicalMarkdownPhase } from "./markdown";
 import { validateRequest } from "./request-validation";
 import { WorkerPublicationOperations } from "./worker-publication";
+import { sha256Hex } from "@/index/Identity";
 import type { TramaDiagnostics, TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
 
 type SqliteModule = {
@@ -39,6 +44,10 @@ type SqliteInitModule = (options: {
 }) => Promise<SqliteModule>;
 type OpfsPool = Awaited<ReturnType<SqliteModule["installOpfsSAHPoolVfs"]>>;
 const storage: WorkerStorageState<MutableSqliteDatabase, SqliteConnection, OpfsPool> = {};
+const legacyCacheCandidates = new Map<
+  string,
+  { readonly name: string; readonly database: MutableSqliteDatabase }
+>();
 const scheduler = new SqliteScheduler();
 let sqliteModulePromise: Promise<SqliteModule> | undefined;
 let databaseIdentity = "default";
@@ -111,6 +120,18 @@ function observeRetrievalPhase(
 ): void {
   emitPerformance(retrievalPhaseRecord(diagnosticMethod, phase, durationMs, itemCount));
 }
+function observeLexicalMarkdownPhase(phase: LexicalMarkdownPhase, durationMs: number): void {
+  emitPerformance({
+    tier: "performance",
+    facets: ["index", "lexical", "worker"],
+    area: "index",
+    event: "phase",
+    operation: "lexical",
+    phase,
+    durationMs,
+    nested: true,
+  });
+}
 export function retrievalPhaseRecord(
   method: SqliteRequest["method"] | undefined,
   phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
@@ -146,6 +167,8 @@ let bootConfig:
   | {
       corpusFingerprint: string;
       embeddingFingerprint: string;
+      profileModelId: string;
+      profileEndpointOrigin: string;
       buildIdentity: string;
       dimensions: number;
     }
@@ -304,7 +327,8 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
         bootConfig.corpusFingerprint,
         bootConfig.dimensions,
         bootConfig.embeddingFingerprint,
-        bootConfig.buildIdentity
+        bootConfig.buildIdentity,
+        { modelId: bootConfig.profileModelId, endpointOrigin: bootConfig.profileEndpointOrigin }
       );
     } catch (error) {
       // Local databases are disposable when their persisted format or vector
@@ -329,24 +353,32 @@ function resetIncompatibleLocalDatabase(config: {
   embeddingFingerprint: string;
   buildIdentity: string;
   dimensions: number;
+  profileModelId: string;
+  profileEndpointOrigin: string;
 }): MutableSqliteDatabase {
   try {
-    closeConnection();
-    if (!storage.opfsPool) throw new Error("OPFS pool is unavailable");
-    storage.opfsPool.unlink("/index.sqlite3");
-    storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
-    storage.database = new MutableSqliteDatabase(
-      storage.connection,
-      workerDiagnostics,
-      observeRetrievalPhase
-    );
-    storage.database.boot(
-      config.corpusFingerprint,
-      config.dimensions,
-      config.embeddingFingerprint,
-      config.buildIdentity
-    );
-    return storage.database;
+    const pool = storage.opfsPool;
+    if (!pool) throw new Error("OPFS pool is unavailable");
+    return resetWorkerDatabase(storage, pool, () => {
+      let connection: SqliteConnection | undefined;
+      let database: MutableSqliteDatabase | undefined;
+      try {
+        connection = new pool.OpfsSAHPoolDb("/index.sqlite3", "c");
+        database = new MutableSqliteDatabase(connection, workerDiagnostics, observeRetrievalPhase);
+        database.boot(
+          config.corpusFingerprint,
+          config.dimensions,
+          config.embeddingFingerprint,
+          config.buildIdentity,
+          { modelId: config.profileModelId, endpointOrigin: config.profileEndpointOrigin }
+        );
+        return { connection, database };
+      } catch (error) {
+        if (database) database.close();
+        else connection?.close();
+        throw error;
+      }
+    });
   } catch (error) {
     if (error && typeof error === "object" && "error" in error) throw error;
     storageFailure("incompatible database reset", error);
@@ -373,6 +405,17 @@ const publication = new WorkerPublicationOperations({
   openDatabase: () => openDatabase(),
   closeConnection,
   runtimeConfig,
+  onPhase: (phase, durationMs) =>
+    emitPerformance({
+      tier: "performance",
+      facets: ["index", "publication", "worker"],
+      area: "index",
+      event: "phase",
+      operation: "publication",
+      phase,
+      durationMs,
+      nested: true,
+    }),
 });
 
 async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unknown> {
@@ -382,6 +425,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       corpusFingerprint: p.corpusFingerprint as string,
       dimensions: p.dimensions as number,
       embeddingFingerprint: (p.embeddingFingerprint ?? "") as string,
+      profileModelId: (p.profileModelId ?? "") as string,
+      profileEndpointOrigin: (p.profileEndpointOrigin ?? "") as string,
       buildIdentity: (p.buildIdentity ?? SQLITE_BUILD_IDENTITY) as string,
     };
     bootConfig = config;
@@ -390,7 +435,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
         config.corpusFingerprint,
         config.dimensions,
         config.embeddingFingerprint,
-        config.buildIdentity
+        config.buildIdentity,
+        { modelId: config.profileModelId, endpointOrigin: config.profileEndpointOrigin }
       );
     } catch (error) {
       if ((error as any)?.error?.code !== "incompatible_state") throw error;
@@ -400,14 +446,110 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
   }
   if (request.method === "shutdown") {
     scheduler.shutdown();
+    for (const candidate of legacyCacheCandidates.values()) {
+      candidate.database.close();
+      storage.opfsPool?.unlink(candidate.name);
+    }
+    legacyCacheCandidates.clear();
     closeConnection();
     bootConfig = undefined;
     return { closed: true };
+  }
+  if (request.method === "resetLocalDatabase") {
+    if (!bootConfig)
+      throw sqliteError("storage_unavailable", "SQLite index must be booted before reset", true);
+    return resetIncompatibleLocalDatabase(bootConfig).getState();
   }
   if (request.method === "preparePublication") return publication.prepare(p.publicationId);
   if (request.method === "finalizePublication") return publication.finalize(p);
   if (request.method === "inspectPublication") return publication.inspect(p);
   if (request.method === "adoptPublication") return publication.adopt(p);
+  if (request.method === "prepareCacheShard") {
+    const database = await openDatabase();
+    return database.prepareCacheShard(
+      storage.opfsPool!,
+      p.afterActionKey,
+      p.taskKind ?? "document",
+      p.profile,
+      p.sourceDigests,
+      p.presentDigests,
+      p.maxPayloadBytes,
+      p.now
+    );
+  }
+  if (request.method === "ingestCacheShard") {
+    const database = await openDatabase();
+    return database.ingestCacheShard(storage.opfsPool!, p.bytes, p.digest);
+  }
+  if (request.method === "extractLegacyCacheShard") {
+    const database = await openDatabase();
+    const digest = p.digest as string;
+    let candidate = legacyCacheCandidates.get(digest);
+    if (!candidate) {
+      if (!(p.bytes instanceof ArrayBuffer) || (await sha256Hex(p.bytes)) !== digest)
+        throw sqliteError("integrity_failed", "Legacy index digest mismatch");
+      const expected = runtimeConfig(database);
+      const name = `/legacy-cache-${digest.slice(0, 16)}`;
+      storage.opfsPool!.importDb(name, p.bytes);
+      const connection = new storage.opfsPool!.OpfsSAHPoolDb(name, "c");
+      const isolated = new MutableSqliteDatabase(
+        connection,
+        workerDiagnostics,
+        observeRetrievalPhase
+      );
+      try {
+        isolated.validateSnapshot(
+          expected.corpus,
+          expected.dimensions,
+          expected.embedding,
+          expected.buildIdentity
+        );
+        candidate = { name, database: isolated };
+        legacyCacheCandidates.set(digest, candidate);
+      } catch (error) {
+        isolated.close();
+        storage.opfsPool!.unlink(name);
+        throw error;
+      }
+    }
+    try {
+      const shard = await candidate.database.prepareCacheShard(storage.opfsPool!, p.afterActionKey);
+      if (!shard) {
+        candidate.database.close();
+        storage.opfsPool!.unlink(candidate.name);
+        legacyCacheCandidates.delete(digest);
+      }
+      return shard;
+    } catch (error) {
+      candidate.database.close();
+      storage.opfsPool!.unlink(candidate.name);
+      legacyCacheCandidates.delete(digest);
+      throw error;
+    }
+  }
+  if (request.method === "hasLegacyCacheSource")
+    return (await openDatabase()).hasLegacyCacheSource(p.digest);
+  if (request.method === "markLegacyCacheSource") {
+    (await openDatabase()).markLegacyCacheSource(p.digest);
+    return { marked: true };
+  }
+  if (request.method === "maintainCache") return (await openDatabase()).maintainCache(p.now);
+  if (request.method === "recordCacheShard") {
+    (await openDatabase()).recordCacheShard(p.digest, p.profile, p.taskKind, p.actionKeys);
+    return { recorded: true };
+  }
+  if (request.method === "recordCacheRetirements") {
+    await (
+      await openDatabase()
+    ).recordCacheRetirements(p.sourceDigests, p.replacementDigests, p.now);
+    return { recorded: true };
+  }
+  if (request.method === "listCacheRetirements")
+    return (await openDatabase()).listCacheRetirements();
+  if (request.method === "completeCacheRetirement") {
+    (await openDatabase()).completeCacheRetirement(p.sourceDigest, p.now);
+    return { completed: true };
+  }
   const db = await openDatabase();
   switch (request.method) {
     case "getState":
@@ -422,7 +564,13 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
         scope: p.scope,
       });
     case "applyLexicalBatch":
-      return applyLexicalMarkdownBatch(db, p.runId, p.notes, signal);
+      return applyLexicalMarkdownBatch(
+        db,
+        p.runId,
+        p.notes,
+        signal,
+        diagnosticsEnabled ? observeLexicalMarkdownPhase : undefined
+      );
     case "finishLexicalRun":
       return db.finishLexicalRun(p.runId);
     case "abortLexicalRun":
@@ -439,6 +587,12 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       );
     case "commitSemanticResults":
       return db.commitSemanticResults(p.results, p.embeddingFingerprint, p.preprocessing);
+    case "lookupQueryVector":
+      return db.lookupQueryVector(p.query, p.embeddingFingerprint);
+    case "storeQueryVector":
+      return db.storeQueryVector(p.query, p.embeddingFingerprint, p.dimensions, p.vector);
+    case "selectEmbeddingProfile":
+      return db.selectEmbeddingProfile(p.fingerprint);
     case "clearSemanticCache":
       return db.clearSemanticCache();
     case "retrieve":
@@ -507,10 +661,19 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
     return;
   }
   const isMaintenance = [
+    "resetLocalDatabase",
     "preparePublication",
     "finalizePublication",
     "inspectPublication",
     "adoptPublication",
+    "prepareCacheShard",
+    "extractLegacyCacheShard",
+    "markLegacyCacheSource",
+    "maintainCache",
+    "recordCacheShard",
+    "recordCacheRetirements",
+    "listCacheRetirements",
+    "completeCacheRetirement",
   ].includes(request.method);
   if (isMaintenance) maintenance = true;
   void scheduler

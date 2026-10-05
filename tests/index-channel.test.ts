@@ -9,6 +9,7 @@ const state: SqliteState = {
   dimensions: 2,
   corpusFingerprint: "corpus",
   embeddingFingerprint: "embedding",
+  embeddingProfiles: [],
   incomplete: false,
   snapshotLoaded: false,
   changeCounter: 1,

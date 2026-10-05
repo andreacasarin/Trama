@@ -47,11 +47,11 @@ export const sourceDigestsV1: Readonly<Record<WorkloadProfile["id"], string>> = 
 };
 
 // prettier-ignore
-export const REFERENCE_SOURCE_MANIFEST_SHA256 = "1de3cf5176b2e7e438bd80b671b83055cc21251ac7dc49b16f1b443fd6ce1ba4";
+export const REFERENCE_SOURCE_MANIFEST_SHA256 = "f6d7e424735a0b32545fcf1551f7aa521d57b62a9ecb3c38f33df2822c53c15c";
 
 export const REFERENCE_SOURCE_MANIFEST_PATHS = [
   "scripts/benchmark/run.mjs",
-  "src/benchmark/Oracle.ts",
+  "tests/workloads/legacy-oracle.ts",
   "tests/sqlite-test-client.ts",
   "tests/workloads/benchmark-lifecycle.ts",
   "test-vaults/benchmark/config.ts",
@@ -60,6 +60,8 @@ export const REFERENCE_SOURCE_MANIFEST_PATHS = [
   "test-vaults/benchmark/generator.ts",
   "tests/workloads/instrumentation.ts",
   "tests/workloads/trama-benchmark.ts",
+  "tests/workloads/ranking-reference.ts",
+  "tests/workloads/ranking-reference.test.ts",
 ] as const;
 
 export function computeReferenceSourceManifestSha256(
@@ -110,4 +112,4 @@ export const deterministicProviderChallengeSha256 =
 export const queryVectorSha256V1 =
   "7b0fa73abfdf474642ea98dac60e72c29c5566e5814f760c8365c5e3b3fe118b";
 
-export { expectedOutputsV1ByProfile } from "@/benchmark/Oracle";
+export { expectedOutputsV1ByProfile } from "../../tests/workloads/legacy-oracle";

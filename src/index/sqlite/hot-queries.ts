@@ -14,6 +14,7 @@ export const SEMANTIC_MISSING_INPUTS_SQL = `WITH candidates AS MATERIALIZED (
       WHERE ec.input_digest=ei.action_key
         AND ec.embedding_fingerprint=?
         AND ec.preprocessing=?
+        AND ec.task_kind='document'
     )
   ORDER BY ei.input_id
   LIMIT ?
@@ -30,6 +31,14 @@ FROM bounded
 WHERE itemNumber<=? AND (itemNumber=1 OR inputBytes<=?)
 ORDER BY inputId`;
 
+export const SEMANTIC_AFFECTED_NOTES_SQL = `INSERT INTO semantic_affected_notes(note_id)
+  SELECT DISTINCT n.note_id
+  FROM semantic_result_inputs r
+  CROSS JOIN chunk_occurrences o
+  JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
+  WHERE r.input_digest=o.embedding_input_digest
+    AND n.lexical_revision_id IS NOT NULL`;
+
 const semanticPromotion = (affected: string) => `UPDATE notes AS n
   SET semantic_revision_id=n.lexical_revision_id
   WHERE n.lexical_revision_id IS NOT NULL
@@ -43,6 +52,7 @@ const semanticPromotion = (affected: string) => `UPDATE notes AS n
         ON ec.input_digest=ei.action_key
        AND ec.embedding_fingerprint=?
        AND ec.preprocessing=?
+       AND ec.task_kind='document'
       WHERE o.note_id=n.note_id
         AND o.revision_id=n.lexical_revision_id
         AND ec.cache_id IS NULL

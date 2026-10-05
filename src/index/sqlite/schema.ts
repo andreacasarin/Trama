@@ -1,7 +1,39 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 9;
-export const SQLITE_PROTOCOL_VERSION = 9;
+export const SQLITE_SCHEMA_VERSION = 14;
+export const SQLITE_PROTOCOL_VERSION = 12;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
+
+export const SQLITE_LEXICAL_NOTES_MIGRATION_SQL = `
+CREATE TABLE lexical_notes (
+  note_id INTEGER PRIMARY KEY REFERENCES notes(note_id) ON DELETE CASCADE,
+  revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
+  path_text TEXT COLLATE BINARY NOT NULL,
+  filename TEXT COLLATE BINARY NOT NULL,
+  title TEXT NOT NULL,
+  headings TEXT NOT NULL,
+  body TEXT NOT NULL
+) STRICT;
+CREATE VIRTUAL TABLE lexical_notes_fts USING fts5(
+  body, path_text, filename, title, headings,
+  content='lexical_notes', content_rowid='note_id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE INDEX lexical_notes_revision ON lexical_notes(revision_id);
+CREATE TRIGGER lexical_notes_ai AFTER INSERT ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+END;
+CREATE TRIGGER lexical_notes_ad AFTER DELETE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+END;
+CREATE TRIGGER lexical_notes_au AFTER UPDATE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+END;
+`;
 
 export function schemaSql(dimensions: number): string {
   if (!Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096)
@@ -25,6 +57,7 @@ CREATE TABLE IF NOT EXISTS index_state (
   dimensions INTEGER NOT NULL CHECK (dimensions > 0),
   corpus_fingerprint TEXT NOT NULL,
   embedding_fingerprint TEXT NOT NULL,
+  embedding_profile_selection TEXT NOT NULL DEFAULT 'none' CHECK (embedding_profile_selection IN ('none','automatic','configured','user')),
   incomplete INTEGER NOT NULL CHECK (incomplete IN (0,1)),
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
   lexical_generation INTEGER NOT NULL DEFAULT 0 CHECK (lexical_generation >= 0),
@@ -87,22 +120,79 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
   action_key TEXT COLLATE BINARY NOT NULL UNIQUE,
   embedding_fingerprint TEXT COLLATE BINARY NOT NULL,
   preprocessing TEXT NOT NULL,
-  vector BLOB NOT NULL
+  vector BLOB NOT NULL,
+  task_kind TEXT NOT NULL DEFAULT 'document' CHECK (task_kind IN ('document','query')),
+  unused_since INTEGER,
+  created_at INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_artifact_receipts (
+  digest TEXT PRIMARY KEY COLLATE BINARY,
+  profile TEXT COLLATE BINARY NOT NULL,
+  received_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_legacy_sources (
+  digest TEXT PRIMARY KEY COLLATE BINARY,
+  extracted_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_shard_membership (
+  digest TEXT NOT NULL COLLATE BINARY,
+  action_key TEXT NOT NULL COLLATE BINARY,
+  task_kind TEXT NOT NULL CHECK(task_kind IN ('document','query')),
+  profile TEXT NOT NULL COLLATE BINARY,
+  PRIMARY KEY(digest,action_key,task_kind)
+) STRICT;
+CREATE INDEX IF NOT EXISTS cache_shard_membership_key ON cache_shard_membership(action_key,task_kind);
+CREATE TABLE IF NOT EXISTS cache_compaction_state (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  last_completed_at INTEGER NOT NULL DEFAULT 0
+) STRICT;
+INSERT OR IGNORE INTO cache_compaction_state(id,last_completed_at) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS cache_compaction_retirements (
+  source_digest TEXT PRIMARY KEY COLLATE BINARY,
+  replacement_set_id TEXT NOT NULL COLLATE BINARY,
+  retire_after INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_compaction_replacements (
+  replacement_set_id TEXT NOT NULL COLLATE BINARY,
+  digest TEXT NOT NULL COLLATE BINARY,
+  PRIMARY KEY(replacement_set_id,digest)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS embedding_cache_fingerprint ON embedding_cache(embedding_fingerprint);
-CREATE INDEX IF NOT EXISTS embedding_cache_lookup ON embedding_cache(input_digest, embedding_fingerprint, preprocessing);
-CREATE TABLE IF NOT EXISTS active_lexical (
-  occurrence_id INTEGER PRIMARY KEY REFERENCES chunk_occurrences(occurrence_id) ON DELETE CASCADE,
-  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+CREATE INDEX IF NOT EXISTS embedding_cache_lookup ON embedding_cache(input_digest, embedding_fingerprint, preprocessing, task_kind);
+CREATE TABLE IF NOT EXISTS embedding_profiles (
+  fingerprint TEXT PRIMARY KEY COLLATE BINARY,
+  dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+  model_id TEXT NOT NULL DEFAULT '',
+  endpoint_origin TEXT NOT NULL DEFAULT ''
+) STRICT;
+CREATE TABLE IF NOT EXISTS lexical_notes (
+  note_id INTEGER PRIMARY KEY REFERENCES notes(note_id) ON DELETE CASCADE,
   revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
   path_text TEXT COLLATE BINARY NOT NULL,
   filename TEXT COLLATE BINARY NOT NULL,
+  title TEXT NOT NULL,
+  headings TEXT NOT NULL,
   body TEXT NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS active_lexical_note ON active_lexical(note_id, revision_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS active_lexical_fts USING fts5(
-  body, path_text, filename, content='active_lexical', content_rowid='occurrence_id',
+CREATE INDEX IF NOT EXISTS lexical_notes_revision ON lexical_notes(revision_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS lexical_notes_fts USING fts5(
+  body, path_text, filename, title, headings,
+  content='lexical_notes', content_rowid='note_id',
   tokenize='unicode61 remove_diacritics 2'
 );
+CREATE TRIGGER IF NOT EXISTS lexical_notes_ai AFTER INSERT ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_notes_ad AFTER DELETE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_notes_au AFTER UPDATE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+END;
 `;
 }

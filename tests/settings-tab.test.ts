@@ -29,10 +29,14 @@ describe("settings projection", () => {
     const updateIndex = vi.fn(async () => undefined);
     const rebuildIndex = vi.fn(async () => undefined);
     const publishIndex = vi.fn(async () => undefined);
+    const resetIndexes = vi.fn(async () => undefined);
+    const clearIndexesAndSharedCache = vi.fn(async () => undefined);
     const stopIndex = vi.fn(async () => undefined);
     const callbacks = new Map<string, () => unknown>();
     const toggleCallbacks = new Map<string, (value: boolean) => void>();
     const warnings: string[] = [];
+    const confirmation = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmation);
     const settingNames: string[] = [];
     let indexStatus: ReturnType<NonNullable<SettingsTabCallbacks["getIndexStatus"]>>;
     let settings = DEFAULT_SETTINGS;
@@ -146,6 +150,8 @@ describe("settings projection", () => {
           updateIndex,
           rebuildIndex,
           publishIndex,
+          resetIndexes,
+          clearIndexesAndSharedCache,
           stopIndex,
         } as any
       );
@@ -167,9 +173,13 @@ describe("settings projection", () => {
       await callbacks.get("Update")?.();
       await callbacks.get("Rebuild")?.();
       await callbacks.get("Publish")?.();
+      await callbacks.get("Reset all indexes")?.();
+      await callbacks.get("Clear indexes and shared cache")?.();
       expect(updateIndex).toHaveBeenCalledOnce();
       expect(rebuildIndex).toHaveBeenCalledOnce();
       expect(publishIndex).toHaveBeenCalledOnce();
+      expect(resetIndexes).toHaveBeenCalledOnce();
+      expect(clearIndexesAndSharedCache).toHaveBeenCalledOnce();
       expect(callbacks.has("Prepare")).toBe(false);
       toggleCallbacks.get("Automatic searches")?.(true);
       await vi.waitFor(() => expect(settings.lente.automaticSearches).toBe(true));
@@ -200,6 +210,7 @@ describe("settings projection", () => {
         expect(warnings).toContain("Index saved locally, but publication failed: offline")
       );
     } finally {
+      vi.unstubAllGlobals();
       for (const [method, descriptor] of originals)
         if (descriptor) Object.defineProperty(proto, method, descriptor);
         else delete proto[method];

@@ -19,7 +19,8 @@ import {
 } from "@/diagnostics/TramaDiagnostics";
 
 const HANDSHAKE_TYPE = "trama-runtime-handshake";
-const HANDSHAKE_TIMEOUT_MS = 1_000;
+const DIAGNOSTICS_CONFIGURATION_TIMEOUT_MS = 1_000;
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 export interface SqliteWorkerLike {
   postMessage(message: unknown, transfer?: readonly ArrayBuffer[]): void;
@@ -207,7 +208,7 @@ export class SqliteWorkerClient {
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => finish(new Error("SQLite diagnostic configuration timed out.")),
-        HANDSHAKE_TIMEOUT_MS
+        DIAGNOSTICS_CONFIGURATION_TIMEOUT_MS
       );
       const finish = (error?: unknown) => {
         clearTimeout(timer);
@@ -266,14 +267,19 @@ export class SqliteWorkerClient {
       } catch (error) {
         finish(error);
       }
-    }).catch(() => {
+    }).catch((error: unknown) => {
       this.handshakePromise = undefined;
       this.terminateNow();
-      throw sqliteError(
-        "storage_unavailable",
-        "Installed SQLite runtime files do not match. Reinstall the plugin and reload Obsidian.",
-        true
-      );
+      if (error instanceof SqliteProtocolError) throw error;
+      if (error instanceof Error && error.message === "SQLite Worker handshake timed out.")
+        throw sqliteError("storage_unavailable", "SQLite Worker handshake timed out.", true);
+      if (error instanceof Error && error.message === "SQLite Worker build identity mismatch.")
+        throw sqliteError(
+          "storage_unavailable",
+          "Installed SQLite runtime files do not match. Reinstall the plugin and reload Obsidian.",
+          true
+        );
+      throw sqliteError("storage_unavailable", "SQLite Worker failed during startup.", true);
     });
     return this.handshakePromise;
   }
@@ -356,6 +362,19 @@ export class SqliteWorkerClient {
       this.handshakeState = undefined;
       return;
     }
+    if (
+      handshake &&
+      reply?.v === SQLITE_PROTOCOL_VERSION &&
+      reply.id === handshake.id &&
+      !reply.ok &&
+      reply.error.code === "storage_unavailable"
+    ) {
+      this.handshakeState = undefined;
+      handshake.finish(
+        sqliteError("storage_unavailable", "SQLite Worker module could not be started.", true)
+      );
+      return;
+    }
     if (!reply || reply.v !== SQLITE_PROTOCOL_VERSION || !Number.isSafeInteger(reply.id)) return;
     const entry = this.pending.get(reply.id);
     if (!entry) return;
@@ -372,7 +391,9 @@ export class SqliteWorkerClient {
     if (handshake) {
       this.handshakeState = undefined;
       handshake.finish(
-        sqliteError("storage_unavailable", "SQLite Worker failed during startup.", true)
+        error instanceof SqliteProtocolError
+          ? error
+          : sqliteError("storage_unavailable", "SQLite Worker failed during startup.", true)
       );
     }
     for (const [id, entry] of this.pending) {

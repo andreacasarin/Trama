@@ -5,39 +5,23 @@ development notes: 10 daily entries in `journal` and 30 linked topic notes in
 `zettelkasten`, covering retrieval, embeddings, SQLite, and Trama workflows.
 The source notes live in `test-vaults/demo/`; the runnable copy is ignored by Git.
 
-From a fresh clone, use Node.js 24 and install dependencies once:
+From a fresh clone, use Node.js 24 and install dependencies once with `npm ci`.
 
-```sh
-npm ci
-```
-
-Before a demo, build and generate/install the runnable copy:
-
-```sh
-npm run build
-npm run demo:prepare
-```
-
-These commands recreate missing ignored artifacts from committed sources. Obsidian
-does not need to be running during preparation. Rerun them after code changes;
-if the vault is already open, reload Trama (or reopen the vault) to load the new build.
-
-To create both test vaults on a fresh checkout, or update Trama in existing copies:
+Run this one-time setup to create both generated test vaults and install or update
+Trama in them:
 
 ```sh
 npm run install:plugin -- --test-vaults
 ```
 
-This builds once and installs only into the two fixed, marked generated vaults.
-It reuses the demo and benchmark preparation scripts for missing copies. Existing
-vaults keep their notes, settings, index data, and benchmark run; they are not
-regenerated. Existing copies and destination paths pass marker/path/symlink checks
-before preparation or installation starts. It ignores `OBSIDIAN_VAULT_PATH` and
-sends no Obsidian commands or model requests. On a fresh checkout, run `npm ci`
-first, then this single command. Register the generated folders in Obsidian once
-and enable community plugins in those vaults only. Reload Trama or reopen each
-test vault to activate an updated build. A newly created benchmark vault uses
-the default small profile unless `TRAMA_BENCHMARK_PROFILE` is set.
+It builds once, prepares only missing generated copies, and installs or updates Trama
+in both the demo and benchmark vaults. Existing generated vaults are reused rather
+than regenerated; their benchmark corpus/run and reports are preserved. The
+command validates the exact generated paths before writing, prints both paths, and
+instructs you to add both vaults to Obsidian and enable Trama in each. Enable the
+Obsidian CLI in Settings > General > Command line interface for benchmark runs.
+Setup sends no Obsidian CLI commands or model requests; no manual vault ID is
+needed for the standard flow.
 
 Open `.artifacts/test-vaults/demo/Trama Test Vault` as a vault in Obsidian. Enable
 community plugins and Trama **in that vault only**. The normal commands are
@@ -45,11 +29,11 @@ community plugins and Trama **in that vault only**. The normal commands are
 `.trama-demo-vault` marker, not the benchmark marker, so it starts the normal UI
 and does not register the benchmark command.
 
-The preparer only writes to that exact marked path, refuses symlinks, preserves
-plugin settings, and refuses to overwrite edited demo notes. It neither accesses
-personal vaults nor modifies benchmark vaults. Any CLI interaction must first
-prove the exact demo path with `verifyDemoCliTarget`; there is no active-vault
-fallback. A new vault requires manual registration once.
+The setup validates each exact marked path before writing, refuses symlinks, and
+preserves plugin settings. The demo-note preparer refuses to overwrite edited demo
+notes and writes only to the marked demo path. Setup never accesses personal vaults.
+Any CLI interaction must first prove the exact demo path with
+`verifyDemoCliTarget`; there is no active-vault fallback. A new vault requires manual registration once.
 
 For a first demo, use keyword search in Lente, then run Update to index the notes.
 For semantic/hybrid retrieval and Filo suggestions, configure an embedding model

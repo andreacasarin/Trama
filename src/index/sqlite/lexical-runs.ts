@@ -221,12 +221,6 @@ export class SqliteLexicalRunStore {
           );
           if (deleted) {
             this.context.db.exec({
-              sql: `INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename)
-                    SELECT 'delete',a.occurrence_id,a.body,a.path_text,a.filename
-                    FROM active_lexical a JOIN notes n ON n.note_id=a.note_id
-                    JOIN lexical_delete_paths d ON d.path=n.path`,
-            });
-            this.context.db.exec({
               sql: LEXICAL_BOUNDED_DELETE_SQL,
             });
           }

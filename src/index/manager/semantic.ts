@@ -9,7 +9,7 @@ import {
   type SqliteSemanticWorkBatch,
   type SqliteState,
 } from "@/index/sqlite/protocol";
-import type { SemanticPrepareResult } from "./contracts";
+import { SemanticProviderError, type SemanticPrepareResult } from "./contracts";
 import { IndexJournal } from "./journal";
 import { check, IndexRuntime } from "./runtime";
 
@@ -80,11 +80,28 @@ export class SemanticCoordinator {
     );
   }
 
+  async promoteCachedSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    if (!this.runtime.loaded) await this.runtime.load();
+    const state = this.runtime.state;
+    if (!state) throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+    if (!state.embeddingFingerprint)
+      return {
+        operation: "prepare",
+        changed: false,
+        converged: true,
+        state,
+        stored: 0,
+        skipped: 0,
+      };
+    return this.runSemanticPreparation(signal, 1, 0, undefined, true);
+  }
+
   private async runSemanticPreparation(
     signal: AbortSignal,
     maxBatches = Number.POSITIVE_INFINITY,
     batchSizeOverride?: number,
-    shouldYield?: () => boolean
+    shouldYield?: () => boolean,
+    cacheOnly = false
   ): Promise<SemanticPrepareResult> {
     await this.runtime.waitForMaintenance(signal);
     if (this.runtime.building || this.runtime.preparing)
@@ -108,7 +125,7 @@ export class SemanticCoordinator {
       const overallOperationId = overallTimer
         ? this.runtime.ensureClient().diagnosticOperationId()
         : undefined;
-      const embeddingFingerprint = await this.runtime.embeddingFingerprintId();
+      const embeddingFingerprint = this.runtime.state.embeddingFingerprint;
       const providerLimits = this.embedding.batchLimits ?? {};
       const maxInputBytes = Math.min(
         SQLITE_MAX_SEMANTIC_INPUT_BYTES,
@@ -123,7 +140,12 @@ export class SemanticCoordinator {
       );
       const requestedItems = Math.min(
         SQLITE_MAX_SEMANTIC_BATCH_ITEMS,
-        Math.max(1, Math.floor(batchSizeOverride ?? this.runtime.options.prepareBatchSize ?? 128)),
+        cacheOnly
+          ? 0
+          : Math.max(
+              1,
+              Math.floor(batchSizeOverride ?? this.runtime.options.prepareBatchSize ?? 128)
+            ),
         Math.max(1, Math.floor(providerLimits.maxItems ?? SQLITE_MAX_SEMANTIC_BATCH_ITEMS)),
         Math.max(1, Math.floor(maxVectorBytes / (this.embedding.dimensions * 4)))
       );
@@ -183,22 +205,28 @@ export class SemanticCoordinator {
         if (!work.requests.length) break;
         const missing = work.requests;
         const providerTimer = this.runtime.performanceTimer();
-        const vectors = await this.embedding.embed(
-          missing.map((item) => item.serialization),
-          signal,
-          (progress) =>
-            this.runtime.reportProgress(
-              {
-                operation,
-                phase: "build-vector",
-                completed: stored + progress.completed,
-                total: Math.max(totalMissing, stored + missing.length),
-                unit: "chunks",
-                determinate: true,
-              },
-              false
-            )
-        );
+        let vectors: readonly number[][];
+        try {
+          vectors = await this.embedding.embed(
+            missing.map((item) => item.serialization),
+            signal,
+            (progress) =>
+              this.runtime.reportProgress(
+                {
+                  operation,
+                  phase: "build-vector",
+                  completed: stored + progress.completed,
+                  total: Math.max(totalMissing, stored + missing.length),
+                  unit: "chunks",
+                  determinate: true,
+                },
+                false
+              )
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          throw new SemanticProviderError(error);
+        }
         this.runtime.emitPhase(
           "semantic",
           "provider",

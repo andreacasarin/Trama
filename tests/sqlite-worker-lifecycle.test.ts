@@ -2,10 +2,65 @@ import { describe, expect, it, vi } from "vitest";
 import {
   closeWorkerDatabase,
   exportOpfsDatabase,
+  resetWorkerDatabase,
   type OpfsSAHPoolUtilLike,
 } from "@/index/sqlite/worker-lifecycle";
+import { PublicationService } from "@/index/manager/publication";
+import { SqliteScheduler } from "@/index/sqlite/scheduler";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => (resolve = done));
+  return { promise, resolve };
+}
 
 describe("SQLite Worker storage lifecycle", () => {
+  it("keeps queued reads available behind serialized cache-shard ingestion", async () => {
+    const scheduler = new SqliteScheduler();
+    const ingestGate = deferred<void>();
+    const state = { noteCount: 1 };
+    const order: string[] = [];
+    let id = 0;
+    const runtime = {
+      building: false,
+      preparing: false,
+      loaded: true,
+      unavailable: false,
+      state,
+      isInMaintenance: () => false,
+      beginMaintenance: vi.fn(),
+      endMaintenance: vi.fn(),
+      setState: vi.fn(),
+      ensureClient: () => ({
+        call: (method: string) =>
+          scheduler.enqueue(++id, async () => {
+            order.push(method);
+            if (method === "ingestCacheShard") {
+              await ingestGate.promise;
+              return { imported: 1, duplicate: false, profile: "profile", taskKind: "document" };
+            }
+            if (method === "getState") return state;
+            throw new Error("unexpected worker method");
+          }),
+      }),
+    };
+    const service = new PublicationService(runtime as any);
+    const ingest = service.ingestCacheShard(new ArrayBuffer(1), "digest");
+    const related = scheduler.enqueue(++id, async () => {
+      order.push("findRelated");
+      return [{ path: "notes/0002.md" }];
+    });
+    expect(runtime.isInMaintenance()).toBe(false);
+    expect(runtime.beginMaintenance).not.toHaveBeenCalled();
+    expect(order).toEqual(["ingestCacheShard"]);
+
+    ingestGate.resolve();
+    await expect(ingest).resolves.toMatchObject({ imported: 1, duplicate: false });
+    await expect(related).resolves.toEqual([{ path: "notes/0002.md" }]);
+    expect(order).toEqual(["ingestCacheShard", "findRelated", "getState"]);
+    expect(runtime.endMaintenance).not.toHaveBeenCalled();
+  });
+
   it("does not throw while sanitizing an open failure with no message", async () => {
     const platformError = Object.create(Error.prototype) as Error;
     Object.defineProperty(platformError, "message", { value: undefined });
@@ -167,4 +222,68 @@ describe("SQLite Worker storage lifecycle", () => {
     expect(pool.exportFile).toHaveBeenCalledWith("/index.sqlite3");
     expect("releaseAccessHandles" in pool).toBe(false);
   });
+
+  it("closes then unlinks only the index file in the same pool before installing fresh refs", () => {
+    const order: string[] = [];
+    const priorDatabase = { close: vi.fn(() => order.push("close")) };
+    const priorConnection = {};
+    const state: {
+      database?: typeof priorDatabase;
+      connection?: object;
+      opfsPool?: { unlink: (name: string) => boolean };
+    } = { database: priorDatabase, connection: priorConnection };
+    const pool = {
+      unlink: vi.fn((name: string) => {
+        order.push(`unlink:${name}`);
+        expect(state.database).toBeUndefined();
+        expect(state.connection).toBeUndefined();
+        return false;
+      }),
+    };
+    state.opfsPool = pool;
+    const connection = {};
+    const database = { close: vi.fn() };
+    const result = resetWorkerDatabase(state, pool, () => {
+      order.push("open");
+      return { connection, database };
+    });
+
+    expect(result).toBe(database);
+    expect(order).toEqual(["close", "unlink:/index.sqlite3", "open"]);
+    expect(pool.unlink).toHaveBeenCalledOnce();
+    expect(state).toEqual({ database, connection, opfsPool: pool });
+  });
+
+  it.each(["close", "unlink", "open"] as const)(
+    "leaves cleared refs and rejects a reset when %s fails",
+    (failure) => {
+      const priorDatabase = {
+        close: vi.fn(() => {
+          if (failure === "close") throw new Error("close failed");
+        }),
+      };
+      const pool = {
+        unlink: vi.fn(() => {
+          if (failure === "unlink") throw new Error("unlink failed");
+          return true;
+        }),
+      };
+      const state: {
+        database?: typeof priorDatabase;
+        connection?: object;
+        opfsPool?: typeof pool;
+      } = { database: priorDatabase, connection: {}, opfsPool: pool };
+      const open = vi.fn(() => {
+        if (failure === "open") throw new Error("open failed");
+        return { connection: {}, database: { close: vi.fn() } };
+      });
+
+      expect(() => resetWorkerDatabase(state, pool, open)).toThrow(`${failure} failed`);
+      expect(state.database).toBeUndefined();
+      expect(state.connection).toBeUndefined();
+      expect(state.opfsPool).toBe(pool);
+      expect(pool.unlink).toHaveBeenCalledTimes(failure === "close" ? 0 : 1);
+      expect(open).toHaveBeenCalledTimes(failure === "close" || failure === "unlink" ? 0 : 1);
+    }
+  );
 });

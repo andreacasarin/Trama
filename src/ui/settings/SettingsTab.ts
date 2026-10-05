@@ -2,6 +2,7 @@ import { PluginSettingTab, Setting } from "obsidian";
 import { Plugin } from "obsidian";
 import { EndpointApproval } from "@/security/EndpointPolicy";
 import type { IndexCapabilities } from "@/domain/contracts";
+import type { EmbeddingProfile } from "@/index/sqlite/protocol";
 import {
   normalizeExcludedPaths,
   normalizeExcludedPath,
@@ -26,6 +27,8 @@ export interface SettingsTabCallbacks {
   rebuildIndex(): Promise<void>;
   stopIndex(): Promise<void>;
   publishIndex(): Promise<void>;
+  resetIndexes(): Promise<void>;
+  clearIndexesAndSharedCache(): Promise<void>;
   checkPublication?(): Promise<void>;
   getIndexStatus?():
     | {
@@ -36,6 +39,9 @@ export interface SettingsTabCallbacks {
       }
     | undefined;
   getPublicationMetrics?(): { byteSize: number; durationMs: number } | undefined;
+  getEmbeddingProfiles?(): readonly EmbeddingProfile[];
+  getActiveEmbeddingProfile?(): string;
+  selectEmbeddingProfile?(fingerprint: string): Promise<void>;
 }
 
 export interface SettingsDraft {
@@ -199,6 +205,33 @@ export class TramaSettingsTab extends PluginSettingTab {
       EMBEDDING_ENDPOINT_DESCRIPTION
     );
     this.modelSelector("embedding", draft);
+    if (!draft.embeddingModelId.trim()) {
+      const profiles =
+        this.controller.getEmbeddingProfiles?.().filter((profile) => profile.vectorCount > 0) ?? [];
+      if (profiles.length > 1) {
+        new Setting(this.containerEl)
+          .setName("Local semantic profile")
+          .setDesc("Choose which locally available embedding profile to use offline.")
+          .addDropdown((dropdown) => {
+            dropdown.addOption("", "Choose a profile");
+            for (const profile of profiles) {
+              const label = [
+                profile.modelId,
+                profile.endpointOrigin,
+                `${profile.dimensions} dimensions`,
+              ]
+                .filter(Boolean)
+                .join(" · ");
+              dropdown.addOption(profile.fingerprint, label || profile.fingerprint.slice(0, 12));
+            }
+            dropdown.setValue(this.controller.getActiveEmbeddingProfile?.() ?? "");
+            dropdown.onChange((fingerprint) => {
+              if (fingerprint)
+                void this.run(() => this.controller.selectEmbeddingProfile?.(fingerprint));
+            });
+          });
+      }
+    }
     this.exclusions(draft);
 
     this.sectionHeading("Advanced");
@@ -335,7 +368,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Synchronized SQLite folder")
       .setDesc(
-        "Vault-relative folder for index.sqlite3. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
+        "Vault-relative folder for immutable embedding cache shards. Legacy index.sqlite3 files are read once for compatible vectors and never replace this device's local note index. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
       )
       .addText((text) => {
         text.setValue(draft.publicationDirectory ?? "Trama/index");
@@ -346,7 +379,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Index maintenance")
       .setDesc(
-        "Update changed notes, publish the current index, or rebuild the index and its semantic vectors."
+        "Update changed notes, publish the current index, or rebuild the index and its semantic vectors. Reset clears local and published index data."
       )
       .addButton((button) =>
         button
@@ -375,6 +408,16 @@ export class TramaSettingsTab extends PluginSettingTab {
         button
           .setButtonText("Check")
           .onClick(() => void this.run(() => this.controller.checkPublication?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Reset all indexes")
+          .onClick(() => void this.run(() => this.controller.resetIndexes?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Clear indexes and shared cache")
+          .onClick(() => void this.run(() => this.controller.clearIndexesAndSharedCache?.()))
       );
     const status = this.controller.getIndexStatus?.();
     if (status?.capabilities) {
