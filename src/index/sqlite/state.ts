@@ -200,12 +200,12 @@ export class SqliteStateStore {
     this.context.dimensions = dimensions;
     return this.getState();
   }
-  reconcileImportedEmbeddingProfiles(): SqliteState {
+  reconcileImportedEmbeddingProfiles(): void {
     const state = rows(
       this.context.db,
       "SELECT embedding_fingerprint,embedding_profile_selection FROM index_state WHERE id=1"
     )[0];
-    if (!state) return this.getState();
+    if (!state) throw sqliteError("incompatible_state", "SQLite state is not initialized");
     const profiles = rows(
       this.context.db,
       `SELECT p.fingerprint,p.dimensions FROM embedding_profiles p
@@ -235,7 +235,6 @@ export class SqliteStateStore {
       this.context.embeddingFingerprint = next;
       this.context.dimensions = dimensions;
     }
-    return this.getState();
   }
   migrateLegacySnapshotSchema(buildIdentity: string): void {
     const app = Number(rows(this.context.db, "PRAGMA application_id")[0]?.application_id ?? 0);

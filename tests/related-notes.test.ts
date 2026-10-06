@@ -325,7 +325,26 @@ describe("RelatedNotes", () => {
     release();
     const second = await service.find("current.md", signal);
     expect(second.results).toEqual([{ path: "a.md", score: 1 }]);
-    expect(current.search).toHaveBeenCalledOnce();
+    expect(current.search).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels obsolete retrieval when its last consumer leaves", async () => {
+    let workerSignal!: AbortSignal;
+    let release!: () => void;
+    const current = snapshot("current.md", "query", []);
+    const service = new RelatedNotes({
+      relatedState: () => current.value,
+      findRelated: (_path, signal) => {
+        workerSignal = signal;
+        return new Promise((resolve) => (release = () => resolve([])));
+      },
+    });
+    const controller = new AbortController();
+    const pending = service.find("current.md", controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow("cancelled");
+    expect(workerSignal.aborted).toBe(true);
+    release();
   });
 
   it("shares work while one consumer cancels", async () => {

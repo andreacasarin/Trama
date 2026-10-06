@@ -57,15 +57,19 @@ export class PublicationService {
     if (!this.runtime.loaded) await this.runtime.load();
     if (this.runtime.unavailable || !this.runtime.state)
       throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
-    const result = await this.runtime.ensureClient().call("ingestCacheShard", { bytes, digest });
-    const state = (await this.runtime.ensureClient().call("getState", {})) as SqliteState;
-    this.runtime.setState(state);
-    return result as {
+    const result = (await this.runtime
+      .ensureClient()
+      .call("ingestCacheShard", { bytes, digest })) as {
       imported: number;
       duplicate: boolean;
       profile: string;
       taskKind: "document" | "query";
     };
+    if (!result.duplicate) {
+      const state = (await this.runtime.ensureClient().call("getState", {})) as SqliteState;
+      this.runtime.setState(state);
+    }
+    return result;
   }
 
   async extractLegacyCacheShard(

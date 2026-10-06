@@ -144,8 +144,8 @@ export class PublicationManager {
     return this.lastMetrics;
   }
 
-  async publish(): Promise<PublicationResult> {
-    return this.publishCacheShards();
+  async publish(shouldYield?: () => boolean): Promise<PublicationResult> {
+    return this.publishCacheShards(shouldYield);
   }
 
   /** Inspect and adopt the exact configured file without publishing directly. */
@@ -153,17 +153,20 @@ export class PublicationManager {
     return this.ingestCacheShards(shouldYield);
   }
 
-  private async publishCacheShards(): Promise<PublicationResult> {
+  private async publishCacheShards(shouldYield?: () => boolean): Promise<PublicationResult> {
     const started = Date.now();
     let totalBytes = 0;
     try {
       if (!this.index.prepareCacheShard)
         throw new StructuredError("unavailable", "Cache shard export is unavailable.", true);
       const now = Date.now();
+      if (shouldYield?.()) return { published: false };
       const retention = (await this.index.maintainCache?.(now)) as
         { expiredSourceDigests?: readonly string[]; lastCompactionAt?: number } | undefined;
-      await this.retireReadyShards(now);
-      if (retention) await this.compactIfDue(retention, now);
+      await this.retireReadyShards(now, shouldYield);
+      if (shouldYield?.()) return { published: false };
+      if (retention) await this.compactIfDue(retention, now, shouldYield);
+      if (shouldYield?.()) return { published: false };
       const state = await this.index.getState?.();
       const profiles: (string | undefined)[] = state?.embeddingProfiles?.length
         ? state.embeddingProfiles.map((profile) => profile.fingerprint)
@@ -175,6 +178,7 @@ export class PublicationManager {
         for (const taskKind of ["document", "query"] as const) {
           let cursor: string | undefined;
           for (;;) {
+            if (shouldYield?.()) return { published: false };
             const shard = await this.index.prepareCacheShard(
               cursor,
               taskKind,
@@ -183,6 +187,7 @@ export class PublicationManager {
               presentDigests
             );
             if (!shard) break;
+            if (shouldYield?.()) return { published: false };
             if (shard.bytes.byteLength !== 0 && shard.bytes.byteLength > 4_194_304)
               throw new StructuredError(
                 "invalid_request",
@@ -224,7 +229,7 @@ export class PublicationManager {
     }
   }
 
-  private async retireReadyShards(now: number): Promise<void> {
+  private async retireReadyShards(now: number, shouldYield?: () => boolean): Promise<void> {
     if (!this.index.listCacheRetirements || !this.index.completeCacheRetirement) return;
     const retirements = await this.index.listCacheRetirements();
     const listed = new Map(
@@ -237,6 +242,7 @@ export class PublicationManager {
       groups.set(retirement.replacementSetId, current);
     }
     for (const group of groups.values()) {
+      if (shouldYield?.()) return;
       if (group.some((item) => item.retireAfter > now)) continue;
       const replacements = group[0]?.replacements ?? [];
       let valid = true;
@@ -249,6 +255,7 @@ export class PublicationManager {
       }
       if (!valid) continue;
       for (const item of group) {
+        if (shouldYield?.()) return;
         if (listed.has(item.sourceDigest)) await this.store.removeCacheShard(item.sourceDigest);
         await this.index.completeCacheRetirement(item.sourceDigest, now);
       }
@@ -257,16 +264,29 @@ export class PublicationManager {
 
   private async compactIfDue(
     retention: { expiredSourceDigests?: readonly string[]; lastCompactionAt?: number },
-    now: number
+    now: number,
+    shouldYield?: () => boolean
   ): Promise<void> {
     if (!this.index.ingestCacheShard || !this.index.recordCacheRetirements) return;
     if (now - (retention.lastCompactionAt ?? 0) < 7 * 24 * 60 * 60 * 1000) return;
     const files = await this.store.listCacheShards();
+    // Sources and their replacements must stay stable throughout the grace window.
+    const retirements = (await this.index.listCacheRetirements?.()) ?? [];
+    const protectedDigests = new Set(
+      retirements.flatMap((item) => [item.sourceDigest, ...item.replacements])
+    );
     const small: (typeof files)[number][] = [];
     const selected = new Set<string>();
     let capturedBytes = 0;
-    const expired = new Set(retention.expiredSourceDigests ?? []);
+    const eligibleDigests = new Set(
+      files.filter((file) => !protectedDigests.has(file.digest)).map((file) => file.digest)
+    );
+    const expired = new Set(
+      (retention.expiredSourceDigests ?? []).filter((digest) => eligibleDigests.has(digest))
+    );
     for (const file of files) {
+      if (shouldYield?.()) return;
+      if (protectedDigests.has(file.digest)) continue;
       const bytes = await this.store.readCacheShard(file.path);
       if ((await sha256Hex(bytes)) !== file.digest)
         throw new StructuredError("internal", "Cache shard name hash mismatch.", false);
@@ -292,6 +312,7 @@ export class PublicationManager {
       { profile: string; taskKind: "document" | "query"; digests: string[] }
     >();
     for (const file of files) {
+      if (shouldYield?.()) return;
       if (!selected.has(file.digest)) continue;
       const bytes = await this.store.readCacheShard(file.path);
       const ingested = await this.index.ingestCacheShard(bytes, file.digest);
@@ -308,6 +329,7 @@ export class PublicationManager {
     for (const group of grouped.values()) {
       let cursor: string | undefined;
       for (;;) {
+        if (shouldYield?.()) return;
         const shard = await this.index.prepareCacheShard?.(
           cursor,
           group.taskKind,
@@ -318,6 +340,7 @@ export class PublicationManager {
           now
         );
         if (!shard) break;
+        if (shouldYield?.()) return;
         await this.store.installCacheShard(shard.bytes, shard.digest);
         await this.index.recordCacheShard?.(
           shard.digest,
@@ -330,6 +353,7 @@ export class PublicationManager {
       }
     }
     const retireSources = [...selected].filter((digest) => !replacementDigests.has(digest));
+    if (shouldYield?.()) return;
     await this.index.recordCacheRetirements(
       retireSources,
       retireSources.length ? [...replacementDigests] : [],

@@ -72,6 +72,51 @@ function setup() {
 }
 
 describe("PublicationManager cache shards", () => {
+  it("leaves pending retirement sources and replacements alone during weekly compaction", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    const sources: string[] = [];
+    for (let index = 0; index < 8; index++) {
+      const bytes = new Uint8Array([index + 1]).buffer;
+      const digest = await sha256Hex(bytes);
+      sources.push(digest);
+      await manager.store.installCacheShard(bytes, digest);
+    }
+    const replacement = await fixture.digestPromise;
+    await manager.store.installCacheShard(fixture.data, replacement);
+    const retirement = sources.map((sourceDigest) => ({
+      sourceDigest,
+      replacementSetId: "original",
+      retireAfter: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      replacements: [replacement],
+    }));
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: sources,
+    }));
+    fixture.index.listCacheRetirements = vi.fn(async () => retirement);
+    fixture.index.completeCacheRetirement = vi.fn(async () => undefined);
+    fixture.index.recordCacheRetirements = vi.fn(async () => undefined);
+    vi.mocked(fixture.index.prepareCacheShard!).mockResolvedValue(undefined);
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(fixture.index.recordCacheRetirements).not.toHaveBeenCalled();
+    expect(fixture.index.ingestCacheShard).not.toHaveBeenCalled();
+    expect(await manager.store.listCacheShards()).toHaveLength(9);
+  });
+
+  it("yields publication after the current shard is durable without exporting the next one", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    let interrupted = false;
+    fixture.index.recordCacheShard = vi.fn(async () => {
+      interrupted = true;
+    });
+    await expect(manager.publish(() => interrupted)).resolves.toEqual({ published: false });
+    expect(await manager.store.listCacheShards()).toHaveLength(1);
+    expect(fixture.index.recordCacheShard).toHaveBeenCalledOnce();
+    expect(fixture.index.prepareCacheShard).toHaveBeenCalledOnce();
+  });
+
   it("stages immutable SHA-named cache-only shards and leaves legacy snapshot untouched", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);

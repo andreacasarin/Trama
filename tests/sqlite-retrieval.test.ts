@@ -56,6 +56,26 @@ async function passageCorpus(
 }
 
 describe("revision retrieval", () => {
+  it.each([
+    "# Zebracobalt\n\nOrdinary prose",
+    "Zebracobalt\n============\n\nOrdinary prose",
+    "## Zebracobalt\n\nOrdinary prose",
+  ])("includes heading content in Voce lexical retrieval: %s", async (markdown) => {
+    const client = createTestSqliteClient();
+    await client.call("boot", { corpusFingerprint: digest("headings"), dimensions: 2 });
+    await applyTestLexicalRun(client, [
+      { path: "content.md", markdown },
+      { path: "Zebracobalt.md", markdown: "Unrelated prose" },
+    ]);
+    const hits = await client.call("retrieve", {
+      query: "Zebracobalt",
+      limit: 5,
+      lexicalProfile: "voce",
+    });
+    expect(hits.map((hit: { path: string }) => hit.path)).toEqual(["content.md"]);
+    expect(hits[0].text).toContain("Zebracobalt");
+  });
+
   it("retrieves lexical occurrences from the active head", async () => {
     const client = createTestSqliteClient();
     const corpusFingerprint = digest("corpus-retrieval");

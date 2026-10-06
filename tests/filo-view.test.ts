@@ -4,6 +4,83 @@ import { FiloView } from "@/ui/filo/FiloView";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 
 describe("Filo semantic index display", () => {
+  it.each(["lexical", "semantic", "publication", "adopt", "reset"])(
+    "defers related lookups during %s and ignores the interrupted request's failure",
+    async (phase) => {
+      const status = new IndexStatusController({} as any, {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        reset: async () => undefined,
+        stop: () => undefined,
+      });
+      const capabilities = {
+        availability: "available" as const,
+        lexical: { state: "ready" as const, activity: "idle" as const, searchable: true },
+        semantic: { state: "ready" as const, activity: "idle" as const, searchable: true },
+        freshness: "locally-reconciled" as const,
+      };
+      status.setReady();
+      status.setCapabilities(capabilities);
+      const labels: string[] = [];
+      const root = {
+        empty: () => labels.splice(0),
+        createEl: (_tag: string, options: { text?: string }) => {
+          labels.push(options.text ?? "");
+          return { addEventListener: () => undefined };
+        },
+        createDiv: (options: { text?: string }) => {
+          labels.push(options.text ?? "");
+          return root;
+        },
+      };
+      let reject!: (error: Error) => void;
+      let activeSignal!: AbortSignal;
+      const find = vi.fn(async (_path: string, _signal: AbortSignal) => ({
+        currentPath: "one.md",
+        contentHash: "current",
+        results: [],
+      }));
+      find.mockImplementationOnce((_path, signal) => {
+        activeSignal = signal;
+        return new Promise((_resolve, fail) => {
+          reject = fail;
+        });
+      });
+      const view = new FiloView(
+        new WorkspaceLeaf(),
+        status,
+        { find },
+        async () => undefined,
+        () => undefined
+      );
+      (view as any).root = root;
+      (view as any).app = { workspace: { getActiveFile: () => ({ path: "one.md" }) } };
+      const unsubscribe = status.subscribe((current) => {
+        (view as any).status = current;
+        (view as any).refreshRelated();
+      });
+      expect(find).toHaveBeenCalledOnce();
+      status.setMaintenance({
+        lane: phase === "adopt" ? "adoption" : "update",
+        phase,
+        pending: false,
+        suspended: false,
+      });
+      expect(activeSignal.aborted).toBe(true);
+      status.setCapabilities(capabilities);
+      expect(find).toHaveBeenCalledOnce();
+      reject(new Error("interrupted lookup"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(labels).not.toContain("Related notes could not be loaded.");
+      status.setMaintenance({ lane: "idle", pending: false, suspended: false }, capabilities);
+      await vi.waitFor(() => expect(find).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(labels).toContain("No related notes found."));
+      expect(labels).not.toContain("Related notes could not be loaded.");
+      unsubscribe();
+    }
+  );
+
   it("asks for a local semantic profile before incompatible-vector updates", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,

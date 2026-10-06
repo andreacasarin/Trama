@@ -232,6 +232,15 @@ export class TramaPlugin extends Plugin {
       if (clearGeneratedContributions) await publication.store.clearCacheShards();
       manager.requestFullRecovery();
     });
+    if (
+      !clearGeneratedContributions &&
+      !scheduler.snapshot.suspended &&
+      this.index === manager &&
+      this.maintenance === scheduler
+    ) {
+      const result = await scheduler.checkPublication(true);
+      this.applyAdoptionResult(manager, result);
+    }
   }
 
   private async runGeneratedVaultBenchmark(
@@ -524,9 +533,14 @@ export class TramaPlugin extends Plugin {
     this.indexLoadResult = loaded;
     this.updateIndexCapabilities(manager);
     const maintenance = this.maintenance?.snapshot;
-    if (maintenance && (maintenance.pending || maintenance.lane !== "idle")) {
-      if (maintenance.lane === "idle" && manager.hasUsableIndex())
-        this.indexStatus?.markStale(true);
+    if (
+      maintenance &&
+      (maintenance.pending ||
+        maintenance.lane !== "idle" ||
+        maintenance.suspended ||
+        maintenance.error !== undefined)
+    ) {
+      this.indexStatus?.setMaintenance(maintenance, manager.capabilities());
       return;
     }
     if (!loaded || !manager.isComplete()) {
@@ -601,10 +615,10 @@ export class TramaPlugin extends Plugin {
     return metrics ? { byteSize: metrics.byteSize, durationMs: metrics.durationMs } : undefined;
   }
 
-  async checkPublication(): Promise<void> {
+  async checkPublication(manual = true): Promise<void> {
     const scheduler = this.maintenance;
     const manager = this.index;
-    const result = await scheduler?.checkPublication();
+    const result = await scheduler?.checkPublication(manual);
     if (!scheduler || scheduler !== this.maintenance || manager !== this.index || !result) return;
     this.applyAdoptionResult(manager!, result);
   }
@@ -642,7 +656,8 @@ export class TramaPlugin extends Plugin {
 
   private applyMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void {
     if (this.index !== manager) return;
-    this.indexStatus?.setMaintenance(snapshot);
+    if (snapshot.lane === "update" || snapshot.lane === "rebuild") this.relatedNotes?.cancel();
+    this.indexStatus?.setMaintenance(snapshot, manager.capabilities());
   }
 
   private clearPublicationWarning(origin: "publication" | "check"): void {
@@ -729,7 +744,7 @@ export class TramaPlugin extends Plugin {
       do {
         check.dirty = false;
         try {
-          await this.checkPublication();
+          await this.checkPublication(false);
         } catch {
           // A later event still gets one check, even when this check fails.
         }

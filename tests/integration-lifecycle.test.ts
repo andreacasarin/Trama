@@ -4,6 +4,7 @@ import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { BENCHMARK_CORPUS_SHA256 } from "@/benchmark/Manifest";
 import { IndexManager } from "@/index/IndexManager";
+import type { EmbeddingModel } from "@/domain/contracts";
 import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
 import { SQLITE_PROTOCOL_VERSION } from "@/index/sqlite/protocol";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
@@ -132,6 +133,82 @@ function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SE
 }
 
 describe("TramaPlugin lifecycle integration", () => {
+  it("does not rescan local state for an unchanged cache shard", async () => {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+    };
+    const plugin = projectedPlugin(projectedApp(), settings) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, ...Array(settings.embedding.dimensions - 1).fill(0)])
+    );
+    await plugin.updateIndex();
+    const [shard] = await plugin.publicationManager.store.listCacheShards();
+    const bytes = await plugin.publicationManager.store.readCacheShard(shard.path);
+    // Published membership is recorded before the first receipt is imported.
+    await plugin.index.ingestCacheShard(bytes, shard.digest);
+    const call = vi.spyOn(plugin.index.runtime.ensureClient(), "call");
+    const result = await plugin.index.ingestCacheShard(bytes, shard.digest);
+    expect(result.duplicate).toBe(true);
+    expect(call.mock.calls.map(([method]) => method)).toEqual(["ingestCacheShard"]);
+  });
+
+  it("keeps Stop effective through reset's follow-up cache import", async () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const gate = deferred<void>();
+    vi.spyOn(plugin.index, "resetLocalDatabase").mockImplementationOnce(() => gate.promise);
+    const adopt = vi.spyOn(plugin.maintenance, "checkPublication");
+    adopt.mockClear();
+    const resetting = plugin.resetAllIndexes();
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.phase).toBe("reset"));
+    await plugin.stopIndex();
+    gate.resolve();
+    await resetting;
+    expect(adopt).not.toHaveBeenCalled();
+    expect(plugin.maintenance.snapshot).toMatchObject({
+      pending: true,
+      suspended: true,
+      lane: "idle",
+    });
+  });
+
+  it.each(["updateIndex", "rebuildIndex", "resetThenUpdate"] as const)(
+    "promotes reused cached vectors after providerless %s creates a lexical head",
+    async (command) => {
+      const app = projectedApp();
+      const settings = {
+        ...DEFAULT_SETTINGS,
+        embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+      };
+      const plugin = projectedPlugin(app, settings) as any;
+      await plugin.onload();
+      await plugin.indexLoad;
+      vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(
+        async (inputs) => inputs.map(() => [1, ...Array(settings.embedding.dimensions - 1).fill(0)])
+      );
+      await plugin.updateIndex();
+      expect((await plugin.index.getState()).semanticHeadCount).toBe(2);
+      await plugin.saveSettings({ ...settings, embedding: { ...settings.embedding, modelId: "" } });
+      await plugin.indexLoad;
+      await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+      const embed = vi.spyOn(plugin.embeddingModel, "embed");
+      if (command === "resetThenUpdate") await plugin.resetAllIndexes();
+      app.vault.getMarkdownFiles().push({ path: "Copied.md", name: "Copied.md" });
+      vi.spyOn(app.vault, "read").mockImplementation(async (file) =>
+        file.path === "Copied.md" ? "contents of Note.md" : `contents of ${file.path}`
+      );
+      plugin.index.requestFullRecovery();
+      await plugin[command === "resetThenUpdate" ? "updateIndex" : command]();
+      expect((await plugin.index.getState()).semanticHeadCount).toBe(3);
+      expect(embed).not.toHaveBeenCalled();
+      expect(plugin.getIndexStatus().capabilities.semantic.searchable).toBe(true);
+    }
+  );
+
   beforeEach(() => {
     Platform.isDesktopApp = true;
     vi.restoreAllMocks();
@@ -412,7 +489,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).maintenance.snapshot.pending).toBe(true);
   });
 
-  it("does not reconcile a synchronized snapshot immediately after startup adoption", async () => {
+  it("reconciles local Markdown after startup cache adoption", async () => {
     const app = projectedApp();
     const IndexManager = (await import("@/index/IndexManager")).IndexManager;
     const MaintenanceScheduler = (await import("@/index/MaintenanceScheduler"))
@@ -428,9 +505,9 @@ describe("TramaPlugin lifecycle integration", () => {
     await plugin.onload();
     await (plugin as any).indexLoad;
 
-    expect(requestFullRecovery).not.toHaveBeenCalled();
-    expect(invalidate).not.toHaveBeenCalled();
-    expect((plugin as any).maintenance.snapshot.pending).toBe(false);
+    expect(requestFullRecovery).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect((plugin as any).maintenance.snapshot.pending).toBe(true);
   });
 
   it("routes eligible vault events and exact publication-file changes through maintenance", async () => {

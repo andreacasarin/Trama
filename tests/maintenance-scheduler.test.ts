@@ -62,9 +62,11 @@ function fixture(semanticConfigured = true) {
     converged: true,
     state: {} as never,
   }));
-  const publish = vi.fn(async () => ({ published: true }) as PublicationResult);
+  const publish = vi.fn(
+    async (_shouldYield?: () => boolean) => ({ published: true }) as PublicationResult
+  );
   const adopt = vi.fn(
-    async (_shouldYield?: () => boolean) =>
+    async (_shouldYield?: () => boolean, _onCachePreparation?: () => void) =>
       ({ adopted: false, ignored: "missing" as const }) as AdoptionResult
   );
   const port: MaintenancePort = {
@@ -108,7 +110,156 @@ function deferred<T>() {
 }
 
 describe("MaintenanceScheduler", () => {
-  it("publishes lexical work on provider failure without suspending or retaining an eager retry", async () => {
+  it("distinguishes cached semantic preparation from import and clears it on completion", async () => {
+    const f = fixture();
+    const gate = deferred<void>();
+    f.adopt.mockImplementationOnce(async (_shouldYield, onCachePreparation) => {
+      onCachePreparation?.();
+      await gate.promise;
+      return { adopted: false, ignored: "same-id" };
+    });
+    const checking = f.controller.checkPublication();
+    expect(f.controller.snapshot).toMatchObject({ lane: "adoption", phase: "semantic" });
+    gate.resolve();
+    await checking;
+    expect(f.controller.snapshot.lane).toBe("idle");
+    expect(f.controller.snapshot.phase).toBeUndefined();
+  });
+
+  it.each(["publish", "check"])("releases background checks after manual %s", async (command) => {
+    const f = fixture();
+    const gate = deferred<void>();
+    if (command === "publish")
+      f.publish.mockImplementationOnce(async () => {
+        await gate.promise;
+        return { published: true };
+      });
+    else
+      f.adopt.mockImplementationOnce(async () => {
+        await gate.promise;
+        return { adopted: false, ignored: "missing" };
+      });
+    const manual =
+      command === "publish" ? f.controller.publishCurrent() : f.controller.checkPublication(true);
+    const background = f.controller.checkPublication();
+    gate.resolve();
+    await manual;
+    await background;
+    expect(f.adopt).toHaveBeenCalledTimes(command === "publish" ? 1 : 2);
+    expect(f.controller.snapshot.lane).toBe("idle");
+  });
+
+  it("reconciles edits arriving before a provider failure without its retry delay", async () => {
+    const f = fixture();
+    const provider = deferred<SemanticPrepareResult>();
+    f.semantic.mockImplementationOnce(() => provider.promise);
+    f.controller.setAutomaticEnabled(true);
+    f.controller.invalidate();
+    await f.advance(3_000);
+    expect(f.semantic).toHaveBeenCalledOnce();
+    f.controller.invalidate();
+    provider.reject(new SemanticProviderError(new Error("offline")));
+    await vi.waitFor(() => expect(f.controller.snapshot.lane).toBe("idle"));
+    await f.advance(3_000);
+    await vi.waitFor(() => expect(f.lexical).toHaveBeenCalledTimes(2));
+  });
+
+  it("indexes new edits during provider retry cooldown and lets Stop cancel the retry", async () => {
+    const f = fixture();
+    f.controller.setAutomaticEnabled(true);
+    f.lexical.mockResolvedValue({ changed: true, converged: true });
+    f.semantic.mockRejectedValue(new SemanticProviderError(new Error("offline")));
+    f.controller.invalidate();
+    await f.advance(3_000);
+    await vi.waitFor(() => expect(f.controller.snapshot.lane).toBe("idle"));
+    f.controller.invalidate();
+    await f.advance(3_000);
+    await vi.waitFor(() => expect(f.lexical).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(f.controller.snapshot.lane).toBe("idle"));
+    expect(f.publish).toHaveBeenCalledTimes(2);
+    f.controller.stop();
+    expect(f.timers.size).toBe(0);
+    await f.advance(120_000);
+    expect(f.semantic).toHaveBeenCalledTimes(2);
+    expect(f.controller.snapshot).toMatchObject({ pending: true, suspended: true });
+  });
+
+  it.each(
+    ["lexical", "semantic", "publication", "adoption"].flatMap((phase) =>
+      ["update", "rebuild", "publish", "check", "reset"].map((command) => ({ phase, command }))
+    )
+  )("manual $command interrupts active $phase and runs next", async ({ phase, command }) => {
+    const f = fixture();
+    const gate = deferred<void>();
+    let signal: AbortSignal | undefined;
+    let shouldYield: (() => boolean) | undefined;
+    if (phase === "lexical")
+      f.lexical.mockImplementationOnce(async (currentSignal) => {
+        signal = currentSignal;
+        await gate.promise;
+        return { changed: true, converged: true };
+      });
+    if (phase === "semantic")
+      f.semantic.mockImplementationOnce(async (currentSignal) => {
+        signal = currentSignal;
+        await gate.promise;
+        return {
+          operation: "prepare",
+          changed: true,
+          converged: true,
+          stored: 1,
+          skipped: 0,
+          state: {} as never,
+        };
+      });
+    if (phase === "publication") {
+      f.lexical.mockResolvedValue({ changed: true, converged: true });
+      f.publish.mockImplementationOnce(async (yieldRequested) => {
+        shouldYield = yieldRequested;
+        await gate.promise;
+        return { published: !shouldYield?.() };
+      });
+    }
+    if (phase === "adoption")
+      f.adopt.mockImplementationOnce(async (yieldRequested) => {
+        shouldYield = yieldRequested;
+        await gate.promise;
+        return { adopted: false };
+      });
+    let background: Promise<unknown> | undefined;
+    if (phase === "adoption") background = f.controller.checkPublication();
+    else {
+      f.controller.setAutomaticEnabled(true);
+      f.controller.invalidate();
+      await f.advance(3_000);
+    }
+    await vi.waitFor(() =>
+      expect(f.controller.snapshot.phase).toBe(phase === "adoption" ? "adopt" : phase)
+    );
+    const reset = vi.fn(async () => undefined);
+    const manual =
+      command === "update"
+        ? f.controller.update()
+        : command === "rebuild"
+          ? f.controller.rebuild()
+          : command === "publish"
+            ? f.controller.publishCurrent()
+            : command === "check"
+              ? f.controller.checkPublication(true)
+              : f.controller.resetExclusive(reset);
+    expect(signal?.aborted ?? shouldYield?.()).toBe(true);
+    expect(reset).not.toHaveBeenCalled();
+    gate.resolve();
+    await manual;
+    await background;
+    expect(f.controller.snapshot).toMatchObject({ lane: "idle", suspended: false });
+    expect(f.controller.snapshot.error).toBeUndefined();
+    if (command === "reset") expect(reset).toHaveBeenCalledOnce();
+    if (command === "rebuild") expect(f.rebuild).toHaveBeenCalledOnce();
+    if (command === "check") expect(f.adopt).toHaveBeenCalledTimes(phase === "adoption" ? 2 : 1);
+  });
+
+  it("publishes lexical work and retains semantic backlog with automation disabled", async () => {
     const f = fixture();
     f.lexical.mockResolvedValueOnce({ changed: true, converged: true });
     f.semantic.mockRejectedValueOnce(new SemanticProviderError(new Error("offline")));
@@ -116,11 +267,11 @@ describe("MaintenanceScheduler", () => {
     await expect(update).rejects.toBeInstanceOf(SemanticProviderError);
     expect(f.publish).toHaveBeenCalledOnce();
     expect(f.controller.snapshot.suspended).toBe(false);
-    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.controller.snapshot.pending).toBe(true);
     expect(f.timers.size).toBe(0);
   });
 
-  it("continues later lexical edits after an automatic semantic provider failure", async () => {
+  it("retries a recovered semantic provider without requiring another vault edit", async () => {
     const f = fixture();
     f.controller.setAutomaticEnabled(true);
     f.lexical.mockResolvedValue({ changed: true, converged: true });
@@ -130,7 +281,10 @@ describe("MaintenanceScheduler", () => {
     await vi.waitFor(() => expect(f.controller.snapshot.lane).toBe("idle"));
     expect(f.publish).toHaveBeenCalledOnce();
     expect(f.controller.snapshot.suspended).toBe(false);
-    expect(f.controller.snapshot.pending).toBe(false);
+    expect(f.controller.snapshot.pending).toBe(true);
+    expect(f.timers.size).toBe(1);
+    await f.advance(59_999);
+    expect(f.semantic).toHaveBeenCalledOnce();
 
     f.semantic.mockResolvedValue({
       operation: "prepare",
@@ -140,11 +294,11 @@ describe("MaintenanceScheduler", () => {
       skipped: 0,
       state: {} as never,
     });
-    f.controller.invalidate();
-    await f.advance(3_000);
-    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+    await f.advance(1);
+    await vi.waitFor(() => expect(f.semantic).toHaveBeenCalledTimes(2));
     expect(f.lexical).toHaveBeenCalledTimes(2);
     expect(f.controller.snapshot.suspended).toBe(false);
+    expect(f.controller.snapshot.pending).toBe(false);
   });
 
   it("escalates quiet delays 3→9→20 seconds once per invalidated automatic attempt", async () => {
@@ -488,19 +642,20 @@ describe("MaintenanceScheduler", () => {
     expect(f.lexical).toHaveBeenCalled();
   });
 
-  it("refuses reset while active or queued explicit maintenance exists", async () => {
+  it("prioritizes reset over active and queued explicit maintenance", async () => {
     const f = fixture();
     const lexical = deferred<{ changed: boolean; converged: boolean }>();
     f.lexical.mockImplementationOnce(() => lexical.promise);
     const active = f.controller.update();
     await f.settle();
     const queued = f.controller.rebuild();
-    await expect(f.controller.resetExclusive(async () => undefined)).rejects.toMatchObject({
-      code: "busy",
-      retryable: true,
-    });
+    const reset = vi.fn(async () => undefined);
+    const resetting = f.controller.resetExclusive(reset);
+    expect(reset).not.toHaveBeenCalled();
     lexical.resolve({ changed: true, converged: true });
-    await Promise.all([active, queued]);
+    await Promise.all([active, queued, resetting]);
+    expect(reset).toHaveBeenCalledOnce();
+    expect(f.rebuild).not.toHaveBeenCalled();
   });
 
   it("waits for active adoption, cancels its queued publication, and excludes new lanes", async () => {
@@ -836,7 +991,7 @@ describe("MaintenanceScheduler", () => {
     expect(f.publish).toHaveBeenCalledOnce();
   });
 
-  it("yields explicit semantic work at a committed batch boundary to the next explicit request", async () => {
+  it("cancels an explicit semantic operation when a newer manual request arrives", async () => {
     const f = fixture();
     const semanticBatch = deferred<void>();
     const order: string[] = [];
@@ -883,14 +1038,8 @@ describe("MaintenanceScheduler", () => {
     semanticBatch.resolve();
     await Promise.all([update, rebuild]);
 
-    expect(order).toEqual([
-      "update-lexical",
-      "update-semantic-batch",
-      "rebuild-lexical",
-      "update-lexical",
-      "resumed-update-semantic",
-    ]);
-    expect(f.publish).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["update-lexical", "update-semantic-batch", "rebuild-lexical"]);
+    expect(f.publish).toHaveBeenCalledOnce();
   });
 
   it("retains an edit made while publication is settling and repeats the explicit pass", async () => {

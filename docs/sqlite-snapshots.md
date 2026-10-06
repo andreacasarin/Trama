@@ -22,6 +22,28 @@ when available; with no configured provider, one imported compatible profile can
 selected automatically, while multiple choices require selection and lexical search
 remains available.
 
+With automatic maintenance enabled, startup reconciles local Markdown even when
+new shared cache shards have been imported. A device without a configured provider
+promotes any complete cached semantic heads after lexical reconciliation. A provider
+failure preserves semantic backlog and retries after a one-minute delay; lexical
+changes remain usable. Manual maintenance commands supersede active cancellable work
+and queued commands. SQLite transactions and file installation finish their current
+atomic step before yielding. Filo refreshes related notes after maintenance settles.
+Stop during reset also cancels its follow-up cache import. Edits arriving during a
+failed embedding request retain normal lexical scheduling instead of waiting for
+the provider retry.
+
+Related retrieval scores all probes in one corpus scan and loads exact reranking
+tiles through occurrence and cache lookup indexes. It retains the same symmetric
+passage scoring and 16-vector tile bound. Performance diagnostics distinguish
+`centroid`, `relatedCandidates`, and `relatedRerank`. When the last consumer cancels
+a related request, its Worker request is cancelled as well; remaining consumers
+continue sharing the computation. Duplicate shard imports still validate SHA but
+skip profile reconciliation and unchanged local-state scans in both the Worker and
+the plugin. Profile reconciliation after a new shard updates profile selection
+without computing a discarded full corpus status. Cache import and cached semantic
+preparation have separate maintenance status messages.
+
 ## Publish and receive
 
 Cache contributions are immutable, standalone SQLite databases with a maximum final
@@ -59,10 +81,14 @@ eligible files are each no larger than 1 MiB, or if files contain eligible expir
 rows. It emits standalone shards no larger than 4 MiB. All replacements are made
 durable before the exact captured source files are retired after a separate 30-day
 grace period. Uncaptured files that arrive during compaction are left alone. If a
+source or replacement is already in that grace window, later compaction leaves it
+alone and retains its original retirement deadline. Membership records preserve the
+identity of dirty shards after their expired local vectors have been deleted. If a
 contribution file disappears, repair republishes only still-needed active,
 last-complete, pending, or in-flight document vectors and fresh query vectors.
 
-The ordinary **Reset all indexes** operation preserves shared cache contributions.
+The ordinary **Reset all indexes** operation preserves shared cache contributions
+and imports them again before rebuilding local heads.
 The marker-gated benchmark reset may clear generated benchmark cache state for a
 fresh fixture run.
 

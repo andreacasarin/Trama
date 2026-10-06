@@ -110,6 +110,8 @@ export function composeRuntime(
       semanticConfigured: settings.embedding.modelId.trim().length > 0,
       synchronize: async (signal) => {
         const result = await manager.reconcileQueuedChanges(signal);
+        if (result.converged && !settings.embedding.modelId.trim())
+          await manager.promoteCachedSemantic(signal);
         host.onIndexOperation(manager, result.changed);
         return result;
       },
@@ -117,6 +119,8 @@ export function composeRuntime(
         const revision = manager.journalSnapshot().revision;
         const result = await manager.build(signal);
         if (result.converged) manager.clearJournalIfCurrent(revision);
+        if (result.converged && !settings.embedding.modelId.trim())
+          await manager.promoteCachedSemantic(signal);
         host.onIndexOperation(manager, result.changed);
         return result;
       },
@@ -130,11 +134,11 @@ export function composeRuntime(
         host.onIndexOperation(manager, result.changed);
         return result;
       },
-      publish: async () => {
+      publish: async (shouldYield) => {
         warningOrigin = "publication";
         const elapsed = diagnosticTimer(host.diagnostics, "performance");
         try {
-          const result = await publication.publish();
+          const result = await publication.publish(shouldYield);
           if (result.published && !result.warning) host.onPublicationSuccess(manager);
           return result;
         } finally {
@@ -150,7 +154,7 @@ export function composeRuntime(
             });
         }
       },
-      adoptCurrent: async (shouldYield) => {
+      adoptCurrent: async (shouldYield, onCachePreparation) => {
         warningOrigin = "check";
         try {
           const elapsed = diagnosticTimer(host.diagnostics, "performance");
@@ -170,6 +174,7 @@ export function composeRuntime(
               });
           }
           if (!shouldYield?.()) {
+            onCachePreparation?.();
             const cached = await manager.promoteCachedSemantic(new AbortController().signal);
             host.onIndexOperation(manager, cached.changed);
           }
@@ -208,17 +213,9 @@ export function composeRuntime(
         void scheduler.checkPublication().then((result) => {
           if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
           if (
-            settings.automaticMaintenance &&
-            host.isCurrent(manager) &&
-            manager.hasPendingSemanticWork()
-          )
-            scheduler.invalidate(false);
-          if (
             host.isAutomaticMaintenanceEnabled() &&
             host.isCurrent(manager) &&
-            !scheduler.snapshot.pending &&
             !scheduler.snapshot.suspended &&
-            !result.adopted &&
             !result.replacementRequired
           ) {
             manager.requestFullRecovery();

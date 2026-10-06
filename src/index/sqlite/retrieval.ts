@@ -99,7 +99,13 @@ export class SqliteRetrieval {
   constructor(
     private readonly context: SqliteContext,
     private readonly onPhase?: (
-      phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+      phase:
+        | "semanticCandidates"
+        | "lexicalCandidates"
+        | "fusion"
+        | "centroid"
+        | "relatedCandidates"
+        | "relatedRerank",
       durationMs: number,
       itemCount: number
     ) => void,
@@ -113,7 +119,13 @@ export class SqliteRetrieval {
   }
 
   private finishPhase(
-    phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+    phase:
+      | "semanticCandidates"
+      | "lexicalCandidates"
+      | "fusion"
+      | "centroid"
+      | "relatedCandidates"
+      | "relatedRerank",
     timer: (() => number) | undefined,
     itemCount: number
   ): void {
@@ -133,17 +145,18 @@ export class SqliteRetrieval {
     readonly bind: readonly unknown[];
   } {
     const pathFilter = path ? "AND n.path=?" : excludePath ? "AND n.path<>?" : "";
+    // Keep note/occurrence filters ahead of cache lookups. SQLite otherwise starts
+    // with every vector in the profile even for a single note or a 16-row tile.
     return {
       sql: `WITH compatible_occurrences AS (
         SELECT o.occurrence_id AS occurrenceId,o.note_id AS noteId,n.path,o.chunk_id AS id,o.ordinal,
-               ei.action_key AS inputDigest,
+               o.embedding_input_digest AS inputDigest,
                ROW_NUMBER() OVER (
-                 PARTITION BY o.note_id,ei.action_key ORDER BY o.ordinal,o.chunk_id COLLATE BINARY
+                 PARTITION BY o.note_id,o.embedding_input_digest ORDER BY o.ordinal,o.chunk_id COLLATE BINARY
                ) AS duplicateRank
-        FROM chunk_occurrences o
-        JOIN notes n ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
-        JOIN embedding_inputs ei ON ei.action_key=o.embedding_input_digest
-        JOIN embedding_cache ec ON ec.input_digest=ei.action_key
+        FROM notes n
+        CROSS JOIN chunk_occurrences o ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
+        CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=o.embedding_input_digest
           AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
         WHERE 1=1 ${pathFilter}
       ), related_passages AS (
@@ -174,34 +187,13 @@ export class SqliteRetrieval {
     }));
   }
 
-  private relatedPassageTile(path: string, offset: number): RelatedPassage[] {
-    const query = this.relatedPassageCte(path);
-    return rows(
-      this.context.db,
-      `${query.sql}
-       SELECT p.occurrenceId,p.id,p.path,p.ordinal,p.inputDigest,ec.vector
-       FROM related_passages p
-       JOIN embedding_cache ec ON ec.input_digest=p.inputDigest
-         AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
-       ORDER BY p.ordinal,p.id COLLATE BINARY LIMIT ? OFFSET ?`,
-      [
-        ...query.bind,
-        this.context.embeddingFingerprint,
-        EMBEDDING_PREPROCESSING_VERSION,
-        RELATED_VECTOR_TILE_SIZE,
-        offset,
-      ]
-    ).map((row) => this.relatedPassageFromRow(row));
-  }
-
   private relatedVectors(refs: readonly RelatedPassageRef[]): Float32Array[] {
     if (!refs.length) return [];
     const rowsById = rows(
       this.context.db,
       `SELECT o.occurrence_id AS occurrenceId,ec.vector
-       FROM chunk_occurrences o JOIN notes n ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
-       JOIN embedding_inputs ei ON ei.action_key=o.embedding_input_digest
-       JOIN embedding_cache ec ON ec.input_digest=ei.action_key
+       FROM chunk_occurrences o CROSS JOIN notes n ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
+       CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=o.embedding_input_digest
          AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
        WHERE o.occurrence_id IN (${refs.map(() => "?").join(",")})`,
       [
@@ -230,7 +222,7 @@ export class SqliteRetrieval {
       sql: `${query.sql}
         SELECT p.occurrenceId,p.id,p.path,p.ordinal,p.inputDigest,ec.vector
         FROM related_passages p
-        JOIN embedding_cache ec ON ec.input_digest=p.inputDigest
+        CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=p.inputDigest
           AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
         ORDER BY p.path COLLATE BINARY,p.ordinal,p.id COLLATE BINARY`,
       bind: [...query.bind, this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
@@ -365,7 +357,8 @@ export class SqliteRetrieval {
           .join(" OR ")
       : "";
     if (expression && lexicalLimit) {
-      const scoped = options.lexicalProfile === "voce" ? `body:(${expression})` : expression;
+      const scoped =
+        options.lexicalProfile === "voce" ? `{body headings}:(${expression})` : expression;
       const filter = currentPath ? " AND n.path<>?" : "";
       const filterBind = currentPath ? [currentPath] : [];
       const scored = noteShape
@@ -450,7 +443,7 @@ export class SqliteRetrieval {
                        JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
                        JOIN note_revisions r ON r.revision_id=o.revision_id
                        ORDER BY s.passageRank,o.ordinal,o.chunk_id COLLATE BINARY LIMIT 1`,
-                    [scoped]
+                    [expression]
                   )
                 );
               } finally {
@@ -628,20 +621,27 @@ export class SqliteRetrieval {
     return probes;
   }
 
-  private relatedNoteCandidates(query: Float32Array, sourcePath: string): SemanticCandidate[] {
+  private relatedNoteCandidates(
+    queries: readonly Float32Array[],
+    sourcePath: string
+  ): SemanticCandidate[] {
     const queryCte = this.relatedPassageCte(undefined, sourcePath);
-    const top: SemanticCandidate[] = [];
+    const top = queries.map(() => [] as SemanticCandidate[]);
     let currentPath = "";
-    let best: SemanticCandidate | undefined;
+    const best: (SemanticCandidate | undefined)[] = queries.map(() => undefined);
     const flush = () => {
-      if (best) offerTopK(top, best, RELATED_NOTES_PER_PROBE, compareSemanticCandidates);
-      best = undefined;
+      for (let index = 0; index < queries.length; index++) {
+        const candidate = best[index];
+        if (candidate)
+          offerTopK(top[index], candidate, RELATED_NOTES_PER_PROBE, compareSemanticCandidates);
+        best[index] = undefined;
+      }
     };
     this.context.db.exec({
       sql: `${queryCte.sql}
         SELECT p.occurrenceId,p.id,p.path,p.ordinal,ec.vector
         FROM related_passages p
-        JOIN embedding_cache ec ON ec.input_digest=p.inputDigest
+        CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=p.inputDigest
           AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
         ORDER BY p.path COLLATE BINARY,p.ordinal,p.id COLLATE BINARY`,
       bind: [...queryCte.bind, this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
@@ -652,25 +652,30 @@ export class SqliteRetrieval {
           flush();
           currentPath = passagePath;
         }
-        const candidate: SemanticCandidate = {
-          occurrenceId: Number(row.occurrenceId),
-          id: String(row.id),
-          path: passagePath,
-          ordinal: Number(row.ordinal),
-          score: normalizedDot(query, this.relatedVector(row.vector)),
-        };
-        if (!best || compareSemanticCandidates(candidate, best) < 0) best = candidate;
+        const vector = this.relatedVector(row.vector);
+        for (let index = 0; index < queries.length; index++) {
+          const candidate: SemanticCandidate = {
+            occurrenceId: Number(row.occurrenceId),
+            id: String(row.id),
+            path: passagePath,
+            ordinal: Number(row.ordinal),
+            score: normalizedDot(queries[index], vector),
+          };
+          const previous = best[index];
+          if (!previous || compareSemanticCandidates(candidate, previous) < 0)
+            best[index] = candidate;
+        }
       },
     });
     flush();
-    return top.sort(compareSemanticCandidates);
+    return top.flatMap((candidates) => candidates.sort(compareSemanticCandidates));
   }
 
   private symmetricRelatedScore(
-    sourcePath: string,
-    sourceCount: number,
+    source: readonly RelatedPassageRef[],
     target: readonly RelatedPassageRef[]
   ): { readonly score: number; readonly evidenceId: number } | undefined {
+    const sourceCount = source.length;
     if (!sourceCount || !target.length) return undefined;
     const targetMax = new Float64Array(target.length).fill(-Infinity);
     const sourceTop = [-Infinity, -Infinity];
@@ -679,9 +684,10 @@ export class SqliteRetrieval {
       sourceOffset < sourceCount;
       sourceOffset += RELATED_VECTOR_TILE_SIZE
     ) {
-      const sourceTile = this.relatedPassageTile(sourcePath, sourceOffset);
-      if (!sourceTile.length) break;
-      const sourceMax = new Float64Array(sourceTile.length).fill(-Infinity);
+      const sourceVectors = this.relatedVectors(
+        source.slice(sourceOffset, sourceOffset + RELATED_VECTOR_TILE_SIZE)
+      );
+      const sourceMax = new Float64Array(sourceVectors.length).fill(-Infinity);
       for (
         let targetOffset = 0;
         targetOffset < target.length;
@@ -689,9 +695,9 @@ export class SqliteRetrieval {
       ) {
         const targetRefs = target.slice(targetOffset, targetOffset + RELATED_VECTOR_TILE_SIZE);
         const targetVectors = this.relatedVectors(targetRefs);
-        for (let sourceIndex = 0; sourceIndex < sourceTile.length; sourceIndex++) {
+        for (let sourceIndex = 0; sourceIndex < sourceVectors.length; sourceIndex++) {
           for (let targetIndex = 0; targetIndex < targetVectors.length; targetIndex++) {
-            const score = normalizedDot(sourceTile[sourceIndex].vector, targetVectors[targetIndex]);
+            const score = normalizedDot(sourceVectors[sourceIndex], targetVectors[targetIndex]);
             if (score > sourceMax[sourceIndex]) sourceMax[sourceIndex] = score;
             const targetIndexOverall = targetOffset + targetIndex;
             if (score > targetMax[targetIndexOverall]) targetMax[targetIndexOverall] = score;
@@ -736,13 +742,16 @@ export class SqliteRetrieval {
       ...probes.map(({ vector }) => vector),
     ];
     const candidates = new Map<string, SemanticCandidate>();
-    for (const query of candidateQueries)
-      for (const candidate of this.relatedNoteCandidates(query, path))
-        if (!candidates.has(candidate.path)) candidates.set(candidate.path, candidate);
+    const candidateTimer = this.startPhase();
+    for (const candidate of this.relatedNoteCandidates(candidateQueries, path))
+      if (!candidates.has(candidate.path)) candidates.set(candidate.path, candidate);
+    this.finishPhase("relatedCandidates", candidateTimer, candidates.size);
+    const rerankTimer = this.startPhase();
+    const sourceRefs = this.relatedPassageRefs(path);
     const hits: SqliteHit[] = [];
     for (const candidate of candidates.values()) {
       const target = this.relatedPassageRefs(candidate.path);
-      const related = this.symmetricRelatedScore(path, source.count, target);
+      const related = this.symmetricRelatedScore(sourceRefs, target);
       if (!related) continue;
       const evidence = rows(
         this.context.db,
@@ -767,6 +776,7 @@ export class SqliteRetrieval {
         endLine: Number(evidence.endLine),
       });
     }
+    this.finishPhase("relatedRerank", rerankTimer, hits.length);
     return hits
       .sort(
         (left, right) =>

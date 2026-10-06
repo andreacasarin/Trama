@@ -21,6 +21,69 @@ import { createBenchmarkCounters, instrumentSqliteClient } from "./workloads/ins
 const digest = (_value: string) => "a".repeat(64);
 
 describe("revision cache database", () => {
+  it.each([
+    { markdown: "# Real title\n\nBody", expected: "Real title" },
+    { markdown: "Real title\n==========\n\nBody", expected: "Real title" },
+    { markdown: "# old\n\nBody", expected: "old" },
+    { markdown: "old\n===\n\nBody", expected: "old" },
+    { markdown: "## old\n\nBody", expected: "new" },
+    { markdown: "Body only", expected: "new" },
+  ])(
+    "preserves content titles and updates fallback titles on rename: $markdown",
+    async ({ markdown, expected }) => {
+      const sqlite = await loadTestSqlite();
+      const raw = new sqlite.oo1.DB(":memory:", "c");
+      const database = new MutableSqliteDatabase(raw);
+      database.boot(digest("rename"), 2);
+      const initial = database.beginLexicalRun({ scope: { mayClearIncomplete: true } });
+      await applyLexicalMarkdownBatch(database, initial.runId, [{ path: "old.md", markdown }]);
+      database.finishLexicalRun(initial.runId);
+      const rename = database.beginLexicalRun({
+        scope: { renames: [{ from: "old.md", to: "new.md" }], mayClearIncomplete: true },
+      });
+      database.finishLexicalRun(rename.runId);
+      expect(raw.selectValue("SELECT title FROM lexical_notes")).toBe(expected);
+      expect(raw.selectValue("SELECT filename FROM lexical_notes")).toBe("new");
+      expect(raw.selectValue("SELECT path_text FROM lexical_notes")).toBe("new.md");
+      database.close();
+    }
+  );
+
+  it("keeps expired shard identities discoverable after cache rows have been deleted", async () => {
+    const sqlite = await loadTestSqlite();
+    const raw = new sqlite.oo1.DB(":memory:", "c");
+    const database = new MutableSqliteDatabase(raw);
+    const profile = "a".repeat(64);
+    database.boot(digest("expiry"), 2, profile);
+    const now = 2_000_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await database.storeQueryVector("old query", profile, 2, new Float32Array([1, 0]));
+      const actionKey = String(raw.selectValue("SELECT action_key FROM embedding_cache"));
+      const source = "b".repeat(64);
+      database.recordCacheShard(source, profile, "query", [actionKey]);
+      raw.exec("UPDATE embedding_cache SET created_at=1");
+      await database.recordCacheRetirements([], [], now);
+      expect(database.maintainCache(now + 1).expiredSourceDigests).toEqual([source]);
+      expect(raw.selectValue("SELECT count(*) FROM embedding_cache")).toBe(0);
+      expect(database.maintainCache(now + 8 * 24 * 60 * 60 * 1000).expiredSourceDigests).toEqual([
+        source,
+      ]);
+
+      // Query lookup can evict a row before publication gets to maintenance.
+      await database.storeQueryVector("second query", profile, 2, new Float32Array([1, 0]));
+      const secondKey = String(raw.selectValue("SELECT action_key FROM embedding_cache"));
+      const second = "c".repeat(64);
+      database.recordCacheShard(second, profile, "query", [secondKey]);
+      raw.exec("UPDATE embedding_cache SET created_at=1");
+      await database.lookupQueryVector("second query", profile);
+      expect(database.maintainCache(now + 1).expiredSourceDigests.sort()).toEqual([source, second]);
+    } finally {
+      clock.mockRestore();
+      database.close();
+    }
+  });
+
   it("migrates schema 13 to full-note lexical search without losing heads or vectors", async () => {
     const sqlite = await loadTestSqlite();
     const raw = new sqlite.oo1.DB(":memory:", "c");
@@ -1173,6 +1236,13 @@ describe("revision cache database", () => {
       database.completeCacheRetirement(source, now + 30 * 24 * 60 * 60 * 1000 - 1)
     ).toThrow();
     expect(database.listCacheRetirements()).toHaveLength(1);
+    const original = database.listCacheRetirements();
+    await database.recordCacheRetirements(
+      [source],
+      ["c".repeat(64)],
+      now + 7 * 24 * 60 * 60 * 1000
+    );
+    expect(database.listCacheRetirements()).toEqual(original);
     database.completeCacheRetirement(source, now + 30 * 24 * 60 * 60 * 1000);
     expect(database.listCacheRetirements()).toEqual([]);
     database.close();

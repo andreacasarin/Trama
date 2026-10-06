@@ -1,6 +1,6 @@
 # Work brief: local indexes and a shared embedding cache
 
-Status: the V1 local-index and shared-vector-cache implementation is present at schema 14/protocol 12. The full test suite passed with 527 passed and 1 skipped; build, lint, and formatting passed. Two normal D5 benchmark runs passed all 12 gates in 53.027s and 56.603s, with complete 2,684-record captures: `e6a84c53-9ce0-4c6b-afa5-c88e51d544a0` and `4c5357ca-7981-47ae-b0ad-a06f2b1336e6`. This brief makes no claim of shipping, real-device performance, or judged relevance quality.
+Status: the V1 local-index and shared-vector-cache implementation is present at schema 14/protocol 12, with the review blockers and subsequent maintenance, cache-import, and related-retrieval fixes applied. Latest verification: 586 tests passed and 1 skipped; build, affected lint, formatting, and diff checks passed. The unchanged 3,000-note CLI benchmark passed all 12 gates in 51.574s, with a complete 2,669-record capture (`7a0c4906-a5d5-4cd2-ad2a-04975bf67f21`). After the additional Worker cache-import fix, two real reloads with cache preserved settled to an idle maintenance lane and usable semantic search in 1.409s and 1.323s including CLI verification; evidence is in `.artifacts/benchmarks/cache-reload-verification.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
 
 ## Agreed direction
 

@@ -114,7 +114,13 @@ export function aggregateSemanticPhase(
   );
 }
 function observeRetrievalPhase(
-  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  phase:
+    | "semanticCandidates"
+    | "lexicalCandidates"
+    | "fusion"
+    | "centroid"
+    | "relatedCandidates"
+    | "relatedRerank",
   durationMs: number,
   itemCount: number
 ): void {
@@ -134,7 +140,13 @@ function observeLexicalMarkdownPhase(phase: LexicalMarkdownPhase, durationMs: nu
 }
 export function retrievalPhaseRecord(
   method: SqliteRequest["method"] | undefined,
-  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  phase:
+    | "semanticCandidates"
+    | "lexicalCandidates"
+    | "fusion"
+    | "centroid"
+    | "relatedCandidates"
+    | "relatedRerank",
   durationMs: number,
   itemCount: number
 ): Omit<TramaPerformanceRecord, "context"> {

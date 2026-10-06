@@ -59,7 +59,13 @@ export class MutableSqliteDatabase {
     db: SqliteConnection,
     diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS,
     retrievalPhaseObserver?: (
-      phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+      phase:
+        | "semanticCandidates"
+        | "lexicalCandidates"
+        | "fusion"
+        | "centroid"
+        | "relatedCandidates"
+        | "relatedRerank",
       durationMs: number,
       itemCount: number
     ) => void
@@ -241,7 +247,7 @@ export class MutableSqliteDatabase {
       this.context.dimensions,
       this.context.embeddingFingerprint
     ).then((result) => {
-      this.state.reconcileImportedEmbeddingProfiles();
+      if (!result.duplicate) this.state.reconcileImportedEmbeddingProfiles();
       return result;
     });
   }
@@ -275,9 +281,9 @@ export class MutableSqliteDatabase {
     transaction(this.context.db, () => {
       expiredSourceDigests = rows(
         this.context.db,
-        `SELECT DISTINCT m.digest FROM embedding_cache ec
-        JOIN cache_shard_membership m ON m.action_key=ec.action_key AND m.task_kind=ec.task_kind
-        WHERE (ec.task_kind='query' AND (ec.created_at<? OR ec.cache_id IN (
+        `SELECT DISTINCT m.digest FROM cache_shard_membership m
+        LEFT JOIN embedding_cache ec ON m.action_key=ec.action_key AND m.task_kind=ec.task_kind
+        WHERE ec.cache_id IS NULL OR (ec.task_kind='query' AND (ec.created_at<? OR ec.cache_id IN (
           SELECT cache_id FROM (SELECT cache_id,embedding_fingerprint,
             ROW_NUMBER() OVER(PARTITION BY embedding_fingerprint ORDER BY created_at DESC,action_key COLLATE BINARY ASC) AS position
             FROM embedding_cache WHERE task_kind='query') WHERE position>1000
@@ -334,11 +340,15 @@ export class MutableSqliteDatabase {
     const orderedSources = sourceDigests.slice().sort();
     const setId = `${now}-${await sha256Hex(orderedSources.join("\n"))}`;
     transaction(this.context.db, () => {
-      for (const digest of sourceDigests)
+      let recorded = sourceDigests.length === 0;
+      for (const digest of sourceDigests) {
         this.context.db.exec({
-          sql: "INSERT OR REPLACE INTO cache_compaction_retirements(source_digest,replacement_set_id,retire_after) VALUES(?,?,?)",
+          sql: "INSERT OR IGNORE INTO cache_compaction_retirements(source_digest,replacement_set_id,retire_after) VALUES(?,?,?)",
           bind: [digest, setId, now + 30 * 24 * 60 * 60 * 1000],
         });
+        recorded ||= Number(rows(this.context.db, "SELECT changes() AS count")[0]?.count) > 0;
+      }
+      if (!recorded) return;
       for (const digest of replacements)
         this.context.db.exec({
           sql: "INSERT OR IGNORE INTO cache_compaction_replacements(replacement_set_id,digest) VALUES(?,?)",

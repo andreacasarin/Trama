@@ -124,8 +124,25 @@ export class FiloView extends ItemView {
 
   private refreshRelated(): void {
     const path = this.currentPath();
-    if (path !== this.activePath) this.expandedPaths.clear();
+    if (path !== this.activePath) {
+      this.expandedPaths.clear();
+      this.related = undefined;
+    }
     this.activePath = path;
+    if (
+      this.status.kind === "loading" ||
+      this.status.kind === "building" ||
+      this.status.kind === "preparing" ||
+      (this.status.maintenance && this.status.maintenance.lane !== "idle")
+    ) {
+      this.requestGeneration++;
+      this.requestAbort?.abort();
+      this.requestAbort = undefined;
+      this.requestKey = undefined;
+      this.relatedError = false;
+      this.render();
+      return;
+    }
     if (!path || !this.relatedSource || !this.hasLocalSemanticProfile() || !this.semanticReady()) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
@@ -193,7 +210,11 @@ export class FiloView extends ItemView {
       });
       return;
     }
-    if (capabilities?.availability === "unavailable") {
+    if (
+      capabilities?.availability === "unavailable" &&
+      status.kind !== "building" &&
+      status.kind !== "preparing"
+    ) {
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
         text: "SQLite lexical and semantic indexes are unavailable. Related notes cannot be loaded.",

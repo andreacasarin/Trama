@@ -210,7 +210,7 @@ describe("TramaPlugin publication integration", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("keeps a queued Check from reclassifying a deferred publication warning", async () => {
+  it("keeps a queued background Check from reclassifying a deferred publication warning", async () => {
     const app = projectedApp();
     const settings = {
       ...DEFAULT_SETTINGS,
@@ -239,7 +239,7 @@ describe("TramaPlugin publication integration", () => {
     adoption.mockClear();
     const update = plugin.maintenance.update();
     await vi.waitFor(() => expect(plugin.maintenance.snapshot.phase).toBe("publication"));
-    const check = plugin.checkPublication();
+    const check = plugin.checkPublication(false);
     pending.resolve(undefined);
     await Promise.all([expect(update).rejects.toEqual(warning), check]);
     expect(adoption).toHaveBeenCalled();

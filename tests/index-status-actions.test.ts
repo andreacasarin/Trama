@@ -13,6 +13,83 @@ vi.mock("obsidian", async (importOriginal) => ({
 }));
 
 describe("index maintenance actions", () => {
+  it("reports palette and Filo action failures without an unhandled rejection", async () => {
+    notices.length = 0;
+    const status = new IndexStatusController({} as any, {
+      update: async () => {
+        throw new Error("provider offline");
+      },
+      rebuild: async () => {
+        throw new Error("storage unavailable");
+      },
+      reset: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setReady();
+    await expect(status.run("index")).resolves.toBeUndefined();
+    await expect(status.run("reindex")).resolves.toBeUndefined();
+    expect(notices).toEqual([
+      "Trama index update failed: provider offline",
+      "Trama index rebuild failed: storage unavailable",
+    ]);
+  });
+
+  it.each(["lexical", "semantic", "publication"])(
+    "allows manual commands to supersede active %s work",
+    async (phase) => {
+      const update = vi.fn(async () => undefined);
+      const rebuild = vi.fn(async () => undefined);
+      const status = new IndexStatusController({} as any, {
+        update,
+        rebuild,
+        reset: async () => undefined,
+        stop: () => undefined,
+      });
+      status.setMaintenance({ lane: "automatic", phase, pending: true, suspended: false });
+      await status.run("index");
+      await status.run("reindex");
+      expect(update).toHaveBeenCalledOnce();
+      expect(rebuild).toHaveBeenCalledOnce();
+    }
+  );
+
+  it("keeps semantic failure attribution through publication and accepts newer batch progress", () => {
+    const status = new IndexStatusController({} as any, {
+      update: async () => undefined,
+      rebuild: async () => undefined,
+      reset: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setMaintenance({ lane: "update", phase: "semantic", pending: true, suspended: false });
+    const progress = {
+      operation: "incremental" as const,
+      phase: "build-vector" as const,
+      completed: 1,
+      total: 3,
+      unit: "chunks" as const,
+      determinate: true,
+      changeCounter: 1,
+    };
+    status.reportProgress(progress);
+    status.reportProgress({ ...progress, changeCounter: 2, completed: 2 });
+    expect(status.getStatus().progress?.completed).toBe(2);
+    status.reportProgress({ ...progress, changeCounter: 1, completed: 3 });
+    expect(status.getStatus().progress?.completed).toBe(2);
+    status.setMaintenance({
+      lane: "update",
+      phase: "publication",
+      pending: true,
+      suspended: false,
+    });
+    status.setMaintenance({
+      lane: "idle",
+      pending: true,
+      suspended: false,
+      error: new Error("provider offline"),
+    });
+    expect(status.getStatus()).toMatchObject({ kind: "error", channel: "semantic" });
+  });
+
   it("routes Clear indexes and shared cache through the shared action", () => {
     const commands: { id: string; callback?: () => void }[] = [];
     const clearShared = vi.fn(async () => undefined);
@@ -317,6 +394,13 @@ describe("index maintenance actions", () => {
       canIndex: true,
       canReindex: true,
     });
+    status.setMaintenance({
+      lane: "adoption",
+      phase: "semantic",
+      pending: false,
+      suspended: false,
+    });
+    expect(status.getStatus().message).toBe("Applying cached semantic vectors…");
     status.setMaintenance({ lane: "idle", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({ kind: "empty", canIndex: true });
   });

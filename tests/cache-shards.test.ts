@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createEmbeddingActionKey,
   createInputDigest,
@@ -128,6 +128,31 @@ function seedQueryProfile(raw: any, fingerprint: string, count: number, createdA
 }
 
 describe("cache-only SQLite shards", () => {
+  it("does not scan corpus status during first or duplicate shard ingestion", async () => {
+    const source = await database();
+    const target = await database();
+    const pool = await poolFixture(source.sqlite);
+    try {
+      await insertCache(source.raw, "cache import must not scan note heads");
+      const shard = await source.db.prepareCacheShard(pool, undefined, "document");
+      const state = vi.spyOn((target.db as any).state, "getState");
+      await expect(
+        target.db.ingestCacheShard(pool, shard!.bytes, shard!.digest)
+      ).resolves.toMatchObject({ duplicate: false });
+      expect(state).not.toHaveBeenCalled();
+      const reconcile = vi.spyOn((target.db as any).state, "reconcileImportedEmbeddingProfiles");
+      await expect(
+        target.db.ingestCacheShard(pool, shard!.bytes, shard!.digest)
+      ).resolves.toMatchObject({ duplicate: true });
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(state).not.toHaveBeenCalled();
+      expect(target.db.getState().compatibleVectorCount).toBe(1);
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
   it("records a locally published shard receipt so later ingestion skips its database import", async () => {
     const local = await database();
     const pool = await poolFixture(local.sqlite);

@@ -241,7 +241,16 @@ export class SqliteLexicalBatchStore {
           sql: `UPDATE lexical_notes
                 SET path_text=(SELECT to_path FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id),
                     filename=(SELECT filename FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id),
-                    title=(SELECT filename FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id)
+                    title=CASE WHEN title=filename AND NOT EXISTS (
+                      SELECT 1 FROM chunk_occurrences o
+                      WHERE o.note_id=lexical_notes.note_id AND o.revision_id=lexical_notes.revision_id
+                        AND o.kind='heading' AND (
+                          ltrim(o.display_text) LIKE '# %' OR ltrim(o.display_text) LIKE '#' || char(9) || '%'
+                          OR instr(o.display_text,char(10) || '=')>0
+                          OR (length(trim(o.display_text))>0 AND replace(trim(o.display_text),'=','')='')
+                        )
+                    ) THEN (SELECT filename FROM lexical_run_renames r WHERE r.note_id=lexical_notes.note_id)
+                    ELSE title END
                 WHERE note_id IN (SELECT note_id FROM lexical_run_renames)`,
         });
       }

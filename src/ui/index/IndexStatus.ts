@@ -38,6 +38,7 @@ export interface IndexStatus {
   readonly freshness?: IndexFreshness;
   readonly publicationId?: string;
   readonly publicationWarning?: string;
+  readonly maintenance?: MaintenanceSnapshot;
 }
 
 const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
@@ -90,6 +91,7 @@ type IndexAction = "index" | "reindex";
 export class IndexStatusController {
   private revision = 0;
   private operationChannel?: "lexical" | "semantic";
+  private maintenance?: MaintenanceSnapshot;
   private readonly listeners = new Set<(status: IndexStatus) => void>();
   private progressTimer?: ReturnType<typeof setTimeout>;
   private pendingProgress?: IndexProgress;
@@ -188,6 +190,7 @@ export class IndexStatusController {
     this.status = {
       ...this.status,
       capabilities,
+      hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
       freshness: capabilities.freshness,
       publicationId: capabilities.publicationId,
       revision: ++this.revision,
@@ -224,7 +227,7 @@ export class IndexStatusController {
     const previous = this.status.progress;
     if (
       previous?.changeCounter !== undefined && progress.changeCounter !== undefined
-        ? previous.changeCounter !== progress.changeCounter
+        ? progress.changeCounter < previous.changeCounter
         : previous?.generationId &&
           progress.generationId &&
           previous.generationId !== progress.generationId
@@ -243,6 +246,7 @@ export class IndexStatusController {
       !previous ||
       previous.phase !== progress.phase ||
       previous.operation !== progress.operation ||
+      previous.changeCounter !== progress.changeCounter ||
       previous.generationId !== progress.generationId;
     const elapsed = this.timing.now() - this.progressAt;
     if (!phaseChanged && elapsed < 125) {
@@ -293,14 +297,25 @@ export class IndexStatusController {
     for (const listener of [...this.listeners]) listener(this.status);
   }
 
-  setMaintenance(snapshot: MaintenanceSnapshot): void {
+  setMaintenance(snapshot: MaintenanceSnapshot, capabilities?: IndexCapabilities): void {
+    this.maintenance = snapshot;
+    if (capabilities)
+      this.status = {
+        ...this.status,
+        capabilities,
+        hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
+        freshness: capabilities.freshness,
+        publicationId: capabilities.publicationId,
+      };
     if (snapshot.lane === "adoption") {
       this.set(
         "stale",
         this.status.hasLastGood,
         snapshot.phase === "queued"
           ? "Index operation queued; finishing the current synchronized cache import…"
-          : "Checking synchronized cache…",
+          : snapshot.phase === "semantic"
+            ? "Applying cached semantic vectors…"
+            : "Checking synchronized cache…",
         false
       );
       return;
@@ -321,7 +336,8 @@ export class IndexStatusController {
       this.projectCompletedMaintenance();
       return;
     }
-    this.operationChannel = snapshot.phase === "semantic" ? "semantic" : "lexical";
+    if (snapshot.phase === "semantic") this.operationChannel = "semantic";
+    else if (snapshot.phase !== "publication") this.operationChannel = "lexical";
     const kind = this.operationChannel === "semantic" ? "preparing" : "building";
     const label =
       snapshot.phase === "reset"
@@ -381,23 +397,18 @@ export class IndexStatusController {
       hasLastGood,
       changeCounter: this.status.changeCounter,
       message,
-      canIndex:
-        kind === "index-required" ||
-        kind === "ready" ||
-        kind === "stale" ||
-        kind === "cancelled" ||
-        kind === "error" ||
-        kind === "empty",
-      canReindex:
-        kind === "index-required" ||
-        kind === "ready" ||
-        kind === "stale" ||
-        ((kind === "cancelled" || kind === "error" || kind === "empty") && hasLastGood),
-      canCancel: kind === "building" || kind === "preparing",
+      canIndex: kind !== "loading",
+      canReindex: kind !== "loading",
+      canCancel:
+        kind === "building" ||
+        kind === "preparing" ||
+        this.maintenance?.lane === "adoption" ||
+        (this.maintenance?.pending === true && !this.maintenance.suspended),
       capabilities: this.status.capabilities,
       freshness: this.status.freshness,
       publicationId: this.status.publicationId,
       publicationWarning: this.status.publicationWarning,
+      maintenance: this.maintenance,
     };
     if (emitDiagnostic && diagnosticsEnabled(this.diagnostics, "detailed"))
       this.emitDiagnostic({
@@ -427,6 +438,11 @@ export class IndexStatusController {
   run(kind: IndexAction): Promise<void> {
     if (kind === "index" && !this.status.canIndex) return Promise.resolve();
     if (kind === "reindex" && !this.status.canReindex) return Promise.resolve();
-    return kind === "index" ? this.actions.update() : this.actions.rebuild();
+    const action = kind === "index" ? this.actions.update() : this.actions.rebuild();
+    return action.catch((error) => {
+      new Notice(
+        `Trama index ${kind === "index" ? "update" : "rebuild"} failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
   }
 }
