@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { readFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { createSimpleBenchmarkCorpus } from "../test-vaults/benchmark/generator";
 import {
   BENCHMARK_EXPECTED_PATH,
@@ -17,6 +17,7 @@ import {
   benchmarkDispatchEval,
   benchmarkIdleFailures,
   benchmarkVaultName,
+  benchmarkVaultPath,
   attachBenchmarkDebugger,
   assertBenchmarkDispatchReceipt,
   childErrorObservation,
@@ -30,6 +31,40 @@ import {
   withFixtureEmbeddingSettings,
   // @ts-expect-error The Node host runner is JavaScript and intentionally has no runtime type surface.
 } from "../scripts/benchmark/obsidian.mjs";
+
+// CLI-boundary tests model a marked generated vault without reading a local vault.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    lstat: vi.fn(original.lstat),
+    realpath: vi.fn(original.realpath),
+    readFile: vi.fn(original.readFile),
+  };
+});
+
+afterEach(() => {
+  vi.mocked(lstat).mockReset();
+  vi.mocked(realpath).mockReset();
+  vi.mocked(readFile).mockReset();
+});
+
+function mockMarkedCliVault(markerReads: number) {
+  vi.mocked(realpath).mockImplementation(async (file) => String(file));
+  vi.mocked(lstat).mockResolvedValue({
+    isSymbolicLink: () => false,
+  } as Awaited<ReturnType<typeof lstat>>);
+  for (let i = 0; i < markerReads; i++)
+    vi.mocked(readFile).mockResolvedValueOnce(
+      JSON.stringify({
+        version: BENCHMARK_MARKER_VERSION,
+        vaultName: BENCHMARK_VAULT_NAME,
+        expectedPath: benchmarkVaultPath,
+        noteCount: BENCHMARK_NOTE_COUNT,
+        corpusSha256: BENCHMARK_CORPUS_SHA256,
+      })
+    );
+}
 
 describe("simple Obsidian benchmark", () => {
   it("builds the same exact 3,000-note, 400-character corpus each time", () => {
@@ -183,41 +218,43 @@ describe("simple Obsidian benchmark", () => {
   });
 
   it("requires exact benchmark path proof at the CLI boundary", async () => {
+    mockMarkedCliVault(3);
     const stage = "benchmark-dispatch";
     await expect(
-      validateMarkedVaultRoot(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME)
+      validateMarkedVaultRoot(benchmarkVaultPath, BENCHMARK_VAULT_NAME)
     ).resolves.toMatchObject({
       version: BENCHMARK_MARKER_VERSION,
       vaultName: BENCHMARK_VAULT_NAME,
-      expectedPath: BENCHMARK_EXPECTED_PATH,
+      expectedPath: benchmarkVaultPath,
       noteCount: BENCHMARK_NOTE_COUNT,
       corpusSha256: BENCHMARK_CORPUS_SHA256,
     });
-    await expect(validateMarkedVaultRoot(BENCHMARK_EXPECTED_PATH, "Personal")).rejects.toThrow(
+    await expect(validateMarkedVaultRoot(benchmarkVaultPath, "Personal")).rejects.toThrow(
       "Refusing a vault outside the exact benchmark output path."
     );
     const goodInvoke = vi.fn(async (command: string, parameters: string[]) => {
       expect([command, parameters]).toEqual(["vault", ["info=path"]]);
-      return { stdout: `${BENCHMARK_EXPECTED_PATH}\n` };
+      return { stdout: `${benchmarkVaultPath}\n` };
     });
     await expect(
-      verifyCliTarget(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, stage, goodInvoke)
+      verifyCliTarget(benchmarkVaultPath, BENCHMARK_VAULT_NAME, stage, goodInvoke)
     ).resolves.toBeUndefined();
 
     const failedInvoke = vi.fn(async () => ({ stdout: "/private/other-vault\n" }));
     await expect(
-      verifyCliTarget(BENCHMARK_EXPECTED_PATH, BENCHMARK_VAULT_NAME, stage, failedInvoke)
+      verifyCliTarget(benchmarkVaultPath, BENCHMARK_VAULT_NAME, stage, failedInvoke)
     ).rejects.toThrow(`failed at ${stage}: single-absolute`);
     expect(failedInvoke).toHaveBeenCalledWith("vault", ["info=path"]);
   });
 
   it("saves bounded path-proof stdout and stderr with the failure", async () => {
+    mockMarkedCliVault(1);
     const stdout = "Error: Obsidian CLI is not ready.\n";
     const stderr = "retry after window load\n";
     let failure: unknown;
     try {
       await verifyCliTarget(
-        BENCHMARK_EXPECTED_PATH,
+        benchmarkVaultPath,
         BENCHMARK_VAULT_NAME,
         "post-reload-idle",
         async () => ({ stdout, stderr })
