@@ -1,4 +1,4 @@
-import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
+import { StructuredError } from "@/domain/contracts";
 import { sha256Hex } from "@/index/Identity";
 import { SqliteProtocolError, type SqliteState } from "@/index/sqlite/protocol";
 import { PublicationStore, type PublicationDataAdapter } from "./PublicationStore";
@@ -40,11 +40,10 @@ export interface PublicationIndexPort {
     actionKeys: readonly string[]
   ): Promise<void>;
   getState?(): Promise<SqliteState | undefined>;
-  capabilities?(): IndexCapabilities;
 }
 
 export interface PublicationWarning {
-  readonly phase: "prepare" | "stage" | "replace" | "finalize" | "inspect" | "adopt";
+  readonly phase: "stage" | "inspect";
   readonly code?: string;
   readonly message: string;
   readonly error: unknown;
@@ -55,8 +54,6 @@ export interface PublicationResourceMetrics {
   readonly byteSize: number;
   readonly copyBytes: number;
   readonly durationMs: number;
-  readonly stageDurationMs?: number;
-  readonly replaceDurationMs?: number;
 }
 
 export interface PublicationResult {
@@ -68,7 +65,6 @@ export interface PublicationResult {
 export interface AdoptionResult {
   readonly adopted: boolean;
   readonly ignored?: "missing" | "same-id";
-  readonly state?: SqliteState;
   readonly warning?: PublicationWarning;
 }
 
@@ -111,15 +107,6 @@ export class PublicationManager {
   }
 
   async publish(shouldYield?: () => boolean): Promise<PublicationResult> {
-    return this.publishCacheShards(shouldYield);
-  }
-
-  /** Inspect and adopt the exact configured file without publishing directly. */
-  async adoptCurrent(shouldYield?: () => boolean): Promise<AdoptionResult> {
-    return this.ingestCacheShards(shouldYield);
-  }
-
-  private async publishCacheShards(shouldYield?: () => boolean): Promise<PublicationResult> {
     const started = Date.now();
     let totalBytes = 0;
     try {
@@ -134,48 +121,20 @@ export class PublicationManager {
       if (retention) await this.compactIfDue(retention, now, shouldYield);
       if (shouldYield?.()) return { published: false };
       const state = await this.index.getState?.();
-      const profiles = [state?.embeddingFingerprint || undefined];
+      const profile = state?.embeddingFingerprint || undefined;
       const presentDigests = this.store.supportsCacheShardListing()
         ? (await this.store.listCacheShards()).map((file) => file.digest)
         : undefined;
-      for (const profile of profiles) {
-        for (const taskKind of ["document", "query"] as const) {
-          let cursor: string | undefined;
-          for (;;) {
-            if (shouldYield?.()) return { published: false };
-            const shard = await this.index.prepareCacheShard(
-              cursor,
-              taskKind,
-              profile,
-              undefined,
-              presentDigests
-            );
-            if (!shard) break;
-            if (shouldYield?.()) return { published: false };
-            if (shard.bytes.byteLength !== 0 && shard.bytes.byteLength > 4_194_304)
-              throw new StructuredError(
-                "invalid_request",
-                "Cache shard exceeds the file size limit.",
-                false
-              );
-            if (!shard.rowCount || !shard.nextActionKey || shard.nextActionKey === cursor)
-              throw new StructuredError(
-                "invalid_request",
-                "Cache shard cursor did not advance.",
-                false
-              );
-            await this.store.installCacheShard(shard.bytes, shard.digest);
-            await this.index.recordCacheShard?.(
-              shard.digest,
-              shard.profile,
-              taskKind,
-              shard.actionKeys
-            );
-            cursor = shard.nextActionKey;
-            totalBytes += shard.bytes.byteLength;
-          }
-        }
+      for (const taskKind of ["document", "query"] as const) {
+        for await (const shard of this.installShards(
+          (cursor) =>
+            this.index.prepareCacheShard!(cursor, taskKind, profile, undefined, presentDigests),
+          taskKind,
+          shouldYield
+        ))
+          totalBytes += shard.bytes.byteLength;
       }
+      if (shouldYield?.()) return { published: false };
       const metrics = {
         byteSize: totalBytes,
         copyBytes: totalBytes,
@@ -273,11 +232,7 @@ export class PublicationManager {
       capturedBytes += bytes.byteLength;
       if (expired.size || bytes.byteLength <= 1024 * 1024) selected.add(file.digest);
     }
-    if (!expired.size && selected.size < 8) {
-      await this.index.recordCacheRetirements([], [], now);
-      return;
-    }
-    if (!selected.size) {
+    if ((!expired.size && selected.size < 8) || !selected.size) {
       await this.index.recordCacheRetirements([], [], now);
       return;
     }
@@ -309,30 +264,21 @@ export class PublicationManager {
     }
     const replacementDigests = new Set<string>();
     for (const group of grouped.values()) {
-      let cursor: string | undefined;
-      for (;;) {
-        if (shouldYield?.()) return;
-        const shard = await this.index.prepareCacheShard?.(
-          cursor,
-          group.taskKind,
-          group.profile,
-          group.digests,
-          [],
-          3_500_000,
-          now
-        );
-        if (!shard) break;
-        if (shouldYield?.()) return;
-        await this.store.installCacheShard(shard.bytes, shard.digest);
-        await this.index.recordCacheShard?.(
-          shard.digest,
-          shard.profile,
-          group.taskKind,
-          shard.actionKeys
-        );
+      for await (const shard of this.installShards(
+        (cursor) =>
+          this.index.prepareCacheShard!(
+            cursor,
+            group.taskKind,
+            group.profile,
+            group.digests,
+            [],
+            3_500_000,
+            now
+          ),
+        group.taskKind,
+        shouldYield
+      ))
         replacementDigests.add(shard.digest);
-        cursor = shard.nextActionKey;
-      }
     }
     const retireSources = [...selected].filter((digest) => !replacementDigests.has(digest));
     if (shouldYield?.()) return;
@@ -341,6 +287,30 @@ export class PublicationManager {
       retireSources.length ? [...replacementDigests] : [],
       now
     );
+  }
+
+  private async *installShards(
+    prepare: (cursor?: string) => Promise<CacheShardResult | undefined>,
+    taskKind: "document" | "query",
+    shouldYield?: () => boolean
+  ): AsyncGenerator<CacheShardResult> {
+    let cursor: string | undefined;
+    while (!shouldYield?.()) {
+      const shard = await prepare(cursor);
+      if (!shard || shouldYield?.()) return;
+      if (shard.bytes.byteLength > 4_194_304)
+        throw new StructuredError(
+          "invalid_request",
+          "Cache shard exceeds the file size limit.",
+          false
+        );
+      if (!shard.rowCount || !shard.nextActionKey || shard.nextActionKey === cursor)
+        throw new StructuredError("invalid_request", "Cache shard cursor did not advance.", false);
+      await this.store.installCacheShard(shard.bytes, shard.digest);
+      await this.index.recordCacheShard?.(shard.digest, shard.profile, taskKind, shard.actionKeys);
+      cursor = shard.nextActionKey;
+      yield shard;
+    }
   }
 
   private async receiptsFor(digests: readonly string[]): Promise<Map<string, string>> {
@@ -353,7 +323,7 @@ export class PublicationManager {
     return receipts;
   }
 
-  private async ingestCacheShards(shouldYield?: () => boolean): Promise<AdoptionResult> {
+  async adoptCurrent(shouldYield?: () => boolean): Promise<AdoptionResult> {
     if (!this.index.ingestCacheShard) return { adopted: false, ignored: "missing" };
     try {
       let imported = 0;
@@ -401,14 +371,12 @@ function isRetryable(error: unknown): boolean {
   const details = publicationErrorDetails(error);
   if (details.code && PERMANENT_PUBLICATION_CODES.has(details.code)) return false;
   if (details.retryable !== undefined) return details.retryable;
-  if (details.code === "busy") return true;
   return true;
 }
 
 interface PublicationErrorDetails {
   readonly code?: string;
   readonly retryable?: boolean;
-  readonly phase?: string;
 }
 
 const PERMANENT_PUBLICATION_CODES = new Set([
@@ -429,17 +397,14 @@ function publicationErrorDetails(error: unknown): PublicationErrorDetails {
     const value = current as {
       code?: unknown;
       retryable?: unknown;
-      phase?: unknown;
       error?: unknown;
     };
     const code = typeof value.code === "string" ? value.code : undefined;
     const retryable = typeof value.retryable === "boolean" ? value.retryable : undefined;
-    const phase = typeof value.phase === "string" ? value.phase : undefined;
-    if (code !== undefined || retryable !== undefined || phase !== undefined) {
+    if (code !== undefined || retryable !== undefined) {
       result = {
         code: code ?? result.code,
         retryable: retryable ?? result.retryable,
-        phase: phase ?? result.phase,
       };
     }
     if (current instanceof SqliteProtocolError || value.error !== undefined) {

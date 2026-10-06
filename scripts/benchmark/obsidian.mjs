@@ -376,12 +376,8 @@ export async function verifyCliTarget(
   } catch (error) {
     const status = childProcessStatus(error);
     const observation = childErrorObservation(`path-proof-${stage}`, error);
-    observation.stdout = observation.stdout
-      .slice(0, 2000)
-      .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "<path>");
-    observation.stderr = observation.stderr
-      .slice(0, 2000)
-      .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "<path>");
+    observation.stdout = boundedPathOutput(observation.stdout);
+    observation.stderr = boundedPathOutput(observation.stderr);
     const artifact = await saveCliResponse(`path-proof-${stage}`, observation);
     const failure = new Error(
       `Obsidian CLI path proof failed at ${stage}: cli-error (exitCode=${status.exitCode}, signal=${status.signal}, timedOut=${status.timedOut}); response saved at ${artifact}.`
@@ -405,14 +401,12 @@ export async function verifyCliTarget(
               ? "single-absolute"
               : "other";
     const stderr = typeof result?.stderr === "string" ? result.stderr : "";
-    const boundedOutput = (value) =>
-      value.slice(0, 2000).replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "<path>");
     const artifact = await saveCliResponse(`path-proof-${stage}`, {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: boundedOutput(stdout),
-      stderr: boundedOutput(stderr),
+      stdout: boundedPathOutput(stdout),
+      stderr: boundedPathOutput(stderr),
     });
     const failure = new Error(
       `Obsidian CLI path proof failed at ${stage}: ${classification} (${Buffer.byteLength(stdout)} bytes); response saved at ${artifact}.`
@@ -610,16 +604,7 @@ export async function attachBenchmarkDebugger({
   now = Date.now,
 } = {}) {
   const off = await invoke("dev:debug", ["off"], "debug-attach");
-  const offArtifact = await saveCliResponse("debug-detach", {
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    stdout: off.stdout,
-    stderr: off.stderr,
-  });
-  process.stdout.write(
-    `Debugger detach response saved at ${offArtifact}; stdout=${JSON.stringify(off.stdout.slice(0, 1000))}; stderr=${JSON.stringify(off.stderr.slice(0, 1000))}\n`
-  );
+  await recordCliResponse("debug-detach", off, "Debugger detach");
   if (
     !/debugger.*detached/i.test(off.stdout.trim()) ||
     !/capture stopped/i.test(off.stdout.trim()) ||
@@ -630,16 +615,7 @@ export async function attachBenchmarkDebugger({
   const deadline = now() + readinessTimeoutMs;
   while (now() < deadline) {
     const debug = await invoke("dev:debug", ["on"], "debug-attach");
-    const artifact = await saveCliResponse("debug-attach", {
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: debug.stdout,
-      stderr: debug.stderr,
-    });
-    process.stdout.write(
-      `Debugger attach response saved at ${artifact}; stdout=${JSON.stringify(debug.stdout.slice(0, 1000))}; stderr=${JSON.stringify(debug.stderr.slice(0, 1000))}\n`
-    );
+    await recordCliResponse("debug-attach", debug, "Debugger attach");
     if (
       /debugger.*attached/i.test(debug.stdout.trim()) &&
       /capture started/i.test(debug.stdout.trim()) &&
@@ -719,6 +695,26 @@ async function archivePreviousReport(marker) {
   const destination = path.join(archiveRoot, `trama-simple-${report.runId}.json`);
   if (await exists(destination)) throw new Error("Benchmark report archive already exists.");
   await rename(reportPath, destination);
+}
+
+function boundedPathOutput(value) {
+  return value.slice(0, 2000).replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "<path>");
+}
+
+async function recordCliResponse(stage, result, label) {
+  const response = {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+  const artifact = await saveCliResponse(stage, response);
+  if (label)
+    process.stdout.write(
+      `${label} response saved at ${artifact}; stdout=${JSON.stringify(response.stdout.slice(0, 1000))}; stderr=${JSON.stringify(response.stderr.slice(0, 1000))}\n`
+    );
+  return { response, artifact };
 }
 
 async function saveCliResponse(stage, response) {
@@ -843,13 +839,7 @@ export async function runBenchmarkOnce({
 
 async function captureLiveProgress() {
   const stateResponse = await cli("eval", [`code=${readinessEval}`], "console-capture");
-  const stateArtifact = await saveCliResponse("live-status", {
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    stdout: stateResponse.stdout,
-    stderr: stateResponse.stderr,
-  });
+  const stateArtifact = (await recordCliResponse("live-status", stateResponse)).artifact;
   const state = parseReadinessStdout(stateResponse.stdout);
   const safeState = {
     pluginPresent: state.pluginPresent === true,
@@ -864,13 +854,7 @@ async function captureLiveProgress() {
     ["level=error", "limit=2000"],
     "console-capture"
   );
-  const consoleArtifact = await saveCliResponse("live-errors", {
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    stdout: consoleResponse.stdout,
-    stderr: consoleResponse.stderr,
-  });
+  const consoleArtifact = (await recordCliResponse("live-errors", consoleResponse)).artifact;
   process.stdout.write(
     `Live benchmark state: ${JSON.stringify(safeState)}; error console bytes=${Buffer.byteLength(consoleResponse.stdout)}; artifacts=${stateArtifact},${consoleArtifact}\n`
   );
@@ -923,17 +907,7 @@ async function main() {
           }
           throw error;
         }
-        const response = {
-          exitCode: 0,
-          signal: null,
-          timedOut: false,
-          stdout: result.stdout,
-          stderr: result.stderr,
-        };
-        const artifact = await saveCliResponse("benchmark-dispatch", response);
-        process.stdout.write(
-          `Dispatch CLI response saved at ${artifact}; stdout=${JSON.stringify(response.stdout.slice(0, 1000))}; stderr=${JSON.stringify(response.stderr.slice(0, 1000))}\n`
-        );
+        const { response } = await recordCliResponse("benchmark-dispatch", result, "Dispatch CLI");
         assertBenchmarkDispatchReceipt(response.stdout);
         return response;
       },

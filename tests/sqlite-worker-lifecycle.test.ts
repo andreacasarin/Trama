@@ -1,3 +1,4 @@
+import { deferred } from "./test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import {
   closeWorkerDatabase,
@@ -7,12 +8,6 @@ import {
 } from "@/index/sqlite/worker-lifecycle";
 import { PublicationService } from "@/index/manager/publication";
 import { SqliteScheduler } from "@/index/sqlite/scheduler";
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => (resolve = done));
-  return { promise, resolve };
-}
 
 describe("SQLite Worker storage lifecycle", () => {
   it("keeps queued reads available behind serialized cache-shard ingestion", async () => {

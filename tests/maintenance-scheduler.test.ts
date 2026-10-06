@@ -1,3 +1,4 @@
+import { deferred } from "./test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import {
   MaintenanceScheduler,
@@ -98,16 +99,6 @@ function fixture(semanticConfigured = true, refreshRelated?: MaintenancePort["re
     adopt,
     settle,
   };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((done, fail) => {
-    resolve = done;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
 }
 
 describe("MaintenanceScheduler", () => {

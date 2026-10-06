@@ -66,6 +66,40 @@ function mockMarkedCliVault(markerReads: number) {
     );
 }
 
+const idleBenchmarkState = {
+  pluginPresent: true,
+  loadResult: true,
+  running: false,
+  resetting: false,
+  lane: "idle",
+};
+
+function completedReport() {
+  return {
+    version: "trama-simple-benchmark-report-v1",
+    corpusSha256: BENCHMARK_CORPUS_SHA256,
+    noteCount: 3000,
+    runId: "11111111-1111-4111-8111-111111111111",
+    status: "completed",
+    correctness: Object.fromEntries(
+      [
+        "corpusNoteCount",
+        "corpusPaths",
+        "coldIndex",
+        "cacheCleared",
+        "indexedAllNotes",
+        "semanticReady",
+        "lexicalSentinel",
+        "hybridSentinel",
+        "relatedSentinel",
+        "cacheShardsPublished",
+        "cacheShardHashesValid",
+        "cacheShardCheckStable",
+      ].map((field) => [field, true])
+    ),
+  };
+}
+
 describe("simple Obsidian benchmark", () => {
   it("builds the same exact 3,000-note, 400-character corpus each time", () => {
     const first = createSimpleBenchmarkCorpus();
@@ -202,13 +236,7 @@ describe("simple Obsidian benchmark", () => {
   });
 
   it("uses only the tiny idle projection and refuses active or unknown state", () => {
-    const idle = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
-    };
+    const idle = idleBenchmarkState;
     expect(benchmarkIdleFailures(idle)).toEqual([]);
     expect(benchmarkIdleFailures({ ...idle, running: true })).toContain("running-or-unknown");
     expect(benchmarkIdleFailures({ ...idle, resetting: undefined })).toContain(
@@ -274,13 +302,7 @@ describe("simple Obsidian benchmark", () => {
   });
 
   it("keeps initial readiness plain and leaves capture refresh for the dispatch boundary", async () => {
-    const state = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
-    };
+    const state = idleBenchmarkState;
     const order: string[] = [];
     const verifyPath = vi.fn(async () => order.push("path"));
     const readReadiness = vi.fn(async (stage: string) => {
@@ -310,11 +332,7 @@ describe("simple Obsidian benchmark", () => {
     let elapsed = 0;
     let proofs = 0;
     const state = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
+      ...idleBenchmarkState,
       timeOrigin: 101,
     };
     await expect(
@@ -347,11 +365,7 @@ describe("simple Obsidian benchmark", () => {
     let elapsed = 0;
     let reads = 0;
     const state = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
+      ...idleBenchmarkState,
       timeOrigin: 101,
     };
     await expect(
@@ -374,11 +388,7 @@ describe("simple Obsidian benchmark", () => {
 
   it("waits for a new renderer and plugin load, then accepts its known active lane", async () => {
     const oldIdle = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
+      ...idleBenchmarkState,
       timeOrigin: 100,
     };
     const pluginStarting = {
@@ -411,11 +421,7 @@ describe("simple Obsidian benchmark", () => {
 
   it("keeps wrong, multiline, and CLI-error proofs strict and shares the reload deadline", async () => {
     const idle = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
+      ...idleBenchmarkState,
       timeOrigin: 101,
     };
     for (const classification of ["single-absolute", "multiline", "cli-error"]) {
@@ -500,29 +506,7 @@ describe("simple Obsidian benchmark", () => {
     expect(wait).toHaveBeenCalledOnce();
 
     const order: string[] = [];
-    const report = {
-      version: "trama-simple-benchmark-report-v1",
-      corpusSha256: BENCHMARK_CORPUS_SHA256,
-      noteCount: 3000,
-      runId: "11111111-1111-4111-8111-111111111111",
-      status: "completed",
-      correctness: Object.fromEntries(
-        [
-          "corpusNoteCount",
-          "corpusPaths",
-          "coldIndex",
-          "cacheCleared",
-          "indexedAllNotes",
-          "semanticReady",
-          "lexicalSentinel",
-          "hybridSentinel",
-          "relatedSentinel",
-          "cacheShardsPublished",
-          "cacheShardHashesValid",
-          "cacheShardCheckStable",
-        ].map((field) => [field, true])
-      ),
-    };
+    const report = completedReport();
     await runBenchmarkOnce({
       assertFreshReport: async () => order.push("fresh-report-check"),
       beforeDispatch: async () => order.push("capture-refresh"),
@@ -539,13 +523,7 @@ describe("simple Obsidian benchmark", () => {
   });
 
   it("waits only for known maintenance lanes, with a fixed idle deadline", async () => {
-    const idle = {
-      pluginPresent: true,
-      loadResult: true,
-      running: false,
-      resetting: false,
-      lane: "idle",
-    };
+    const idle = idleBenchmarkState;
     const states = [
       { ...idle, loadResult: null, lane: "adoption" },
       { ...idle, lane: "adoption" },
@@ -721,29 +699,7 @@ describe("simple Obsidian benchmark", () => {
   it("dispatches once only after stale-report refusal and requires fresh complete evidence", async () => {
     const order: string[] = [];
     const runId = "11111111-1111-4111-8111-111111111111";
-    const report = {
-      version: "trama-simple-benchmark-report-v1",
-      corpusSha256: BENCHMARK_CORPUS_SHA256,
-      noteCount: 3000,
-      runId,
-      status: "completed",
-      correctness: Object.fromEntries(
-        [
-          "corpusNoteCount",
-          "corpusPaths",
-          "coldIndex",
-          "cacheCleared",
-          "indexedAllNotes",
-          "semanticReady",
-          "lexicalSentinel",
-          "hybridSentinel",
-          "relatedSentinel",
-          "cacheShardsPublished",
-          "cacheShardHashesValid",
-          "cacheShardCheckStable",
-        ].map((field) => [field, true])
-      ),
-    };
+    const report = completedReport();
     const operations = {
       assertFreshReport: async () => order.push("freshness"),
       dispatch: async () => {
@@ -800,11 +756,7 @@ describe("simple Obsidian benchmark", () => {
   it("rejects incomplete or overflowing production performance captures", async () => {
     const runId = "11111111-1111-4111-8111-111111111111";
     const report = {
-      version: "trama-simple-benchmark-report-v1",
-      corpusSha256: BENCHMARK_CORPUS_SHA256,
-      noteCount: 3000,
-      runId,
-      status: "completed",
+      ...completedReport(),
       startedAt: "2026-10-06T10:00:00.000Z",
       finishedAt: "2026-10-06T10:01:00.000Z",
       relatedLookup: {
@@ -813,22 +765,6 @@ describe("simple Obsidian benchmark", () => {
         maintenanceBefore: false,
         maintenanceAfter: false,
       },
-      correctness: Object.fromEntries(
-        [
-          "corpusNoteCount",
-          "corpusPaths",
-          "coldIndex",
-          "cacheCleared",
-          "indexedAllNotes",
-          "semanticReady",
-          "lexicalSentinel",
-          "hybridSentinel",
-          "relatedSentinel",
-          "cacheShardsPublished",
-          "cacheShardHashesValid",
-          "cacheShardCheckStable",
-        ].map((field) => [field, true])
-      ),
       performanceCapture: { complete: false, records: [] },
     };
     const operations = {

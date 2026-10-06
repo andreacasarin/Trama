@@ -1,7 +1,7 @@
+import { createTestIndexStatus } from "./index-status-fixture";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "obsidian";
 import { FiloView } from "@/ui/filo/FiloView";
-import { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { RelatedNotesResult } from "@/index/RelatedNotes";
 
 describe("Filo semantic index display", () => {
@@ -141,12 +141,7 @@ describe("Filo semantic index display", () => {
   it.each(["lexical", "semantic", "publication", "adopt", "reset"])(
     "defers related lookups during %s and ignores the interrupted request's failure",
     async (phase) => {
-      const status = new IndexStatusController({} as any, {
-        update: async () => undefined,
-        rebuild: async () => undefined,
-        reset: async () => undefined,
-        stop: () => undefined,
-      });
+      const status = createTestIndexStatus();
       const capabilities = {
         availability: "available" as const,
         lexical: { state: "ready" as const, activity: "idle" as const, searchable: true },
@@ -155,18 +150,7 @@ describe("Filo semantic index display", () => {
       };
       status.setReady();
       status.setCapabilities(capabilities);
-      const labels: string[] = [];
-      const root = {
-        empty: () => labels.splice(0),
-        createEl: (_tag: string, options: { text?: string }) => {
-          labels.push(options.text ?? "");
-          return { addEventListener: () => undefined };
-        },
-        createDiv: (options: { text?: string }) => {
-          labels.push(options.text ?? "");
-          return root;
-        },
-      };
+      const { labels, root } = renderedRoot();
       let reject!: (error: Error) => void;
       let activeSignal!: AbortSignal;
       const find = vi.fn(async (_path: string, _signal: AbortSignal) => ({
@@ -218,12 +202,7 @@ describe("Filo semantic index display", () => {
   it.each(["ready", "stale", "error", "cancelled", "empty"])(
     "keeps the model-change rebuild warning visible when %s",
     (kind) => {
-      const status = new IndexStatusController({} as any, {
-        update: async () => undefined,
-        rebuild: async () => undefined,
-        reset: async () => undefined,
-        stop: () => undefined,
-      });
+      const status = createTestIndexStatus();
       status.setReady();
       status.setCapabilities({
         availability: "available",
@@ -236,15 +215,7 @@ describe("Filo semantic index display", () => {
         },
         freshness: "locally-reconciled",
       });
-      const labels: string[] = [];
-      const root = {
-        empty: () => labels.splice(0),
-        createEl: (_tag: string, options: { text?: string }) => {
-          labels.push(options.text ?? "");
-          return { addEventListener: () => undefined };
-        },
-        createDiv: (options: { text?: string }) => labels.push(options.text ?? ""),
-      };
+      const { labels, root } = renderedRoot();
       const view = new FiloView(
         new WorkspaceLeaf(),
         status,
@@ -265,12 +236,7 @@ describe("Filo semantic index display", () => {
   );
 
   it("asks for the vault embedding model before incompatible-vector updates", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      reset: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setCapabilities({
       availability: "available",
@@ -278,15 +244,7 @@ describe("Filo semantic index display", () => {
       semantic: { state: "incompatible", activity: "idle", searchable: false },
       freshness: "locally-reconciled",
     });
-    const labels: string[] = [];
-    const root = {
-      empty: () => labels.splice(0),
-      createEl: (_tag: string, options: { text?: string }) => {
-        labels.push(options.text ?? "");
-        return { addEventListener: () => undefined };
-      },
-      createDiv: (options: { text?: string }) => labels.push(options.text ?? ""),
-    };
+    const { labels, root } = renderedRoot();
     let configured = false;
     const find = vi.fn();
     const view = new FiloView(
@@ -318,12 +276,7 @@ describe("Filo semantic index display", () => {
     expect(labels).toContain("Update search indexes");
   });
   it("shows semantic progress and Stop even when a rebuild has cleared the vectors", async () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      reset: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "update", phase: "semantic", pending: false, suspended: false });
     status.reportProgress({
@@ -335,17 +288,7 @@ describe("Filo semantic index display", () => {
       determinate: true,
     });
 
-    const rendered: { tag: string; text: string }[] = [];
-    const root = {
-      empty: () => rendered.splice(0),
-      createEl: (tag: string, options: { text?: string }) => {
-        rendered.push({ tag, text: options.text ?? "" });
-        return { addEventListener: () => undefined };
-      },
-      createDiv: (options: { text?: string }) => {
-        rendered.push({ tag: "div", text: options.text ?? "" });
-      },
-    };
+    const { rendered, root } = renderedRoot();
     const view = new FiloView(
       new WorkspaceLeaf(),
       status,
@@ -372,26 +315,13 @@ describe("Filo semantic index display", () => {
   });
 
   it("offers Update after a semantic failure", async () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      reset: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "update", phase: "semantic", pending: false, suspended: false });
     status.markStale(true);
     status.markError(new Error("provider unavailable"));
 
-    const labels: string[] = [];
-    const root = {
-      empty: () => labels.splice(0),
-      createEl: (_tag: string, options: { text?: string }) => {
-        labels.push(options.text ?? "");
-        return { addEventListener: () => undefined };
-      },
-      createDiv: (options: { text?: string }) => labels.push(options.text ?? ""),
-    };
+    const { labels, root } = renderedRoot();
     const view = new FiloView(
       new WorkspaceLeaf(),
       status,
@@ -409,12 +339,7 @@ describe("Filo semantic index display", () => {
   });
 
   it("shows the unavailable prompt for nonsearchable partial coverage", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      reset: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setCapabilities({
       availability: "available",
@@ -423,21 +348,7 @@ describe("Filo semantic index display", () => {
       freshness: "locally-reconciled",
     });
 
-    const labels: string[] = [];
-    const root = {
-      empty: () => labels.splice(0),
-      createEl: (_tag: string, options: { text?: string }) => {
-        const label = options.text ?? "";
-        labels.push(label);
-        return {
-          addEventListener: () => undefined,
-        };
-      },
-      createDiv: (options: { text?: string }) => {
-        labels.push(options.text ?? "");
-        return root;
-      },
-    };
+    const { labels, root } = renderedRoot();
     const view = new FiloView(
       new WorkspaceLeaf(),
       status,
@@ -457,27 +368,11 @@ describe("Filo semantic index display", () => {
   });
 
   it("keeps indexed related notes visible alongside stale-index actions", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      reset: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.markStale(true);
 
-    const labels: string[] = [];
-    const root = {
-      empty: () => labels.splice(0),
-      createEl: (_tag: string, options: { text?: string }) => {
-        labels.push(options.text ?? "");
-        return { addEventListener: () => undefined };
-      },
-      createDiv: (options: { text?: string }) => {
-        labels.push(options.text ?? "");
-        return root;
-      },
-    };
+    const { labels, root } = renderedRoot();
     const view = new FiloView(
       new WorkspaceLeaf(),
       status,
@@ -499,12 +394,7 @@ describe("Filo semantic index display", () => {
 });
 
 function retainedResultsFixture() {
-  const status = new IndexStatusController({} as any, {
-    update: async () => undefined,
-    rebuild: async () => undefined,
-    reset: async () => undefined,
-    stop: () => undefined,
-  });
+  const status = createTestIndexStatus();
   status.setReady();
   status.setCapabilities({
     availability: "available",
@@ -512,19 +402,7 @@ function retainedResultsFixture() {
     semantic: { state: "ready", activity: "idle", searchable: true },
     freshness: "locally-reconciled",
   });
-  const labels: string[] = [];
-  const root = {
-    empty: () => labels.splice(0),
-    createEl: (_tag: string, options: { text?: string }) => {
-      labels.push(options.text ?? "");
-      return { addEventListener: () => undefined };
-    },
-    createDiv: (options: { text?: string }) => {
-      labels.push(options.text ?? "");
-      return root;
-    },
-    createSpan: (options: { text?: string }) => labels.push(options.text ?? ""),
-  };
+  const { labels, root } = renderedRoot();
   let resolve!: (result: RelatedNotesResult) => void;
   let reject!: (error: Error) => void;
   const pending = new Promise<RelatedNotesResult>((done, fail) => {
@@ -561,4 +439,30 @@ function retainedResultsFixture() {
     (fixture.view as any).refreshRelated();
   });
   return fixture;
+}
+
+function renderedRoot() {
+  const labels: string[] = [];
+  const rendered: { tag: string; text: string }[] = [];
+  const record = (tag: string, options: { text?: string }) => {
+    const text = options.text ?? "";
+    labels.push(text);
+    rendered.push({ tag, text });
+  };
+  const root = {
+    empty: () => {
+      labels.splice(0);
+      rendered.splice(0);
+    },
+    createEl: (tag: string, options: { text?: string }) => {
+      record(tag, options);
+      return { addEventListener: () => undefined };
+    },
+    createDiv: (options: { text?: string }) => {
+      record("div", options);
+      return root;
+    },
+    createSpan: (options: { text?: string }) => record("span", options),
+  };
+  return { labels, rendered, root };
 }

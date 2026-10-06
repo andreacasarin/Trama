@@ -285,7 +285,7 @@ async function serialized(opened: OpenDatabase): Promise<Uint8Array> {
   return new Uint8Array(sqlite.capi.sqlite3_js_db_export(opened.raw.pointer));
 }
 
-function createCachePool(sqlite: any): CacheShardPool {
+export function createCachePool(sqlite: any): CacheShardPool {
   const files = new Map<string, any>();
   class PoolDb extends sqlite.oo1.DB {
     private readonly name: string;
@@ -297,7 +297,7 @@ function createCachePool(sqlite: any): CacheShardPool {
         const pointer = sqlite.wasm.allocFromTypedArray(bytes);
         const flags =
           sqlite.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite.capi.SQLITE_DESERIALIZE_RESIZEABLE;
-        sqlite.capi.sqlite3_deserialize(
+        const rc = sqlite.capi.sqlite3_deserialize(
           this.pointer,
           "main",
           pointer,
@@ -305,6 +305,7 @@ function createCachePool(sqlite: any): CacheShardPool {
           bytes.byteLength,
           flags
         );
+        if (rc !== 0) throw new Error("candidate deserialize failed");
       }
       files.set(name, this);
     }

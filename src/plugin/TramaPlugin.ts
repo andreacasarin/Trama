@@ -658,7 +658,7 @@ export class TramaPlugin extends Plugin {
     }
     const message =
       origin === "check"
-        ? `Shared embeddings ${warning.phase === "adopt" ? "import" : "check"} failed: ${warning.message}`
+        ? `Shared embeddings check failed: ${warning.message}`
         : `Search data saved locally, but sharing embeddings failed: ${warning.message}`;
     this.publicationWarnings[origin] = message;
     this.projectPublicationWarning();

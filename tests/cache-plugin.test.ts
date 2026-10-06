@@ -47,15 +47,15 @@ describe("Shared cache plugin maintenance", () => {
     );
     plugin.handlePublicationWarning(
       {
-        phase: "adopt",
-        message: "replace failed",
-        error: new Error("replace failed"),
+        phase: "inspect",
+        message: "import failed",
+        error: new Error("import failed"),
         retryable: true,
       },
       "check"
     );
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Shared embeddings import failed: replace failed"
+      "Shared embeddings check failed: import failed"
     );
     plugin.handlePublicationWarning(
       {
@@ -67,7 +67,7 @@ describe("Shared cache plugin maintenance", () => {
       "publication"
     );
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Shared embeddings import failed: replace failed"
+      "Shared embeddings check failed: import failed"
     );
     plugin.clearPublicationWarning("check");
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
@@ -76,14 +76,14 @@ describe("Shared cache plugin maintenance", () => {
   });
 
   it.each(["same-id", "missing"] as const)(
-    "clears an adoption warning after a successful %s Check",
+    "clears an import warning after a successful %s Check",
     async (ignored) => {
       const setPublicationWarning = vi.fn();
       const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
       const warning = {
-        phase: "adopt",
-        message: "replace failed",
-        error: new Error("replace failed"),
+        phase: "inspect",
+        message: "import failed",
+        error: new Error("import failed"),
         retryable: true,
       };
       plugin.indexStatus = { setPublicationWarning };
@@ -100,7 +100,7 @@ describe("Shared cache plugin maintenance", () => {
 
       expect(setPublicationWarning).toHaveBeenNthCalledWith(
         1,
-        "Shared embeddings import failed: replace failed"
+        "Shared embeddings check failed: import failed"
       );
       expect(setPublicationWarning).toHaveBeenNthCalledWith(2, undefined);
     }

@@ -6,16 +6,13 @@ import {
 } from "@/index/Identity";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import { applyLexicalMarkdownBatch } from "@/index/sqlite/markdown";
-import {
-  ingestCacheShard,
-  prepareCacheShard,
-  type CacheShardPool,
-} from "@/index/sqlite/cache-shards";
+import { ingestCacheShard, prepareCacheShard } from "@/index/sqlite/cache-shards";
 import {
   applyTestLexicalRun,
   createTestSqliteClient,
   embedAllTestInputs,
   loadTestSqlite,
+  createCachePool,
 } from "./sqlite-test-client";
 
 const profile = "a".repeat(64);
@@ -28,59 +25,6 @@ async function database() {
   const db = new MutableSqliteDatabase(raw);
   db.boot("b".repeat(64), dimensions, profile);
   return { sqlite, raw, db };
-}
-
-async function poolFixture(sqlite: any): Promise<CacheShardPool> {
-  const files = new Map<string, any>();
-  class PoolDb extends sqlite.oo1.DB {
-    private readonly cacheName: string;
-    constructor(name: string, mode: string) {
-      super(":memory:", mode);
-      this.cacheName = name;
-      const imported = files.get(name);
-      if (imported instanceof Uint8Array) {
-        const pointer = sqlite.wasm.allocFromTypedArray(imported);
-        const flags =
-          sqlite.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite.capi.SQLITE_DESERIALIZE_RESIZEABLE;
-        const rc = sqlite.capi.sqlite3_deserialize(
-          this.pointer,
-          "main",
-          pointer,
-          imported.byteLength,
-          imported.byteLength,
-          flags
-        );
-        if (rc !== 0) throw new Error("candidate deserialize failed");
-      }
-      files.set(name, this);
-    }
-    close() {
-      files.set(this.cacheName, new Uint8Array(sqlite.capi.sqlite3_js_db_export(this.pointer)));
-      super.close();
-    }
-  }
-  return {
-    OpfsSAHPoolDb: PoolDb as unknown as CacheShardPool["OpfsSAHPoolDb"],
-    exportFile(name) {
-      const value = files.get(name);
-      if (!value) throw new Error("missing candidate");
-      return value instanceof Uint8Array
-        ? value.slice()
-        : new Uint8Array(sqlite.capi.sqlite3_js_db_export(value.pointer));
-    },
-    importDb(name, bytes) {
-      const view = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
-      files.set(name, view.slice());
-      return 0;
-    },
-    unlink(name) {
-      const db = files.get(name);
-      if (!db) return false;
-      if (!(db instanceof Uint8Array)) db.close();
-      files.delete(name);
-      return true;
-    },
-  };
 }
 
 async function insertCache(
@@ -131,7 +75,7 @@ describe("cache-only SQLite shards", () => {
   it("does not scan corpus status during first or duplicate shard ingestion", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     try {
       await insertCache(source.raw, "cache import must not scan note heads");
       const shard = await source.db.prepareCacheShard(pool, undefined, "document");
@@ -155,7 +99,7 @@ describe("cache-only SQLite shards", () => {
 
   it("records a locally published shard receipt so later ingestion skips its database import", async () => {
     const local = await database();
-    const pool = await poolFixture(local.sqlite);
+    const pool = createCachePool(local.sqlite);
     await insertCache(local.raw, "locally published exact provider input");
     const shard = await local.db.prepareCacheShard(pool, undefined, "document");
     let imports = 0;
@@ -182,7 +126,7 @@ describe("cache-only SQLite shards", () => {
   it("exports cache-only bytes and additively ingests vectors with an atomic receipt", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await insertCache(source.raw, "exact provider input");
     const shard = await prepareCacheShard(source.raw, pool, profile, dimensions);
     expect(shard).toMatchObject({ rowCount: 1 });
@@ -232,7 +176,7 @@ describe("cache-only SQLite shards", () => {
   it("does not reimport an expired query shard with a matching receipt and membership", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await source.db.storeQueryVector(
       "expired query shard",
       profile,
@@ -290,7 +234,7 @@ describe("cache-only SQLite shards", () => {
 
   it("resumes cache-shard paging at the first row that exceeded the payload budget", async () => {
     const source = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     const inputs = ["pagination input A", "pagination input B"];
     for (const input of inputs) await insertCache(source.raw, input);
     const oneRowBytes =
@@ -377,7 +321,7 @@ describe("cache-only SQLite shards", () => {
   it("deduplicates same logical vector rows across distinct shard byte hashes", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await insertCache(source.raw, "same exact input", 1);
     const first = await prepareCacheShard(source.raw, pool, profile, dimensions);
     source.raw.exec("UPDATE embedding_cache SET created_at=2");
@@ -394,7 +338,7 @@ describe("cache-only SQLite shards", () => {
   it("transports query vectors and keeps them out of document semantic coverage", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await insertCache(source.raw, "document input");
     await source.db.storeQueryVector("exact query", profile, dimensions, new Float32Array([0, 1]));
     const documentShard = await source.db.prepareCacheShard(pool, undefined, "document");
@@ -433,7 +377,7 @@ describe("cache-only SQLite shards", () => {
   it("promotes imported document vectors for local notes without calling a provider", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     const note = [
       {
         path: "offline.md",
@@ -467,7 +411,7 @@ describe("cache-only SQLite shards", () => {
 
   it("repairs only missing current document and fresh query cache memberships", async () => {
     const local = await database();
-    const pool = await poolFixture(local.sqlite);
+    const pool = createCachePool(local.sqlite);
     const run = local.db.beginLexicalRun({ scope: { mayClearIncomplete: true } });
     await applyLexicalMarkdownBatch(local.db, run.runId, [
       { path: "present.md", markdown: "present semantic input" },
@@ -624,7 +568,7 @@ describe("cache-only SQLite shards", () => {
   it("rejects invalid digest and ignores vectors from another model", async () => {
     const source = await database();
     const target = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await insertCache(source.raw, "provider input");
     const shard = await prepareCacheShard(source.raw, pool, profile, dimensions);
     await expect(
@@ -636,7 +580,7 @@ describe("cache-only SQLite shards", () => {
     expect(Number(target.raw.selectValue("SELECT count(*) FROM embedding_cache"))).toBe(0);
     expect(Number(target.raw.selectValue("SELECT count(*) FROM cache_artifact_receipts"))).toBe(1);
     const malformedSource = await database();
-    const malformedPool = await poolFixture(malformedSource.sqlite);
+    const malformedPool = createCachePool(malformedSource.sqlite);
     await insertCache(malformedSource.raw, "provider input");
     malformedSource.raw.exec({
       sql: "UPDATE embedding_cache SET action_key=?",
@@ -674,7 +618,7 @@ describe("cache-only SQLite shards", () => {
 
   it("supports more than 2,000 rows without materializing or limiting a whole-corpus dump", async () => {
     const source = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     for (let index = 0; index < 2_100; index++) await insertCache(source.raw, `input-${index}`);
     const shard = await prepareCacheShard(source.raw, pool, profile, dimensions);
     expect(shard?.rowCount).toBeGreaterThan(2_000);
@@ -684,7 +628,7 @@ describe("cache-only SQLite shards", () => {
 
   it("does not emit a file for an empty cache", async () => {
     const source = await database();
-    const pool = await poolFixture(source.sqlite);
+    const pool = createCachePool(source.sqlite);
     await expect(prepareCacheShard(source.raw, pool, profile, dimensions)).resolves.toBeUndefined();
     source.db.close();
   });

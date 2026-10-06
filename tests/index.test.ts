@@ -1,3 +1,4 @@
+import { deferred } from "./test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import { StructuredError, type IndexProgress } from "@/domain/contracts";
 import {
@@ -13,12 +14,6 @@ import { createTestSqliteClient } from "./sqlite-test-client";
 import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
 
 const signal = new AbortController().signal;
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => (resolve = done));
-  return { promise, resolve };
-}
 
 class HandshakeWorker {
   readonly messages: { value: any; transfer?: readonly ArrayBuffer[] }[] = [];
