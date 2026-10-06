@@ -14,17 +14,30 @@ Semantic input uses structural Markdown blocks capped at 384 characters of canon
 serialized input including heading context, with zero overlap. While changed inputs
 are prepared, the last complete compatible semantic head remains searchable.
 
-A vector is reusable only for the exact provider-input bytes, task, proven model/output
-space, and any vector-affecting transforms not already represented in those bytes.
-Endpoint reachability, a provider name, or matching dimensions alone do not prove
-compatibility. Profiles remain isolated. A configured compatible profile is selected
-when available; with no configured provider, one imported compatible profile can be
-selected automatically, while multiple choices require selection and lexical search
-remains available.
+A vault uses one active embedding model/version, dimensions, and preprocessing
+identity. Model identifiers must identify the same version on all devices; endpoint
+addresses are transport settings and do not change that identity. Query and document
+tasks remain distinct, and vectors are reusable only for exact compatible inputs.
+Changing model identity disables semantic retrieval and prompts an explicit rebuild;
+lexical search stays available. A model-change rebuild atomically drops all local
+semantic heads, document and query cache entries, and cache import/retirement bookkeeping,
+then recalculates with the configured model. Recalculation is intentional; the rebuild
+does not include a special shared-cache recovery step. Ordinary subsequent cache imports
+and updates can reuse compatible entries. The rebuild deletes shared cache shards before switching the local model; a deletion failure leaves the model change pending for retry.
+Late-arriving other-model shards are ignored during both import and compaction.
+Incompatible prior local schemas reset and rebuild without migration.
 
-With automatic maintenance enabled, startup reconciles local Markdown even when
-new shared cache shards have been imported. A device without a configured provider
-promotes any complete cached semantic heads after lexical reconciliation. A provider
+The shared `EmbeddingResolver` uses SQLite cache lookup before provider calls.
+Semantic preparation selects unique document misses across notes in SQL, filling
+bounded provider batches by item and byte limits; cached passages consume no provider
+batch slots. Query misses dispatch immediately, while cached queries work offline.
+With no provider configured, the saved vault model can still use its cache.
+
+Startup and synchronization import cache entries only: they never promote semantic
+heads or call a provider as part of import. Imported entries make work eligible for
+ordinary automatic maintenance when enabled; otherwise the next manual update uses
+them. Automatic startup reconciliation still checks local Markdown. A providerless
+device promotes complete cache hits during ordinary local indexing. A provider
 failure preserves semantic backlog and retries after a one-minute delay; lexical
 changes remain usable. Manual maintenance commands supersede active cancellable work
 and queued commands. SQLite transactions and file installation finish their current
@@ -41,8 +54,8 @@ a related request, its Worker request is cancelled as well; remaining consumers
 continue sharing the computation. Duplicate shard imports still validate SHA but
 skip profile reconciliation and unchanged local-state scans in both the Worker and
 the plugin. Profile reconciliation after a new shard updates profile selection
-without computing a discarded full corpus status. Cache import and cached semantic
-preparation have separate maintenance status messages.
+without computing a discarded full corpus status. Semantic preparation is a separate
+maintenance operation; cache checks only display import activity.
 
 ## Publish and receive
 
@@ -57,13 +70,13 @@ Each shard is hashed with SHA-256, staged, read back, and byte-checked before at
 rename into the shared publication area. The publisher does not reimport its own
 export. On first receipt, Trama verifies the named SHA-256 and validates the shard schema, profile, keys, dimensions,
 and finite vector values before merging. It records receipt atomically
-with the conflict-safe merge. A repeated artifact digest skips the merge; vector keys
+with the conflict-safe merge. A repeated artifact digest skips file reading and merge through batched SQLite receipt lookup; vector keys
 also deduplicate across different shard digests. Incoming data adds reusable vectors
 and never replaces compatible local entries or current note visibility.
 
-A legacy whole-database publication is not adopted as a local index head. Trama may
-extract only vectors with proven compatibility, while preserving the original file;
-unproven legacy cache state stays isolated.
+Only the current local database schema and cache-shard format are supported.
+An incompatible disposable local index is reset and rebuilt; there is no migration
+or whole-database import/publication workflow.
 
 ## Retention and recovery
 

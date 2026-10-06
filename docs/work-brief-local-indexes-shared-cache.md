@@ -1,6 +1,83 @@
 # Work brief: local indexes and a shared embedding cache
 
-Status: the V1 local-index and shared-vector-cache implementation is present at schema 14/protocol 12, with the review blockers and subsequent maintenance, cache-import, and related-retrieval fixes applied. Latest verification: 586 tests passed and 1 skipped; build, affected lint, formatting, and diff checks passed. The unchanged 3,000-note CLI benchmark passed all 12 gates in 51.574s, with a complete 2,669-record capture (`7a0c4906-a5d5-4cd2-ad2a-04975bf67f21`). After the additional Worker cache-import fix, two real reloads with cache preserved settled to an idle maintenance lane and usable semantic search in 1.409s and 1.323s including CLI verification; evidence is in `.artifacts/benchmarks/cache-reload-verification.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
+Status: the current implementation uses schema 15/protocol 13, with the approved resolver, single-model reset, and deletion cleanup applied. Latest verification after test cleanup and Filo display fix: 581 tests passed, none skipped; build, lint, and formatting passed. The generated 3,000-note Obsidian CLI benchmark passed all 12 gates in 52.696s with a complete 2,655-record capture (`8103c46b-5ef8-4c76-a52c-a6f2cbe70533`). The prior current-design run took 53.594s: cold-run performance is comparable. The final repeated unchanged cache check took 0.8 ms. The final build reloaded with cache preserved and the fixture provider stopped, reaching idle in 2.273s including CLI verification; evidence is in `.artifacts/benchmarks/cleanup-cache-reload.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
+
+## Approved deletion cleanup (6 October 2026)
+
+Only the current schema (15) and protocol (13) are supported. Whole-database
+publication/adoption and legacy extraction, schema migrations, profile selection modes,
+write-only chunk copies, and the old generated-corpus installer upgrade were removed. Current
+cache-shard VACUUM/SHA validation, local lexical/semantic heads, and providerless retrieval remain.
+Cache checks look up SHA filename receipts in SQL batches of 512 before reading files.
+Compaction reads at most eight artifacts and 16 MiB per check, reuses captured bytes,
+and records weekly no-op checks. File-size metadata skips near-full artifacts before
+reading them. Historical verification below predates this cleanup.
+`tests/workloads/expected-results.ts` is the current frozen ranking reference, renamed
+from `legacy-oracle.ts` without changing expected values. The source-manifest hash is
+refreshed for the rename; fixture content and ranking gates remain unchanged.
+
+## Test-suite cleanup (6 October 2026)
+
+The retired in-memory benchmark runner, report generation, RSS/timing instrumentation,
+and their tests were removed. `npm run benchmark` remains the single live Obsidian
+CLI workflow. A focused `tests/workloads/retrieval.test.ts` integration test keeps the
+frozen small-workload content hashes, semantic coverage, and lexical/hybrid/Filo/Voce
+rankings checked against production indexing and retrieval after mutations and a local
+restart. The independent ranking reference still checks all three fixture profiles.
+Fixture bytes and expected result values are unchanged. The source manifest now covers
+only maintained fixture/reference/test sources; obsolete baseline report metadata was
+removed. An unused semantic oracle, obsolete snapshot payloads, and unused test-client
+options/callbacks were removed. Tests observe actual production phase diagnostics
+without duplicating the retired benchmark instrumentation or pinning incidental SQL
+statement counts. The former skipped benchmark entry point is gone.
+
+Filo retains the active note’s previous related results above maintenance progress and
+while a refreshed lookup is pending. Successful retrieval replaces them; a failed
+refresh keeps them with a warning. Switching notes clears retained results and aborts
+the previous request. Initial indexing without prior results still shows progress only.
+
+Settings commands wrap beneath their descriptions in narrow panels. Cache publication
+and import are labeled explicitly; reset is local, while Clear also deletes shared
+cache files. Folder, scheduled-maintenance, and model-change descriptions reflect
+cache-only sharing. Publication status says “Publishing embedding cache”; its work
+includes retention, periodic compaction, compact SQLite export, SHA validation and
+file writes, and receipt recording. Settings show export size in MiB and duration
+in seconds.
+
+Updates, rebuilds, and automatic maintenance now refresh open Filo results after local
+indexing settles and before sharing embeddings. The scheduler awaits that refresh;
+no open Filo view means no retrieval work. A refresh failure does not block sharing,
+and cancellation releases the wait so newer manual commands retain priority. Filo
+allows lookups during the results stage, retains rows throughout sharing, and avoids
+repeating a completed lookup afterward. Settings and palette labels distinguish local
+search indexes from shared embeddings: Update search indexes, Rebuild embeddings,
+Share embeddings, Import shared embeddings, Reset local search data, and Clear local
+search data and shared embeddings. Existing command IDs remain unchanged; sharing
+and importing have explicit palette commands.
+
+## Approved resolver simplification (6 October 2026)
+
+This follow-up supersedes the multi-profile selection and import-time semantic
+promotion rules below. Each vault uses one active model/version, dimensions, and
+preprocessing identity. Endpoints are transport configuration; all devices must use
+identifiers for the same model version. Document and query tasks stay distinct.
+A changed model requires explicit semantic rebuild while lexical search remains
+usable. Incompatible prior local schemas are reset and rebuilt, without migration.
+Model-change rebuild atomically clears all local semantic vectors and document/query
+cache entries, plus import and compaction bookkeeping, and starts fresh with the configured
+model. Recalculation is acceptable; there is no special reimport step during rebuild.
+Lexical data remains usable. Model-change rebuild deletes shared cache shards before switching the local model; deletion failure can be retried.
+Late-arriving other-model shared shards are ignored
+and excluded from compaction and retirement. Filo keeps the required rebuild action
+visible across idle stale, error, cancelled, and empty statuses.
+
+Cache reception only validates and merges SQLite cache entries. It never indexes
+notes, promotes heads, or calls the provider. The ordinary maintenance schedule
+handles semantic preparation afterward; automatic maintenance remains opt-in.
+`EmbeddingResolver` owns document cache selection and query cache/provider fallback.
+SQL selects unique document misses across notes and packs bounded provider batches;
+cache hits consume no provider slots. Query cache misses dispatch immediately.
+Existing generation checks and short transactional commits remain in force.
 
 ## Agreed direction
 
@@ -27,7 +104,7 @@ Remaining pre-adoption work is capability confirmation, implementation validatio
 
 ## Current implementation and verification status
 
-Builder reports B1/B2/B3 as implemented with schema 14/protocol 12. The local
+Builder reports B1/B2/B3 as implemented with schema 15/protocol 13. The local
 SQLite/WASM database maintains full-note lexical FTS separately from structural
 semantic blocks and current/last-complete semantic heads. Markdown remains the
 visibility authority. The current semantic input cap is 384 canonical serialized
@@ -79,7 +156,7 @@ The user accepted this concrete V1 contract for implementation. It records appro
 - Provider requests stay outside SQL transactions. Persist successful compatible cache results in bounded transactions. Keep active work and old last-complete inputs protected from pruning. Derive pending work from current inputs versus cache/coverage; do not add a durable request queue or arbitrary revision history in V1.
 - Use the existing single local DB worker/VFS, including candidate databases where needed; two separately maintained local databases are not a V1 requirement.
 - The accepted initial semantic cap is 384 characters of canonical serialized input including its heading, with zero overlap. This is the currently exercised bound, not a claim that characters equal tokens or an ideal chunk size. Current adapters lack an exact tokenizer. Any later cap change requires verified provider limits and relevance-quality evaluation.
-- Separate embedding model/output-space identity (verified model identity, dimensions, and provenance) from input-recipe metadata (chunking and semantic-head reconciliation). The exact cache key is the final provider-input bytes digest plus true model/output space, task, and any vector-affecting input/output transform not captured by those bytes. Pure segmentation or recipe-version changes do not force a miss when provider bytes are identical; changed headings/serialization miss when they change those bytes. Preserve the last-complete old-recipe head while refreshing chunks if the verified model space is unchanged; never mix changed model spaces. Current fingerprinting includes normalized-float32 preprocessing/input options rather than a direct chunk-algorithm version. Existing legacy fingerprints bundle endpoint/model/dimensions/preparation; migrate only mappings with proven compatibility. Do not automatically equate opaque provider aliases; otherwise isolate the legacy cache while preserving its profile.
+- Separate embedding model/output-space identity (verified model identity, dimensions, and provenance) from input-recipe metadata (chunking and semantic-head reconciliation). The exact cache key is the final provider-input bytes digest plus true model/output space, task, and any vector-affecting input/output transform not captured by those bytes. Pure segmentation or recipe-version changes do not force a miss when provider bytes are identical; changed headings/serialization miss when they change those bytes. Preserve the last-complete old-recipe head while refreshing chunks if the verified model space is unchanged; never mix changed model spaces. Current fingerprinting includes normalized-float32 preprocessing/input options rather than a direct chunk-algorithm version. Use the configured versioned model identifier, dimensions, and preprocessing. Do not infer equivalence between opaque aliases or migrate old fingerprints.
 
 ### Shared publication and cache lifecycle
 
@@ -134,6 +211,6 @@ The user accepted this concrete V1 contract for implementation. It records appro
 
 ### Remaining external validation before adoption
 
-- Verify deployed providers expose enough identity/compatibility information to apply the accepted profile rules; treat unproven model equivalence as incompatible. Confirm actual provider limits and tokenizer availability before any cap change. Verify migration follows the accepted rule to reuse only proven-compatible mappings and preserve or isolate legacy state otherwise.
+- Verify deployed providers expose enough identity/compatibility information to apply the accepted profile rules; treat unproven model equivalence as incompatible. Confirm actual provider limits and tokenizer availability before any cap change. Verify incompatible local schemas rebuild and incompatible shared shards are ignored.
 - Validate the accepted SQLite/VFS artifact lifecycle, atomic receipt and merge, bounded batching, compaction/grace behavior, and recovery under delayed or duplicate sync using the unchanged standard runtime and generated-vault safety rules.
 - Judge search quality and measure real-device initialization, query, sync, and maintenance costs. The iPhone 12 target and accepted numerical settings remain unmeasured. Physical table/record names are implementation details where the contract marks names illustrative.

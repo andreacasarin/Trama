@@ -130,9 +130,16 @@ export function composeRuntime(
         return result;
       },
       rebuildSemantic: async (signal, shouldYield) => {
+        if ((await manager.getState())?.semanticRebuildRequired) {
+          // Delete shared data before switching the local model so failure remains retryable.
+          await publication.store.clearCacheShards();
+        }
         const result = await manager.rebuildSemantic(signal, shouldYield);
         host.onIndexOperation(manager, result.changed);
         return result;
+      },
+      refreshRelated: async () => {
+        if (host.isCurrent(manager)) await host.modelRuntime.refreshOpenFilo(app);
       },
       publish: async (shouldYield) => {
         warningOrigin = "publication";
@@ -154,7 +161,7 @@ export function composeRuntime(
             });
         }
       },
-      adoptCurrent: async (shouldYield, onCachePreparation) => {
+      adoptCurrent: async (shouldYield) => {
         warningOrigin = "check";
         try {
           const elapsed = diagnosticTimer(host.diagnostics, "performance");
@@ -172,11 +179,6 @@ export function composeRuntime(
                 phase: "overall",
                 durationMs: elapsed(),
               });
-          }
-          if (!shouldYield?.()) {
-            onCachePreparation?.();
-            const cached = await manager.promoteCachedSemantic(new AbortController().signal);
-            host.onIndexOperation(manager, cached.changed);
           }
           return result;
         } finally {
@@ -215,11 +217,10 @@ export function composeRuntime(
           if (
             host.isAutomaticMaintenanceEnabled() &&
             host.isCurrent(manager) &&
-            !scheduler.snapshot.suspended &&
-            !result.replacementRequired
+            !scheduler.snapshot.suspended
           ) {
             manager.requestFullRecovery();
-            scheduler.invalidate(result.ignored === "missing");
+            if (!scheduler.snapshot.pending) scheduler.invalidate(result.ignored === "missing");
           }
         });
       }

@@ -19,8 +19,6 @@ import {
 import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
 import { applyLexicalMarkdownBatch, type LexicalMarkdownPhase } from "./markdown";
 import { validateRequest } from "./request-validation";
-import { WorkerPublicationOperations } from "./worker-publication";
-import { sha256Hex } from "@/index/Identity";
 import type { TramaDiagnostics, TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
 
 type SqliteModule = {
@@ -44,10 +42,6 @@ type SqliteInitModule = (options: {
 }) => Promise<SqliteModule>;
 type OpfsPool = Awaited<ReturnType<SqliteModule["installOpfsSAHPoolVfs"]>>;
 const storage: WorkerStorageState<MutableSqliteDatabase, SqliteConnection, OpfsPool> = {};
-const legacyCacheCandidates = new Map<
-  string,
-  { readonly name: string; readonly database: MutableSqliteDatabase }
->();
 const scheduler = new SqliteScheduler();
 let sqliteModulePromise: Promise<SqliteModule> | undefined;
 let databaseIdentity = "default";
@@ -396,40 +390,6 @@ function resetIncompatibleLocalDatabase(config: {
     storageFailure("incompatible database reset", error);
   }
 }
-function runtimeConfig(database: MutableSqliteDatabase) {
-  const state = database.getState();
-  return bootConfig
-    ? {
-        corpus: bootConfig.corpusFingerprint,
-        embedding: bootConfig.embeddingFingerprint,
-        dimensions: bootConfig.dimensions,
-        buildIdentity: bootConfig.buildIdentity,
-      }
-    : {
-        corpus: state.corpusFingerprint,
-        embedding: state.embeddingFingerprint,
-        dimensions: state.dimensions,
-        buildIdentity: state.buildIdentity,
-      };
-}
-const publication = new WorkerPublicationOperations({
-  storage,
-  openDatabase: () => openDatabase(),
-  closeConnection,
-  runtimeConfig,
-  onPhase: (phase, durationMs) =>
-    emitPerformance({
-      tier: "performance",
-      facets: ["index", "publication", "worker"],
-      area: "index",
-      event: "phase",
-      operation: "publication",
-      phase,
-      durationMs,
-      nested: true,
-    }),
-});
-
 async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unknown> {
   const p: any = request.payload;
   if (request.method === "boot") {
@@ -458,11 +418,6 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
   }
   if (request.method === "shutdown") {
     scheduler.shutdown();
-    for (const candidate of legacyCacheCandidates.values()) {
-      candidate.database.close();
-      storage.opfsPool?.unlink(candidate.name);
-    }
-    legacyCacheCandidates.clear();
     closeConnection();
     bootConfig = undefined;
     return { closed: true };
@@ -472,10 +427,6 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       throw sqliteError("storage_unavailable", "SQLite index must be booted before reset", true);
     return resetIncompatibleLocalDatabase(bootConfig).getState();
   }
-  if (request.method === "preparePublication") return publication.prepare(p.publicationId);
-  if (request.method === "finalizePublication") return publication.finalize(p);
-  if (request.method === "inspectPublication") return publication.inspect(p);
-  if (request.method === "adoptPublication") return publication.adopt(p);
   if (request.method === "prepareCacheShard") {
     const database = await openDatabase();
     return database.prepareCacheShard(
@@ -492,58 +443,6 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
   if (request.method === "ingestCacheShard") {
     const database = await openDatabase();
     return database.ingestCacheShard(storage.opfsPool!, p.bytes, p.digest);
-  }
-  if (request.method === "extractLegacyCacheShard") {
-    const database = await openDatabase();
-    const digest = p.digest as string;
-    let candidate = legacyCacheCandidates.get(digest);
-    if (!candidate) {
-      if (!(p.bytes instanceof ArrayBuffer) || (await sha256Hex(p.bytes)) !== digest)
-        throw sqliteError("integrity_failed", "Legacy index digest mismatch");
-      const expected = runtimeConfig(database);
-      const name = `/legacy-cache-${digest.slice(0, 16)}`;
-      storage.opfsPool!.importDb(name, p.bytes);
-      const connection = new storage.opfsPool!.OpfsSAHPoolDb(name, "c");
-      const isolated = new MutableSqliteDatabase(
-        connection,
-        workerDiagnostics,
-        observeRetrievalPhase
-      );
-      try {
-        isolated.validateSnapshot(
-          expected.corpus,
-          expected.dimensions,
-          expected.embedding,
-          expected.buildIdentity
-        );
-        candidate = { name, database: isolated };
-        legacyCacheCandidates.set(digest, candidate);
-      } catch (error) {
-        isolated.close();
-        storage.opfsPool!.unlink(name);
-        throw error;
-      }
-    }
-    try {
-      const shard = await candidate.database.prepareCacheShard(storage.opfsPool!, p.afterActionKey);
-      if (!shard) {
-        candidate.database.close();
-        storage.opfsPool!.unlink(candidate.name);
-        legacyCacheCandidates.delete(digest);
-      }
-      return shard;
-    } catch (error) {
-      candidate.database.close();
-      storage.opfsPool!.unlink(candidate.name);
-      legacyCacheCandidates.delete(digest);
-      throw error;
-    }
-  }
-  if (request.method === "hasLegacyCacheSource")
-    return (await openDatabase()).hasLegacyCacheSource(p.digest);
-  if (request.method === "markLegacyCacheSource") {
-    (await openDatabase()).markLegacyCacheSource(p.digest);
-    return { marked: true };
   }
   if (request.method === "maintainCache") return (await openDatabase()).maintainCache(p.now);
   if (request.method === "recordCacheShard") {
@@ -564,6 +463,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
   }
   const db = await openDatabase();
   switch (request.method) {
+    case "listCacheReceipts":
+      return db.listCacheReceipts(p.digests);
     case "getState":
       return db.getState();
     case "markIncomplete":
@@ -674,13 +575,7 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
   }
   const isMaintenance = [
     "resetLocalDatabase",
-    "preparePublication",
-    "finalizePublication",
-    "inspectPublication",
-    "adoptPublication",
     "prepareCacheShard",
-    "extractLegacyCacheShard",
-    "markLegacyCacheSource",
     "maintainCache",
     "recordCacheShard",
     "recordCacheRetirements",
@@ -698,10 +593,6 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
           "commitSemanticResults",
           "retrieve",
           "findRelated",
-          "preparePublication",
-          "finalizePublication",
-          "inspectPublication",
-          "adoptPublication",
         ].includes(request.method);
       if (measured) {
         diagnosticRequestId = request.id;
@@ -743,13 +634,9 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
                 ? "related"
                 : request.method === "retrieve"
                   ? "retrieve"
-                  : request.method === "adoptPublication"
-                    ? "adoption"
-                    : request.method.includes("Publication")
-                      ? "publication"
-                      : request.method.includes("Semantic")
-                        ? "semantic"
-                        : "lexical",
+                  : request.method.includes("Semantic")
+                    ? "semantic"
+                    : "lexical",
             ],
             area: request.method === "findRelated" ? "filo" : "index",
             event: "phase",
@@ -758,13 +645,9 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
                 ? "retrieve"
                 : request.method === "findRelated"
                   ? "related"
-                  : request.method === "adoptPublication"
-                    ? "adoption"
-                    : request.method.includes("Publication")
-                      ? "publication"
-                      : request.method.includes("Semantic")
-                        ? "semantic"
-                        : "lexical",
+                  : request.method.includes("Semantic")
+                    ? "semantic"
+                    : "lexical",
             phase: request.method,
             durationMs: Math.max(0, performance.now() - started),
           });

@@ -18,6 +18,7 @@ function setup() {
       files.set(path, new Uint8Array(bytes.slice(0)));
     },
     mkdir: async () => undefined,
+    stat: async (path) => (files.has(path) ? { size: files.get(path)!.byteLength } : null),
     rename: async (from, to) => {
       if (files.has(to)) throw new Error("destination exists");
       const bytes = files.get(from);
@@ -38,6 +39,11 @@ function setup() {
   let exported = false;
   const ingested = new Set<string>();
   const index: PublicationIndexPort = {
+    listCacheReceipts: vi.fn(async (digests: readonly string[]) =>
+      digests
+        .filter((digest) => ingested.has(digest))
+        .map((digest) => ({ digest, profile: "a".repeat(64) }))
+    ),
     prepareCacheShard: vi.fn(async (after?: string) => {
       if (exported || after) return undefined;
       exported = true;
@@ -72,6 +78,102 @@ function setup() {
 }
 
 describe("PublicationManager cache shards", () => {
+  it("skips known SHA-named artifacts before reading or importing their bytes", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.store.installCacheShard(fixture.data, await fixture.digestPromise);
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({ adopted: true });
+    const read = vi.spyOn(manager.store, "readCacheShard");
+    vi.mocked(fixture.index.ingestCacheShard!).mockClear();
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      ignored: "same-id",
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(fixture.index.ingestCacheShard).not.toHaveBeenCalled();
+  });
+
+  it("checks receipt digests in bounded batches", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    const shards = Array.from({ length: 1100 }, (_, i) => ({
+      digest: i.toString(16).padStart(64, "0"),
+      path: `cache-${i}`,
+    }));
+    vi.spyOn(manager.store, "listCacheShards").mockResolvedValue(shards);
+    fixture.index.listCacheReceipts = vi.fn(async (digests: readonly string[]) =>
+      digests.map((digest) => ({ digest, profile: "a".repeat(64) }))
+    );
+    const read = vi.spyOn(manager.store, "readCacheShard");
+    await manager.adoptCurrent();
+    expect(
+      vi.mocked(fixture.index.listCacheReceipts).mock.calls.map((call) => call[0].length)
+    ).toEqual([512, 512, 76]);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("reads each captured compaction source once and bounds the inventory bytes", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: [],
+    }));
+    fixture.index.recordCacheRetirements = vi.fn(async () => undefined);
+    for (let i = 0; i < 32; i++) {
+      const bytes = new Uint8Array([i + 1]).buffer;
+      await manager.store.installCacheShard(bytes, await sha256Hex(bytes));
+    }
+    const read = vi.spyOn(manager.store, "readCacheShard");
+    await manager.publish();
+    expect(read).toHaveBeenCalledTimes(8);
+    expect(new Set(read.mock.calls.map((call) => call[0])).size).toBe(8);
+  });
+
+  it("skips near-full shards by metadata and still compacts later small shards", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: [],
+    }));
+    fixture.index.recordCacheRetirements = vi.fn(async () => undefined);
+    const large = new Uint8Array(2 * 1024 * 1024).buffer;
+    const largeDigest = await sha256Hex(large);
+    await manager.store.installCacheShard(large, largeDigest);
+    for (let i = 0; i < 8; i++) {
+      const bytes = new Uint8Array([i + 1]).buffer;
+      await manager.store.installCacheShard(bytes, await sha256Hex(bytes));
+    }
+    const read = vi.spyOn(manager.store, "readCacheShard");
+    await expect(manager.publish()).resolves.toMatchObject({ published: true });
+    expect(read).toHaveBeenCalledTimes(8);
+    expect(read.mock.calls.some((call) => call[0].includes(largeDigest))).toBe(false);
+    const [sources] = vi.mocked(fixture.index.recordCacheRetirements).mock.calls[0];
+    expect(sources).toHaveLength(8);
+    expect(sources).not.toContain(largeDigest);
+  });
+
+  it("records a weekly no-op check when there are too few small shards", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    let lastCompactionAt = 0;
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt,
+      expiredSourceDigests: [],
+    }));
+    fixture.index.recordCacheRetirements = vi.fn(async (_sources, _replacements, now) => {
+      lastCompactionAt = now;
+    });
+    vi.mocked(fixture.index.prepareCacheShard!).mockResolvedValue(undefined);
+    await manager.store.installCacheShard(fixture.data, await fixture.digestPromise);
+    const read = vi.spyOn(manager.store, "readCacheShard");
+    await manager.publish();
+    expect(read).toHaveBeenCalledTimes(1);
+    await manager.publish();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves pending retirement sources and replacements alone during weekly compaction", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);
@@ -99,7 +201,7 @@ describe("PublicationManager cache shards", () => {
     fixture.index.recordCacheRetirements = vi.fn(async () => undefined);
     vi.mocked(fixture.index.prepareCacheShard!).mockResolvedValue(undefined);
     await expect(manager.publish()).resolves.toMatchObject({ published: true });
-    expect(fixture.index.recordCacheRetirements).not.toHaveBeenCalled();
+    expect(fixture.index.recordCacheRetirements).toHaveBeenCalledWith([], [], expect.any(Number));
     expect(fixture.index.ingestCacheShard).not.toHaveBeenCalled();
     expect(await manager.store.listCacheShards()).toHaveLength(9);
   });
@@ -117,14 +219,14 @@ describe("PublicationManager cache shards", () => {
     expect(fixture.index.prepareCacheShard).toHaveBeenCalledOnce();
   });
 
-  it("stages immutable SHA-named cache-only shards and leaves legacy snapshot untouched", async () => {
+  it("stages immutable SHA-named cache-only shards and preserves unrelated files", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);
-    fixture.files.set("Trama/index/index.sqlite3", new Uint8Array([1, 2]));
+    fixture.files.set("Trama/index/unrelated.bin", new Uint8Array([1, 2]));
     await expect(manager.publish()).resolves.toMatchObject({ published: true });
     const digest = await fixture.digestPromise;
     expect(fixture.files.has(`Trama/index/cache-v1/cache-${digest}.sqlite3`)).toBe(true);
-    expect([...fixture.files.get("Trama/index/index.sqlite3")!]).toEqual([1, 2]);
+    expect([...fixture.files.get("Trama/index/unrelated.bin")!]).toEqual([1, 2]);
     expect([...fixture.files.keys()].some((path) => path.includes("trama-tmp"))).toBe(false);
   });
 
@@ -136,7 +238,7 @@ describe("PublicationManager cache shards", () => {
     const second = await manager.adoptCurrent();
     expect(first).toMatchObject({ adopted: true });
     expect(second).toMatchObject({ adopted: false, ignored: "same-id" });
-    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(2);
+    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(1);
   });
 
   it("yields between cache shards and resumes from receipts on the next check", async () => {
@@ -158,7 +260,7 @@ describe("PublicationManager cache shards", () => {
     });
     expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(1);
     await expect(manager.adoptCurrent()).resolves.toMatchObject({ adopted: true });
-    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(3);
+    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(2);
     await expect(manager.adoptCurrent()).resolves.toMatchObject({
       adopted: false,
       ignored: "same-id",
@@ -206,6 +308,53 @@ describe("PublicationManager cache shards", () => {
     await expect(manager.publish()).resolves.toMatchObject({ published: true });
     expect(fixture.index.maintainCache).toHaveBeenCalledWith(expect.any(Number));
     expect(ordered).toEqual(["membership", "retirement"]);
+  });
+
+  it.each([4, 8])("never retires %s ignored foreign-model shards", async (ignoredCount) => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    fixture.index.maintainCache = vi.fn(async () => ({
+      lastCompactionAt: 0,
+      expiredSourceDigests: [],
+    }));
+    const ignored = new Set<string>();
+    const accepted: string[] = [];
+    for (let index = 0; index < 8; index++) {
+      const bytes = new Uint8Array([index + 1]).buffer;
+      const digest = await sha256Hex(bytes);
+      await manager.store.installCacheShard(bytes, digest);
+      if (index < ignoredCount) ignored.add(digest);
+      else accepted.push(digest);
+    }
+    fixture.index.ingestCacheShard = vi.fn(async (_bytes, digest) => ({
+      imported: 0,
+      duplicate: !ignored.has(digest),
+      ignored: ignored.has(digest),
+      profile: (ignored.has(digest) ? "b" : "a").repeat(64),
+      taskKind: "document" as const,
+    }));
+    fixture.index.recordCacheRetirements = vi.fn(async () => undefined);
+    await manager.publish();
+    if (accepted.length) {
+      expect(fixture.index.recordCacheRetirements).toHaveBeenCalledWith(
+        expect.arrayContaining(accepted),
+        expect.any(Array),
+        expect.any(Number)
+      );
+      expect(vi.mocked(fixture.index.recordCacheRetirements).mock.calls[0][0]).toHaveLength(
+        accepted.length
+      );
+    } else
+      expect(fixture.index.recordCacheRetirements).toHaveBeenCalledWith([], [], expect.any(Number));
+    for (const digest of ignored)
+      expect(fixture.files.has(`${manager.store.cacheDirectory}/cache-${digest}.sqlite3`)).toBe(
+        true
+      );
+    expect(
+      vi
+        .mocked(fixture.index.prepareCacheShard!)
+        .mock.calls.some((call) => call[2] === "b".repeat(64))
+    ).toBe(false);
   });
 
   it("keeps every captured source when a later replacement batch fails and retries idempotently", async () => {
@@ -284,6 +433,10 @@ describe("PublicationManager cache shards", () => {
     });
     fixture.index.recordCacheRetirements = vi.fn(
       async (sources: readonly string[], replacements: readonly string[], now: number) => {
+        if (!sources.length) {
+          lastCompactionAt = now;
+          return;
+        }
         expect(sources).toHaveLength(8);
         expect(sources).not.toContain(arrivalDigest);
         lastCompactionAt = now;

@@ -47,21 +47,17 @@ export const sourceDigestsV1: Readonly<Record<WorkloadProfile["id"], string>> = 
 };
 
 // prettier-ignore
-export const REFERENCE_SOURCE_MANIFEST_SHA256 = "f6d7e424735a0b32545fcf1551f7aa521d57b62a9ecb3c38f33df2822c53c15c";
+export const REFERENCE_SOURCE_MANIFEST_SHA256 = "b3ce9cd2aa8347c7e0bc79a9c5a649754f96ad21bd9bef6516e8fbc03daad037";
 
 export const REFERENCE_SOURCE_MANIFEST_PATHS = [
-  "scripts/benchmark/run.mjs",
-  "tests/workloads/legacy-oracle.ts",
+  "tests/workloads/expected-results.ts",
   "tests/sqlite-test-client.ts",
-  "tests/workloads/benchmark-lifecycle.ts",
   "test-vaults/benchmark/config.ts",
   "test-vaults/benchmark/contract-v1.ts",
-  "tests/workloads/evidence.test.ts",
   "test-vaults/benchmark/generator.ts",
-  "tests/workloads/instrumentation.ts",
-  "tests/workloads/trama-benchmark.ts",
   "tests/workloads/ranking-reference.ts",
   "tests/workloads/ranking-reference.test.ts",
+  "tests/workloads/retrieval.test.ts",
 ] as const;
 
 export function computeReferenceSourceManifestSha256(
@@ -98,18 +94,8 @@ export function computeReferenceSourceManifestSha256(
   return hash.digest("hex");
 }
 
-export const referenceBaselineV1 = {
-  referenceBaseRevision: "17455e78f3654a2033999e786dad527f8a463e3c",
-  referenceTreeStatus: "uncommitted contract implementation",
-  referenceSourceManifestSha256: REFERENCE_SOURCE_MANIFEST_SHA256,
-  settings: { timeoutMs: 300000, repetitions: 1, diagnostics: true },
-  sourceDigests: sourceDigestsV1,
-} as const;
-
 export const DETERMINISTIC_PROVIDER_BEHAVIOR_VERSION = "trama-deterministic-provider-v1" as const;
 export const deterministicProviderChallengeSha256 =
   "da609bed7a65f51e21ed579971f02dab7d70eb60dbeecc34dc72a3e441983747";
 export const queryVectorSha256V1 =
   "7b0fa73abfdf474642ea98dac60e72c29c5566e5814f760c8365c5e3b3fe118b";
-
-export { expectedOutputsV1ByProfile } from "../../tests/workloads/legacy-oracle";

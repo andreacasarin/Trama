@@ -188,7 +188,6 @@ export class LexicalCoordinator {
             deletes: [...deletes].sort(compareCodeUnits),
             mayClearIncomplete:
               !before.incomplete &&
-              !before.snapshotLoaded &&
               !this.journal.fullRecoveryRequested &&
               revision === this.journal.revision,
           },
@@ -222,9 +221,7 @@ export class LexicalCoordinator {
         return { changed, converged: false };
       }
       this.journal.reconciledRevision = revision;
-      this.runtime.freshness = this.runtime.state?.snapshotLoaded
-        ? "snapshot-loaded"
-        : "locally-reconciled";
+      this.runtime.freshness = "locally-reconciled";
       const result = { changed, converged: this.runtime.state?.incomplete === false };
       if (result.converged)
         this.runtime.notifySuccessfulOperation({

@@ -256,9 +256,7 @@ export class LenteView extends ItemView {
     } else if (this.batch.mode === "lexical") {
       messages.push("Lexical search ready.");
     }
-    if (this.batch.freshness === "snapshot-loaded")
-      messages.push("Snapshot loaded; not reconciled with the current vault.");
-    else if (this.batch.freshness === "unknown")
+    if (this.batch.freshness === "unknown")
       messages.push("Lexical index may be stale; update required.");
     if (this.batch.semanticPartial)
       messages.push("Semantic index is incomplete; search uses available vectors.");

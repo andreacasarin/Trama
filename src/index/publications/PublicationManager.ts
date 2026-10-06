@@ -1,15 +1,11 @@
 import { StructuredError, type IndexCapabilities } from "@/domain/contracts";
 import { sha256Hex } from "@/index/Identity";
-import {
-  SqliteProtocolError,
-  type PublicationInspection,
-  type PublicationPrepared,
-  type SqliteState,
-} from "@/index/sqlite/protocol";
+import { SqliteProtocolError, type SqliteState } from "@/index/sqlite/protocol";
 import { PublicationStore, type PublicationDataAdapter } from "./PublicationStore";
 import type { CacheShardResult } from "@/index/sqlite/cache-shards";
 
 export interface PublicationIndexPort {
+  listCacheReceipts?(digests: readonly string[]): Promise<{ digest: string; profile: string }[]>;
   prepareCacheShard?(
     afterActionKey?: string,
     taskKind?: "document" | "query",
@@ -25,16 +21,10 @@ export interface PublicationIndexPort {
   ): Promise<{
     imported: number;
     duplicate: boolean;
+    ignored?: boolean;
     profile: string;
     taskKind: "document" | "query";
   }>;
-  extractLegacyCacheShard?(
-    bytes: ArrayBuffer | undefined,
-    digest: string,
-    afterActionKey?: string
-  ): Promise<CacheShardResult | undefined>;
-  hasLegacyCacheSource?(digest: string): Promise<boolean>;
-  markLegacyCacheSource?(digest: string): Promise<void>;
   maintainCache?(now: number): Promise<unknown>;
   recordCacheRetirements?(
     sourceDigests: readonly string[],
@@ -49,28 +39,9 @@ export interface PublicationIndexPort {
     taskKind: "document" | "query",
     actionKeys: readonly string[]
   ): Promise<void>;
-  publishPublication?<T>(
-    publicationId: string,
-    install: (
-      prepared: PublicationPrepared,
-      inspect?: (bytes: ArrayBuffer, transferOwnership?: boolean) => Promise<PublicationInspection>
-    ) => Promise<T>,
-    settle?: (committed: boolean) => Promise<void>
-  ): Promise<{ prepared: PublicationPrepared; installed: T }>;
-  inspectPublication?(
-    bytes: ArrayBuffer,
-    transferOwnership?: boolean
-  ): Promise<PublicationInspection>;
-  adoptPublication?(
-    bytes: ArrayBuffer,
-    expectedPublicationId?: string,
-    inspection?: PublicationInspection
-  ): Promise<SqliteState>;
   getState?(): Promise<SqliteState | undefined>;
   capabilities?(): IndexCapabilities;
 }
-
-const LEGACY_EXTRACTION_MARKER = "e".repeat(64);
 
 export interface PublicationWarning {
   readonly phase: "prepare" | "stage" | "replace" | "finalize" | "inspect" | "adopt";
@@ -81,7 +52,6 @@ export interface PublicationWarning {
 }
 
 export interface PublicationResourceMetrics {
-  readonly publicationId?: string;
   readonly byteSize: number;
   readonly copyBytes: number;
   readonly durationMs: number;
@@ -91,16 +61,13 @@ export interface PublicationResourceMetrics {
 
 export interface PublicationResult {
   readonly published: boolean;
-  readonly publicationId?: string;
   readonly metrics?: PublicationResourceMetrics;
   readonly warning?: PublicationWarning;
 }
 
 export interface AdoptionResult {
   readonly adopted: boolean;
-  readonly replacementRequired?: boolean;
   readonly ignored?: "missing" | "same-id";
-  readonly publicationId?: string;
   readonly state?: SqliteState;
   readonly warning?: PublicationWarning;
 }
@@ -108,7 +75,6 @@ export interface AdoptionResult {
 export interface PublicationManagerOptions {
   readonly directory?: unknown;
   readonly temporaryToken?: () => string;
-  readonly idFactory?: () => string;
   readonly onWarning?: (warning: PublicationWarning) => void;
   readonly onMetrics?: (metrics: PublicationResourceMetrics) => void;
 }
@@ -168,9 +134,7 @@ export class PublicationManager {
       if (retention) await this.compactIfDue(retention, now, shouldYield);
       if (shouldYield?.()) return { published: false };
       const state = await this.index.getState?.();
-      const profiles: (string | undefined)[] = state?.embeddingProfiles?.length
-        ? state.embeddingProfiles.map((profile) => profile.fingerprint)
-        : [state?.embeddingFingerprint || undefined];
+      const profiles = [state?.embeddingFingerprint || undefined];
       const presentDigests = this.store.supportsCacheShardListing()
         ? (await this.store.listCacheShards()).map((file) => file.digest)
         : undefined;
@@ -275,38 +239,48 @@ export class PublicationManager {
     const protectedDigests = new Set(
       retirements.flatMap((item) => [item.sourceDigest, ...item.replacements])
     );
-    const small: (typeof files)[number][] = [];
+    const receipts = await this.receiptsFor(files.map((file) => file.digest));
+    const activeProfile = (await this.index.getState?.())?.embeddingFingerprint;
+    const expired = new Set(retention.expiredSourceDigests ?? []);
+    const eligible = files.filter(
+      (file) =>
+        !protectedDigests.has(file.digest) &&
+        (!activeProfile ||
+          !receipts.has(file.digest) ||
+          receipts.get(file.digest) === activeProfile)
+    );
+    const candidates = expired.size
+      ? eligible.filter((file) => expired.has(file.digest))
+      : eligible;
     const selected = new Set<string>();
+    const captured = new Map<string, ArrayBuffer>();
     let capturedBytes = 0;
-    const eligibleDigests = new Set(
-      files.filter((file) => !protectedDigests.has(file.digest)).map((file) => file.digest)
-    );
-    const expired = new Set(
-      (retention.expiredSourceDigests ?? []).filter((digest) => eligibleDigests.has(digest))
-    );
-    for (const file of files) {
+    for (const file of candidates) {
       if (shouldYield?.()) return;
-      if (protectedDigests.has(file.digest)) continue;
-      const bytes = await this.store.readCacheShard(file.path);
-      if ((await sha256Hex(bytes)) !== file.digest)
-        throw new StructuredError("internal", "Cache shard name hash mismatch.", false);
-      if (expired.has(file.digest)) {
-        if (capturedBytes + bytes.byteLength <= 16 * 1024 * 1024) {
-          selected.add(file.digest);
-          capturedBytes += bytes.byteLength;
-        }
-      } else if (!expired.size && bytes.byteLength <= 1024 * 1024) {
-        small.push(file);
+      if (captured.size >= 8 || capturedBytes > 12 * 1024 * 1024) break;
+      if (!expired.size) {
+        const size = await this.store.cacheShardSize(file.path);
+        if (size !== undefined && size > 1024 * 1024) continue;
       }
+      const bytes = await this.store.readCacheShard(file.path);
+      if (bytes.byteLength > 4_194_304 || (await sha256Hex(bytes)) !== file.digest)
+        throw new StructuredError(
+          "invalid_request",
+          "Cache shard size or name hash mismatch.",
+          false
+        );
+      captured.set(file.digest, bytes);
+      capturedBytes += bytes.byteLength;
+      if (expired.size || bytes.byteLength <= 1024 * 1024) selected.add(file.digest);
     }
-    if (!expired.size) {
-      if (small.length < 8) return;
-      for (const file of small.slice(0, 8)) selected.add(file.digest);
-      capturedBytes = 0;
-      for (const file of small.slice(0, 8))
-        capturedBytes += (await this.store.readCacheShard(file.path)).byteLength;
+    if (!expired.size && selected.size < 8) {
+      await this.index.recordCacheRetirements([], [], now);
+      return;
     }
-    if (!selected.size || capturedBytes > 16 * 1024 * 1024) return;
+    if (!selected.size) {
+      await this.index.recordCacheRetirements([], [], now);
+      return;
+    }
     const grouped = new Map<
       string,
       { profile: string; taskKind: "document" | "query"; digests: string[] }
@@ -314,8 +288,12 @@ export class PublicationManager {
     for (const file of files) {
       if (shouldYield?.()) return;
       if (!selected.has(file.digest)) continue;
-      const bytes = await this.store.readCacheShard(file.path);
+      const bytes = captured.get(file.digest)!;
       const ingested = await this.index.ingestCacheShard(bytes, file.digest);
+      if (ingested.ignored) {
+        selected.delete(file.digest);
+        continue;
+      }
       const key = `${ingested.profile}:${ingested.taskKind}`;
       const group = grouped.get(key) ?? {
         profile: ingested.profile,
@@ -324,6 +302,10 @@ export class PublicationManager {
       };
       group.digests.push(file.digest);
       grouped.set(key, group);
+    }
+    if (!selected.size) {
+      await this.index.recordCacheRetirements([], [], now);
+      return;
     }
     const replacementDigests = new Set<string>();
     for (const group of grouped.values()) {
@@ -361,48 +343,30 @@ export class PublicationManager {
     );
   }
 
+  private async receiptsFor(digests: readonly string[]): Promise<Map<string, string>> {
+    const receipts = new Map<string, string>();
+    for (let offset = 0; offset < digests.length; offset += 512)
+      for (const receipt of (await this.index.listCacheReceipts?.(
+        digests.slice(offset, offset + 512)
+      )) ?? [])
+        receipts.set(receipt.digest, receipt.profile);
+    return receipts;
+  }
+
   private async ingestCacheShards(shouldYield?: () => boolean): Promise<AdoptionResult> {
     if (!this.index.ingestCacheShard) return { adopted: false, ignored: "missing" };
     try {
       let imported = 0;
-      const legacyDone = this.index.hasLegacyCacheSource
-        ? await this.index.hasLegacyCacheSource(LEGACY_EXTRACTION_MARKER)
-        : false;
-      const legacy = legacyDone ? undefined : await this.store.read();
-      if (legacy && this.index.extractLegacyCacheShard) {
-        const digest = await sha256Hex(legacy);
-        let cursor: string | undefined;
-        let first = true;
-        for (;;) {
-          if (shouldYield?.()) return { adopted: imported > 0 };
-          const shard = await this.index.extractLegacyCacheShard(
-            first ? legacy : undefined,
-            digest,
-            cursor
-          );
-          first = false;
-          if (!shard) break;
-          if (!shard.rowCount || !shard.nextActionKey || shard.nextActionKey === cursor)
-            throw new StructuredError(
-              "invalid_request",
-              "Legacy cache extraction cursor did not advance.",
-              false
-            );
-          await this.store.installCacheShard(shard.bytes, shard.digest);
-          const result = await this.index.ingestCacheShard(shard.bytes, shard.digest);
-          if (!result.duplicate) imported += result.imported;
-          cursor = shard.nextActionKey;
-        }
-        await this.index.markLegacyCacheSource?.(LEGACY_EXTRACTION_MARKER);
-      }
       const shards = await this.store.listCacheShards();
+      const receipts = await this.receiptsFor(shards.map((shard) => shard.digest));
       let seen = 0;
       for (const shard of shards) {
         if (shouldYield?.()) return { adopted: imported > 0 };
+        seen++;
+        if (receipts.has(shard.digest)) continue;
         const bytes = await this.store.readCacheShard(shard.path);
         const result = await this.index.ingestCacheShard(bytes, shard.digest);
         if (!result.duplicate) imported += result.imported;
-        seen++;
       }
       return { adopted: imported > 0, ignored: seen ? "same-id" : "missing" };
     } catch (error) {

@@ -5,23 +5,16 @@ import { SqliteWorkerClient, type SqliteCallHandler } from "@/index/sqlite/clien
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 
-export interface SemanticPhaseObservation {
-  readonly operation: "prepare" | "commit";
+interface SemanticPhaseObservation {
   readonly phase: string;
-  readonly wallMs: number;
-  readonly sqlMs: number;
   readonly sqlCalls: number;
   readonly callbackRows: number;
   readonly copiedBytes: number;
-  readonly jsEstimateMs: number;
-  readonly nested: boolean;
 }
 type SemanticPhaseObserver = (observation: SemanticPhaseObservation) => void;
 import { sqliteError } from "@/index/sqlite/protocol";
 import { applyLexicalMarkdownBatch, hashMarkdown } from "@/index/sqlite/markdown";
 import type { SqliteLexicalScope } from "@/index/sqlite/protocol";
-import { schemaSql } from "@/index/sqlite/schema";
-import { SQLITE_SCHEMA_9_BUILD_IDENTITY } from "@/build/identity";
 import type { CacheShardPool } from "@/index/sqlite/cache-shards";
 
 interface TestStorage {
@@ -90,7 +83,7 @@ export async function snapshotFor(identity: object): Promise<Uint8Array> {
   return durable.snapshot.slice();
 }
 
-export async function inspectBenchmarkSnapshot(bytes: ArrayBuffer | Uint8Array): Promise<{
+export async function inspectWorkloadState(bytes: ArrayBuffer | Uint8Array): Promise<{
   readonly noteCount: number;
   readonly occurrenceCount: number;
   readonly perPathOccurrenceCounts: readonly (readonly [string, number])[];
@@ -120,10 +113,11 @@ export async function inspectBenchmarkSnapshot(bytes: ArrayBuffer | Uint8Array):
     opened.raw.exec({
       sql: `SELECT n.path AS path,o.ordinal AS ordinal,o.kind AS kind,
                    o.start_line AS startLine,o.end_line AS endLine,
-                   o.display_text AS displayText,o.heading_context AS headingContext,
-                   o.body AS body,o.embedding_input AS embeddingInput
+                   o.display_text AS displayText,json_extract(ei.serialized_input,'$.heading') AS headingContext,
+                   o.display_text AS body,ei.serialized_input AS embeddingInput
             FROM notes n JOIN chunk_occurrences o
               ON o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
+            JOIN embedding_inputs ei ON ei.action_key=o.embedding_input_digest
             ORDER BY n.path COLLATE BINARY,o.ordinal`,
       rowMode: "object",
       callback: (row: (typeof rows)[number]) =>
@@ -169,6 +163,51 @@ export async function inspectBenchmarkSnapshot(bytes: ArrayBuffer | Uint8Array):
   }
 }
 
+export async function inspectIndexStateColumns(bytes: ArrayBuffer | Uint8Array): Promise<string[]> {
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  try {
+    const columns: string[] = [];
+    opened.raw.exec({
+      sql: "PRAGMA table_info(index_state)",
+      rowMode: "object",
+      callback: (row: { name: string }) => columns.push(row.name),
+    });
+    return columns;
+  } finally {
+    opened.database.close();
+  }
+}
+
+export async function inspectSnapshotTables(bytes: ArrayBuffer | Uint8Array): Promise<{
+  revisions: number;
+  occurrences: number;
+  inputs: number;
+  cache: number;
+}> {
+  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  try {
+    const count = (table: string) => {
+      let value = 0;
+      opened.raw.exec({
+        sql: `SELECT count(*) AS count FROM ${table}`,
+        rowMode: "object",
+        callback: (row: Record<string, unknown>) => {
+          value = Number(row.count);
+        },
+      });
+      return value;
+    };
+    return {
+      revisions: count("note_revisions"),
+      occurrences: count("chunk_occurrences"),
+      inputs: count("embedding_inputs"),
+      cache: count("embedding_cache"),
+    };
+  } finally {
+    opened.database.close();
+  }
+}
+
 export const hashTestMarkdown = (markdown: string, corpusFingerprint: string) =>
   hashMarkdown(markdown, corpusFingerprint);
 
@@ -194,85 +233,6 @@ export async function loadTestSqlite(): Promise<any> {
     });
   })();
   return runtimePromise;
-}
-
-export async function malformedSchema8Snapshot(
-  defect: "missing-vector" | "wrong-fts" | "wrong-index"
-): Promise<Uint8Array> {
-  const sqlite = await loadTestSqlite();
-  const raw = new sqlite.oo1.DB(":memory:", "c");
-  raw.exec(schemaSql(2));
-  raw.exec("ALTER TABLE index_state ADD COLUMN lexical_revision_count INTEGER NOT NULL DEFAULT 0");
-  raw.exec("ALTER TABLE index_state ADD COLUMN semantic_revision_count INTEGER NOT NULL DEFAULT 0");
-  raw.exec("ALTER TABLE index_state ADD COLUMN embedding_input_count INTEGER NOT NULL DEFAULT 0");
-  raw.exec("PRAGMA user_version=8");
-  raw.exec(
-    "INSERT INTO index_state(id,app_version,schema_version,protocol_version,build_identity,extraction_version,chunk_algorithm_version,embedding_input_version,dimensions,corpus_fingerprint,embedding_fingerprint,incomplete,change_counter,snapshot_loaded) VALUES(1,'trama',8,8,'trama-sqlite-schema-8-protocol-8-heads-fts5-vector-float32-cosine-opfs-sah-v1',1,2,1,2,?, ?,1,0,0)",
-    { bind: ["a".repeat(64), "b".repeat(64)] }
-  );
-  if (defect === "missing-vector") raw.exec("ALTER TABLE embedding_cache DROP COLUMN vector");
-  if (defect === "wrong-fts") {
-    raw.exec("DROP TABLE lexical_notes_fts");
-    raw.exec(
-      "CREATE VIRTUAL TABLE lexical_notes_fts USING fts5(body,path_text,filename,title,headings,content='lexical_notes',content_rowid='wrong_id',tokenize='unicode61')"
-    );
-  }
-  if (defect === "wrong-index") {
-    raw.exec("DROP INDEX lexical_notes_revision");
-    raw.exec("CREATE INDEX lexical_notes_revision ON lexical_notes(revision_id,note_id)");
-  }
-  const bytes = new Uint8Array(sqlite.capi.sqlite3_js_db_export(raw.pointer));
-  raw.close();
-  return bytes;
-}
-
-export async function inspectIndexStateColumns(bytes: ArrayBuffer | Uint8Array): Promise<string[]> {
-  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
-  try {
-    const columns: string[] = [];
-    opened.raw.exec({
-      sql: "PRAGMA table_info(index_state)",
-      rowMode: "object",
-      callback: (row: { name: string }) => columns.push(row.name),
-    });
-    return columns;
-  } finally {
-    opened.database.close();
-  }
-}
-
-export async function snapshotWithUserVersion(
-  bytes: ArrayBuffer | Uint8Array,
-  version: number,
-  options: {
-    readonly dropIndexState?: boolean;
-    readonly legacySchema9?: boolean;
-    readonly legacySchema10?: boolean;
-  } = {}
-): Promise<Uint8Array> {
-  if (!Number.isSafeInteger(version) || version < 0) throw new Error("Invalid SQLite user version");
-  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
-  try {
-    opened.raw.exec(`PRAGMA user_version=${version}`);
-    if (options.legacySchema9) {
-      opened.raw
-        .exec(`DROP TRIGGER lexical_notes_ai; DROP TRIGGER lexical_notes_ad; DROP TRIGGER lexical_notes_au;
-        DROP TABLE lexical_notes_fts; DROP INDEX lexical_notes_revision; DROP TABLE lexical_notes;
-        UPDATE index_state SET schema_version=9,protocol_version=9,build_identity='${SQLITE_SCHEMA_9_BUILD_IDENTITY}'`);
-    }
-    if (options.legacySchema10) {
-      opened.raw
-        .exec(`DROP TABLE IF EXISTS cache_artifact_receipts; DROP TABLE IF EXISTS cache_legacy_sources;
-        DROP INDEX IF EXISTS embedding_cache_lookup;
-        ALTER TABLE embedding_cache DROP COLUMN created_at;
-        ALTER TABLE embedding_cache DROP COLUMN task_kind;
-        UPDATE index_state SET schema_version=10,protocol_version=9,build_identity='trama-sqlite-schema-10-protocol-9-heads-fts5-vector-float32-cosine-opfs-sah-v1'`);
-    }
-    if (options.dropIndexState) opened.raw.exec("DROP TABLE index_state");
-    return await serialized(opened);
-  } finally {
-    opened.database.close();
-  }
 }
 
 async function open(
@@ -310,15 +270,10 @@ async function open(
       )
         return;
       semanticObserver?.({
-        operation: record.semanticStep,
         phase: record.phase,
-        wallMs: record.durationMs,
-        sqlMs: record.sqlMs ?? 0,
         sqlCalls: record.sqlCalls ?? 0,
         callbackRows: record.callbackRows ?? 0,
         copiedBytes: record.copiedBytes ?? 0,
-        jsEstimateMs: Math.max(0, record.durationMs - (record.sqlMs ?? 0)),
-        nested: record.nested === true,
       });
     },
   };
@@ -380,36 +335,6 @@ function createCachePool(sqlite: any): CacheShardPool {
   };
 }
 
-export async function inspectSnapshotTables(bytes: ArrayBuffer | Uint8Array): Promise<{
-  revisions: number;
-  occurrences: number;
-  inputs: number;
-  cache: number;
-}> {
-  const opened = await open(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
-  try {
-    const count = (table: string) => {
-      let value = 0;
-      opened.raw.exec({
-        sql: `SELECT count(*) AS count FROM ${table}`,
-        rowMode: "object",
-        callback: (row: Record<string, unknown>) => {
-          value = Number(row.count);
-        },
-      });
-      return value;
-    };
-    return {
-      revisions: count("note_revisions"),
-      occurrences: count("chunk_occurrences"),
-      inputs: count("embedding_inputs"),
-      cache: count("embedding_cache"),
-    };
-  } finally {
-    opened.database.close();
-  }
-}
-
 export async function inspectPersistedOccurrences(
   identity: object
 ): Promise<{ headingContext: string; embeddingInput: string }[]> {
@@ -419,7 +344,7 @@ export async function inspectPersistedOccurrences(
   try {
     const rows: { headingContext: string; embeddingInput: string }[] = [];
     opened.raw.exec({
-      sql: "SELECT heading_context AS headingContext, embedding_input AS embeddingInput FROM chunk_occurrences ORDER BY occurrence_id",
+      sql: "SELECT json_extract(ei.serialized_input,'$.heading') AS headingContext, ei.serialized_input AS embeddingInput FROM chunk_occurrences o JOIN embedding_inputs ei ON ei.action_key=o.embedding_input_digest ORDER BY o.occurrence_id",
       rowMode: "object",
       callback: (row: { headingContext: string; embeddingInput: string }) => rows.push(row),
     });
@@ -453,53 +378,24 @@ export function createTestSqliteClient(
   identity: object = {},
   options: {
     readonly persistMutations?: boolean;
-    readonly snapshot?: Uint8Array;
-    readonly captureLifecycleSnapshots?: boolean;
     readonly onSemanticPhase?: (phase: SemanticPhaseObservation) => void;
-    readonly onSemanticHandler?: (
-      method: "prepareSemanticWork" | "commitSemanticResults",
-      elapsedMs: number
-    ) => void;
     readonly diagnostics?: TramaDiagnostics;
   } = {}
 ): SqliteWorkerClient {
   const durable = storage.get(identity) ?? {};
-  if (!durable.snapshot && options.snapshot) durable.snapshot = options.snapshot;
   storage.set(identity, durable);
   let openedPromise: Promise<OpenDatabase> | undefined;
   const current = () =>
     (openedPromise ??= open(durable.snapshot, options.onSemanticPhase, options.diagnostics));
   const cachePoolPromise = loadTestSqlite().then(createCachePool);
-  const legacyCandidates = new Map<string, OpenDatabase>();
   const persist = async (opened: OpenDatabase) => {
     durable.snapshot = await serialized(opened);
   };
-  const reopen = async (opened: OpenDatabase): Promise<OpenDatabase> => {
-    const state = opened.database.getState();
-    const snapshot = await serialized(opened);
-    opened.database.close();
-    const next = await open(snapshot, options.onSemanticPhase, options.diagnostics);
-    next.database.boot(
-      state.corpusFingerprint,
-      state.dimensions,
-      state.embeddingFingerprint,
-      state.buildIdentity
-    );
-    openedPromise = Promise.resolve(next);
-    return next;
-  };
   let maintenance = false;
   const handler: SqliteCallHandler = async (method, payload, signal) => {
-    const handlerStarted = performance.now();
     const isMaintenance =
-      method === "preparePublication" ||
-      method === "finalizePublication" ||
-      method === "inspectPublication" ||
-      method === "adoptPublication" ||
       method === "prepareCacheShard" ||
       method === "ingestCacheShard" ||
-      method === "extractLegacyCacheShard" ||
-      method === "markLegacyCacheSource" ||
       method === "maintainCache" ||
       method === "recordCacheShard" ||
       method === "recordCacheRetirements" ||
@@ -554,6 +450,8 @@ export function createTestSqliteClient(
           );
           break;
         }
+        case "listCacheReceipts":
+          return opened.database.listCacheReceipts(value.digests);
         case "getState":
           return opened.database.getState();
         case "prepareCacheShard":
@@ -574,38 +472,6 @@ export function createTestSqliteClient(
             value.bytes,
             value.digest
           );
-          break;
-        case "extractLegacyCacheShard": {
-          let candidate = legacyCandidates.get(value.digest);
-          if (!candidate) {
-            if (!value.bytes)
-              throw sqliteError("invalid_request", "Legacy cache source bytes are missing");
-            candidate = await open(new Uint8Array(value.bytes));
-            const state = opened.database.getState();
-            candidate.database.validateSnapshot(
-              state.corpusFingerprint,
-              state.dimensions,
-              state.embeddingFingerprint,
-              state.buildIdentity
-            );
-            legacyCandidates.set(value.digest, candidate);
-          }
-          result = await candidate.database.prepareCacheShard(
-            await cachePoolPromise,
-            value.afterActionKey
-          );
-          if (!result) {
-            candidate.database.close();
-            legacyCandidates.delete(value.digest);
-          }
-          break;
-        }
-        case "hasLegacyCacheSource":
-          result = opened.database.hasLegacyCacheSource(value.digest);
-          break;
-        case "markLegacyCacheSource":
-          opened.database.markLegacyCacheSource(value.digest);
-          result = { marked: true };
           break;
         case "maintainCache":
           result = opened.database.maintainCache(value.now);
@@ -711,120 +577,6 @@ export function createTestSqliteClient(
           );
         case "findRelated":
           return opened.database.findRelated(value.path, value.vector, value.limit);
-        case "finalizePublication":
-          result = opened.database.finalizePublication(
-            value.publicationId,
-            value.expectedChangeCounter,
-            value.expectedLexicalGeneration,
-            value.expectedSemanticGeneration
-          );
-          break;
-        case "preparePublication": {
-          if (opened.database.hasActiveLexicalRuns())
-            throw sqliteError("busy", "A lexical run is still active", true);
-          const state = opened.database.getState();
-          opened.database.validateSnapshot(
-            state.corpusFingerprint,
-            state.dimensions,
-            state.embeddingFingerprint,
-            state.buildIdentity
-          );
-          const candidate = await open(await serialized(opened));
-          try {
-            candidate.database.boot(
-              state.corpusFingerprint,
-              state.dimensions,
-              state.embeddingFingerprint,
-              state.buildIdentity
-            );
-            candidate.database.pruneForPublication();
-            candidate.database.setPublicationId(value.publicationId);
-            candidate.database.validateSnapshot(
-              state.corpusFingerprint,
-              state.dimensions,
-              state.embeddingFingerprint,
-              state.buildIdentity
-            );
-            const bytes = (await serialized(candidate)).slice().buffer;
-            result = {
-              publicationId: value.publicationId,
-              state: candidate.database.getState(),
-              bytes,
-              byteSize: bytes.byteLength,
-              durationMs: 0,
-              copyBytes: bytes.byteLength,
-            };
-          } finally {
-            candidate.database.close();
-            opened = await reopen(opened);
-          }
-          break;
-        }
-        case "inspectPublication": {
-          if (opened.database.hasActiveLexicalRuns())
-            throw sqliteError("busy", "A lexical run is still active", true);
-          const state = opened.database.getState();
-          const candidate = await open(new Uint8Array(value.bytes));
-          try {
-            candidate.database.validateSnapshot(
-              value.corpusFingerprint ?? state.corpusFingerprint,
-              value.dimensions ?? state.dimensions,
-              value.embeddingFingerprint ?? state.embeddingFingerprint,
-              value.buildIdentity ?? state.buildIdentity
-            );
-            const candidateState = candidate.database.getState();
-            if (!candidateState.publicationId)
-              throw sqliteError("incompatible_state", "Publication ID is missing");
-            result = {
-              valid: true,
-              publicationId: candidateState.publicationId,
-              state: candidateState,
-              byteSize: value.bytes.byteLength,
-            };
-          } finally {
-            candidate.database.close();
-            opened = await reopen(opened);
-          }
-          break;
-        }
-        case "adoptPublication": {
-          if (opened.database.hasActiveLexicalRuns())
-            throw sqliteError("busy", "A lexical run is still active", true);
-          const prior = opened.database.getState();
-          const candidate = await open(new Uint8Array(value.bytes));
-          try {
-            candidate.database.validateSnapshot(
-              prior.corpusFingerprint,
-              prior.dimensions,
-              prior.embeddingFingerprint,
-              prior.buildIdentity
-            );
-            candidate.database.boot(
-              prior.corpusFingerprint,
-              prior.dimensions,
-              prior.embeddingFingerprint,
-              prior.buildIdentity
-            );
-            const candidateState = candidate.database.getState();
-            if (!candidateState.publicationId)
-              throw sqliteError("incompatible_state", "Publication ID is missing");
-            if (
-              value.expectedPublicationId &&
-              value.expectedPublicationId !== candidateState.publicationId
-            )
-              throw sqliteError("incompatible_state", "Publication ID changed during adoption");
-            candidate.database.markSnapshotLoaded();
-            const adoptedState = candidate.database.getState();
-            opened.database.close();
-            opened = candidate;
-            openedPromise = Promise.resolve(candidate);
-            result = adoptedState;
-          } catch (error) {
-            if (opened.database !== candidate.database) candidate.database.close();
-            throw error;
-          }
-          break;
-        }
         case "cancelQueued":
           return { cancelled: false };
         case "shutdown":
@@ -835,20 +587,7 @@ export function createTestSqliteClient(
         default:
           throw sqliteError("unsupported", `SQLite method ${method} is unavailable`);
       }
-      if (
-        options.persistMutations !== false ||
-        (options.captureLifecycleSnapshots &&
-          (method === "finishLexicalRun" || method === "adoptPublication"))
-      )
-        await persist(opened);
-      if (method === "prepareSemanticWork" || method === "commitSemanticResults") {
-        const elapsedMs = performance.now() - handlerStarted;
-        try {
-          options.onSemanticHandler?.(method, elapsedMs);
-        } catch {
-          /* Test observations cannot change a completed RPC. */
-        }
-      }
+      if (options.persistMutations !== false) await persist(opened);
       return result;
     } finally {
       if (isMaintenance) maintenance = false;

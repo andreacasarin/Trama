@@ -90,7 +90,7 @@ describe("index maintenance actions", () => {
     expect(status.getStatus()).toMatchObject({ kind: "error", channel: "semantic" });
   });
 
-  it("routes Clear indexes and shared cache through the shared action", () => {
+  it("routes Clear local search data and shared embeddings through the shared action", () => {
     const commands: { id: string; callback?: () => void }[] = [];
     const clearShared = vi.fn(async () => undefined);
     const status = new IndexStatusController(
@@ -115,6 +115,8 @@ describe("index maintenance actions", () => {
     const update = vi.fn(async () => undefined);
     const rebuild = vi.fn(async () => undefined);
     const reset = vi.fn(async () => undefined);
+    const share = vi.fn(async () => undefined);
+    const importShared = vi.fn(async () => undefined);
     const status = new IndexStatusController(
       {
         addCommand: (command: { id: string; name: string; callback?: () => void }) =>
@@ -124,6 +126,8 @@ describe("index maintenance actions", () => {
         update,
         rebuild,
         reset,
+        share,
+        importShared,
         stop: () => undefined,
       }
     );
@@ -131,12 +135,18 @@ describe("index maintenance actions", () => {
     status.register();
 
     expect(commands.map(({ name }) => name)).toEqual([
-      "Update index",
-      "Clear indexes and shared cache",
-      "Rebuild index",
-      "Reset all indexes",
+      "Update search indexes",
+      "Clear local search data and shared embeddings",
+      "Rebuild embeddings",
+      "Reset local search data",
+      "Share embeddings",
+      "Import shared embeddings",
       "Stop index maintenance",
     ]);
+    commands.find(({ id }) => id === "publish-embeddings")?.callback?.();
+    commands.find(({ id }) => id === "import-shared-embeddings")?.callback?.();
+    expect(share).toHaveBeenCalledOnce();
+    expect(importShared).toHaveBeenCalledOnce();
     await status.run("reindex");
     expect(rebuild).toHaveBeenCalledOnce();
     commands.find(({ id }) => id === "reset-all-indexes")?.callback?.();
@@ -370,7 +380,7 @@ describe("index maintenance actions", () => {
     expect(update).toHaveBeenCalledOnce();
     status.setMaintenance({ lane: "adoption", phase: "queued", pending: true, suspended: false });
     expect(status.getStatus().message).toBe(
-      "Index operation queued; finishing the current synchronized cache import…"
+      "Search update queued; finishing the current shared embeddings import…"
     );
   });
 
@@ -390,17 +400,10 @@ describe("index maintenance actions", () => {
     status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({
       kind: "stale",
-      message: "Checking synchronized cache…",
+      message: "Importing shared embeddings…",
       canIndex: true,
       canReindex: true,
     });
-    status.setMaintenance({
-      lane: "adoption",
-      phase: "semantic",
-      pending: false,
-      suspended: false,
-    });
-    expect(status.getStatus().message).toBe("Applying cached semantic vectors…");
     status.setMaintenance({ lane: "idle", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({ kind: "empty", canIndex: true });
   });
@@ -421,7 +424,7 @@ describe("index maintenance actions", () => {
         freshness: "locally-reconciled",
       });
       status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
-      expect(status.getStatus().message).toBe("Checking synchronized cache…");
+      expect(status.getStatus().message).toBe("Importing shared embeddings…");
       status.setMaintenance({ lane: "idle", pending: false, suspended: false });
       expect(status.getStatus()).toMatchObject({ kind: "ready", message: undefined });
     }

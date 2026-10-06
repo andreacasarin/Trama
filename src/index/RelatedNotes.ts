@@ -33,7 +33,6 @@ export interface RelatedNotesResult {
   readonly contentHash: string;
   readonly freshness?: IndexFreshness;
   readonly semanticPartial?: boolean;
-  readonly publicationId?: string;
   readonly unavailableReason?: "semantic-unavailable" | "incomplete-vectors";
   readonly results: readonly RelatedNoteResult[];
 }
@@ -97,7 +96,6 @@ export class RelatedNotes {
         results: [],
         ...(state?.freshness ? { freshness: state.freshness } : {}),
         ...(state?.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-        ...(state?.publicationId ? { publicationId: state.publicationId } : {}),
       };
       this.publish(result, state ? this.key(state) : "");
       return result;
@@ -111,7 +109,6 @@ export class RelatedNotes {
         contentHash: state.contentHash,
         ...(state.freshness ? { freshness: state.freshness } : {}),
         ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-        ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         unavailableReason: readiness,
         results: [],
       };
@@ -287,7 +284,6 @@ export class RelatedNotes {
       results,
       ...(state.freshness ? { freshness: state.freshness } : {}),
       ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-      ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
 
@@ -297,11 +293,11 @@ export class RelatedNotes {
   }
 
   private key(state: RelatedIndexState): string {
-    return `${state.currentPath}\0${state.contentHash}\0${state.publicationId ?? ""}`;
+    return `${state.currentPath}\0${state.contentHash}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.currentPath}\0${result.contentHash}\0${result.publicationId ?? ""}`;
+    return `${result.currentPath}\0${result.contentHash}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

@@ -4,7 +4,7 @@ import type { RelatedIndexHit, RelatedIndexState } from "@/index/IndexManager";
 import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
 const signal = new AbortController().signal;
-function snapshot(path: string, _text: string, hits: RelatedIndexHit[], generationId = "1") {
+function snapshot(path: string, hits: RelatedIndexHit[], generationId = "1") {
   const search = vi.fn(async () => hits);
   const value: RelatedIndexState = {
     generationId,
@@ -20,7 +20,7 @@ describe("RelatedNotes", () => {
     await expect(new RelatedNotes(absent).find("missing.md", signal)).resolves.toMatchObject({
       results: [],
     });
-    const zeroLimit = snapshot("zero.md", "query", []);
+    const zeroLimit = snapshot("zero.md", []);
     await expect(
       new RelatedNotes({ relatedState: () => zeroLimit.value, findRelated: zeroLimit.search }).find(
         "zero.md",
@@ -32,13 +32,12 @@ describe("RelatedNotes", () => {
   });
 
   it("does not retrieve until compatible vector coverage is complete", async () => {
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     const source = {
       relatedState: () => ({
         ...current.value,
         semantic: { state: "partial" as const, activity: "idle" as const, searchable: false },
-        freshness: "snapshot-loaded" as const,
-        publicationId: "pub-1",
+        freshness: "unknown" as const,
       }),
       findRelated: current.search,
     };
@@ -46,14 +45,13 @@ describe("RelatedNotes", () => {
     await expect(new RelatedNotes(source).find("current.md", signal)).resolves.toMatchObject({
       results: [],
       unavailableReason: "incomplete-vectors",
-      freshness: "snapshot-loaded",
-      publicationId: "pub-1",
+      freshness: "unknown",
     });
     expect(current.search).not.toHaveBeenCalled();
   });
 
   it("uses available related-note vectors when semantic coverage is partial", async () => {
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     const source = {
       relatedState: () => ({
         ...current.value,
@@ -77,7 +75,7 @@ describe("RelatedNotes", () => {
       { path: "b.md", score: 0.9 },
       ...Array.from({ length: 8 }, (_, i) => ({ path: `extra-${i}.md`, score: 0.2 })),
     ];
-    const current = snapshot("current.md", "query", hits);
+    const current = snapshot("current.md", hits);
     const result = await new RelatedNotes({
       relatedState: () => current.value,
       findRelated: current.search,
@@ -95,7 +93,7 @@ describe("RelatedNotes", () => {
   });
 
   it("keeps the winning chunk preview and strongest semantic similarity per note", async () => {
-    const current = snapshot("current.md", "query", [
+    const current = snapshot("current.md", [
       {
         path: "related.md",
         score: 0.03,
@@ -132,7 +130,7 @@ describe("RelatedNotes", () => {
   });
 
   it("shares same-key work and caches successful results", async () => {
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     const source = { relatedState: vi.fn(() => current.value), findRelated: current.search };
     const service = new RelatedNotes(source);
     const [first, second] = await Promise.all([
@@ -146,7 +144,7 @@ describe("RelatedNotes", () => {
   });
 
   it("retains exact rows while cache batches churn without changing the visible head", async () => {
-    const current = snapshot("current.md", "query", [{ path: "settled.md", score: 0.9 }]);
+    const current = snapshot("current.md", [{ path: "settled.md", score: 0.9 }]);
     let activity: "idle" | "updating" = "idle";
     const source = {
       relatedState: vi.fn(() => ({
@@ -164,8 +162,8 @@ describe("RelatedNotes", () => {
   });
 
   it("swaps cached rows once when the visible semantic head changes", async () => {
-    const first = snapshot("current.md", "query", [{ path: "old.md", score: 0.8 }], "head-1");
-    const second = snapshot("current.md", "query", [{ path: "new.md", score: 0.9 }], "head-2");
+    const first = snapshot("current.md", [{ path: "old.md", score: 0.8 }], "head-1");
+    const second = snapshot("current.md", [{ path: "new.md", score: 0.9 }], "head-2");
     let current = first.value;
     const service = new RelatedNotes({
       relatedState: () => current,
@@ -182,7 +180,7 @@ describe("RelatedNotes", () => {
   });
 
   it("reports preparation and retrieval timings for the single shared computation", async () => {
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     const records: TramaDiagnosticRecord[] = [];
     const service = new RelatedNotes(
       { relatedState: () => current.value, findRelated: current.search },
@@ -207,7 +205,7 @@ describe("RelatedNotes", () => {
       score: 1 - index / 100,
       similarity: 0.8 - index / 100,
     }));
-    const current = snapshot("current.md", "query", hits);
+    const current = snapshot("current.md", hits);
     const service = new RelatedNotes({
       relatedState: () => current.value,
       findRelated: current.search,
@@ -222,7 +220,7 @@ describe("RelatedNotes", () => {
   });
 
   it("publishes the same ordered result to subscribers and exposes the latest path", async () => {
-    const current = snapshot("current.md", "query", [
+    const current = snapshot("current.md", [
       { path: "b.md", score: 0.8 },
       { path: "a.md", score: 0.8 },
     ]);
@@ -242,7 +240,7 @@ describe("RelatedNotes", () => {
   });
 
   it("uses locale-independent code-unit ordering for equal-score paths", async () => {
-    const current = snapshot("current.md", "query", [
+    const current = snapshot("current.md", [
       { path: "ä.md", score: 0.8 },
       { path: "a.md", score: 0.8 },
       { path: "Z.md", score: 0.8 },
@@ -257,8 +255,8 @@ describe("RelatedNotes", () => {
   });
 
   it("does not expose a latest result after the live snapshot identity changes", async () => {
-    const first = snapshot("current.md", "query", [{ path: "old.md", score: 1 }], "1");
-    const second = snapshot("current.md", "query", [{ path: "new.md", score: 1 }], "2");
+    const first = snapshot("current.md", [{ path: "old.md", score: 1 }], "1");
+    const second = snapshot("current.md", [{ path: "new.md", score: 1 }], "2");
     let current = first.value;
     const service = new RelatedNotes({
       relatedState: () => current,
@@ -276,11 +274,11 @@ describe("RelatedNotes", () => {
 
   it("allows a late result but suppresses its cache after the live snapshot changes", async () => {
     let release!: () => void;
-    const old = snapshot("old.md", "old", [{ path: "stale.md", score: 1 }]);
+    const old = snapshot("old.md", [{ path: "stale.md", score: 1 }]);
     old.search.mockImplementationOnce(
       () => new Promise((resolve) => (release = () => resolve([{ path: "stale.md", score: 1 }])))
     );
-    const next = snapshot("new.md", "new", [{ path: "fresh.md", score: 1 }], "2");
+    const next = snapshot("new.md", [{ path: "fresh.md", score: 1 }], "2");
     let current = old.value;
     const service = new RelatedNotes({
       relatedState: () => current,
@@ -296,7 +294,7 @@ describe("RelatedNotes", () => {
   });
 
   it("honors caller cancellation", async () => {
-    const current = snapshot("current.md", "query", []);
+    const current = snapshot("current.md", []);
     const controller = new AbortController();
     controller.abort();
     await expect(
@@ -310,7 +308,7 @@ describe("RelatedNotes", () => {
 
   it("does not return aborted shared work to a later same-key consumer", async () => {
     let release!: () => void;
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     current.search.mockImplementationOnce(
       () => new Promise((resolve) => (release = () => resolve([{ path: "a.md", score: 1 }])))
     );
@@ -331,7 +329,7 @@ describe("RelatedNotes", () => {
   it("cancels obsolete retrieval when its last consumer leaves", async () => {
     let workerSignal!: AbortSignal;
     let release!: () => void;
-    const current = snapshot("current.md", "query", []);
+    const current = snapshot("current.md", []);
     const service = new RelatedNotes({
       relatedState: () => current.value,
       findRelated: (_path, signal) => {
@@ -349,7 +347,7 @@ describe("RelatedNotes", () => {
 
   it("shares work while one consumer cancels", async () => {
     let release!: () => void;
-    const current = snapshot("current.md", "query", [{ path: "a.md", score: 1 }]);
+    const current = snapshot("current.md", [{ path: "a.md", score: 1 }]);
     current.search.mockImplementationOnce(
       () => new Promise((resolve) => (release = () => resolve([{ path: "a.md", score: 1 }])))
     );

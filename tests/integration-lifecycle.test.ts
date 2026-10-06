@@ -86,6 +86,7 @@ function projectedApp() {
       }),
       remove: async (path: string) => {
         adapterFiles.delete(path);
+        adapterBinary.delete(path);
       },
       activate: async (path: string, value: string) => {
         adapterFiles.set(path, value);
@@ -133,6 +134,25 @@ function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SE
 }
 
 describe("TramaPlugin lifecycle integration", () => {
+  it("waits for the open Filo refresh before exporting shared embeddings", async () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const refresh = vi.spyOn(plugin.modelRuntime, "refreshOpenFilo").mockImplementation(() => gate);
+    const publish = vi.spyOn(plugin.publicationManager, "publish");
+    const updating = plugin.updateIndex();
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(publish).not.toHaveBeenCalled();
+    release();
+    await updating;
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
   it("does not rescan local state for an unchanged cache shard", async () => {
     const settings = {
       ...DEFAULT_SETTINGS,
@@ -153,6 +173,85 @@ describe("TramaPlugin lifecycle integration", () => {
     const result = await plugin.index.ingestCacheShard(bytes, shard.digest);
     expect(result.duplicate).toBe(true);
     expect(call.mock.calls.map(([method]) => method)).toEqual(["ingestCacheShard"]);
+  });
+
+  it("uses persisted publication receipts to avoid shard reads on a warm cache check", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "receipt-model", dimensions: 2 },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, 0])
+    );
+    await plugin.updateIndex();
+    const read = vi.spyOn(plugin.publicationManager.store, "readCacheShard");
+    const ingest = vi.spyOn(plugin.index, "ingestCacheShard");
+    await plugin.checkPublication();
+    expect(read).not.toHaveBeenCalled();
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("retries failed shared-cache deletion before switching the vault embedding model", async () => {
+    const app = projectedApp();
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "old-model", dimensions: 2 },
+    };
+    const plugin = projectedPlugin(app, settings) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, 0])
+    );
+    await plugin.updateIndex();
+    const oldShards = await plugin.publicationManager.store.listCacheShards();
+    expect(oldShards.length).toBeGreaterThan(0);
+    await plugin.saveSettings({
+      ...settings,
+      embedding: { ...settings.embedding, modelId: "new-model" },
+    });
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    const provider = vi
+      .spyOn(plugin.embeddingModel as EmbeddingModel, "embed")
+      .mockImplementation(async (inputs) => inputs.map(() => [0, 1]));
+    const store = plugin.publicationManager.store;
+    const clear = vi.spyOn(store, "clearCacheShards");
+    clear.mockRejectedValueOnce(new Error("cache deletion failed"));
+    await expect(plugin.rebuildIndex()).rejects.toThrow("cache deletion failed");
+    expect((await plugin.index.getState()).semanticRebuildRequired).toBe(true);
+    expect(provider).not.toHaveBeenCalled();
+    expect(await plugin.index.search("contents", new AbortController().signal, 5)).toHaveLength(2);
+    await plugin.rebuildIndex();
+    expect(clear).toHaveBeenCalledTimes(2);
+    expect((await plugin.index.getState()).semanticRebuildRequired).toBe(false);
+    expect(provider).toHaveBeenCalled();
+    for (const shard of oldShards) expect(await app.vault.adapter.exists(shard.path)).toBe(false);
+    expect((await plugin.publicationManager.store.listCacheShards()).length).toBeGreaterThan(0);
+    // An ordinary same-model rebuild preserves shared contributions.
+    await plugin.rebuildIndex();
+    expect(clear).toHaveBeenCalledTimes(2);
+  });
+
+  it("imports cache without promoting semantic heads or calling the provider", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    const promote = vi.spyOn(plugin.index, "promoteCachedSemantic");
+    const prepare = vi.spyOn(plugin.index, "prepareSemantic");
+    const embed = vi.spyOn(plugin.embeddingModel, "embed");
+    vi.spyOn(plugin.publicationManager, "adoptCurrent").mockResolvedValue({ adopted: true });
+    await plugin.checkPublication(false);
+    expect(promote).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(plugin.maintenance.snapshot.pending).toBe(false);
   });
 
   it("keeps Stop effective through reset's follow-up cache import", async () => {
@@ -278,7 +377,6 @@ describe("TramaPlugin lifecycle integration", () => {
 
     const index = (plugin as any).index;
     const resetLocal = vi.spyOn(index, "resetLocalDatabase");
-    const clearPublication = vi.spyOn((plugin as any).publicationManager.store, "clear");
     const clearShards = vi.spyOn((plugin as any).publicationManager.store, "clearCacheShards");
     vi.spyOn((plugin as any).maintenance, "resetExclusive").mockImplementation((async (
       run: () => Promise<void>
@@ -289,7 +387,6 @@ describe("TramaPlugin lifecycle integration", () => {
     vi.stubGlobal("confirm", () => true);
     await plugin.clearIndexesAndSharedCache();
     expect(resetLocal).toHaveBeenCalledOnce();
-    expect(clearPublication).toHaveBeenCalledOnce();
     expect(clearShards).toHaveBeenCalledOnce();
     vi.unstubAllGlobals();
     plugin.onunload();
@@ -498,7 +595,6 @@ describe("TramaPlugin lifecycle integration", () => {
     const invalidate = vi.spyOn(MaintenanceScheduler.prototype, "invalidate");
     vi.spyOn(MaintenanceScheduler.prototype, "checkPublication").mockResolvedValue({
       adopted: true,
-      publicationId: "remote",
     });
     const plugin = projectedPlugin(app, { ...DEFAULT_SETTINGS, automaticMaintenance: true });
 
@@ -531,7 +627,7 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "Note.md" });
     emit("modify", { path: "image.png" });
     expect(invalidate).toHaveBeenCalledTimes(1);
-    const publicationPath = (plugin as any).publicationManager.store.path;
+    const publicationPath = `${(plugin as any).publicationManager.store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`;
     emit("modify", { path: publicationPath });
     await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledTimes(1));
   });
@@ -570,11 +666,11 @@ describe("TramaPlugin lifecycle integration", () => {
 
     first.resolve({ adopted: false, ignored: "missing" });
     await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledTimes(2));
-    followup.resolve({ adopted: true, publicationId: "late-shard" });
+    followup.resolve({ adopted: true });
     await vi.waitFor(() =>
       expect(applyAdoptionResult).toHaveBeenCalledWith(
         plugin.index,
-        expect.objectContaining({ adopted: true, publicationId: "late-shard" })
+        expect.objectContaining({ adopted: true })
       )
     );
     expect(checkPublication).toHaveBeenCalledTimes(2);
@@ -669,7 +765,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(commands.map((item) => item.id)).not.toContain("prepare-semantic-index");
   });
 
-  it("resets local storage and publication through one confirmed scheduler fence", async () => {
+  it("resets local storage through one confirmed scheduler fence and preserves shared cache", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app);
     await plugin.onload();
@@ -682,9 +778,7 @@ describe("TramaPlugin lifecycle integration", () => {
       order.push("local");
       return {} as any;
     });
-    vi.spyOn(publication.store, "clear").mockImplementation(async () => {
-      order.push("publication");
-    });
+    const clearShared = vi.spyOn(publication.store, "clearCacheShards");
     vi.spyOn(manager, "requestFullRecovery").mockImplementation(() => order.push("recovery"));
     vi.spyOn(scheduler, "resetExclusive").mockImplementation((async (run: () => Promise<void>) => {
       order.push("fence");
@@ -695,9 +789,10 @@ describe("TramaPlugin lifecycle integration", () => {
     try {
       await plugin.resetIndexes();
       expect(confirmReset).toHaveBeenCalledWith(
-        "Reset all local and published indexes for this vault? Notes, settings, credentials, and identity will be preserved. Automatic maintenance will rebuild indexes if enabled."
+        "Reset local search data for this vault? Notes and settings will be preserved, and shared embeddings will remain available. Scheduled maintenance will rebuild local search data if enabled."
       );
-      expect(order).toEqual(["fence", "local", "publication", "recovery"]);
+      expect(order).toEqual(["fence", "local", "recovery"]);
+      expect(clearShared).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllGlobals();
     }
@@ -835,13 +930,13 @@ describe("TramaPlugin lifecycle integration", () => {
     };
 
     const loading = index.load();
-    const selectingProfile = index.selectEmbeddingProfile("test-profile");
+    const rebuildingSemantic = index.rebuildSemantic(new AbortController().signal);
     await corpusStarted.promise;
     index.disposeImmediately();
     corpus.resolve("corpus");
 
     await expect(loading).resolves.toBe(false);
-    await expect(selectingProfile).rejects.toBeDefined();
+    await expect(rebuildingSemantic).rejects.toBeDefined();
     expect(workerFactory).toHaveBeenCalledOnce();
     expect(workers).toHaveLength(1);
   });

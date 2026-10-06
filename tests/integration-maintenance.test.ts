@@ -244,7 +244,7 @@ describe("TramaPlugin publication integration", () => {
     await Promise.all([expect(update).rejects.toEqual(warning), check]);
     expect(adoption).toHaveBeenCalled();
     expect(plugin.getIndexStatus().publicationWarning).toBe(
-      "Index saved locally, but publication failed: offline"
+      "Search data saved locally, but sharing embeddings failed: offline"
     );
   });
 
@@ -261,11 +261,11 @@ describe("TramaPlugin publication integration", () => {
       "check"
     );
     expect(plugin.getIndexStatus().publicationWarning).toBe(
-      "Synchronized index check failed: invalid file"
+      "Shared embeddings check failed: invalid file"
     );
     plugin.clearPublicationWarning("check");
     expect(plugin.getIndexStatus().publicationWarning).toBe(
-      "Index saved locally, but publication failed: publish offline"
+      "Search data saved locally, but sharing embeddings failed: publish offline"
     );
     plugin.clearPublicationWarning("publication");
     expect(plugin.getIndexStatus().publicationWarning).toBeUndefined();

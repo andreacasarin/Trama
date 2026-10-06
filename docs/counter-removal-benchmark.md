@@ -1,5 +1,9 @@
 # SQLite counter removal benchmark
 
+Historical evidence: the in-memory runner referenced below has been retired. Use
+`npm run benchmark` for the current generated-vault Obsidian CLI workflow; its timings
+are not directly comparable to these measurements.
+
 ## Workload and conditions
 
 Measured the deterministic `trama-10k` profile through `node scripts/benchmark/run.mjs`, with `TRAMA_BENCHMARK_PROFILE=trama-10k`, `TRAMA_BENCHMARK_REPETITIONS=1`, and `TRAMA_BENCHMARK_TIMEOUT_MS=900000`. Each independent run used seed `99538792`, 1,100 notes, and 10,000 chunks. The benchmark exercises a full lexical build, no-op and reconciliation paths, uncached/cached/partial semantic work, scoped add/modify/delete/rename, publication and adoption, retrieval queries, and a chat-tool turn.

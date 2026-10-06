@@ -84,7 +84,7 @@ describe("LenteSearch", () => {
     expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
   });
 
-  it("gates hybrid retrieval on semantic readiness and carries snapshot freshness", async () => {
+  it("gates hybrid retrieval on semantic readiness and carries stale-index freshness", async () => {
     const search = vi.fn(async () => [hit("snapshot.md", 1)]);
     const service = new LenteSearch(
       {
@@ -92,8 +92,7 @@ describe("LenteSearch", () => {
           changeCounter: 4,
           generationId: "g4",
           semantic: { state: "empty", activity: "idle", searchable: false },
-          freshness: "snapshot-loaded",
-          publicationId: "pub-4",
+          freshness: "unknown",
         }),
         retrieveVaultCandidates: search,
       },
@@ -104,8 +103,7 @@ describe("LenteSearch", () => {
       mode: "lexical",
       degraded: true,
       degradationReason: "semantic-unavailable",
-      freshness: "snapshot-loaded",
-      publicationId: "pub-4",
+      freshness: "unknown",
     });
     expect(search).toHaveBeenCalledWith("needle", "lexical", undefined);
   });

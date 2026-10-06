@@ -1,6 +1,5 @@
 import {
   StructuredError,
-  type EmbeddingModel,
   type IndexCapabilities,
   type IndexFreshness,
   type ProvenanceRecord,
@@ -12,12 +11,13 @@ import type { SqliteHit } from "@/index/sqlite/protocol";
 import type { RetrievalResult } from "@/index/retrieval/contracts";
 import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 import type { RelatedIndexHit, RelatedIndexState } from "./contracts";
+import { EmbeddingResolver } from "./embedding-resolver";
 import { check, IndexRuntime } from "./runtime";
 
 export class RetrievalService implements VaultRetrievalPort {
   constructor(
     private readonly runtime: IndexRuntime,
-    private readonly embedding: EmbeddingModel
+    private readonly embedding: EmbeddingResolver
   ) {}
   async search(
     query: string,
@@ -42,18 +42,15 @@ export class RetrievalService implements VaultRetrievalPort {
     readonly generationId: string;
     readonly semantic: IndexCapabilities["semantic"];
     readonly freshness: IndexFreshness;
-    readonly publicationId?: string;
   } | null {
     if (!this.runtime.hasUsableIndex()) return null;
     const changeCounter = this.runtime.changeCounter();
-    const state = this.runtime.state!;
     const capabilities = this.runtime.capabilities();
     return {
       changeCounter,
       generationId: indexIdentity(changeCounter),
       semantic: capabilities.semantic,
       freshness: this.runtime.freshness,
-      ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
   retrieveVaultCandidates(
@@ -94,54 +91,11 @@ export class RetrievalService implements VaultRetrievalPort {
           "Semantic vectors are not ready. Update the semantic index first.",
           true
         );
-      let queryVector = vector ? new Float32Array(vector) : undefined;
+      let queryVector: Float32Array | undefined = vector ? new Float32Array(vector) : undefined;
       const queryProfile = this.runtime.state?.embeddingFingerprint;
       if (effectiveMode !== "lexical" && !queryVector) {
-        if (queryProfile) {
-          const cached = (await this.runtime.ensureClient().call(
-            "lookupQueryVector",
-            {
-              query,
-              embeddingFingerprint: queryProfile,
-            },
-            requestSignal
-          )) as Float32Array | undefined;
-          if (cached) queryVector = new Float32Array(cached);
-        }
-        const canEmbed = await this.runtime.providerMatchesActiveProfile();
-        if (!queryVector && !canEmbed) throw new QueryEmbeddingError();
-      }
-      if (effectiveMode !== "lexical" && !queryVector) {
         const embeddingTimer = this.runtime.performanceTimer();
-        let values: readonly number[][];
-        try {
-          values = await this.embedding.embed([query], requestSignal);
-        } catch {
-          if (requestSignal.aborted)
-            throw new StructuredError("cancelled", "Search cancelled.", true);
-          throw new QueryEmbeddingError();
-        }
-        queryVector = new Float32Array(values[0] ?? []);
-        if (this.runtime.state?.embeddingFingerprint !== queryProfile)
-          throw new QueryEmbeddingError();
-        if (
-          queryVector &&
-          (queryVector.length !== this.embedding.dimensions ||
-            !queryVector.some((value) => value !== 0))
-        ) {
-          throw new QueryEmbeddingError();
-        }
-        if (queryProfile)
-          await this.runtime.ensureClient().call(
-            "storeQueryVector",
-            {
-              query,
-              embeddingFingerprint: queryProfile,
-              dimensions: queryVector.length,
-              vector: queryVector,
-            },
-            requestSignal
-          );
+        queryVector = await this.embedding.resolveQuery(query, requestSignal);
         this.runtime.emitPhase(
           "retrieve",
           "queryEmbedding",
@@ -255,9 +209,6 @@ export class RetrievalService implements VaultRetrievalPort {
       contentHash: identity,
       semantic: this.runtime.capabilities().semantic,
       freshness: this.runtime.freshness,
-      ...(this.runtime.state?.publicationId
-        ? { publicationId: this.runtime.state.publicationId }
-        : {}),
     };
   }
   async findRelated(

@@ -22,6 +22,8 @@ export const semanticIndex: IndexChannel = {
   status(state, available, updating) {
     const activity = updating ? "updating" : "idle";
     if (!available || !state) return { state: "unavailable", activity, searchable: false };
+    if (state.semanticRebuildRequired)
+      return { state: "incompatible", activity, searchable: false, rebuildRequired: true };
     const eligible = state.semanticEligibleCount;
     const heads = state.semanticHeadCount;
     const missing = state.semanticMissingCount;

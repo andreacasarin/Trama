@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  SQLITE_BUILD_IDENTITY,
-  SQLITE_SCHEMA_9_BUILD_IDENTITY,
-  SQLITE_SCHEMA_11_BUILD_IDENTITY,
-  SQLITE_SCHEMA_13_BUILD_IDENTITY,
-} from "@/build/identity";
+import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import { applyLexicalMarkdownBatch } from "@/index/sqlite/markdown";
 import {
@@ -16,7 +11,6 @@ import {
   loadTestSqlite,
   snapshotFor,
 } from "./sqlite-test-client";
-import { createBenchmarkCounters, instrumentSqliteClient } from "./workloads/instrumentation";
 
 const digest = (_value: string) => "a".repeat(64);
 
@@ -84,94 +78,7 @@ describe("revision cache database", () => {
     }
   });
 
-  it("migrates schema 13 to full-note lexical search without losing heads or vectors", async () => {
-    const sqlite = await loadTestSqlite();
-    const raw = new sqlite.oo1.DB(":memory:", "c");
-    const database = new MutableSqliteDatabase(raw);
-    const corpus = digest("schema-13-migration-corpus");
-    const embedding = digest("schema-13-migration-profile");
-    database.boot(corpus, 2, embedding);
-    const run = database.beginLexicalRun({ scope: { mayClearIncomplete: true } });
-    await applyLexicalMarkdownBatch(database, run.runId, [
-      { path: "migration.md", markdown: "# Migration\n\nPreserved vector coverage." },
-    ]);
-    database.finishLexicalRun(run.runId);
-    const work = database.prepareSemanticWork(embedding);
-    database.commitSemanticResults(
-      work.requests.map((request) => ({ ...request, vector: new Float32Array([1, 0]) })),
-      embedding
-    );
-    raw.exec(`CREATE TABLE active_lexical (
-      occurrence_id INTEGER PRIMARY KEY,note_id INTEGER NOT NULL,revision_id INTEGER NOT NULL,
-      path_text TEXT NOT NULL,filename TEXT NOT NULL,body TEXT NOT NULL
-    ) STRICT`);
-    raw.exec(`CREATE VIRTUAL TABLE active_lexical_fts USING fts5(
-      body,path_text,filename,content='active_lexical',content_rowid='occurrence_id',
-      tokenize='unicode61 remove_diacritics 2'
-    )`);
-    raw.exec({
-      sql: `INSERT INTO active_lexical(occurrence_id,note_id,revision_id,path_text,filename,body)
-            SELECT o.occurrence_id,o.note_id,o.revision_id,n.path,'migration',o.display_text
-            FROM chunk_occurrences o JOIN notes n ON n.note_id=o.note_id
-            WHERE o.revision_id=n.lexical_revision_id`,
-    });
-    raw.exec("INSERT INTO active_lexical_fts(active_lexical_fts) VALUES('rebuild')");
-    raw.exec({
-      sql: "UPDATE index_state SET schema_version=13,protocol_version=12,build_identity=? WHERE id=1",
-      bind: [SQLITE_SCHEMA_13_BUILD_IDENTITY],
-    });
-    raw.exec("PRAGMA user_version=13");
-
-    const migrated = database.boot(corpus, 2, embedding);
-    expect(migrated).toMatchObject({ schemaVersion: 14, semanticHeadCount: 1 });
-    expect(Number(raw.selectValue("SELECT count(*) FROM embedding_cache"))).toBeGreaterThan(0);
-    expect(
-      Number(raw.selectValue("SELECT count(*) FROM sqlite_master WHERE name='active_lexical'"))
-    ).toBe(0);
-    expect(database.retrieve("Preserved", new Float32Array([1, 0]), 5)).toContainEqual(
-      expect.objectContaining({ path: "migration.md", text: expect.stringContaining("Preserved") })
-    );
-    database.close();
-  });
-
-  it("migrates schema 11 profile foundations without losing semantic coverage", async () => {
-    const sqlite = await loadTestSqlite();
-    const raw = new sqlite.oo1.DB(":memory:", "c");
-    const database = new MutableSqliteDatabase(raw);
-    const corpus = digest("schema-11-migration-corpus");
-    const embedding = digest("schema-11-migration-profile");
-    database.boot(corpus, 2, embedding);
-    const run = database.beginLexicalRun({ scope: { mayClearIncomplete: true } });
-    await applyLexicalMarkdownBatch(database, run.runId, [
-      { path: "migration.md", markdown: "# Migration\n\nPreserved vector coverage." },
-    ]);
-    database.finishLexicalRun(run.runId);
-    const work = database.prepareSemanticWork(embedding);
-    database.commitSemanticResults(
-      work.requests.map((request) => ({ ...request, vector: new Float32Array([1, 0]) })),
-      embedding
-    );
-    raw.exec("DROP TABLE embedding_profiles");
-    raw.exec({
-      sql: "UPDATE index_state SET schema_version=11,protocol_version=10,build_identity=? WHERE id=1",
-      bind: [SQLITE_SCHEMA_11_BUILD_IDENTITY],
-    });
-    raw.exec("PRAGMA user_version=11");
-
-    const migrated = database.boot(corpus, 2, embedding);
-    expect(migrated).toMatchObject({
-      schemaVersion: 14,
-      semanticHeadCount: 1,
-      compatibleVectorCount: 2,
-      embeddingFingerprint: embedding,
-    });
-    expect(migrated.embeddingProfiles).toContainEqual(
-      expect.objectContaining({ fingerprint: embedding, dimensions: 2, vectorCount: 2 })
-    );
-    database.close();
-  });
-
-  it("drops a stale query vector when the active profile changes before retrieval", async () => {
+  it("fully resets local semantic state on model change while preserving lexical retrieval", async () => {
     const sqlite = await loadTestSqlite();
     const raw = new sqlite.oo1.DB(":memory:", "c");
     const database = new MutableSqliteDatabase(raw);
@@ -184,6 +91,12 @@ describe("revision cache database", () => {
       { path: "fence.md", markdown: "alpha lexical evidence" },
     ]);
     database.finishLexicalRun(run.runId);
+    const work = database.prepareSemanticWork(previousProfile);
+    database.commitSemanticResults(
+      work.requests.map((request) => ({ ...request, vector: new Float32Array([1, 0]) })),
+      previousProfile
+    );
+    expect(database.getState().semanticHeadCount).toBe(1);
     raw.exec({
       sql: "INSERT INTO embedding_profiles(fingerprint,dimensions,model_id,endpoint_origin) VALUES(?,2,'other','')",
       bind: [nextProfile],
@@ -192,7 +105,37 @@ describe("revision cache database", () => {
       sql: "INSERT INTO embedding_cache(input_digest,action_key,embedding_fingerprint,preprocessing,vector,task_kind,created_at) VALUES('input','cache-key',?,'normalized-float32-v1',?,'document',1)",
       bind: [nextProfile, new Uint8Array(new Float32Array([0, 1]).buffer)],
     });
-    database.selectEmbeddingProfile(nextProfile);
+    expect(database.boot(corpus, 2, nextProfile).semanticRebuildRequired).toBe(true);
+    // Both old and already imported new-model query/document entries are discarded.
+    for (const fingerprint of [previousProfile, nextProfile]) {
+      raw.exec({
+        sql: "INSERT INTO embedding_cache(input_digest,action_key,embedding_fingerprint,preprocessing,vector,task_kind,created_at) VALUES(?,?,?,'normalized-float32-v1',?,'query',1)",
+        bind: [
+          fingerprint,
+          `query-${fingerprint}`,
+          fingerprint,
+          new Uint8Array(new Float32Array([1, 0]).buffer),
+        ],
+      });
+    }
+    raw.exec("INSERT INTO cache_compaction_retirements VALUES('source','replacement-set',1)");
+    raw.exec("INSERT INTO cache_compaction_replacements VALUES('replacement-set','replacement')");
+    raw.exec("INSERT INTO cache_artifact_receipts VALUES('source','old-profile',1)");
+    raw.exec("INSERT INTO cache_shard_membership VALUES('source','key','document','old-profile')");
+    const lexicalGeneration = database.getState().lexicalGeneration;
+    const reset = database.selectEmbeddingProfile(nextProfile);
+    expect(reset.lexicalGeneration).toBe(lexicalGeneration);
+    expect(reset.semanticHeadCount).toBe(0);
+    expect(reset.semanticRebuildRequired).toBe(false);
+    for (const table of [
+      "embedding_cache",
+      "cache_compaction_retirements",
+      "cache_compaction_replacements",
+      "cache_artifact_receipts",
+      "cache_shard_membership",
+    ])
+      expect(Number(raw.selectValue(`SELECT count(*) FROM ${table}`))).toBe(0);
+    expect(raw.selectValue("SELECT fingerprint FROM embedding_profiles")).toBe(nextProfile);
     const hits = database.retrieve("alpha", new Float32Array([0, 1]), 5, undefined, {
       expectedEmbeddingFingerprint: previousProfile,
     });
@@ -201,7 +144,7 @@ describe("revision cache database", () => {
     database.close();
   });
 
-  it("keeps ambiguous imported profiles unselected and persists a local profile choice", async () => {
+  it("retains the vault model offline and rejects arbitrary profile switching", async () => {
     const sqlite = await loadTestSqlite();
     const raw = new sqlite.oo1.DB(":memory:", "c");
     const database = new MutableSqliteDatabase(raw);
@@ -227,8 +170,10 @@ describe("revision cache database", () => {
       });
     }
     expect(database.boot(corpus, 2, "").embeddingFingerprint).toBe("");
-    database.selectEmbeddingProfile(first);
+    expect(() => database.selectEmbeddingProfile(first)).toThrow("configured in settings");
+    database.boot(corpus, 2, first);
     expect(database.boot(corpus, 2, "").embeddingFingerprint).toBe(first);
+    expect(() => database.selectEmbeddingProfile(second)).toThrow("configured in settings");
     database.close();
   });
 
@@ -375,7 +320,7 @@ describe("revision cache database", () => {
     const client = createTestSqliteClient(identity, { persistMutations: true });
     await client.call("boot", { corpusFingerprint: digest("schema"), dimensions: 2 });
     const state = await client.call("getState", {});
-    expect(state.schemaVersion).toBe(14);
+    expect(state.schemaVersion).toBe(15);
     expect(state.noteCount).toBe(0);
     const columns = await inspectIndexStateColumns(await snapshotFor(identity));
     expect(columns).not.toContain("lexical_revision_count");
@@ -492,30 +437,22 @@ describe("revision cache database", () => {
       database.finishLexicalRun(run.runId);
 
       expect(
-        select(
-          "SELECT ordinal,chunk_id,display_text,heading_context,body FROM chunk_occurrences ORDER BY occurrence_id"
-        )
+        select("SELECT ordinal,chunk_id,display_text FROM chunk_occurrences ORDER BY occurrence_id")
       ).toEqual([
         {
           ordinal: 2,
           chunk_id: `${digest("ordered-revision")}:2`,
           display_text: "first row",
-          heading_context: '["Header","First"]',
-          body: "first row",
         },
         {
           ordinal: 0,
           chunk_id: `${digest("ordered-revision")}:0`,
           display_text: "second row",
-          heading_context: '["Second"]',
-          body: "second row",
         },
         {
           ordinal: 1,
           chunk_id: `${digest("ordered-revision")}:1`,
           display_text: "third row",
-          heading_context: "[]",
-          body: "third row",
         },
       ]);
       expect(
@@ -585,9 +522,6 @@ describe("revision cache database", () => {
       {
         persistMutations: false,
         onSemanticPhase: (phase) => phases.push(phase),
-        onSemanticHandler: () => {
-          throw new Error("observer failed");
-        },
       }
     );
     const plain = createTestSqliteClient({}, { persistMutations: false });
@@ -672,18 +606,13 @@ describe("revision cache database", () => {
   });
 
   it("counts only copied semantic vectors after cancellation, stale keys, and duplicates", async () => {
-    const counters = createBenchmarkCounters();
-    counters.semanticScenario = "observer-resume";
-    const client = instrumentSqliteClient(
-      createTestSqliteClient(
-        {},
-        {
-          persistMutations: false,
-          onSemanticPhase: (phase) => counters.semanticPhases.push(phase),
-          onSemanticHandler: (_method, elapsedMs) => counters.semanticHandlerMs.push(elapsedMs),
-        }
-      ),
-      counters
+    const phases: { phase: string; copiedBytes: number }[] = [];
+    const client = createTestSqliteClient(
+      {},
+      {
+        persistMutations: false,
+        onSemanticPhase: (phase) => phases.push(phase),
+      }
     );
     const fingerprint = digest("observer-resume-model");
     await client.call("boot", {
@@ -704,7 +633,7 @@ describe("revision cache database", () => {
         cancelled.signal
       )
     ).rejects.toMatchObject({ error: { code: "cancelled" } });
-    expect(counters.semanticPhases).toHaveLength(0);
+    expect(phases).toHaveLength(0);
     const first = await client.call("prepareSemanticWork", {
       embeddingFingerprint: fingerprint,
       limit: 1,
@@ -720,14 +649,9 @@ describe("revision cache database", () => {
       results: [valid, valid, { ...valid, actionKey: "stale" }],
     });
     expect(committed).toMatchObject({ stored: 1, skipped: 1, hasMore: true });
-    const copy = counters.semanticCalls.at(-1)!;
-    expect(copy.vectorPayloadBytes).toBe(24);
-    expect(copy.blobCopyBytes).toBe(8);
-    expect(copy.phases.find((phase) => phase.phase === "knownBlobCopy")?.samples).toBe(1);
-    expect(copy.phases.find((phase) => phase.phase === "transaction")?.sqlCalls).toBe(13);
-    expect(
-      copy.phases.filter((phase) => !phase.nested).reduce((sum, phase) => sum + phase.sqlCalls, 0)
-    ).toBe(16);
+    const copies = phases.filter((phase) => phase.phase === "knownBlobCopy");
+    expect(copies).toHaveLength(1);
+    expect(copies[0].copiedBytes).toBe(8);
     const second = await client.call("prepareSemanticWork", {
       embeddingFingerprint: fingerprint,
       limit: 1,
@@ -744,36 +668,6 @@ describe("revision cache database", () => {
     });
     expect(resumed).toMatchObject({ stored: 1, skipped: 0, hasMore: false });
     expect((await client.call("getState", {})).semanticHeadCount).toBe(2);
-  });
-
-  it("keeps lexical and old semantic heads while pruning pending publication material", async () => {
-    const client = createTestSqliteClient();
-    const corpusFingerprint = digest("heads");
-    const embeddingFingerprint = digest("model");
-    await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
-
-    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
-    await embedAllTestInputs(client, embeddingFingerprint, () => new Float32Array([1, 0]));
-
-    await applyTestLexicalRun(client, [{ path: "two.md", markdown: "alpha", size: 100 }]);
-    expect(
-      (
-        await client.call("prepareSemanticWork", {
-          embeddingFingerprint,
-          limit: 10,
-          maxInputBytes: 1024,
-        })
-      ).requests
-    ).toHaveLength(0);
-
-    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "beta", size: 100 }]);
-    const prepared = await client.call("preparePublication", { publicationId: "heads-1" });
-    expect(await inspectSnapshotTables(prepared.bytes)).toEqual({
-      revisions: 3,
-      occurrences: 3,
-      inputs: 2,
-      cache: 1,
-    });
   });
 
   it("tracks compact lexical and semantic visibility generations", async () => {
@@ -817,31 +711,6 @@ describe("revision cache database", () => {
       lexicalGeneration: 3,
       semanticGeneration: 3,
     });
-  });
-
-  it("requires both publication generation fences to match", async () => {
-    const client = createTestSqliteClient();
-    await client.call("boot", { corpusFingerprint: digest("publication-fence"), dimensions: 2 });
-    await applyTestLexicalRun(client, [{ path: "one.md", markdown: "alpha", size: 100 }]);
-    const prepared = await client.call("preparePublication", { publicationId: "fenced-1" });
-
-    await expect(
-      client.call("finalizePublication", {
-        publicationId: "fenced-1",
-        expectedChangeCounter: prepared.state.changeCounter,
-        expectedLexicalGeneration: prepared.state.lexicalGeneration + 1,
-        expectedSemanticGeneration: prepared.state.semanticGeneration,
-      })
-    ).rejects.toMatchObject({ error: { code: "busy" } });
-
-    await expect(
-      client.call("finalizePublication", {
-        publicationId: "fenced-1",
-        expectedChangeCounter: prepared.state.changeCounter,
-        expectedLexicalGeneration: prepared.state.lexicalGeneration,
-        expectedSemanticGeneration: prepared.state.semanticGeneration,
-      })
-    ).resolves.toMatchObject({ publicationId: "fenced-1" });
   });
 
   it("keeps cache-only semantic stores off the visible generation", async () => {
@@ -1018,75 +887,6 @@ describe("revision cache database", () => {
     });
   });
 
-  it("migrates legacy schema 9 transactionally while preserving semantic heads and vectors", async () => {
-    const sqlite = await loadTestSqlite();
-    const raw = new sqlite.oo1.DB(":memory:", "c");
-    const database = new MutableSqliteDatabase(raw);
-    const corpus = digest("migration-corpus");
-    const embedding = digest("migration-model");
-    database.boot(corpus, 2, embedding, SQLITE_BUILD_IDENTITY);
-    const read = (sql: string) => {
-      const result: Record<string, unknown>[] = [];
-      raw.exec({
-        sql,
-        rowMode: "object",
-        callback: (row: Record<string, unknown>) => result.push(row),
-      });
-      return result;
-    };
-    try {
-      const run = database.beginLexicalRun({ scope: { mayClearIncomplete: true } });
-      await applyLexicalMarkdownBatch(database, run.runId, [
-        { path: "migration/note.md", markdown: "# Migration\n\nOld semantic text.", size: 384 },
-      ]);
-      database.finishLexicalRun(run.runId);
-      const work = database.prepareSemanticWork(embedding, undefined, 8, 1024);
-      database.commitSemanticResults(
-        work.requests.map((request) => ({ ...request, vector: new Float32Array([1, 0]) })),
-        embedding
-      );
-      expect(database.getState().semanticHeadCount).toBe(1);
-      expect(read("SELECT count(*) AS count FROM embedding_cache")[0].count).toBe(2);
-
-      raw.exec(`DROP TRIGGER lexical_notes_ai; DROP TRIGGER lexical_notes_ad; DROP TRIGGER lexical_notes_au;
-        DROP TABLE lexical_notes_fts; DROP INDEX lexical_notes_revision; DROP TABLE lexical_notes;
-        UPDATE index_state SET schema_version=9,protocol_version=9,build_identity='${SQLITE_SCHEMA_9_BUILD_IDENTITY}';
-        PRAGMA user_version=9;`);
-      const migrated = new MutableSqliteDatabase(raw);
-      const state = migrated.boot(corpus, 2, embedding, SQLITE_BUILD_IDENTITY);
-
-      expect(state.schemaVersion).toBe(14);
-      expect(state.semanticHeadCount).toBe(1);
-      expect(state.compatibleVectorCount).toBe(2);
-      expect(read("SELECT title,headings,body,path_text FROM lexical_notes")).toEqual([
-        {
-          title: "Migration",
-          headings: "# Migration",
-          body: "# Migration\nOld semantic text.",
-          path_text: "migration/note.md",
-        },
-      ]);
-
-      const reuseRun = migrated.beginLexicalRun({ scope: { mayClearIncomplete: true } });
-      await applyLexicalMarkdownBatch(migrated, reuseRun.runId, [
-        { path: "migration/note.md", markdown: "# Migration\n\nOld semantic text.", size: 384 },
-        { path: "migration-copy.md", markdown: "# Migration\n\nOld semantic text.", size: 384 },
-      ]);
-      migrated.finishLexicalRun(reuseRun.runId);
-      const reused = migrated.prepareSemanticWork(embedding);
-      expect(reused.promoted).toBeGreaterThan(0);
-      expect(reused.requests).toEqual([]);
-      expect(migrated.getState().semanticHeadCount).toBe(2);
-      migrated.close();
-    } finally {
-      try {
-        database.close();
-      } catch {
-        // The migrated database closes the shared in-memory connection.
-      }
-    }
-  });
-
   it("keeps current full-note lexical content beside the last complete semantic head", async () => {
     const sqlite = await loadTestSqlite();
     const raw = new sqlite.oo1.DB(":memory:", "c");
@@ -1246,51 +1046,5 @@ describe("revision cache database", () => {
     database.completeCacheRetirement(source, now + 30 * 24 * 60 * 60 * 1000);
     expect(database.listCacheRetirements()).toEqual([]);
     database.close();
-  });
-
-  it("rolls back a failed schema 9 migration without changing legacy coverage", async () => {
-    const sqlite = await loadTestSqlite();
-    const raw = new sqlite.oo1.DB(":memory:", "c");
-    const database = new MutableSqliteDatabase(raw);
-    const corpus = digest("migration-rollback-corpus");
-    const embedding = digest("migration-rollback-model");
-    database.boot(corpus, 2, embedding, SQLITE_BUILD_IDENTITY);
-    const run = database.beginLexicalRun({ scope: { mayClearIncomplete: true } });
-    await applyLexicalMarkdownBatch(database, run.runId, [
-      { path: "legacy.md", markdown: "# Legacy\n\nRetained vector.", size: 384 },
-    ]);
-    database.finishLexicalRun(run.runId);
-    const work = database.prepareSemanticWork(embedding, undefined, 8, 1024);
-    database.commitSemanticResults(
-      work.requests.map((request) => ({ ...request, vector: new Float32Array([1, 0]) })),
-      embedding
-    );
-    raw.exec(`DROP TRIGGER lexical_notes_ai; DROP TRIGGER lexical_notes_ad; DROP TRIGGER lexical_notes_au;
-      DROP TABLE lexical_notes_fts; DROP INDEX lexical_notes_revision; DROP TABLE lexical_notes;
-      CREATE TRIGGER lexical_notes_ai AFTER INSERT ON notes BEGIN SELECT 1; END;
-      UPDATE index_state SET schema_version=9,protocol_version=9,build_identity='${SQLITE_SCHEMA_9_BUILD_IDENTITY}';
-      PRAGMA user_version=9;`);
-    try {
-      expect(() => database.boot(corpus, 2, embedding, SQLITE_BUILD_IDENTITY)).toThrow();
-      const state = database.getState();
-      expect(state.schemaVersion).toBe(9);
-      expect(state.semanticHeadCount).toBe(1);
-      const remaining: Record<string, unknown>[] = [];
-      raw.exec({
-        sql: "SELECT count(*) AS count FROM embedding_cache",
-        rowMode: "object",
-        callback: (row: Record<string, unknown>) => remaining.push(row),
-      });
-      expect(remaining[0].count).toBe(2);
-      const tables: Record<string, unknown>[] = [];
-      raw.exec({
-        sql: "SELECT name FROM sqlite_master WHERE name='lexical_notes'",
-        rowMode: "object",
-        callback: (row: Record<string, unknown>) => tables.push(row),
-      });
-      expect(tables).toEqual([]);
-    } finally {
-      database.close();
-    }
   });
 });

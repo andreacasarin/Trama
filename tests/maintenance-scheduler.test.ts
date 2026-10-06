@@ -8,7 +8,7 @@ import type { SemanticPrepareResult } from "@/index/IndexManager";
 import type { PublicationResult, AdoptionResult } from "@/index/publications/PublicationManager";
 import { SemanticProviderError } from "@/index/manager/contracts";
 
-function fixture(semanticConfigured = true) {
+function fixture(semanticConfigured = true, refreshRelated?: MaintenancePort["refreshRelated"]) {
   let now = 0;
   let nextId = 0;
   const timers = new Map<number, { at: number; callback: () => void }>();
@@ -66,11 +66,12 @@ function fixture(semanticConfigured = true) {
     async (_shouldYield?: () => boolean) => ({ published: true }) as PublicationResult
   );
   const adopt = vi.fn(
-    async (_shouldYield?: () => boolean, _onCachePreparation?: () => void) =>
+    async (_shouldYield?: () => boolean) =>
       ({ adopted: false, ignored: "missing" as const }) as AdoptionResult
   );
   const port: MaintenancePort = {
     semanticConfigured,
+    refreshRelated,
     synchronize: lexical,
     prepareSemantic: semantic,
     rebuildSemantic: semanticRebuild,
@@ -110,16 +111,65 @@ function deferred<T>() {
 }
 
 describe("MaintenanceScheduler", () => {
-  it("distinguishes cached semantic preparation from import and clears it on completion", async () => {
+  it.each(["update", "rebuild", "automatic"] as const)(
+    "refreshes visible results before sharing after %s work",
+    async (kind) => {
+      const gate = deferred<void>();
+      const refresh = vi.fn(async (_signal: AbortSignal) => gate.promise);
+      const f = fixture(true, refresh);
+      let run: Promise<void> | undefined;
+      if (kind === "automatic") {
+        f.lexical.mockResolvedValue({ changed: true, converged: true });
+        f.controller.setAutomaticEnabled(true);
+        f.controller.invalidate(true);
+        await f.advance(3000);
+      } else run = f.controller[kind]();
+      await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+      expect(f.controller.snapshot.phase).toBe("results");
+      expect(f.publish).not.toHaveBeenCalled();
+      gate.resolve();
+      await run;
+      await vi.waitFor(() => expect(f.publish).toHaveBeenCalledOnce());
+      expect(refresh.mock.invocationCallOrder[0]).toBeLessThan(
+        f.publish.mock.invocationCallOrder[0]
+      );
+    }
+  );
+
+  it("shares embeddings even if refreshing visible results fails", async () => {
+    const f = fixture(true, async () => {
+      throw new Error("retrieval failed");
+    });
+    await f.controller.update();
+    expect(f.publish).toHaveBeenCalledOnce();
+    expect(f.controller.snapshot.error).toBeUndefined();
+  });
+
+  it("lets a manual command interrupt a refresh that ignores cancellation", async () => {
+    const blocked = deferred<void>();
+    const refresh = vi.fn(async (_signal: AbortSignal): Promise<void> => undefined);
+    refresh.mockImplementationOnce(async () => blocked.promise);
+    const f = fixture(true, refresh);
+    const updating = f.controller.update();
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    const firstSignal = refresh.mock.calls[0][0];
+    await f.controller.rebuild();
+    await updating;
+    expect(firstSignal.aborted).toBe(true);
+    expect(f.semanticRebuild).toHaveBeenCalledOnce();
+    expect(f.publish).toHaveBeenCalledOnce();
+    blocked.resolve();
+  });
+
+  it("keeps cache import separate from semantic preparation", async () => {
     const f = fixture();
     const gate = deferred<void>();
-    f.adopt.mockImplementationOnce(async (_shouldYield, onCachePreparation) => {
-      onCachePreparation?.();
+    f.adopt.mockImplementationOnce(async () => {
       await gate.promise;
       return { adopted: false, ignored: "same-id" };
     });
     const checking = f.controller.checkPublication();
-    expect(f.controller.snapshot).toMatchObject({ lane: "adoption", phase: "semantic" });
+    expect(f.controller.snapshot).toMatchObject({ lane: "adoption", phase: "adopt" });
     gate.resolve();
     await checking;
     expect(f.controller.snapshot.lane).toBe("idle");
@@ -906,26 +956,6 @@ describe("MaintenanceScheduler", () => {
     expect(f.publish).toHaveBeenCalledOnce();
     expect(f.lexical).not.toHaveBeenCalled();
     expect(f.semantic).not.toHaveBeenCalled();
-  });
-
-  it("converges and replaces a non-newer incompatible synchronized index", async () => {
-    const f = fixture();
-    f.adopt.mockResolvedValueOnce({ adopted: false, replacementRequired: true });
-
-    await expect(f.controller.checkPublication()).resolves.toEqual({ adopted: false });
-    expect(f.lexical).toHaveBeenCalledOnce();
-    expect(f.semantic).toHaveBeenCalledOnce();
-    expect(f.publish).toHaveBeenCalledOnce();
-  });
-
-  it("does not replace an incompatible synchronized index when convergence fails", async () => {
-    const f = fixture();
-    f.adopt.mockResolvedValueOnce({ adopted: false, replacementRequired: true });
-    f.lexical.mockRejectedValueOnce(new Error("offline"));
-
-    await expect(f.controller.checkPublication()).rejects.toThrow("offline");
-    expect(f.publish).not.toHaveBeenCalled();
-    expect(f.controller.snapshot.suspended).toBe(true);
   });
 
   it("reschedules internal automatic nonconvergence from pass completion", async () => {

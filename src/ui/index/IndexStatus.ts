@@ -36,7 +36,6 @@ export interface IndexStatus {
   /** Latest orthogonal capability snapshot, independent of the operation kind. */
   readonly capabilities?: IndexCapabilities;
   readonly freshness?: IndexFreshness;
-  readonly publicationId?: string;
   readonly publicationWarning?: string;
   readonly maintenance?: MaintenanceSnapshot;
 }
@@ -48,7 +47,7 @@ const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
   embed: "Embedding semantic index chunks",
   "encode-write": "Writing lexical index",
   validate: "Validating lexical index",
-  "build-vector": "Updating semantic index",
+  "build-vector": "Updating embeddings",
   "build-lexical": "Preparing lexical index",
   activate: "Activating lexical index",
   GC: "Cleaning up lexical index data",
@@ -67,7 +66,7 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
         : ` · about ${Math.ceil(etaSeconds / 60)} min remaining`;
   const label =
     progress.phase === "build-vector" && progress.operation === "full"
-      ? "Rebuilding semantic index"
+      ? "Rebuilding embeddings"
       : PHASE_LABELS[progress.phase];
   return `${label} — ${count}${eta}`;
 }
@@ -77,6 +76,8 @@ interface StatusActions {
   rebuild(): Promise<void>;
   reset(): Promise<void>;
   clearShared?(): Promise<void>;
+  share?(): Promise<void>;
+  importShared?(): Promise<void>;
   stop(): void;
 }
 interface StatusTiming {
@@ -117,7 +118,7 @@ export class IndexStatusController {
   register(): void {
     this.plugin.addCommand({
       id: "update-index",
-      name: "Update index",
+      name: "Update search indexes",
       callback: () => void this.run("index"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canIndex) return false;
@@ -127,7 +128,7 @@ export class IndexStatusController {
     });
     this.plugin.addCommand({
       id: "clear-indexes-and-shared-cache",
-      name: "Clear indexes and shared cache",
+      name: "Clear local search data and shared embeddings",
       callback: () => {
         void this.actions.clearShared?.().catch((error) => {
           new Notice(
@@ -138,7 +139,7 @@ export class IndexStatusController {
     });
     this.plugin.addCommand({
       id: "rebuild-index",
-      name: "Rebuild index",
+      name: "Rebuild embeddings",
       callback: () => void this.run("reindex"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canReindex) return false;
@@ -148,7 +149,7 @@ export class IndexStatusController {
     });
     this.plugin.addCommand({
       id: "reset-all-indexes",
-      name: "Reset all indexes",
+      name: "Reset local search data",
       callback: () => {
         void this.actions.reset().catch((error) => {
           new Notice(
@@ -157,6 +158,24 @@ export class IndexStatusController {
         });
       },
     });
+    for (const [id, name, action] of [
+      ["publish-embeddings", "Share embeddings", this.actions.share],
+      ["import-shared-embeddings", "Import shared embeddings", this.actions.importShared],
+    ] as const) {
+      if (!action) continue;
+      this.plugin.addCommand({
+        id,
+        name,
+        callback: () => {
+          void action().catch(
+            (error) =>
+              new Notice(
+                `Trama ${name.toLowerCase()} failed: ${error instanceof Error ? error.message : String(error)}`
+              )
+          );
+        },
+      });
+    }
     this.plugin.addCommand({
       id: "stop-index-maintenance",
       name: "Stop index maintenance",
@@ -192,7 +211,6 @@ export class IndexStatusController {
       capabilities,
       hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
       freshness: capabilities.freshness,
-      publicationId: capabilities.publicationId,
       revision: ++this.revision,
     };
     for (const listener of [...this.listeners]) listener(this.status);
@@ -305,17 +323,14 @@ export class IndexStatusController {
         capabilities,
         hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
         freshness: capabilities.freshness,
-        publicationId: capabilities.publicationId,
       };
     if (snapshot.lane === "adoption") {
       this.set(
         "stale",
         this.status.hasLastGood,
         snapshot.phase === "queued"
-          ? "Index operation queued; finishing the current synchronized cache import…"
-          : snapshot.phase === "semantic"
-            ? "Applying cached semantic vectors…"
-            : "Checking synchronized cache…",
+          ? "Search update queued; finishing the current shared embeddings import…"
+          : "Importing shared embeddings…",
         false
       );
       return;
@@ -341,14 +356,16 @@ export class IndexStatusController {
     const kind = this.operationChannel === "semantic" ? "preparing" : "building";
     const label =
       snapshot.phase === "reset"
-        ? "Resetting local and published indexes…"
-        : snapshot.phase === "publication"
-          ? "Publishing index…"
-          : snapshot.phase === "semantic"
-            ? "Updating semantic index…"
-            : snapshot.lane === "rebuild"
-              ? "Rebuilding index…"
-              : "Updating index…";
+        ? "Resetting local search data…"
+        : snapshot.phase === "results"
+          ? "Updating related notes…"
+          : snapshot.phase === "publication"
+            ? "Sharing embeddings…"
+            : snapshot.phase === "semantic"
+              ? "Updating embeddings…"
+              : snapshot.lane === "rebuild"
+                ? "Rebuilding index…"
+                : "Updating index…";
     this.set(kind, this.status.hasLastGood, label, false);
   }
 
@@ -406,7 +423,6 @@ export class IndexStatusController {
         (this.maintenance?.pending === true && !this.maintenance.suspended),
       capabilities: this.status.capabilities,
       freshness: this.status.freshness,
-      publicationId: this.status.publicationId,
       publicationWarning: this.status.publicationWarning,
       maintenance: this.maintenance,
     };

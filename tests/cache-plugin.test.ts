@@ -1,14 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 
-describe("SQLite publication plugin maintenance", () => {
-  it("delegates synchronized-file adoption to the maintenance controller", async () => {
+describe("Shared cache plugin maintenance", () => {
+  it("delegates shared-cache import to the maintenance controller", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.maintenance = {
       checkPublication: vi.fn().mockResolvedValue({
         adopted: true,
-        publicationId: "remote-1",
-        state: { publicationId: "remote-1" },
       }),
     };
     plugin.index = { capabilities: () => ({}), isComplete: () => true, hasUsableIndex: () => true };
@@ -18,7 +16,7 @@ describe("SQLite publication plugin maintenance", () => {
     expect(plugin.maintenance.checkPublication).toHaveBeenCalledTimes(1);
   });
 
-  it("does not adopt or publish when the synchronized file is absent", async () => {
+  it("completes a check when no shared cache is present", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.maintenance = {
       checkPublication: vi.fn().mockResolvedValue({ adopted: false, ignored: "missing" }),
@@ -45,7 +43,7 @@ describe("SQLite publication plugin maintenance", () => {
       "check"
     );
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Synchronized index check failed: invalid SQLite file"
+      "Shared embeddings check failed: invalid SQLite file"
     );
     plugin.handlePublicationWarning(
       {
@@ -57,7 +55,7 @@ describe("SQLite publication plugin maintenance", () => {
       "check"
     );
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Synchronized index adoption failed: replace failed"
+      "Shared embeddings import failed: replace failed"
     );
     plugin.handlePublicationWarning(
       {
@@ -69,11 +67,11 @@ describe("SQLite publication plugin maintenance", () => {
       "publication"
     );
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Synchronized index adoption failed: replace failed"
+      "Shared embeddings import failed: replace failed"
     );
     plugin.clearPublicationWarning("check");
     expect(setPublicationWarning).toHaveBeenLastCalledWith(
-      "Index saved locally, but publication failed: readback failed"
+      "Search data saved locally, but sharing embeddings failed: readback failed"
     );
   });
 
@@ -102,7 +100,7 @@ describe("SQLite publication plugin maintenance", () => {
 
       expect(setPublicationWarning).toHaveBeenNthCalledWith(
         1,
-        "Synchronized index adoption failed: replace failed"
+        "Shared embeddings import failed: replace failed"
       );
       expect(setPublicationWarning).toHaveBeenNthCalledWith(2, undefined);
     }
@@ -130,7 +128,7 @@ describe("SQLite publication plugin maintenance", () => {
 
     expect(setPublicationWarning).toHaveBeenNthCalledWith(
       1,
-      "Index saved locally, but publication failed: readback failed"
+      "Search data saved locally, but sharing embeddings failed: readback failed"
     );
     expect(setPublicationWarning).toHaveBeenCalledTimes(1);
   });

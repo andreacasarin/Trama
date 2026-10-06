@@ -338,10 +338,9 @@ export class SqliteLexicalStagingStore {
       this.context.db.exec({
         sql: `INSERT INTO chunk_occurrences(
                 revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,
-                heading_context,embedding_input,embedding_input_digest,body
+                embedding_input_digest
               )
-              SELECT ?,?,? || ordinal,ordinal,kind,start_line,end_line,display_text,heading_context,
-                     embedding_input,embedding_input_digest,display_text
+              SELECT ?,?,? || ordinal,ordinal,kind,start_line,end_line,display_text,embedding_input_digest
               FROM lexical_stage_occurrences
               WHERE run_id=? AND path_text=? ORDER BY ordinal`,
         bind: [revisionId, noteId, `${revisionDigest}:`, runId, path],

@@ -621,7 +621,7 @@ describe("cache-only SQLite shards", () => {
     local.db.close();
   });
 
-  it("rejects invalid digest while accepting vectors from another local profile", async () => {
+  it("rejects invalid digest and ignores vectors from another model", async () => {
     const source = await database();
     const target = await database();
     const pool = await poolFixture(source.sqlite);
@@ -632,8 +632,9 @@ describe("cache-only SQLite shards", () => {
     ).rejects.toThrow("digest mismatch");
     await expect(
       ingestCacheShard(target.raw, pool, shard!.bytes, shard!.digest, dimensions, "c".repeat(64))
-    ).resolves.toMatchObject({ imported: 1, duplicate: false });
-    expect(Number(target.raw.selectValue("SELECT count(*) FROM embedding_profiles"))).toBe(1);
+    ).resolves.toMatchObject({ imported: 0, duplicate: false, ignored: true });
+    expect(Number(target.raw.selectValue("SELECT count(*) FROM embedding_cache"))).toBe(0);
+    expect(Number(target.raw.selectValue("SELECT count(*) FROM cache_artifact_receipts"))).toBe(1);
     const malformedSource = await database();
     const malformedPool = await poolFixture(malformedSource.sqlite);
     await insertCache(malformedSource.raw, "provider input");
@@ -664,7 +665,7 @@ describe("cache-only SQLite shards", () => {
         profile
       )
     ).rejects.toThrow("row validation failed");
-    expect(Number(target.raw.selectValue("SELECT count(*) FROM embedding_cache"))).toBe(1);
+    expect(Number(target.raw.selectValue("SELECT count(*) FROM embedding_cache"))).toBe(0);
     expect(Number(target.raw.selectValue("SELECT count(*) FROM cache_artifact_receipts"))).toBe(1);
     source.db.close();
     target.db.close();
@@ -709,7 +710,13 @@ describe("cache-only SQLite shards", () => {
       dimensions,
     });
     await applyTestLexicalRun(receiver, [{ path: "rpc.md", markdown: "RPC shard input" }]);
+    const before = await receiver.call("getState", {});
     await receiver.call("ingestCacheShard", { bytes: shard.bytes, digest: shard.digest });
+    expect(await receiver.call("getState", {})).toMatchObject({
+      semanticHeadCount: 0,
+      lexicalGeneration: before.lexicalGeneration,
+      semanticGeneration: before.semanticGeneration,
+    });
     const cached = await receiver.call("prepareSemanticWork", {
       embeddingFingerprint: profile,
       limit: 8,

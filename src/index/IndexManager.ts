@@ -13,11 +13,7 @@ import {
   INDEX_SCHEMA_VERSION,
 } from "@/index/chunking";
 import type { RetrievalResult } from "@/index/retrieval/contracts";
-import type {
-  PublicationInspection,
-  PublicationPrepared,
-  SqliteState,
-} from "@/index/sqlite/protocol";
+import type { SqliteState } from "@/index/sqlite/protocol";
 import { NOOP_TRAMA_DIAGNOSTICS, type TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import type { VaultRetrievalPort } from "@/index/VaultSearch";
 import type {
@@ -28,7 +24,6 @@ import type {
   IndexPathMutation,
   IndexSyncResult,
   IndexVaultPort,
-  PublicationInspector,
   RelatedIndexHit,
   RelatedIndexState,
   SemanticPrepareResult,
@@ -39,6 +34,7 @@ import { LexicalSnapshotService } from "./manager/lexical-snapshot";
 import { PublicationService } from "./manager/publication";
 import { RetrievalService } from "./manager/retrieval";
 import { IndexRuntime } from "./manager/runtime";
+import { EmbeddingResolver } from "./manager/embedding-resolver";
 import { SemanticCoordinator } from "./manager/semantic";
 
 export type {
@@ -49,7 +45,6 @@ export type {
   IndexSyncResult,
   IndexVaultDocument,
   IndexVaultPort,
-  PublicationInspector,
   RelatedIndexHit,
   RelatedIndexState,
   SemanticPrepareResult,
@@ -118,9 +113,10 @@ export class IndexManager implements VaultRetrievalPort {
     this.runtime = new IndexRuntime(vault, this.fingerprintValue, this.options, diagnostics);
     const snapshots = new LexicalSnapshotService(this.runtime, this.journal);
     this.lexical = new LexicalCoordinator(this.runtime, this.journal, snapshots);
-    this.semantic = new SemanticCoordinator(this.runtime, this.journal, this.embedding);
+    const resolver = new EmbeddingResolver(this.runtime, this.embedding);
+    this.semantic = new SemanticCoordinator(this.runtime, this.journal, resolver);
     this.publication = new PublicationService(this.runtime);
-    this.retrieval = new RetrievalService(this.runtime, this.embedding);
+    this.retrieval = new RetrievalService(this.runtime, resolver);
   }
 
   configureDiagnostics(): Promise<void> {
@@ -227,19 +223,6 @@ export class IndexManager implements VaultRetrievalPort {
   hasCompatibleSemanticVectors(): boolean {
     return this.semantic.hasCompatibleSemanticVectors();
   }
-  embeddingProfiles() {
-    return this.runtime.state?.embeddingProfiles ?? [];
-  }
-  activeEmbeddingProfile(): string {
-    return this.runtime.state?.embeddingFingerprint ?? "";
-  }
-  async selectEmbeddingProfile(fingerprint: string): Promise<void> {
-    if (!this.runtime.loaded) await this.runtime.load();
-    const state = (await this.runtime
-      .ensureClient()
-      .call("selectEmbeddingProfile", { fingerprint })) as SqliteState;
-    this.runtime.setState(state);
-  }
   hasPendingSemanticWork(): boolean {
     return this.semantic.hasPendingSemanticWork();
   }
@@ -254,13 +237,6 @@ export class IndexManager implements VaultRetrievalPort {
   }
   promoteCachedSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
     return this.semantic.promoteCachedSemantic(signal);
-  }
-  publishPublication<T>(
-    publicationId: string,
-    install: (prepared: PublicationPrepared, inspect?: PublicationInspector) => Promise<T>,
-    settle: (committed: boolean) => Promise<void> = async () => undefined
-  ): Promise<{ prepared: PublicationPrepared; installed: T }> {
-    return this.publication.publishPublication(publicationId, install, settle);
   }
   prepareCacheShard(
     afterActionKey?: string,
@@ -281,17 +257,11 @@ export class IndexManager implements VaultRetrievalPort {
       now
     );
   }
+  listCacheReceipts(digests: readonly string[]) {
+    return this.publication.listCacheReceipts(digests);
+  }
   ingestCacheShard(bytes: ArrayBuffer, digest: string) {
     return this.publication.ingestCacheShard(bytes, digest);
-  }
-  extractLegacyCacheShard(bytes: ArrayBuffer | undefined, digest: string, afterActionKey?: string) {
-    return this.publication.extractLegacyCacheShard(bytes, digest, afterActionKey);
-  }
-  hasLegacyCacheSource(digest: string) {
-    return this.publication.hasLegacyCacheSource(digest);
-  }
-  markLegacyCacheSource(digest: string) {
-    return this.publication.markLegacyCacheSource(digest);
   }
   maintainCache(now: number) {
     return this.publication.maintainCache(now);
@@ -316,19 +286,6 @@ export class IndexManager implements VaultRetrievalPort {
   }
   completeCacheRetirement(sourceDigest: string, now: number) {
     return this.publication.completeCacheRetirement(sourceDigest, now);
-  }
-  inspectPublication(
-    bytes: ArrayBuffer,
-    transferOwnership = false
-  ): Promise<PublicationInspection> {
-    return this.publication.inspectPublication(bytes, transferOwnership);
-  }
-  adoptPublication(
-    bytes: ArrayBuffer,
-    expectedPublicationId?: string,
-    inspection?: PublicationInspection
-  ): Promise<SqliteState> {
-    return this.publication.adoptPublication(bytes, expectedPublicationId, inspection);
   }
   search(
     query: string,

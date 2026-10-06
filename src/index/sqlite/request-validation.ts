@@ -11,7 +11,6 @@ import {
   SQLITE_MAX_SEMANTIC_VECTOR_BYTES,
   SQLITE_MAX_TEXT,
   SQLITE_PROTOCOL_VERSION,
-  SQLITE_SNAPSHOT_MAX_BYTES,
   isSqliteMethod,
   sqliteError,
   type SqliteEmbeddingResult,
@@ -90,11 +89,6 @@ function validBatchNote(value: unknown): value is SqliteLexicalBatchNoteInput {
       (Number.isSafeInteger(note.size) && note.size >= 1 && note.size <= SQLITE_MAX_TEXT))
   );
 }
-function validPublicationId(value: unknown): value is string {
-  return (
-    typeof value === "string" && value.length > 0 && value.length <= 256 && !value.includes("\0")
-  );
-}
 function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean {
   return (
     value === undefined ||
@@ -103,9 +97,6 @@ function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean
 }
 function validOptionalGeneration(value: unknown): boolean {
   return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
-}
-function validGeneration(value: unknown): boolean {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 function validOptionalDimensions(value: unknown): boolean {
   return (
@@ -119,14 +110,6 @@ function validOptionalResultLimit(value: unknown): boolean {
     (Number.isSafeInteger(value) &&
       (value as number) >= 0 &&
       (value as number) <= SQLITE_MAX_RESULTS)
-  );
-}
-function validSnapshotExpectations(value: Record<string, any>): boolean {
-  return (
-    (value.corpusFingerprint === undefined || validHash(value.corpusFingerprint)) &&
-    (value.embeddingFingerprint === undefined || validHash(value.embeddingFingerprint)) &&
-    validOptionalText(value.buildIdentity, 256) &&
-    validOptionalDimensions(value.dimensions)
   );
 }
 function assertNever(value: never): never {
@@ -323,42 +306,6 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       )
         throw sqliteError("invalid_request", "Invalid related payload");
       return;
-    case "preparePublication":
-      if (!validPublicationId(value.publicationId))
-        throw sqliteError("invalid_request", "Invalid publication ID");
-      return;
-    case "finalizePublication":
-      if (
-        !validPublicationId(value.publicationId) ||
-        !Number.isSafeInteger(value.expectedChangeCounter) ||
-        value.expectedChangeCounter < 0 ||
-        !validGeneration(value.expectedLexicalGeneration) ||
-        !validGeneration(value.expectedSemanticGeneration)
-      )
-        throw sqliteError("invalid_request", "Invalid publication finalization payload");
-      return;
-    case "inspectPublication":
-    case "adoptPublication":
-      if (
-        !(value.bytes instanceof ArrayBuffer) ||
-        value.bytes.byteLength === 0 ||
-        value.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES ||
-        (value.expectedPublicationId !== undefined &&
-          !validPublicationId(value.expectedPublicationId)) ||
-        (value.inspection !== undefined &&
-          (!value.inspection ||
-            typeof value.inspection !== "object" ||
-            value.inspection.valid !== true ||
-            !validPublicationId(value.inspection.publicationId) ||
-            !value.inspection.state ||
-            typeof value.inspection.state !== "object" ||
-            !Number.isSafeInteger(value.inspection.byteSize) ||
-            value.inspection.byteSize < 1 ||
-            value.inspection.byteSize > SQLITE_SNAPSHOT_MAX_BYTES)) ||
-        !validSnapshotExpectations(value)
-      )
-        throw sqliteError("invalid_request", "Invalid publication bytes");
-      return;
     case "prepareCacheShard":
       if (
         (value.afterActionKey !== undefined &&
@@ -381,6 +328,14 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       )
         throw sqliteError("invalid_request", "Invalid cache shard cursor");
       return;
+    case "listCacheReceipts":
+      if (
+        !Array.isArray(value.digests) ||
+        value.digests.length > 512 ||
+        !value.digests.every(validHash)
+      )
+        throw sqliteError("invalid_request", "Invalid cache receipt digests");
+      return;
     case "ingestCacheShard":
       if (
         !(value.bytes instanceof ArrayBuffer) ||
@@ -389,24 +344,6 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
         !validHash(value.digest)
       )
         throw sqliteError("invalid_request", "Invalid cache shard payload");
-      return;
-    case "extractLegacyCacheShard":
-      if (
-        !validHash(value.digest) ||
-        (value.bytes !== undefined &&
-          (!(value.bytes instanceof ArrayBuffer) ||
-            value.bytes.byteLength === 0 ||
-            value.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES)) ||
-        (value.afterActionKey !== undefined &&
-          (typeof value.afterActionKey !== "string" ||
-            value.afterActionKey.length > SQLITE_MAX_TEXT))
-      )
-        throw sqliteError("invalid_request", "Invalid legacy cache extraction payload");
-      return;
-    case "hasLegacyCacheSource":
-    case "markLegacyCacheSource":
-      if (!validHash(value.digest))
-        throw sqliteError("invalid_request", "Invalid legacy cache receipt");
       return;
     case "maintainCache":
       if (!Number.isSafeInteger(value.now) || value.now < 0)

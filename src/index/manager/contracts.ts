@@ -1,6 +1,6 @@
 import type { IndexCapabilities, IndexFreshness, IndexProgress } from "@/domain/contracts";
 import type { SqliteWorkerClient, SqliteWorkerLike } from "@/index/sqlite/client";
-import type { PublicationInspection, SqliteState } from "@/index/sqlite/protocol";
+import type { SqliteState } from "@/index/sqlite/protocol";
 
 export interface IndexVaultDocument {
   readonly path: string;
@@ -48,7 +48,6 @@ export interface RelatedIndexState {
   readonly contentHash: string;
   readonly semantic?: IndexCapabilities["semantic"];
   readonly freshness?: IndexFreshness;
-  readonly publicationId?: string;
 }
 
 export interface SnapshotDataAdapter {
@@ -92,11 +91,6 @@ export interface SemanticPrepareResult extends IndexOperationResult {
   readonly skipped: number;
 }
 
-export type PublicationInspector = (
-  bytes: ArrayBuffer,
-  transferOwnership?: boolean
-) => Promise<PublicationInspection>;
-
 export interface IndexManagerOptions {
   readonly size?: number;
   readonly overlap?: number;
@@ -123,5 +117,4 @@ export interface VaultSearchState {
   readonly generationId: string;
   readonly semantic: IndexCapabilities["semantic"];
   readonly freshness: IndexFreshness;
-  readonly publicationId?: string;
 }

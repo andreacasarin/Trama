@@ -299,11 +299,12 @@ export async function ingestCacheShard(
   pool: CacheShardPool,
   bytes: ArrayBuffer,
   expectedDigest: string,
-  _dimensions: number,
-  _activeProfile: string
+  dimensions: number,
+  activeProfile: string
 ): Promise<{
   readonly imported: number;
   readonly duplicate: boolean;
+  readonly ignored?: boolean;
   readonly profile: string;
   readonly taskKind: "document" | "query";
 }> {
@@ -318,7 +319,7 @@ export async function ingestCacheShard(
     [digest]
   )[0];
   const duplicate = Boolean(receipt);
-  if (receipt) {
+  if (receipt && (!activeProfile || receipt.profile === activeProfile)) {
     const membership = rows(
       target,
       "SELECT DISTINCT task_kind,profile FROM cache_shard_membership WHERE digest=? LIMIT 2",
@@ -360,6 +361,22 @@ export async function ingestCacheShard(
       (meta.endpoint_origin !== "" && !/^https?:\/\/[^/?#@]+$/i.test(meta.endpoint_origin))
     )
       throw sqliteError("incompatible_state", "Cache shard profile is incompatible");
+    if (
+      activeProfile &&
+      (String(meta.profile) !== activeProfile || Number(meta.dimensions) !== dimensions)
+    ) {
+      target.exec({
+        sql: "INSERT OR IGNORE INTO cache_artifact_receipts(digest,profile,received_at) VALUES(?,?,?)",
+        bind: [digest, String(meta.profile), Date.now()],
+      });
+      return {
+        imported: 0,
+        duplicate: false,
+        ignored: true,
+        profile: String(meta.profile),
+        taskKind: meta.task_kind as "document" | "query",
+      };
+    }
     const columns = new Set(
       rows(candidate, "PRAGMA table_info(cache_vectors)").map((row) => String(row.name))
     );

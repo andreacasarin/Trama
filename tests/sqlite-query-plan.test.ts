@@ -27,8 +27,8 @@ const bulkRowsSql = (embeddingFingerprint: string) => `
     SELECT 100000+i,100000+i,printf('%064x',i),1,2,0 FROM seq;
   UPDATE notes SET lexical_revision_id=note_id;
   WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i<2000)
-  INSERT INTO chunk_occurrences(occurrence_id,revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,heading_context,embedding_input,embedding_input_digest,body)
-    SELECT 100000+i,100000+i,100000+i,printf('bulk-chunk-%04d',i),0,'paragraph',1,1,'bulk', '[]', 'bulk-input-'||i, 'bulk-input-'||i, 'bulk' FROM seq;
+  INSERT INTO chunk_occurrences(occurrence_id,revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,embedding_input_digest)
+    SELECT 100000+i,100000+i,100000+i,printf('bulk-chunk-%04d',i),0,'paragraph',1,1,'bulk', 'bulk-input-'||i FROM seq;
   WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i<2000)
   INSERT INTO embedding_inputs(input_id,embedding_fingerprint,serialized_input,preprocessing,action_key)
     SELECT 100000+i,'${embeddingFingerprint}','bulk-input-'||i,'normalized-float32-v1','bulk-input-'||i FROM seq;

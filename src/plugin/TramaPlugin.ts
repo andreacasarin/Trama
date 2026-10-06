@@ -139,6 +139,8 @@ export class TramaPlugin extends Plugin {
         rebuild: () => this.rebuildIndex(),
         reset: () => this.resetIndexes(),
         clearShared: () => this.clearIndexesAndSharedCache(),
+        share: () => this.publishIndex(),
+        importShared: () => this.checkPublication(),
         stop: () => this.maintenance?.stop(),
       },
       this.diagnostics
@@ -192,7 +194,7 @@ export class TramaPlugin extends Plugin {
       return;
     }
     const accepted = globalThis.confirm?.(
-      "Reset all local and published indexes for this vault? Notes, settings, credentials, and identity will be preserved. Automatic maintenance will rebuild indexes if enabled."
+      "Reset local search data for this vault? Notes and settings will be preserved, and shared embeddings will remain available. Scheduled maintenance will rebuild local search data if enabled."
     );
     if (!accepted) return;
     this.benchmarkResetting = true;
@@ -209,7 +211,7 @@ export class TramaPlugin extends Plugin {
       return;
     }
     const accepted = globalThis.confirm?.(
-      "Clear all local indexes and shared cache data for this vault? Notes, settings, credentials, and identity will be preserved."
+      "Clear local search data and shared embeddings for this vault? Notes and settings will be preserved."
     );
     if (!accepted) return;
     this.benchmarkResetting = true;
@@ -228,7 +230,6 @@ export class TramaPlugin extends Plugin {
     if (!manager || !scheduler || !publication) throw new Error("Index is not initialized.");
     await scheduler.resetExclusive(async () => {
       await manager.resetLocalDatabase();
-      await publication.store.clear();
       if (clearGeneratedContributions) await publication.store.clearCacheShards();
       manager.requestFullRecovery();
     });
@@ -452,26 +453,6 @@ export class TramaPlugin extends Plugin {
     }));
   }
 
-  getEmbeddingProfiles() {
-    return this.index?.embeddingProfiles() ?? [];
-  }
-
-  getActiveEmbeddingProfile(): string {
-    return this.index?.activeEmbeddingProfile() ?? "";
-  }
-
-  selectEmbeddingProfile(fingerprint: string): Promise<void> {
-    return (async () => {
-      const index = this.index;
-      if (!index) throw new Error("Index is unavailable.");
-      await index.selectEmbeddingProfile(fingerprint);
-      await index.promoteCachedSemantic(new AbortController().signal);
-      this.updateIndexCapabilities(index);
-      const app = (this as unknown as { app?: any }).app;
-      this.modelRuntime.refreshOpenRelatedSuggestions(app);
-    })();
-  }
-
   private composeRuntime(app: any, settings: TramaSettings): void {
     this.indexLoadResult = undefined;
     const compositionRevision = ++this.compositionRevision;
@@ -632,6 +613,8 @@ export class TramaPlugin extends Plugin {
     this.clearPublicationWarning("check");
     if (!result.adopted) return;
     this.updateIndexCapabilities(manager);
+    if (this.getSettings().automaticMaintenance && !this.maintenance?.snapshot.suspended)
+      this.maintenance?.invalidate();
     const snapshot = this.maintenance?.snapshot;
     if (snapshot?.pending || snapshot?.lane !== "idle") return;
     if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
@@ -675,8 +658,8 @@ export class TramaPlugin extends Plugin {
     }
     const message =
       origin === "check"
-        ? `Synchronized index ${warning.phase === "adopt" ? "adoption" : "check"} failed: ${warning.message}`
-        : `Index saved locally, but publication failed: ${warning.message}`;
+        ? `Shared embeddings ${warning.phase === "adopt" ? "import" : "check"} failed: ${warning.message}`
+        : `Search data saved locally, but sharing embeddings failed: ${warning.message}`;
     this.publicationWarnings[origin] = message;
     this.projectPublicationWarning();
   }
@@ -697,9 +680,8 @@ export class TramaPlugin extends Plugin {
   private notifyPublicationFileEvent(path: string): void {
     const store = this.publicationManager?.store;
     if (
-      path === store?.path ||
-      (path.startsWith(`${store?.cacheDirectory}/cache-`) &&
-        /^cache-[0-9a-f]{64}\.sqlite3$/.test(path.slice(path.lastIndexOf("/") + 1)))
+      path.startsWith(`${store?.cacheDirectory}/cache-`) &&
+      /^cache-[0-9a-f]{64}\.sqlite3$/.test(path.slice(path.lastIndexOf("/") + 1))
     )
       this.queuePublicationEventCheck();
   }

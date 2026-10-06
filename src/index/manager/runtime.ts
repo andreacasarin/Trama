@@ -170,7 +170,6 @@ export class IndexRuntime {
       lexical: lexicalIndex.status(this.state, available, this.building),
       semantic: semanticIndex.status(this.state, available, this.preparing),
       freshness: this.freshness,
-      ...(this.state?.publicationId ? { publicationId: this.state.publicationId } : {}),
     };
   }
 
@@ -233,11 +232,7 @@ export class IndexRuntime {
         identity: await sha256Hex(sqliteIdentity),
       })) as SqliteState;
       this.setState(state);
-      this.freshness = state.snapshotLoaded
-        ? "snapshot-loaded"
-        : state.incomplete
-          ? "unknown"
-          : "locally-reconciled";
+      this.freshness = state.incomplete ? "unknown" : "locally-reconciled";
       this.unavailable = false;
       this.loadError = undefined;
       if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))

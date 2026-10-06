@@ -87,7 +87,6 @@ export class SqliteWorkerClient {
     payload: SqliteRequestPayloads[M],
     signal?: AbortSignal,
     options: {
-      readonly transferOwnedBytes?: boolean;
       readonly diagnosticOperationId?: string;
       readonly diagnosticParentOperationId?: string;
       readonly diagnosticBatchId?: string;
@@ -151,14 +150,7 @@ export class SqliteWorkerClient {
       this.pending.set(id, { resolve, reject, cleanup });
       signal?.addEventListener("abort", onAbort!, { once: true });
       try {
-        if (options.transferOwnedBytes && method !== "inspectPublication")
-          throw new Error("Only staged publication inspection can transfer ownership");
-        const copied = options.transferOwnedBytes
-          ? {
-              request,
-              transfer: [(payload as SqliteRequestPayloads["inspectPublication"]).bytes],
-            }
-          : cloneRequest(request);
+        const copied = cloneRequest(request);
         this.worker!.postMessage(copied.request, copied.transfer);
       } catch (error) {
         settled = true;

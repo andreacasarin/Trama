@@ -23,7 +23,7 @@ export interface SqliteDiagnosticEventMessage {
   readonly record: TramaPerformanceRecord;
 }
 
-export const SQLITE_PROTOCOL_VERSION = 12 as const;
+export const SQLITE_PROTOCOL_VERSION = 13 as const;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
 // Character bound is conservative; hashMarkdown enforces the exact 16 MiB UTF-8 bound.
@@ -35,7 +35,6 @@ export const SQLITE_MAX_RESULTS = 256;
 export const SQLITE_MAX_SEMANTIC_BATCH_ITEMS = 128;
 export const SQLITE_MAX_SEMANTIC_INPUT_BYTES = 4 * 1024 * 1024;
 export const SQLITE_MAX_SEMANTIC_VECTOR_BYTES = 8 * 1024 * 1024;
-export const SQLITE_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 /** Bounds for one additive bounded lexical operation. */
 export const SQLITE_MAX_LEXICAL_BATCH_NOTES = 16;
 export const SQLITE_MAX_LEXICAL_BATCH_MARKDOWN_BYTES = 8 * 1024 * 1024;
@@ -59,15 +58,9 @@ export const SQLITE_METHODS = [
   "clearSemanticCache",
   "retrieve",
   "findRelated",
-  "preparePublication",
-  "finalizePublication",
-  "inspectPublication",
-  "adoptPublication",
   "prepareCacheShard",
   "ingestCacheShard",
-  "extractLegacyCacheShard",
-  "hasLegacyCacheSource",
-  "markLegacyCacheSource",
+  "listCacheReceipts",
   "maintainCache",
   "recordCacheShard",
   "recordCacheRetirements",
@@ -185,9 +178,8 @@ export interface SqliteState {
   readonly dimensions: number;
   readonly corpusFingerprint: string;
   readonly embeddingFingerprint: string;
-  readonly embeddingProfiles: readonly EmbeddingProfile[];
+  readonly semanticRebuildRequired?: boolean;
   readonly incomplete: boolean;
-  readonly snapshotLoaded: boolean;
   readonly changeCounter: number;
   readonly lexicalGeneration: number;
   readonly semanticGeneration: number;
@@ -202,14 +194,6 @@ export interface SqliteState {
   readonly semanticHeadCount: number;
   readonly semanticLagCount: number;
   readonly semanticMissingCount: number;
-  readonly publicationId?: string;
-}
-export interface EmbeddingProfile {
-  readonly fingerprint: string;
-  readonly dimensions: number;
-  readonly modelId: string;
-  readonly endpointOrigin: string;
-  readonly vectorCount: number;
 }
 export interface SqliteNoteSummary {
   readonly path: string;
@@ -250,20 +234,6 @@ export interface SqliteHit {
   readonly text: string;
   readonly startLine: number;
   readonly endLine: number;
-}
-export interface PublicationPrepared {
-  readonly publicationId: string;
-  readonly state: SqliteState;
-  readonly bytes: ArrayBuffer;
-  readonly byteSize: number;
-  readonly durationMs: number;
-  readonly copyBytes: number;
-}
-export interface PublicationInspection {
-  readonly valid: true;
-  readonly publicationId: string;
-  readonly state: SqliteState;
-  readonly byteSize: number;
 }
 
 export interface SqliteRequestPayloads {
@@ -328,30 +298,6 @@ export interface SqliteRequestPayloads {
     readonly expectedEmbeddingFingerprint?: string;
   };
   findRelated: { readonly path: string; readonly vector?: Float32Array; readonly limit: number };
-  preparePublication: { readonly publicationId: string };
-  finalizePublication: {
-    readonly publicationId: string;
-    readonly expectedChangeCounter: number;
-    readonly expectedLexicalGeneration: number;
-    readonly expectedSemanticGeneration: number;
-  };
-  inspectPublication: {
-    readonly bytes: ArrayBuffer;
-    readonly corpusFingerprint?: string;
-    readonly embeddingFingerprint?: string;
-    readonly buildIdentity?: string;
-    readonly dimensions?: number;
-  };
-  adoptPublication: {
-    readonly bytes: ArrayBuffer;
-    readonly expectedPublicationId?: string;
-    /** Candidate was validated by inspectPublication on the same byte buffer. */
-    readonly inspection?: PublicationInspection;
-    readonly corpusFingerprint?: string;
-    readonly embeddingFingerprint?: string;
-    readonly buildIdentity?: string;
-    readonly dimensions?: number;
-  };
   prepareCacheShard: {
     readonly afterActionKey?: string;
     readonly taskKind?: "document" | "query";
@@ -362,13 +308,7 @@ export interface SqliteRequestPayloads {
     readonly now?: number;
   };
   ingestCacheShard: { readonly bytes: ArrayBuffer; readonly digest: string };
-  extractLegacyCacheShard: {
-    readonly bytes?: ArrayBuffer;
-    readonly digest: string;
-    readonly afterActionKey?: string;
-  };
-  hasLegacyCacheSource: { readonly digest: string };
-  markLegacyCacheSource: { readonly digest: string };
+  listCacheReceipts: { readonly digests: readonly string[] };
   maintainCache: { readonly now: number };
   recordCacheShard: {
     readonly digest: string;

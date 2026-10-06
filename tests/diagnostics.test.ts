@@ -156,29 +156,14 @@ describe("diagnostic timing", () => {
     });
   });
 
-  it("allows only the bounded publication snapshot phase names", () => {
+  it("allows the current bounded indexing phase names", () => {
     const records: any[] = [];
     const diagnostics = createTramaDiagnostics(
       () => "performance",
       (record) => records.push(record),
       { sessionId: "publication-phases" }
     );
-    const phases = [
-      "snapshotValidation",
-      "snapshotLiveExport",
-      "snapshotCandidateImport",
-      "snapshotBootPrune",
-      "snapshotCandidateExport",
-      "snapshotLiveReopen",
-      "snapshotIntegrityCheck",
-      "snapshotForeignKeyCheck",
-      "snapshotPointerOwnership",
-      "snapshotFtsCoverage",
-      "snapshotSemanticCoverage",
-      "snapshotVectorValidation",
-      "lexicalInputPreparation",
-      "lexicalSqlMutation",
-    ];
+    const phases = ["lexicalInputPreparation", "lexicalSqlMutation"];
     for (const phase of phases)
       diagnostics.emit({
         tier: "performance",

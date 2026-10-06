@@ -13,13 +13,10 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 // @ts-expect-error The installer is an executable ESM script without a project declaration file.
 import { installPlugin } from "../scripts/install-plugin.mjs";
-// @ts-expect-error The benchmark host is executable JavaScript without declarations.
-import { benchmarkVaultName } from "../scripts/benchmark/obsidian.mjs";
 
 const runtimeFiles = [
   "main.js",
@@ -37,121 +34,6 @@ async function digest(file: string): Promise<string> {
 }
 
 describe("plugin installer", () => {
-  it("upgrades only the recognized legacy generated corpus and preserves vault state", async () => {
-    const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama-upgrade-"));
-    try {
-      for (const name of ["scripts", "src", "test-vaults", "tsconfig.json"])
-        await cp(path.join(process.cwd(), name), path.join(project, name), { recursive: true });
-      await symlink(path.resolve("node_modules"), path.join(project, "node_modules"), "dir");
-      const host = await import(
-        pathToFileURL(path.join(project, "scripts/benchmark/obsidian.mjs")).href
-      );
-      const benchmark = path.join(project, ".artifacts/test-vaults/benchmark", benchmarkVaultName);
-      const markerPath = path.join(benchmark, ".trama-benchmark-vault");
-      const reportPath = path.join(benchmark, ".trama-benchmark-report.json");
-      const reportBytes = Buffer.from("old report bytes, including an incomplete run");
-      const settingsPath = path.join(benchmark, ".obsidian/plugins/trama/data.json");
-      const pluginPath = path.join(benchmark, ".obsidian/plugins/trama/main.js");
-      const sharedPath = path.join(benchmark, "Trama/index/shared.sqlite3");
-      const oldNote = path.join(benchmark, "notes/00003/note-3.md");
-      const preservedNoteFile = path.join(benchmark, "notes/00003/keep.bin");
-      const marker = {
-        version: "trama-obsidian-vault-v1",
-        runId: "8cec312c-71e4-499d-88ce-d3be2dabbafb",
-        vaultName: benchmarkVaultName,
-        expectedPath: benchmark,
-        profile: "trama-10k",
-        noteCount: 1100,
-        targetChunks: 10000,
-      };
-      await mkdir(path.dirname(settingsPath), { recursive: true });
-      await mkdir(path.dirname(sharedPath), { recursive: true });
-      await mkdir(path.dirname(oldNote), { recursive: true });
-      await mkdir(path.join(benchmark, "mutations"), { recursive: true });
-      await writeFile(markerPath, `${JSON.stringify(marker)}\n`);
-      await writeFile(reportPath, reportBytes);
-      await writeFile(settingsPath, "preserve settings bytes\n");
-      await writeFile(pluginPath, "preserve installed plugin bytes\n");
-      await writeFile(path.join(benchmark, ".obsidian/community-plugins.json"), '["trama"]\n');
-      await writeFile(sharedPath, "preserve shared cache bytes\n");
-      await writeFile(oldNote, "old generated markdown\n");
-      await writeFile(preservedNoteFile, "preserve non-markdown bytes\n");
-      await writeFile(path.join(benchmark, "mutations/added.md"), "known generated mutation\n");
-
-      await expect(host.upgradeLegacyGeneratedVault(benchmark, benchmarkVaultName)).resolves.toBe(
-        true
-      );
-      const upgraded = JSON.parse(await readFile(markerPath, "utf8"));
-      expect(upgraded).toMatchObject({ version: "trama-simple-benchmark-v1", noteCount: 3000 });
-      const noteEntries = await readdir(path.join(benchmark, "notes"));
-      const generatedNotes = noteEntries.filter((entry) => /^\d{4}\.md$/.test(entry));
-      expect(generatedNotes).toHaveLength(3000);
-      expect(generatedNotes[0]).toBe("0000.md");
-      expect(generatedNotes.at(-1)).toBe("2999.md");
-      expect(noteEntries).toContain("00003");
-      await expect(readFile(oldNote, "utf8")).rejects.toThrow();
-      await expect(readFile(preservedNoteFile, "utf8")).resolves.toBe(
-        "preserve non-markdown bytes\n"
-      );
-      await expect(readFile(settingsPath, "utf8")).resolves.toBe("preserve settings bytes\n");
-      await expect(readFile(pluginPath, "utf8")).resolves.toBe("preserve installed plugin bytes\n");
-      await expect(readFile(sharedPath, "utf8")).resolves.toBe("preserve shared cache bytes\n");
-      await expect(
-        readFile(path.join(benchmark, ".obsidian/community-plugins.json"), "utf8")
-      ).resolves.toBe('["trama"]\n');
-      await expect(readFile(reportPath)).rejects.toThrow();
-      const archived = await readdir(path.join(project, ".artifacts/benchmarks/archive"));
-      expect(archived).toHaveLength(1);
-      await expect(
-        readFile(path.join(project, ".artifacts/benchmarks/archive", archived[0]))
-      ).resolves.toEqual(reportBytes);
-      const markerBytes = await readFile(markerPath);
-      await expect(host.upgradeLegacyGeneratedVault(benchmark, benchmarkVaultName)).resolves.toBe(
-        false
-      );
-      await expect(readFile(markerPath)).resolves.toEqual(markerBytes);
-      expect(await readdir(path.join(project, ".artifacts/benchmarks/archive"))).toEqual(archived);
-    } finally {
-      await rm(project, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("rejects an unknown Markdown path before any upgrade mutation", async () => {
-    const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama-upgrade-refusal-"));
-    try {
-      for (const name of ["scripts", "src", "test-vaults", "tsconfig.json"])
-        await cp(path.join(process.cwd(), name), path.join(project, name), { recursive: true });
-      await symlink(path.resolve("node_modules"), path.join(project, "node_modules"), "dir");
-      const host = await import(
-        pathToFileURL(path.join(project, "scripts/benchmark/obsidian.mjs")).href
-      );
-      const benchmark = path.join(project, ".artifacts/test-vaults/benchmark", benchmarkVaultName);
-      const markerPath = path.join(benchmark, ".trama-benchmark-vault");
-      const marker = {
-        version: "trama-obsidian-vault-v1",
-        runId: "8cec312c-71e4-499d-88ce-d3be2dabbafb",
-        vaultName: benchmarkVaultName,
-        expectedPath: benchmark,
-        profile: "trama-10k",
-        noteCount: 1100,
-        targetChunks: 10000,
-      };
-      await mkdir(benchmark, { recursive: true });
-      await writeFile(markerPath, `${JSON.stringify(marker)}\n`);
-      await writeFile(path.join(benchmark, "personal.md"), "unknown\n");
-      const beforeMarker = await readFile(markerPath);
-      const beforeNote = await readFile(path.join(benchmark, "personal.md"));
-      await expect(host.upgradeLegacyGeneratedVault(benchmark, benchmarkVaultName)).rejects.toThrow(
-        "outside the recognized generated corpus"
-      );
-      await expect(readFile(markerPath)).resolves.toEqual(beforeMarker);
-      await expect(readFile(path.join(benchmark, "personal.md"))).resolves.toEqual(beforeNote);
-      await expect(readdir(path.join(project, ".artifacts/benchmarks"))).rejects.toThrow();
-    } finally {
-      await rm(project, { recursive: true, force: true });
-    }
-  }, 60_000);
-
   it("creates both vaults from a clean checkout and preserves them on subsequent CLI installs", async () => {
     const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama-install-"));
     try {

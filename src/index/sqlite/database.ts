@@ -28,7 +28,6 @@ import { LexicalRunRegistry } from "./lexical-context";
 import { SqliteLexicalBatchStore } from "./lexical-batch";
 import { SqliteLexicalStagingStore } from "./lexical-staging";
 import { SqliteLexicalRunStore } from "./lexical-runs";
-import { SqlitePublicationStore, type SnapshotValidationPhase } from "./publication";
 import { literalTerms, SqliteRetrieval } from "./retrieval";
 import { SqliteSemanticStore } from "./semantic";
 import {
@@ -47,7 +46,6 @@ export { SQLITE_VECTOR_NORMALIZATION_TOLERANCE, literalTerms };
 export class MutableSqliteDatabase {
   private readonly context: SqliteContext;
   private readonly state: SqliteStateStore;
-  private readonly publication: SqlitePublicationStore;
   private readonly registry = new LexicalRunRegistry();
   private readonly lexicalBatch: SqliteLexicalBatchStore;
   private readonly lexicalStaging: SqliteLexicalStagingStore;
@@ -72,7 +70,6 @@ export class MutableSqliteDatabase {
   ) {
     this.context = new SqliteContext(db);
     this.state = new SqliteStateStore(this.context);
-    this.publication = new SqlitePublicationStore(this.context, this.state);
     this.lexicalBatch = new SqliteLexicalBatchStore(this.context, this.registry);
     this.lexicalStaging = new SqliteLexicalStagingStore(
       this.context,
@@ -238,6 +235,16 @@ export class MutableSqliteDatabase {
     );
   }
 
+  listCacheReceipts(digests: readonly string[]): { digest: string; profile: string }[] {
+    if (!digests.length) return [];
+    return rows(
+      this.context.db,
+      `SELECT digest,profile FROM cache_artifact_receipts
+      WHERE digest IN (${digests.map(() => "?").join(",")})`,
+      digests
+    ).map((row) => ({ digest: String(row.digest), profile: String(row.profile) }));
+  }
+
   ingestCacheShard(pool: CacheShardPool, bytes: ArrayBuffer, digest: string) {
     return ingestCacheShard(
       this.context.db,
@@ -247,24 +254,8 @@ export class MutableSqliteDatabase {
       this.context.dimensions,
       this.context.embeddingFingerprint
     ).then((result) => {
-      if (!result.duplicate) this.state.reconcileImportedEmbeddingProfiles();
+      if (!result.duplicate && !result.ignored) this.state.reconcileImportedEmbeddingProfiles();
       return result;
-    });
-  }
-
-  hasLegacyCacheSource(digest: string): boolean {
-    return (
-      rows(this.context.db, "SELECT 1 FROM cache_legacy_sources WHERE digest=?", [digest]).length >
-      0
-    );
-  }
-
-  markLegacyCacheSource(digest: string): void {
-    transaction(this.context.db, () => {
-      this.context.db.exec({
-        sql: "INSERT INTO cache_legacy_sources(digest,extracted_at) VALUES(?,?) ON CONFLICT(digest) DO NOTHING",
-        bind: [digest, Date.now()],
-      });
     });
   }
 
@@ -433,14 +424,6 @@ export class MutableSqliteDatabase {
     });
   }
 
-  validatePointerOwnership(): void {
-    this.publication.validatePointerOwnership();
-  }
-
-  pruneForPublication(): void {
-    this.publication.pruneForPublication();
-  }
-
   markIncomplete(): SqliteState {
     return this.state.markIncomplete();
   }
@@ -537,53 +520,22 @@ export class MutableSqliteDatabase {
     } = {}
   ): readonly SqliteHit[] {
     const currentVector =
-      options.expectedEmbeddingFingerprint &&
-      options.expectedEmbeddingFingerprint !== this.context.embeddingFingerprint
+      (this.context.configuredEmbeddingFingerprint &&
+        this.context.configuredEmbeddingFingerprint !== this.context.embeddingFingerprint) ||
+      (options.expectedEmbeddingFingerprint &&
+        options.expectedEmbeddingFingerprint !== this.context.embeddingFingerprint)
         ? undefined
         : vector;
     return this.retrieval.retrieve(query, currentVector, limit, currentPath, options);
   }
 
   findRelated(path: string, vector: Float32Array | undefined, limit: number): readonly SqliteHit[] {
+    if (
+      this.context.configuredEmbeddingFingerprint &&
+      this.context.configuredEmbeddingFingerprint !== this.context.embeddingFingerprint
+    )
+      return [];
     return this.retrieval.findRelated(path, vector, limit);
-  }
-
-  validateSnapshot(
-    corpusFingerprint: string,
-    dimensions: number,
-    embeddingFingerprint = this.context.embeddingFingerprint,
-    buildIdentity: string = SQLITE_BUILD_IDENTITY,
-    observer?: (phase: SnapshotValidationPhase, durationMs: number) => void
-  ): void {
-    this.publication.validateSnapshot(
-      corpusFingerprint,
-      dimensions,
-      embeddingFingerprint,
-      buildIdentity,
-      observer
-    );
-  }
-
-  finalizePublication(
-    publicationId: string,
-    expectedChangeCounter: number,
-    expectedLexicalGeneration: number,
-    expectedSemanticGeneration: number
-  ): SqliteState | undefined {
-    return this.publication.finalizePublication(
-      publicationId,
-      expectedChangeCounter,
-      expectedLexicalGeneration,
-      expectedSemanticGeneration
-    );
-  }
-
-  setPublicationId(publicationId: string): SqliteState {
-    return this.publication.setPublicationId(publicationId);
-  }
-
-  markSnapshotLoaded(): SqliteState {
-    return this.publication.markSnapshotLoaded();
   }
 
   close(): void {

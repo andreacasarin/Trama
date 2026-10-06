@@ -72,6 +72,15 @@ export class ModelRuntime {
     this.session?.replaceModel(model);
   }
 
+  async refreshOpenFilo(app: any): Promise<void> {
+    const leaves = app?.workspace?.getLeavesOfType?.("trama-filo") ?? [];
+    await Promise.allSettled(
+      leaves.map(async (leaf: { view?: { refreshRelatedSuggestions?: () => Promise<void> } }) => {
+        await leaf.view?.refreshRelatedSuggestions?.();
+      })
+    );
+  }
+
   refreshOpenRelatedSuggestions(app: any): void {
     if (!app?.workspace) return;
     for (const leaf of app.workspace.getLeavesOfType?.("trama-voce") ?? []) {

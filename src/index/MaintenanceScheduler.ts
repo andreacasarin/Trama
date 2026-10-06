@@ -25,11 +25,9 @@ export interface MaintenancePort {
   prepareSemantic(signal: AbortSignal, shouldYield?: () => boolean): Promise<SemanticPrepareResult>;
   rebuildSemantic(signal: AbortSignal, shouldYield?: () => boolean): Promise<SemanticPrepareResult>;
   rebuild(signal: AbortSignal): Promise<IndexOperationResult>;
+  refreshRelated?(signal: AbortSignal): Promise<void>;
   publish(shouldYield?: () => boolean): Promise<PublicationResult>;
-  adoptCurrent(
-    shouldYield?: () => boolean,
-    onCachePreparation?: () => void
-  ): Promise<AdoptionResult>;
+  adoptCurrent(shouldYield?: () => boolean): Promise<AdoptionResult>;
 }
 
 export type MaintenanceLane = "idle" | "automatic" | "update" | "rebuild" | "adoption";
@@ -198,7 +196,7 @@ export class MaintenanceScheduler {
     }
   }
 
-  /** Publishes the current converged index without repeating lexical or semantic work. */
+  /** Shares computed embeddings without repeating local indexing work. */
   async publishCurrent(): Promise<void> {
     if (this.disposed) return;
     if (this.resetIncomplete)
@@ -228,7 +226,7 @@ export class MaintenanceScheduler {
         throw result.warning.error instanceof Error
           ? result.warning.error
           : new Error(result.warning.message);
-      if (!result.published) throw new Error("Index publication did not complete.");
+      if (!result.published) throw new Error("Sharing embeddings did not complete.");
     } finally {
       this.queuedFenceCancels.delete(cancel);
       if (revision === this.manualRevision) {
@@ -298,22 +296,10 @@ export class MaintenanceScheduler {
         { adopted: false, ignored: "missing" },
         () =>
           this.port.adoptCurrent(
-            () => cancelled || revision !== this.manualRevision || this.suspended || this.disposed,
-            () => {
-              if (cancelled || revision !== this.manualRevision || this.suspended || this.disposed)
-                return;
-              this.phase = "semantic";
-              this.emit();
-            }
+            () => cancelled || revision !== this.manualRevision || this.suspended || this.disposed
           )
       );
-      if (!result.replacementRequired || this.disposed || cancelled) return result;
-      this.queuedFenceCancels.delete(cancel);
-      const updating = this.update();
-      const updateRevision = this.manualRevision;
-      await updating;
-      if (this.disposed || updateRevision !== this.manualRevision || this.suspended) return result;
-      return { adopted: false };
+      return result;
     } finally {
       this.queuedFenceCancels.delete(cancel);
       if (manual && revision === this.manualRevision) {
@@ -582,6 +568,26 @@ export class MaintenanceScheduler {
 
   private async publish(): Promise<boolean> {
     if (this.invalidatedCurrentAttempt || this.suspended) return false;
+    if (this.port.refreshRelated && this.active) {
+      this.phase = "results";
+      this.emit();
+      const signal = this.active.signal;
+      let abort!: () => void;
+      const interrupted = new Promise<void>((resolve) => {
+        abort = resolve;
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) resolve();
+      });
+      try {
+        await Promise.race([this.port.refreshRelated(signal), interrupted]);
+      } catch {
+        // A failed visible-results refresh must not prevent sharing embeddings.
+      } finally {
+        signal.removeEventListener("abort", abort);
+      }
+      if (signal.aborted || this.invalidatedCurrentAttempt || this.suspended || this.disposed)
+        return false;
+    }
     this.phase = "publication";
     this.emit();
     const publication = await this.port.publish(
@@ -591,7 +597,7 @@ export class MaintenanceScheduler {
     if (publication.warning) {
       throw publication.warning;
     }
-    if (!publication.published) throw new Error("Index publication did not complete.");
+    if (!publication.published) throw new Error("Sharing embeddings did not complete.");
     this.error = undefined;
     return true;
   }

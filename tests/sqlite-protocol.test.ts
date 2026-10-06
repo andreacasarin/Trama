@@ -5,7 +5,6 @@ import {
   applyTestLexicalRun,
   createTestSqliteClient,
   embedAllTestInputs,
-  malformedSchema8Snapshot,
 } from "./sqlite-test-client";
 
 const hash = "a".repeat(64);
@@ -77,7 +76,7 @@ describe("SQLite protocol", () => {
     ).toThrow();
   });
 
-  it("rejects malformed retrieval options and publication generation fences", () => {
+  it("rejects malformed retrieval options", () => {
     const request = (method: string, payload: object) => ({
       v: SQLITE_PROTOCOL_VERSION,
       id: 1,
@@ -93,24 +92,6 @@ describe("SQLite protocol", () => {
     ];
     for (const option of retrievalOptions)
       expect(() => validateRequest(request("retrieve", { limit: 10, ...option }))).toThrow();
-
-    for (const fence of [
-      { expectedLexicalGeneration: -1 },
-      { expectedSemanticGeneration: 1.5 },
-      { expectedLexicalGeneration: undefined },
-      { expectedSemanticGeneration: undefined },
-    ])
-      expect(() =>
-        validateRequest(
-          request("finalizePublication", {
-            publicationId: "publication-1",
-            expectedChangeCounter: 1,
-            expectedLexicalGeneration: 0,
-            expectedSemanticGeneration: 0,
-            ...fence,
-          })
-        )
-      ).toThrow();
   });
 
   it("uses safe structured errors", () => {
@@ -130,9 +111,9 @@ describe("SQLite protocol", () => {
         embeddingFingerprint: "b".repeat(64),
         dimensions: 2,
       })
-    ).resolves.toMatchObject({ schemaVersion: 14, protocolVersion: SQLITE_PROTOCOL_VERSION });
+    ).resolves.toMatchObject({ schemaVersion: 15, protocolVersion: SQLITE_PROTOCOL_VERSION });
     await expect(client.call("getState", {})).resolves.toMatchObject({
-      schemaVersion: 14,
+      schemaVersion: 15,
       protocolVersion: SQLITE_PROTOCOL_VERSION,
     });
   });
@@ -142,26 +123,8 @@ describe("SQLite protocol", () => {
     await client.call("boot", { corpusFingerprint: hash, dimensions: 2 });
     await expect(
       client.call("boot", { corpusFingerprint: hash, dimensions: 3 })
-    ).resolves.toMatchObject({ schemaVersion: 14, dimensions: 3, noteCount: 0 });
+    ).resolves.toMatchObject({ schemaVersion: 15, dimensions: 3, noteCount: 0 });
   });
-
-  for (const defect of ["missing-vector", "wrong-fts", "wrong-index"] as const)
-    it(`resets a former-v8 database with ${defect}`, async () => {
-      const client = createTestSqliteClient(
-        { schemaDefectBoundary: defect },
-        { snapshot: await malformedSchema8Snapshot(defect) }
-      );
-      await expect(
-        client.call("boot", {
-          corpusFingerprint: hash,
-          embeddingFingerprint: "b".repeat(64),
-          dimensions: 2,
-        })
-      ).resolves.toMatchObject({ schemaVersion: 14, noteCount: 0 });
-      await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 0 });
-      await applyTestLexicalRun(client, [{ path: "usable.md", markdown: "rebuilt", size: 100 }]);
-      await expect(client.call("getState", {})).resolves.toMatchObject({ noteCount: 1 });
-    });
 
   it("preserves current note/head/cache data on reopen", async () => {
     const client = createTestSqliteClient({ validReopenBoundary: true });
@@ -177,46 +140,4 @@ describe("SQLite protocol", () => {
       semanticHeadCount: 1,
     });
   });
-
-  it("does not let inspection metadata authorize different adoption bytes", async () => {
-    const corpusFingerprint = hash;
-    const embeddingFingerprint = "b".repeat(64);
-    const prepare = async (identity: object, publicationId: string) => {
-      const client = createTestSqliteClient(identity);
-      await client.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
-      const markdown = "This publication contains enough text to create a valid lexical block.";
-      await applyTestLexicalRun(client, [
-        { path: `${publicationId}.md`, markdown, size: markdown.length },
-      ]);
-      return {
-        client,
-        prepared: (await client.call("preparePublication", { publicationId })) as {
-          bytes: ArrayBuffer;
-        },
-      };
-    };
-    const sourceA = await prepare({}, "publication-a");
-    const sourceB = await prepare({}, "publication-b");
-    const inspectionA = await sourceA.client.call("inspectPublication", {
-      bytes: sourceA.prepared.bytes,
-      corpusFingerprint,
-      embeddingFingerprint,
-      dimensions: 2,
-    });
-    const receiver = createTestSqliteClient({ receiver: true });
-    await receiver.call("boot", { corpusFingerprint, embeddingFingerprint, dimensions: 2 });
-    const before = await receiver.call("getState", {});
-
-    await expect(
-      receiver.call("adoptPublication", {
-        bytes: sourceB.prepared.bytes,
-        expectedPublicationId: "publication-a",
-        inspection: inspectionA,
-        corpusFingerprint,
-        embeddingFingerprint,
-        dimensions: 2,
-      })
-    ).rejects.toMatchObject({ error: { code: "incompatible_state" } });
-    expect(await receiver.call("getState", {})).toEqual(before);
-  }, 30_000);
 });

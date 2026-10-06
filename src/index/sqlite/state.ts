@@ -1,17 +1,9 @@
-import type { EmbeddingProfile, SqliteState } from "./protocol";
+import type { SqliteState } from "./protocol";
 import { sqliteError } from "./protocol";
-import {
-  SQLITE_BUILD_IDENTITY,
-  SQLITE_SCHEMA_11_BUILD_IDENTITY,
-  SQLITE_SCHEMA_12_BUILD_IDENTITY,
-  SQLITE_SCHEMA_13_BUILD_IDENTITY,
-  SQLITE_SCHEMA_9_BUILD_IDENTITY,
-  SQLITE_SCHEMA_10_BUILD_IDENTITY,
-} from "../../build/identity";
+import { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 import {
   SQLITE_APPLICATION_ID,
   SQLITE_PROTOCOL_VERSION,
-  SQLITE_LEXICAL_NOTES_MIGRATION_SQL,
   SQLITE_SCHEMA_VERSION,
   schemaSql,
 } from "./schema";
@@ -24,6 +16,8 @@ import {
   type SqliteContext,
   transaction,
 } from "./core";
+
+import { pruneUnreferencedRevisions } from "./lexical-full-note";
 
 export class SqliteStateStore {
   constructor(private readonly context: SqliteContext) {}
@@ -38,7 +32,7 @@ export class SqliteStateStore {
     this.context.ensureOpen();
     let activeFingerprint = embeddingFingerprint;
     let activeDimensions = dimensions;
-    let selectionKind = embeddingFingerprint ? "configured" : "none";
+    this.context.configuredEmbeddingFingerprint = embeddingFingerprint;
     this.context.dimensions = dimensions;
     this.context.embeddingFingerprint = embeddingFingerprint;
     const app = Number(rows(this.context.db, "PRAGMA application_id")[0]?.application_id ?? 0);
@@ -54,7 +48,7 @@ export class SqliteStateStore {
       this.context.db.exec(schemaSql(dimensions));
       transaction(this.context.db, () =>
         this.context.db.exec({
-          sql: "INSERT INTO index_state(id,app_version,schema_version,protocol_version,build_identity,extraction_version,chunk_algorithm_version,embedding_input_version,dimensions,corpus_fingerprint,embedding_fingerprint,incomplete,change_counter,snapshot_loaded) VALUES(1,?,?,?,?,?,?,?,?,?, ?,1,0,0)",
+          sql: "INSERT INTO index_state(id,app_version,schema_version,protocol_version,build_identity,extraction_version,chunk_algorithm_version,embedding_input_version,dimensions,corpus_fingerprint,embedding_fingerprint,incomplete,change_counter) VALUES(1,?,?,?,?,?,?,?,?,?, ?,1,0)",
           bind: [
             APP_VERSION,
             SQLITE_SCHEMA_VERSION,
@@ -71,26 +65,7 @@ export class SqliteStateStore {
       );
       if (activeFingerprint)
         this.saveEmbeddingProfile(activeFingerprint, dimensions, profileMetadata);
-      this.context.db.exec({
-        sql: "UPDATE index_state SET embedding_profile_selection=? WHERE id=1",
-        bind: [selectionKind],
-      });
     } else {
-      if (app === SQLITE_APPLICATION_ID && version === 9) {
-        this.migrateSchema9(buildIdentity);
-      }
-      if (app === SQLITE_APPLICATION_ID && version === 10) {
-        this.migrateSchema10(buildIdentity);
-      }
-      if (app === SQLITE_APPLICATION_ID && version === 11) {
-        this.migrateSchema11(buildIdentity);
-      }
-      if (app === SQLITE_APPLICATION_ID && version === 12) {
-        this.migrateSchema12(buildIdentity);
-      }
-      if (app === SQLITE_APPLICATION_ID && version === 13) {
-        this.migrateSchema13(buildIdentity);
-      }
       const currentVersion = Number(
         rows(this.context.db, "PRAGMA user_version")[0]?.user_version ?? 0
       );
@@ -111,28 +86,32 @@ export class SqliteStateStore {
         const saved = profiles.find(
           (profile) => String(profile.fingerprint) === String(state?.embedding_fingerprint ?? "")
         );
-        if (state?.embedding_profile_selection === "user" && saved) {
+        if (saved) {
           activeFingerprint = String(saved.fingerprint);
           activeDimensions = Number(saved.dimensions);
         } else if (profiles.length === 1) {
           activeFingerprint = String(profiles[0].fingerprint);
           activeDimensions = Number(profiles[0].dimensions);
-          selectionKind = "automatic";
         } else {
           activeFingerprint = "";
-          selectionKind = "none";
         }
       } else {
         this.saveEmbeddingProfile(embeddingFingerprint, dimensions, profileMetadata);
-        selectionKind = "configured";
+        // Keep the old space fenced off until an explicit semantic rebuild.
+        if (
+          state?.embedding_fingerprint &&
+          String(state.embedding_fingerprint) !== embeddingFingerprint
+        ) {
+          activeFingerprint = String(state.embedding_fingerprint);
+          activeDimensions = Number(state.dimensions);
+        }
       }
       this.context.dimensions = activeDimensions;
       this.context.embeddingFingerprint = activeFingerprint;
       if (
         !state ||
         Number(state.protocol_version) !== SQLITE_PROTOCOL_VERSION ||
-        String(state.build_identity) !== buildIdentity ||
-        ![0, 1].includes(Number(state.snapshot_loaded))
+        String(state.build_identity) !== buildIdentity
       )
         throw sqliteError(
           "incompatible_state",
@@ -142,18 +121,16 @@ export class SqliteStateStore {
       const changedCorpus = String(state.corpus_fingerprint) !== corpusFingerprint;
       const changedEmbedding = String(state.embedding_fingerprint) !== activeFingerprint;
       const changedDimensions = Number(state.dimensions) !== activeDimensions;
-      const changedSelection = String(state.embedding_profile_selection) !== selectionKind;
-      if (changedCorpus || changedEmbedding || changedDimensions || changedSelection)
+      if (changedCorpus || changedEmbedding || changedDimensions)
         transaction(this.context.db, () =>
           this.context.db.exec({
-            sql: "UPDATE index_state SET corpus_fingerprint=?,embedding_fingerprint=?,dimensions=?,embedding_profile_selection=?,incomplete=CASE WHEN ? THEN 1 ELSE incomplete END,change_counter=change_counter+? WHERE id=1",
+            sql: "UPDATE index_state SET corpus_fingerprint=?,embedding_fingerprint=?,dimensions=?,incomplete=CASE WHEN ? THEN 1 ELSE incomplete END,change_counter=change_counter+? WHERE id=1",
             bind: [
               corpusFingerprint,
               activeFingerprint,
               activeDimensions,
-              selectionKind,
               changedCorpus ? 1 : 0,
-              changedCorpus || changedEmbedding || changedDimensions || changedSelection ? 1 : 0,
+              changedCorpus || changedEmbedding || changedDimensions ? 1 : 0,
             ],
           })
         );
@@ -180,338 +157,58 @@ export class SqliteStateStore {
 
   selectEmbeddingProfile(fingerprint: string): SqliteState {
     this.context.ensureOpen();
+    if (
+      !this.context.configuredEmbeddingFingerprint ||
+      fingerprint !== this.context.configuredEmbeddingFingerprint
+    )
+      throw sqliteError(
+        "invalid_request",
+        "Rebuild using the embedding model configured in settings."
+      );
     const profile = rows(
       this.context.db,
-      `SELECT p.dimensions FROM embedding_profiles p
-       WHERE p.fingerprint=? AND EXISTS(SELECT 1 FROM embedding_cache ec
-         WHERE ec.embedding_fingerprint=p.fingerprint AND ec.task_kind='document')`,
+      "SELECT dimensions FROM embedding_profiles WHERE fingerprint=?",
       [fingerprint]
     )[0];
-    if (!profile)
-      throw sqliteError("invalid_request", "Embedding profile has no compatible document vectors");
+    if (!profile) throw sqliteError("invalid_request", "Configured embedding model is unavailable");
     const dimensions = Number(profile.dimensions);
-    transaction(this.context.db, () =>
+    transaction(this.context.db, () => {
+      this.context.db.exec("UPDATE notes SET semantic_revision_id=NULL");
+      pruneUnreferencedRevisions(this.context.db);
+      this.context.db.exec("DELETE FROM embedding_cache");
       this.context.db.exec({
-        sql: "UPDATE index_state SET embedding_fingerprint=?,dimensions=?,embedding_profile_selection='user',change_counter=change_counter+1 WHERE id=1",
+        sql: "DELETE FROM embedding_profiles WHERE fingerprint<>?",
+        bind: [fingerprint],
+      });
+      this.context.db.exec("DELETE FROM cache_shard_membership");
+      this.context.db.exec("DELETE FROM cache_artifact_receipts");
+      this.context.db.exec("DELETE FROM cache_compaction_retirements");
+      this.context.db.exec("DELETE FROM cache_compaction_replacements");
+      this.context.db.exec("UPDATE cache_compaction_state SET last_completed_at=0 WHERE id=1");
+      this.context.db.exec({
+        sql: "UPDATE index_state SET embedding_fingerprint=?,dimensions=?,semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
         bind: [fingerprint, dimensions],
-      })
-    );
+      });
+    });
     this.context.embeddingFingerprint = fingerprint;
     this.context.dimensions = dimensions;
     return this.getState();
   }
   reconcileImportedEmbeddingProfiles(): void {
-    const state = rows(
-      this.context.db,
-      "SELECT embedding_fingerprint,embedding_profile_selection FROM index_state WHERE id=1"
-    )[0];
-    if (!state) throw sqliteError("incompatible_state", "SQLite state is not initialized");
+    if (this.context.embeddingFingerprint) return;
     const profiles = rows(
       this.context.db,
-      `SELECT p.fingerprint,p.dimensions FROM embedding_profiles p
-       WHERE EXISTS(SELECT 1 FROM embedding_cache ec WHERE ec.embedding_fingerprint=p.fingerprint AND ec.task_kind='document')
-       ORDER BY p.fingerprint`
+      "SELECT fingerprint,dimensions FROM embedding_profiles LIMIT 2"
     );
-    const selection = String(state.embedding_profile_selection);
-    const active = String(state.embedding_fingerprint);
-    let next = active;
-    let kind = selection;
-    let dimensions = this.context.dimensions;
-    if (selection === "automatic" && profiles.length !== 1) {
-      next = "";
-      kind = "none";
-    } else if (selection === "none" && profiles.length === 1) {
-      next = String(profiles[0].fingerprint);
-      kind = "automatic";
-      dimensions = Number(profiles[0].dimensions);
-    }
-    if (next !== active || kind !== selection) {
-      transaction(this.context.db, () =>
-        this.context.db.exec({
-          sql: "UPDATE index_state SET embedding_fingerprint=?,dimensions=?,embedding_profile_selection=?,change_counter=change_counter+1 WHERE id=1",
-          bind: [next, dimensions, kind],
-        })
-      );
-      this.context.embeddingFingerprint = next;
-      this.context.dimensions = dimensions;
-    }
-  }
-  migrateLegacySnapshotSchema(buildIdentity: string): void {
-    const app = Number(rows(this.context.db, "PRAGMA application_id")[0]?.application_id ?? 0);
-    const version = Number(rows(this.context.db, "PRAGMA user_version")[0]?.user_version ?? 0);
-    if (app === SQLITE_APPLICATION_ID && version === 9) this.migrateSchema9(buildIdentity);
-    if (app === SQLITE_APPLICATION_ID && version === 10) this.migrateSchema10(buildIdentity);
-    if (app === SQLITE_APPLICATION_ID && version === 11) this.migrateSchema11(buildIdentity);
-    if (app === SQLITE_APPLICATION_ID && version === 12) this.migrateSchema12(buildIdentity);
-    if (app === SQLITE_APPLICATION_ID && version === 13) this.migrateSchema13(buildIdentity);
-  }
-
-  private migrateSchema13(buildIdentity: string): void {
-    const legacy = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
-    if (
-      !legacy ||
-      Number(legacy.schema_version) !== 13 ||
-      Number(legacy.protocol_version) !== 12 ||
-      String(legacy.build_identity) !== SQLITE_SCHEMA_13_BUILD_IDENTITY
-    )
-      throw sqliteError("incompatible_state", "Legacy SQLite state is incompatible", false);
-    transaction(this.context.db, () => {
-      this.dropOccurrenceLexicalIndex();
-      this.context.db.exec({
-        sql: "UPDATE index_state SET schema_version=?,protocol_version=?,build_identity=? WHERE id=1",
-        bind: [SQLITE_SCHEMA_VERSION, SQLITE_PROTOCOL_VERSION, buildIdentity],
-      });
-      this.context.db.exec(`PRAGMA user_version=${SQLITE_SCHEMA_VERSION}`);
+    if (profiles.length !== 1) return;
+    const fingerprint = String(profiles[0].fingerprint);
+    const dimensions = Number(profiles[0].dimensions);
+    this.context.db.exec({
+      sql: "UPDATE index_state SET embedding_fingerprint=?,dimensions=?,change_counter=change_counter+1 WHERE id=1",
+      bind: [fingerprint, dimensions],
     });
-  }
-
-  private dropOccurrenceLexicalIndex(): void {
-    this.context.db.exec("DROP TABLE IF EXISTS active_lexical_fts");
-    this.context.db.exec("DROP INDEX IF EXISTS active_lexical_note");
-    this.context.db.exec("DROP TABLE IF EXISTS active_lexical");
-  }
-
-  private migrateSchema10(buildIdentity: string): void {
-    const legacy = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
-    if (
-      !legacy ||
-      Number(legacy.schema_version) !== 10 ||
-      Number(legacy.protocol_version) !== 9 ||
-      String(legacy.build_identity) !== SQLITE_SCHEMA_10_BUILD_IDENTITY
-    )
-      throw sqliteError("incompatible_state", "Legacy SQLite state is incompatible", false);
-    transaction(this.context.db, () => {
-      this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_artifact_receipts (
-        digest TEXT PRIMARY KEY COLLATE BINARY,
-        profile TEXT COLLATE BINARY NOT NULL,
-        received_at INTEGER NOT NULL
-      ) STRICT`);
-      this.context.db.exec(
-        "CREATE TABLE IF NOT EXISTS cache_legacy_sources (digest TEXT PRIMARY KEY COLLATE BINARY, extracted_at INTEGER NOT NULL) STRICT"
-      );
-      this.ensureEmbeddingCacheMetadataColumns();
-      this.ensureEmbeddingCacheRetentionColumn();
-      this.createCacheRetentionTables();
-      this.createEmbeddingProfilesTable();
-      this.seedCurrentEmbeddingProfile();
-      this.ensureProfileSelectionColumn();
-      this.context.db.exec("DROP INDEX IF EXISTS embedding_cache_lookup");
-      this.context.db.exec(
-        "CREATE INDEX embedding_cache_lookup ON embedding_cache(input_digest,embedding_fingerprint,preprocessing,task_kind)"
-      );
-      this.dropOccurrenceLexicalIndex();
-      this.context.db.exec({
-        sql: "UPDATE index_state SET schema_version=?,protocol_version=?,build_identity=? WHERE id=1",
-        bind: [SQLITE_SCHEMA_VERSION, SQLITE_PROTOCOL_VERSION, buildIdentity],
-      });
-      this.context.db.exec(`PRAGMA user_version=${SQLITE_SCHEMA_VERSION}`);
-    });
-  }
-
-  private migrateSchema9(buildIdentity?: string): void {
-    const legacy = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
-    if (
-      !legacy ||
-      Number(legacy.schema_version) !== 9 ||
-      Number(legacy.protocol_version) !== 9 ||
-      String(legacy.build_identity) !== SQLITE_SCHEMA_9_BUILD_IDENTITY
-    )
-      throw sqliteError("incompatible_state", "Legacy SQLite state is incompatible", false);
-    transaction(this.context.db, () => {
-      this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_artifact_receipts (
-        digest TEXT PRIMARY KEY COLLATE BINARY,
-        profile TEXT COLLATE BINARY NOT NULL,
-        received_at INTEGER NOT NULL
-      ) STRICT`);
-      this.context.db.exec(
-        "CREATE TABLE IF NOT EXISTS cache_legacy_sources (digest TEXT PRIMARY KEY COLLATE BINARY, extracted_at INTEGER NOT NULL) STRICT"
-      );
-      this.ensureEmbeddingCacheMetadataColumns();
-      this.ensureEmbeddingCacheRetentionColumn();
-      this.createCacheRetentionTables();
-      this.createEmbeddingProfilesTable();
-      this.seedCurrentEmbeddingProfile();
-      this.ensureProfileSelectionColumn();
-      this.context.db.exec("DROP INDEX IF EXISTS embedding_cache_lookup");
-      this.context.db.exec(
-        "CREATE INDEX embedding_cache_lookup ON embedding_cache(input_digest,embedding_fingerprint,preprocessing,task_kind)"
-      );
-      this.context.db.exec(SQLITE_LEXICAL_NOTES_MIGRATION_SQL);
-      const legacyNotes = rows(
-        this.context.db,
-        `SELECT n.note_id,n.lexical_revision_id,n.path,
-                COALESCE((SELECT group_concat(display_text,char(10)) FROM (
-                  SELECT o.display_text FROM chunk_occurrences o
-                  WHERE o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
-                    AND o.kind='heading' ORDER BY o.ordinal
-                )), '') AS headings,
-                COALESCE((SELECT group_concat(display_text,char(10)) FROM (
-                  SELECT o.display_text FROM chunk_occurrences o
-                  WHERE o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
-                  ORDER BY o.ordinal
-                )), '') AS body
-         FROM notes n WHERE n.lexical_revision_id IS NOT NULL`
-      );
-      for (const note of legacyNotes) {
-        const path = String(note.path);
-        const filename = path.slice(path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
-        const firstHeading = String(note.headings)
-          .split("\n")
-          .map((heading) => heading.match(/^#{1,6}[ \t]+(.+?)\s*#*$/)?.[1])
-          .find(Boolean);
-        this.context.db.exec({
-          sql: "INSERT INTO lexical_notes(note_id,revision_id,path_text,filename,title,headings,body) VALUES(?,?,?,?,?,?,?)",
-          bind: [
-            Number(note.note_id),
-            Number(note.lexical_revision_id),
-            path,
-            filename,
-            firstHeading ?? filename,
-            String(note.headings),
-            String(note.body),
-          ],
-        });
-      }
-      this.context.db.exec(`DELETE FROM note_revisions
-        WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.lexical_revision_id=note_revisions.revision_id)
-          AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.semantic_revision_id=note_revisions.revision_id)`);
-      this.dropOccurrenceLexicalIndex();
-      this.context.db.exec({
-        sql: "UPDATE index_state SET schema_version=?,protocol_version=?,build_identity=COALESCE(?,build_identity) WHERE id=1",
-        bind: [SQLITE_SCHEMA_VERSION, SQLITE_PROTOCOL_VERSION, buildIdentity ?? null],
-      });
-      this.context.db.exec(`PRAGMA user_version=${SQLITE_SCHEMA_VERSION}`);
-    });
-  }
-
-  private migrateSchema11(buildIdentity: string): void {
-    const legacy = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
-    if (
-      !legacy ||
-      Number(legacy.schema_version) !== 11 ||
-      Number(legacy.protocol_version) !== 10 ||
-      String(legacy.build_identity) !== SQLITE_SCHEMA_11_BUILD_IDENTITY
-    )
-      throw sqliteError("incompatible_state", "Legacy SQLite state is incompatible", false);
-    transaction(this.context.db, () => {
-      this.createEmbeddingProfilesTable();
-      this.seedCurrentEmbeddingProfile();
-      this.ensureProfileSelectionColumn();
-      this.ensureEmbeddingCacheRetentionColumn();
-      this.createCacheRetentionTables();
-      this.context.db.exec("DROP INDEX IF EXISTS embedding_cache_lookup");
-      this.context.db.exec(
-        "CREATE INDEX embedding_cache_lookup ON embedding_cache(input_digest,embedding_fingerprint,preprocessing,task_kind)"
-      );
-      this.dropOccurrenceLexicalIndex();
-      this.context.db.exec({
-        sql: "UPDATE index_state SET schema_version=?,protocol_version=?,build_identity=? WHERE id=1",
-        bind: [SQLITE_SCHEMA_VERSION, SQLITE_PROTOCOL_VERSION, buildIdentity],
-      });
-      this.context.db.exec(`PRAGMA user_version=${SQLITE_SCHEMA_VERSION}`);
-    });
-  }
-
-  private migrateSchema12(buildIdentity: string): void {
-    const legacy = rows(this.context.db, "SELECT * FROM index_state WHERE id=1")[0];
-    if (
-      !legacy ||
-      Number(legacy.schema_version) !== 12 ||
-      Number(legacy.protocol_version) !== 11 ||
-      String(legacy.build_identity) !== SQLITE_SCHEMA_12_BUILD_IDENTITY
-    )
-      throw sqliteError("incompatible_state", "Legacy SQLite state is incompatible", false);
-    transaction(this.context.db, () => {
-      this.ensureEmbeddingCacheRetentionColumn();
-      this.createCacheRetentionTables();
-      this.dropOccurrenceLexicalIndex();
-      this.context.db.exec({
-        sql: "UPDATE index_state SET schema_version=?,protocol_version=?,build_identity=? WHERE id=1",
-        bind: [SQLITE_SCHEMA_VERSION, SQLITE_PROTOCOL_VERSION, buildIdentity],
-      });
-      this.context.db.exec(`PRAGMA user_version=${SQLITE_SCHEMA_VERSION}`);
-    });
-  }
-
-  private createEmbeddingProfilesTable(): void {
-    this.context.db.exec(`CREATE TABLE IF NOT EXISTS embedding_profiles (
-      fingerprint TEXT PRIMARY KEY COLLATE BINARY,
-      dimensions INTEGER NOT NULL CHECK(dimensions > 0),
-      model_id TEXT NOT NULL DEFAULT '',
-      endpoint_origin TEXT NOT NULL DEFAULT ''
-    ) STRICT`);
-  }
-
-  private seedCurrentEmbeddingProfile(): void {
-    this.context.db.exec(`INSERT INTO embedding_profiles(fingerprint,dimensions)
-      SELECT embedding_fingerprint,dimensions FROM index_state
-      WHERE id=1 AND embedding_fingerprint<>'' ON CONFLICT(fingerprint) DO NOTHING`);
-  }
-
-  private ensureProfileSelectionColumn(): void {
-    const columns = new Set(
-      rows(this.context.db, "PRAGMA table_info(index_state)").map((row) => String(row.name))
-    );
-    if (!columns.has("embedding_profile_selection")) {
-      this.context.db.exec(
-        "ALTER TABLE index_state ADD COLUMN embedding_profile_selection TEXT NOT NULL DEFAULT 'configured' CHECK(embedding_profile_selection IN ('none','automatic','configured','user'))"
-      );
-      this.context.db.exec(
-        "UPDATE index_state SET embedding_profile_selection=CASE WHEN embedding_fingerprint='' THEN 'none' ELSE 'configured' END WHERE id=1"
-      );
-    }
-  }
-  private ensureEmbeddingCacheMetadataColumns(): void {
-    const columns = new Set(
-      rows(this.context.db, "PRAGMA table_info(embedding_cache)").map((row) => String(row.name))
-    );
-    if (!columns.has("task_kind"))
-      this.context.db.exec(
-        "ALTER TABLE embedding_cache ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'document'"
-      );
-    if (!columns.has("created_at"))
-      this.context.db.exec(
-        "ALTER TABLE embedding_cache ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
-      );
-  }
-
-  private ensureEmbeddingCacheRetentionColumn(): void {
-    const columns = new Set(
-      rows(this.context.db, "PRAGMA table_info(embedding_cache)").map((row) => String(row.name))
-    );
-    if (!columns.has("unused_since"))
-      this.context.db.exec("ALTER TABLE embedding_cache ADD COLUMN unused_since INTEGER");
-    this.context.db.exec(
-      "CREATE INDEX IF NOT EXISTS embedding_cache_unused ON embedding_cache(task_kind,unused_since,created_at)"
-    );
-  }
-
-  private createCacheRetentionTables(): void {
-    this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_shard_membership (
-      digest TEXT NOT NULL COLLATE BINARY,
-      action_key TEXT NOT NULL COLLATE BINARY,
-      task_kind TEXT NOT NULL CHECK(task_kind IN ('document','query')),
-      profile TEXT NOT NULL COLLATE BINARY,
-      PRIMARY KEY(digest,action_key,task_kind)
-    ) STRICT`);
-    this.context.db.exec(
-      "CREATE INDEX IF NOT EXISTS cache_shard_membership_key ON cache_shard_membership(action_key,task_kind)"
-    );
-    this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_compaction_state (
-      id INTEGER PRIMARY KEY CHECK(id=1),last_completed_at INTEGER NOT NULL DEFAULT 0
-    ) STRICT`);
-    this.context.db.exec(
-      "INSERT OR IGNORE INTO cache_compaction_state(id,last_completed_at) VALUES(1,0)"
-    );
-    this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_compaction_retirements (
-      source_digest TEXT PRIMARY KEY COLLATE BINARY,
-      replacement_set_id TEXT NOT NULL COLLATE BINARY,
-      retire_after INTEGER NOT NULL
-    ) STRICT`);
-    this.context.db.exec(`CREATE TABLE IF NOT EXISTS cache_compaction_replacements (
-      replacement_set_id TEXT NOT NULL COLLATE BINARY,digest TEXT NOT NULL COLLATE BINARY,
-      PRIMARY KEY(replacement_set_id,digest)
-    ) STRICT`);
+    this.context.embeddingFingerprint = fingerprint;
+    this.context.dimensions = dimensions;
   }
 
   private assertSchemaLayout(): void {
@@ -528,13 +225,10 @@ export class SqliteStateStore {
         "dimensions",
         "corpus_fingerprint",
         "embedding_fingerprint",
-        "embedding_profile_selection",
         "incomplete",
         "change_counter",
         "lexical_generation",
         "semantic_generation",
-        "publication_id",
-        "snapshot_loaded",
         "reconciliation_summary",
       ],
       notes: [
@@ -563,10 +257,7 @@ export class SqliteStateStore {
         "start_line",
         "end_line",
         "display_text",
-        "heading_context",
-        "embedding_input",
         "embedding_input_digest",
-        "body",
       ],
       embedding_inputs: [
         "input_id",
@@ -588,7 +279,6 @@ export class SqliteStateStore {
       ],
       embedding_profiles: ["fingerprint", "dimensions", "model_id", "endpoint_origin"],
       cache_artifact_receipts: ["digest", "profile", "received_at"],
-      cache_legacy_sources: ["digest", "extracted_at"],
       cache_shard_membership: ["digest", "action_key", "task_kind", "profile"],
       cache_compaction_state: ["id", "last_completed_at"],
       cache_compaction_retirements: ["source_digest", "replacement_set_id", "retire_after"],
@@ -715,21 +405,11 @@ export class SqliteStateStore {
       [String(s.embedding_fingerprint), EMBEDDING_PREPROCESSING_VERSION]
     )[0];
     const chunks = Number(c.chunks);
-    const compatible = Number(c.vectors);
-    const embeddingProfiles = rows(
-      this.context.db,
-      `SELECT p.fingerprint,p.dimensions,p.model_id,p.endpoint_origin,
-              count(ec.cache_id) AS vector_count
-       FROM embedding_profiles p LEFT JOIN embedding_cache ec
-         ON ec.embedding_fingerprint=p.fingerprint AND ec.task_kind='document'
-       GROUP BY p.fingerprint ORDER BY p.fingerprint`
-    ).map((profile): EmbeddingProfile => ({
-      fingerprint: String(profile.fingerprint),
-      dimensions: Number(profile.dimensions),
-      modelId: String(profile.model_id),
-      endpointOrigin: String(profile.endpoint_origin),
-      vectorCount: Number(profile.vector_count),
-    }));
+    const rebuildRequired = Boolean(
+      this.context.configuredEmbeddingFingerprint &&
+      this.context.configuredEmbeddingFingerprint !== String(s.embedding_fingerprint)
+    );
+    const compatible = rebuildRequired ? 0 : Number(c.vectors);
     const coverage = compatible === 0 ? "none" : compatible === chunks ? "complete" : "partial";
     return {
       schemaVersion: Number(s.schema_version),
@@ -738,18 +418,18 @@ export class SqliteStateStore {
       dimensions: Number(s.dimensions),
       corpusFingerprint: String(s.corpus_fingerprint),
       embeddingFingerprint: String(s.embedding_fingerprint),
-      embeddingProfiles,
+      semanticRebuildRequired: rebuildRequired,
       incomplete: Number(s.incomplete) !== 0,
-      snapshotLoaded: Number(s.snapshot_loaded) !== 0,
       changeCounter: Number(s.change_counter),
       lexicalGeneration: Number(s.lexical_generation),
       semanticGeneration: Number(s.semantic_generation),
       noteCount: Number(c.notes),
       chunkCount: chunks,
       compatibleVectorCount: compatible,
-      vectorCount: Number(c.vectors),
+      vectorCount: compatible,
       vectorCoverage: coverage,
       semanticReady:
+        !rebuildRequired &&
         Number(heads.eligible ?? 0) > 0 &&
         Number(heads.eligible ?? 0) === Number(heads.semanticHeads ?? 0) &&
         Number(heads.eligible ?? 0) === Number(heads.currentSemanticHeads ?? 0) &&
@@ -757,10 +437,9 @@ export class SqliteStateStore {
         Number(missing.missing ?? 0) === 0 &&
         !Number(s.incomplete),
       semanticEligibleCount: Number(heads.eligible ?? 0),
-      semanticHeadCount: Number(heads.usableSemanticHeads ?? 0),
+      semanticHeadCount: rebuildRequired ? 0 : Number(heads.usableSemanticHeads ?? 0),
       semanticLagCount: Number(heads.lagging ?? 0),
       semanticMissingCount: Number(missing.missing ?? 0),
-      ...(s.publication_id == null ? {} : { publicationId: String(s.publication_id) }),
     };
   }
   /** Read the immutable corpus identity without calculating index status. */

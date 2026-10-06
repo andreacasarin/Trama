@@ -84,15 +84,15 @@ export interface IndexChannelStatus {
   readonly state: IndexChannelState;
   readonly activity: IndexChannelActivity;
   readonly searchable: boolean;
+  readonly rebuildRequired?: boolean;
 }
-export type IndexFreshness = "locally-reconciled" | "snapshot-loaded" | "unknown";
+export type IndexFreshness = "locally-reconciled" | "unknown";
 
 export interface IndexCapabilities {
   readonly availability: IndexAvailability;
   readonly lexical: IndexChannelStatus;
   readonly semantic: IndexChannelStatus;
   readonly freshness: IndexFreshness;
-  readonly publicationId?: string;
 }
 export type IndexProgressPhase =
   | "discover"
@@ -115,7 +115,7 @@ export interface IndexProgress {
   readonly determinate: boolean;
   /** True when total is a fast metadata-based estimate rather than a completed count. */
   readonly estimated?: boolean;
-  /** Mutable-index cache token; unlike the legacy generation field it never denotes publication. */
+  /** Mutable-index cache token for local retrieval results. */
   readonly changeCounter?: number;
   readonly generationId?: string;
 }

@@ -159,13 +159,8 @@ async function testVaultExists(vaultPath) {
 export async function installTestVaults(install = installPlugin) {
   const { demoVaultPath, validateDemoVault, prepareDemoVault } =
     await import("./benchmark/demo.mjs");
-  const {
-    benchmarkVaultName,
-    upgradeLegacyGeneratedVault,
-    validateGeneratedVault,
-    prepareVault,
-    installBenchmarkPlugin,
-  } = await import("./benchmark/obsidian.mjs");
+  const { benchmarkVaultName, validateGeneratedVault, prepareVault, installBenchmarkPlugin } =
+    await import("./benchmark/obsidian.mjs");
   const benchmarkPath = path.join(
     projectRoot,
     ".artifacts/test-vaults/benchmark",
@@ -176,7 +171,6 @@ export async function installTestVaults(install = installPlugin) {
   const benchmarkExists = await testVaultExists(benchmarkPath);
   if (demoExists) await validateDemoVault();
   if (benchmarkExists) {
-    await upgradeLegacyGeneratedVault(benchmarkPath, benchmarkVaultName);
     await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
     await rejectSymlinks(benchmarkPath);
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createWorkload } from "../../test-vaults/benchmark/generator";
-import { expectedOutputsV1ByProfile } from "./legacy-oracle";
+import { expectedOutputsV1ByProfile } from "./expected-results";
 import {
   computedInputKeyCounts,
   deriveRankingProbes,

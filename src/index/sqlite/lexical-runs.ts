@@ -234,7 +234,7 @@ export class SqliteLexicalRunStore {
       this.context.db.exec({
         sql: `UPDATE index_state
               SET incomplete=CASE WHEN ? THEN 0 ELSE 1 END,
-                  snapshot_loaded=0,reconciliation_summary='',
+                  reconciliation_summary='',
                   lexical_generation=lexical_generation+?,
                   semantic_generation=semantic_generation+CASE WHEN ? > 0 THEN 1 ELSE 0 END,
                   change_counter=change_counter+CASE WHEN ? THEN 1 ELSE 0 END

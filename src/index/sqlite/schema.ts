@@ -1,39 +1,7 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 14;
-export const SQLITE_PROTOCOL_VERSION = 12;
+export const SQLITE_SCHEMA_VERSION = 15;
+export const SQLITE_PROTOCOL_VERSION = 13;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
-
-export const SQLITE_LEXICAL_NOTES_MIGRATION_SQL = `
-CREATE TABLE lexical_notes (
-  note_id INTEGER PRIMARY KEY REFERENCES notes(note_id) ON DELETE CASCADE,
-  revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
-  path_text TEXT COLLATE BINARY NOT NULL,
-  filename TEXT COLLATE BINARY NOT NULL,
-  title TEXT NOT NULL,
-  headings TEXT NOT NULL,
-  body TEXT NOT NULL
-) STRICT;
-CREATE VIRTUAL TABLE lexical_notes_fts USING fts5(
-  body, path_text, filename, title, headings,
-  content='lexical_notes', content_rowid='note_id',
-  tokenize='unicode61 remove_diacritics 2'
-);
-CREATE INDEX lexical_notes_revision ON lexical_notes(revision_id);
-CREATE TRIGGER lexical_notes_ai AFTER INSERT ON lexical_notes BEGIN
-  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
-  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
-END;
-CREATE TRIGGER lexical_notes_ad AFTER DELETE ON lexical_notes BEGIN
-  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
-  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
-END;
-CREATE TRIGGER lexical_notes_au AFTER UPDATE ON lexical_notes BEGIN
-  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
-  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
-  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
-  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
-END;
-`;
 
 export function schemaSql(dimensions: number): string {
   if (!Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096)
@@ -57,13 +25,10 @@ CREATE TABLE IF NOT EXISTS index_state (
   dimensions INTEGER NOT NULL CHECK (dimensions > 0),
   corpus_fingerprint TEXT NOT NULL,
   embedding_fingerprint TEXT NOT NULL,
-  embedding_profile_selection TEXT NOT NULL DEFAULT 'none' CHECK (embedding_profile_selection IN ('none','automatic','configured','user')),
   incomplete INTEGER NOT NULL CHECK (incomplete IN (0,1)),
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
   lexical_generation INTEGER NOT NULL DEFAULT 0 CHECK (lexical_generation >= 0),
   semantic_generation INTEGER NOT NULL DEFAULT 0 CHECK (semantic_generation >= 0),
-  publication_id TEXT,
-  snapshot_loaded INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_loaded IN (0,1)),
   reconciliation_summary TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE TABLE IF NOT EXISTS notes (
@@ -97,10 +62,7 @@ CREATE TABLE IF NOT EXISTS chunk_occurrences (
   start_line INTEGER NOT NULL CHECK (start_line >= 1),
   end_line INTEGER NOT NULL CHECK (end_line >= start_line),
   display_text TEXT NOT NULL,
-  heading_context TEXT NOT NULL,
-  embedding_input TEXT NOT NULL,
   embedding_input_digest TEXT COLLATE BINARY NOT NULL,
-  body TEXT NOT NULL,
   UNIQUE(revision_id, ordinal),
   UNIQUE(revision_id, chunk_id)
 ) STRICT;
@@ -129,10 +91,6 @@ CREATE TABLE IF NOT EXISTS cache_artifact_receipts (
   digest TEXT PRIMARY KEY COLLATE BINARY,
   profile TEXT COLLATE BINARY NOT NULL,
   received_at INTEGER NOT NULL
-) STRICT;
-CREATE TABLE IF NOT EXISTS cache_legacy_sources (
-  digest TEXT PRIMARY KEY COLLATE BINARY,
-  extracted_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS cache_shard_membership (
   digest TEXT NOT NULL COLLATE BINARY,

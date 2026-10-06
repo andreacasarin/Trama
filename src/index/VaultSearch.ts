@@ -23,7 +23,6 @@ export interface VaultSearchState {
   readonly generationId: string;
   readonly semantic: IndexChannelStatus;
   readonly freshness?: IndexFreshness;
-  readonly publicationId?: string;
 }
 
 export interface VaultRetrievalPort {

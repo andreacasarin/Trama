@@ -120,11 +120,10 @@ export class SqliteLexicalBatchStore {
               ])
             );
             this.context.db.exec({
-              sql: `INSERT INTO chunk_occurrences(revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,heading_context,embedding_input,embedding_input_digest,body)
+              sql: `INSERT INTO chunk_occurrences(revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,embedding_input_digest)
                     SELECT ?,?,json_extract(j.value,'$[1]'),CAST(json_extract(j.value,'$[0]') AS INTEGER),
                            json_extract(j.value,'$[2]'),json_extract(j.value,'$[3]'),json_extract(j.value,'$[4]'),
-                           json_extract(j.value,'$[5]'),json_extract(j.value,'$[6]'),json_extract(j.value,'$[7]'),
-                           json_extract(j.value,'$[8]'),json_extract(j.value,'$[5]')
+                           json_extract(j.value,'$[5]'),json_extract(j.value,'$[8]')
                     FROM json_each(?) AS j
                     ORDER BY CAST(j.key AS INTEGER)`,
               bind: [revisionId, noteId, occurrenceRows],

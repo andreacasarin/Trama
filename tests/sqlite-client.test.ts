@@ -508,17 +508,6 @@ describe("SqliteWorkerClient", () => {
     expect(worker.messages[0].value.payload.vectors[0].vector).not.toBe(vector);
   });
 
-  it("transfers owned publication readback without copying it on the main thread", async () => {
-    const worker = new FakeWorker();
-    const client = new SqliteWorkerClient(worker);
-    const bytes = new Uint8Array([1, 2, 3]).buffer;
-
-    await client.call("inspectPublication", { bytes }, undefined, { transferOwnedBytes: true });
-
-    expect(worker.messages[0].value.payload.bytes).toBe(bytes);
-    expect(worker.messages[0].transfer).toEqual([bytes]);
-  });
-
   it("rejects pending calls on a Worker crash", async () => {
     const worker = new FakeWorker();
     const client = new SqliteWorkerClient(worker);
