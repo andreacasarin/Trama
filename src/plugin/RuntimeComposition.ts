@@ -150,13 +150,13 @@ export function composeRuntime(
             });
         }
       },
-      adoptCurrent: async () => {
+      adoptCurrent: async (shouldYield) => {
         warningOrigin = "check";
         try {
           const elapsed = diagnosticTimer(host.diagnostics, "performance");
           let result: AdoptionResult;
           try {
-            result = await publication.adoptCurrent();
+            result = await publication.adoptCurrent(shouldYield);
           } finally {
             if (elapsed)
               emitTramaDiagnostic(host.diagnostics, {
@@ -169,8 +169,10 @@ export function composeRuntime(
                 durationMs: elapsed(),
               });
           }
-          const cached = await manager.promoteCachedSemantic(new AbortController().signal);
-          host.onIndexOperation(manager, cached.changed);
+          if (!shouldYield?.()) {
+            const cached = await manager.promoteCachedSemantic(new AbortController().signal);
+            host.onIndexOperation(manager, cached.changed);
+          }
           return result;
         } finally {
           warningOrigin = "publication";
@@ -214,6 +216,8 @@ export function composeRuntime(
           if (
             host.isAutomaticMaintenanceEnabled() &&
             host.isCurrent(manager) &&
+            !scheduler.snapshot.pending &&
+            !scheduler.snapshot.suspended &&
             !result.adopted &&
             !result.replacementRequired
           ) {

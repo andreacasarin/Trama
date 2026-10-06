@@ -94,6 +94,32 @@ describe("PublicationManager cache shards", () => {
     expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(2);
   });
 
+  it("yields between cache shards and resumes from receipts on the next check", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    await manager.publish();
+    const extra = new Uint8Array([4, 5, 6]).buffer;
+    const extraDigest = await sha256Hex(extra);
+    fixture.files.set(`Trama/index/cache-v1/cache-${extraDigest}.sqlite3`, new Uint8Array(extra));
+    let yieldRequested = false;
+    const original = fixture.index.ingestCacheShard!;
+    fixture.index.ingestCacheShard = vi.fn(async (bytes, digest) => {
+      const result = await original(bytes, digest);
+      yieldRequested = true;
+      return result;
+    });
+    await expect(manager.adoptCurrent(() => yieldRequested)).resolves.toMatchObject({
+      adopted: true,
+    });
+    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(1);
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({ adopted: true });
+    expect(fixture.index.ingestCacheShard).toHaveBeenCalledTimes(3);
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      ignored: "same-id",
+    });
+  });
+
   it("reports staging errors without replacing the existing shard", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);

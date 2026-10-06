@@ -57,7 +57,7 @@ describe("Filo semantic index display", () => {
     );
     expect(labels).toContain("Update index");
   });
-  it("shows semantic progress and Cancel instead of the idle Update prompt", async () => {
+  it("shows semantic progress and Stop even when a rebuild has cleared the vectors", async () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
       rebuild: async () => undefined,
@@ -91,7 +91,8 @@ describe("Filo semantic index display", () => {
       status,
       undefined,
       async () => undefined,
-      () => undefined
+      () => undefined,
+      () => false
     );
     (view as any).root = root;
     (view as any).activePath = "one.md";
@@ -104,6 +105,9 @@ describe("Filo semantic index display", () => {
     });
     expect(rendered).toContainEqual({ tag: "progress", text: "" });
     expect(rendered).toContainEqual({ tag: "button", text: "Stop" });
+    expect(rendered.some((item) => item.text.includes("No compatible semantic vectors"))).toBe(
+      false
+    );
     expect(rendered.some((item) => item.text === "Update semantic index")).toBe(false);
   });
 

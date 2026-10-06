@@ -200,13 +200,6 @@ export class FiloView extends ItemView {
       });
       return;
     }
-    if (!this.hasLocalSemanticProfile()) {
-      this.root.createDiv({
-        cls: "setting-item-description mod-warning trama-filo__message",
-        text: "No compatible semantic vectors are available locally. Select a local profile or connect its provider, then update the index.",
-      });
-      return;
-    }
     if (status.kind === "index-required") {
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
@@ -268,6 +261,13 @@ export class FiloView extends ItemView {
       });
       if (status.canReindex) this.actionButton("Rebuild index", "reindex");
       else if (status.canIndex) this.actionButton("Update index", "index");
+      return;
+    }
+    if (!this.hasLocalSemanticProfile()) {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: "No compatible semantic vectors are available locally. Select a local profile or connect its provider, then update the index.",
+      });
       return;
     }
     if (capabilities && !capabilities.semantic.searchable) {

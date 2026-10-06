@@ -280,6 +280,23 @@ describe("index maintenance actions", () => {
     });
   });
 
+  it("keeps manual actions available during a cache check and acknowledges a queued click", async () => {
+    const update = vi.fn(async () => undefined);
+    const status = new IndexStatusController({} as any, {
+      update,
+      rebuild: async () => undefined,
+      reset: async () => undefined,
+      stop: () => undefined,
+    });
+    status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
+    await status.run("index");
+    expect(update).toHaveBeenCalledOnce();
+    status.setMaintenance({ lane: "adoption", phase: "queued", pending: true, suspended: false });
+    expect(status.getStatus().message).toBe(
+      "Index operation queued; finishing the current synchronized cache import…"
+    );
+  });
+
   it("shows Check activity and projects an empty lexical index on completion", () => {
     const status = new IndexStatusController({} as any, {
       update: async () => undefined,
@@ -295,8 +312,10 @@ describe("index maintenance actions", () => {
     });
     status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({
-      kind: "preparing",
-      message: "Checking synchronized index…",
+      kind: "stale",
+      message: "Checking synchronized cache…",
+      canIndex: true,
+      canReindex: true,
     });
     status.setMaintenance({ lane: "idle", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({ kind: "empty", canIndex: true });
@@ -318,7 +337,7 @@ describe("index maintenance actions", () => {
         freshness: "locally-reconciled",
       });
       status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
-      expect(status.getStatus().message).toBe("Checking synchronized index…");
+      expect(status.getStatus().message).toBe("Checking synchronized cache…");
       status.setMaintenance({ lane: "idle", pending: false, suspended: false });
       expect(status.getStatus()).toMatchObject({ kind: "ready", message: undefined });
     }

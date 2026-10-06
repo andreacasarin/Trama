@@ -64,7 +64,8 @@ function fixture(semanticConfigured = true) {
   }));
   const publish = vi.fn(async () => ({ published: true }) as PublicationResult);
   const adopt = vi.fn(
-    async () => ({ adopted: false, ignored: "missing" as const }) as AdoptionResult
+    async (_shouldYield?: () => boolean) =>
+      ({ adopted: false, ignored: "missing" as const }) as AdoptionResult
   );
   const port: MaintenancePort = {
     semanticConfigured,
@@ -954,6 +955,33 @@ describe("MaintenanceScheduler", () => {
     expect(f.publish).not.toHaveBeenCalled();
     expect(f.controller.snapshot.pending).toBe(true);
   });
+
+  it.each(["update", "rebuild"] as const)(
+    "yields a startup cache check to a manual %s without interrupting its active import",
+    async (kind) => {
+      const f = fixture();
+      const currentImport = deferred<void>();
+      let shouldYield!: () => boolean;
+      f.adopt.mockImplementationOnce(async (yieldRequested) => {
+        shouldYield = yieldRequested!;
+        await currentImport.promise;
+        expect(shouldYield()).toBe(true);
+        return { adopted: true };
+      });
+      const check = f.controller.checkPublication();
+      expect(shouldYield()).toBe(false);
+      const manual = f.controller[kind]();
+      expect(shouldYield()).toBe(true);
+      expect(f.controller.snapshot).toMatchObject({ lane: "adoption", phase: "queued" });
+      expect(f.lexical).not.toHaveBeenCalled();
+      expect(f.rebuild).not.toHaveBeenCalled();
+      currentImport.resolve();
+      await check;
+      await manual;
+      expect(kind === "update" ? f.lexical : f.rebuild).toHaveBeenCalled();
+      expect(f.controller.snapshot.lane).toBe("idle");
+    }
+  );
 
   it("Stop cancels a queued Check while an already started adoption settles", async () => {
     const f = fixture();

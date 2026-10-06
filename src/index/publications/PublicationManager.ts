@@ -149,8 +149,8 @@ export class PublicationManager {
   }
 
   /** Inspect and adopt the exact configured file without publishing directly. */
-  async adoptCurrent(): Promise<AdoptionResult> {
-    return this.ingestCacheShards();
+  async adoptCurrent(shouldYield?: () => boolean): Promise<AdoptionResult> {
+    return this.ingestCacheShards(shouldYield);
   }
 
   private async publishCacheShards(): Promise<PublicationResult> {
@@ -337,7 +337,7 @@ export class PublicationManager {
     );
   }
 
-  private async ingestCacheShards(): Promise<AdoptionResult> {
+  private async ingestCacheShards(shouldYield?: () => boolean): Promise<AdoptionResult> {
     if (!this.index.ingestCacheShard) return { adopted: false, ignored: "missing" };
     try {
       let imported = 0;
@@ -350,6 +350,7 @@ export class PublicationManager {
         let cursor: string | undefined;
         let first = true;
         for (;;) {
+          if (shouldYield?.()) return { adopted: imported > 0 };
           const shard = await this.index.extractLegacyCacheShard(
             first ? legacy : undefined,
             digest,
@@ -373,6 +374,7 @@ export class PublicationManager {
       const shards = await this.store.listCacheShards();
       let seen = 0;
       for (const shard of shards) {
+        if (shouldYield?.()) return { adopted: imported > 0 };
         const bytes = await this.store.readCacheShard(shard.path);
         const result = await this.index.ingestCacheShard(bytes, shard.digest);
         if (!result.duplicate) imported += result.imported;

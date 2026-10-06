@@ -25,7 +25,7 @@ export interface MaintenancePort {
   rebuildSemantic(signal: AbortSignal, shouldYield?: () => boolean): Promise<SemanticPrepareResult>;
   rebuild(signal: AbortSignal): Promise<IndexOperationResult>;
   publish(): Promise<PublicationResult>;
-  adoptCurrent(): Promise<AdoptionResult>;
+  adoptCurrent(shouldYield?: () => boolean): Promise<AdoptionResult>;
 }
 
 export type MaintenanceLane = "idle" | "automatic" | "update" | "rebuild" | "adoption";
@@ -273,7 +273,8 @@ export class MaintenanceScheduler {
         "adoption",
         "adopt",
         { adopted: false, ignored: "missing" },
-        () => this.port.adoptCurrent()
+        () =>
+          this.port.adoptCurrent(() => this.explicit.length > 0 || this.suspended || this.disposed)
       );
       if (!result.replacementRequired || this.disposed || cancelled) return result;
       await this.update();
@@ -302,6 +303,7 @@ export class MaintenanceScheduler {
     const promise = new Promise<void>((resolve, reject) =>
       this.explicit.push({ kind, sequence: ++this.explicitSequence, resolve, reject })
     );
+    if (this.lane === "adoption") this.phase = "queued";
     this.clearTimer();
     void this.drain();
     this.emit();

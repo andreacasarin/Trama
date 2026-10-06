@@ -295,16 +295,14 @@ export class IndexStatusController {
 
   setMaintenance(snapshot: MaintenanceSnapshot): void {
     if (snapshot.lane === "adoption") {
-      if (this.status.kind === "stale") {
-        this.status = {
-          ...this.status,
-          message: "Checking synchronized index…",
-          revision: ++this.revision,
-        };
-        for (const listener of [...this.listeners]) listener(this.status);
-        return;
-      }
-      this.set("preparing", this.status.hasLastGood, "Checking synchronized index…", false);
+      this.set(
+        "stale",
+        this.status.hasLastGood,
+        snapshot.phase === "queued"
+          ? "Index operation queued; finishing the current synchronized cache import…"
+          : "Checking synchronized cache…",
+        false
+      );
       return;
     }
     if (snapshot.lane === "idle") {
