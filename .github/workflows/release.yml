@@ -105,6 +105,11 @@ jobs:
           if (release.tagName !== expectedTag) throw new Error(`Release tag mismatch: ${release.tagName}`);
           NODE
 
+          # Preserve an explicitly designated prerelease even with a numeric tag.
+          if [[ "$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).isPrerelease))' "$release_json")" == "true" ]]; then
+            RELEASE_PRERELEASE=true
+          fi
+
           asset="trama-${RELEASE_VERSION}.zip"
           draft="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).isDraft))' "$release_json")"
           has_asset="$(node -e 'const x=JSON.parse(process.argv[1]); process.stdout.write(String(x.assets.some((asset) => asset.name === process.argv[2])))' "$release_json" "$asset")"
