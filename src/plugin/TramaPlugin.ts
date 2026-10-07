@@ -1,6 +1,10 @@
 import { Notice, Plugin } from "obsidian";
 import { readBenchmarkManifest } from "@/benchmark/Manifest";
-import { runObsidianBenchmark } from "@/benchmark/ObsidianBenchmark";
+import {
+  runObsidianBenchmark,
+  writeBenchmarkFailureReport,
+  writeBenchmarkReport,
+} from "@/benchmark/ObsidianBenchmark";
 import { createTramaDiagnostics, formatDiagnosticLogLine } from "@/diagnostics/TramaDiagnostics";
 import { compareCodeUnits } from "@/index/Identity";
 import { IndexManager, type IndexPathMutation } from "@/index/IndexManager";
@@ -31,8 +35,17 @@ export class TramaPlugin extends Plugin {
   private indexStatus?: IndexStatusController;
   private relatedNotes?: RelatedNotes;
   private indexLoad?: Promise<boolean>;
+  // Read by the host benchmark's synchronous readiness evaluation.
+  indexLoadResult?: boolean;
   private maintenance?: ComposedRuntime["scheduler"];
   private publicationManager?: PublicationManager;
+  private publicationEventCheck?: {
+    readonly revision: number;
+    readonly scheduler: ComposedRuntime["scheduler"];
+    readonly manager: IndexManager;
+    started: boolean;
+    dirty: boolean;
+  };
   private compositionRevision = 0;
   private compositionReplacement = false;
   private compositionDirty = false;
@@ -40,6 +53,8 @@ export class TramaPlugin extends Plugin {
   private readonly publicationWarnings: Partial<Record<"publication" | "check", string>> = {};
   private projectedPublicationWarning?: string;
   private upgradeNoticeShown = false;
+  private benchmarkRunning = false;
+  private benchmarkResetting = false;
   private visibleMarkdownCatalog: () => readonly string[] = () => [];
   private contextNoteSuggestions: () => readonly string[] = () => [];
   private lastActiveMarkdownPath?: string;
@@ -122,6 +137,10 @@ export class TramaPlugin extends Plugin {
       {
         update: () => this.updateIndex(),
         rebuild: () => this.rebuildIndex(),
+        reset: () => this.resetIndexes(),
+        clearShared: () => this.clearIndexesAndSharedCache(),
+        share: () => this.publishIndex(),
+        importShared: () => this.checkPublication(),
         stop: () => this.maintenance?.stop(),
       },
       this.diagnostics
@@ -135,6 +154,7 @@ export class TramaPlugin extends Plugin {
       contextNoteSuggestions: this.contextNoteSuggestions,
       getLenteSearch: () => this.modelRuntime.lenteSearch,
       getSettings: () => this.getSettings(),
+      hasLocalSemanticProfile: () => this.index?.hasCompatibleSemanticVectors() ?? false,
       stopMaintenance: () => this.maintenance?.stop(),
     });
     this.registerVaultEvents(app.vault);
@@ -144,26 +164,83 @@ export class TramaPlugin extends Plugin {
       app.vault.getName?.() ?? ""
     );
     if (benchmarkManifest && app.vault.adapter.getBasePath?.() === benchmarkManifest.expectedPath) {
-      let running = false;
       this.addCommand({
         id: "run-obsidian-benchmark",
         name: "Run generated-vault benchmark",
         callback: () => {
-          if (running) return;
-          running = true;
+          if (this.benchmarkRunning || this.benchmarkResetting) return;
+          this.benchmarkRunning = true;
           void this.runGeneratedVaultBenchmark(app, benchmarkManifest)
             .then((report) => new Notice(`Trama benchmark ${report.status}: ${report.runId}`))
-            .catch(
-              (error) =>
-                new Notice(
-                  `Trama benchmark refused: ${error instanceof Error ? error.message : String(error)}`
-                )
-            )
+            .catch(async (error) => {
+              await writeBenchmarkFailureReport(app, benchmarkManifest, error).catch(
+                () => undefined
+              );
+              new Notice(
+                `Trama benchmark refused: ${error instanceof Error ? error.message : String(error)}`
+              );
+            })
             .finally(() => {
-              running = false;
+              this.benchmarkRunning = false;
             });
         },
       });
+    }
+  }
+
+  async resetIndexes(): Promise<void> {
+    if (this.benchmarkRunning || this.benchmarkResetting) {
+      new Notice("A benchmark or index reset is already running.");
+      return;
+    }
+    const accepted = globalThis.confirm?.(
+      "Reset local search data for this vault? Notes and settings will be preserved, and shared embeddings will remain available. Scheduled maintenance will rebuild local search data if enabled."
+    );
+    if (!accepted) return;
+    this.benchmarkResetting = true;
+    try {
+      await this.resetAllIndexes();
+    } finally {
+      this.benchmarkResetting = false;
+    }
+  }
+
+  async clearIndexesAndSharedCache(): Promise<void> {
+    if (this.benchmarkRunning || this.benchmarkResetting) {
+      new Notice("A benchmark or index reset is already running.");
+      return;
+    }
+    const accepted = globalThis.confirm?.(
+      "Clear local search data and shared embeddings for this vault? Notes and settings will be preserved."
+    );
+    if (!accepted) return;
+    this.benchmarkResetting = true;
+    try {
+      await this.resetAllIndexes(true);
+    } finally {
+      this.benchmarkResetting = false;
+    }
+  }
+
+  private async resetAllIndexes(clearGeneratedContributions = false): Promise<void> {
+    await this.indexLoad;
+    const manager = this.index;
+    const scheduler = this.maintenance;
+    const publication = this.publicationManager;
+    if (!manager || !scheduler || !publication) throw new Error("Index is not initialized.");
+    await scheduler.resetExclusive(async () => {
+      await manager.resetLocalDatabase();
+      if (clearGeneratedContributions) await publication.store.clearCacheShards();
+      manager.requestFullRecovery();
+    });
+    if (
+      !clearGeneratedContributions &&
+      !scheduler.snapshot.suspended &&
+      this.index === manager &&
+      this.maintenance === scheduler
+    ) {
+      const result = await scheduler.checkPublication(true);
+      this.applyAdoptionResult(manager, result);
     }
   }
 
@@ -172,34 +249,71 @@ export class TramaPlugin extends Plugin {
     manifest: import("@/benchmark/Manifest").BenchmarkManifest
   ) {
     await this.indexLoad;
-    if (!this.index || !this.publicationManager || !this.relatedNotes || !this.modelRuntime.session)
+    if (!this.index || !this.publicationManager || !this.relatedNotes)
       throw new Error("Trama runtime is not initialized.");
-    return runObsidianBenchmark(app, manifest, this.manifest.version, {
-      index: this.index,
-      publication: this.publicationManager,
-      related: this.relatedNotes,
-      session: this.modelRuntime.session,
-      getLenteSearch: () => this.modelRuntime.lenteSearch!,
-      getSettings: () => this.getSettings(),
-      saveSettings: (settings) => this.saveSettings(settings),
-      rebuild: () => this.rebuildIndex(),
-      update: () => this.updateIndex(),
-      publish: () => this.publishIndex(),
-      checkPublication: () => this.checkPublication(),
-      stop: () => this.stopIndex(),
-    });
+    const capturePerformance = this.diagnostics.capturePerformance;
+    if (!capturePerformance) throw new Error("Performance capture is unavailable.");
+    const records: import("@/diagnostics/TramaDiagnostics").TramaPerformanceRecord[] = [];
+    let recordBytes = 0;
+    let complete = true;
+    let report!: import("@/benchmark/Manifest").BenchmarkReport;
+    await capturePerformance(
+      async () => undefined,
+      async () => {
+        report = await runObsidianBenchmark(app, manifest, {
+          index: this.index!,
+          publication: this.publicationManager!,
+          related: this.relatedNotes!,
+          getLenteSearch: () => this.modelRuntime.lenteSearch!,
+          clearIndexesAndSharedCache: async () => {
+            const current = await readBenchmarkManifest(app.vault.adapter, manifest.vaultName);
+            if (
+              !current ||
+              app.vault.adapter.getBasePath?.() !== manifest.expectedPath ||
+              current.corpusSha256 !== manifest.corpusSha256
+            )
+              throw new Error("Generated benchmark marker or path changed; refusing index clear.");
+            await this.resetAllIndexes(true);
+          },
+          rebuild: () => this.rebuildIndex(),
+          publish: () => this.publishIndex(),
+          checkPublication: () => this.checkPublication(),
+          hasPublicationCheckWarning: () => this.publicationWarnings.check !== undefined,
+        });
+      },
+      (record) => {
+        if (!complete) return;
+        const bytes = new TextEncoder().encode(JSON.stringify(record)).byteLength + 1;
+        if (records.length >= 10_000 || recordBytes + bytes > 8 * 1024 * 1024) {
+          complete = false;
+          return;
+        }
+        records.push(record);
+        recordBytes += bytes;
+      }
+    );
+    report = {
+      ...report,
+      ...(complete
+        ? {}
+        : { status: "error" as const, error: "Performance capture exceeded its bound." }),
+      performanceCapture: { complete, records },
+    };
+    await writeBenchmarkReport(app, manifest, report);
+    return report;
   }
 
   override onunload(): void {
     const maintenance = this.maintenance;
     const index = this.index;
-    const load = this.indexLoad;
     this.compositionRevision++;
+    this.publicationEventCheck = undefined;
     this.compositionReplacement = false;
     this.compositionDirty = false;
     this.vaultEvents.dispose();
     this.maintenance = undefined;
     this.indexLoad = undefined;
+    this.indexLoadResult = undefined;
     this.index = undefined;
     this.publicationManager = undefined;
     this.indexStatus = undefined;
@@ -213,10 +327,9 @@ export class TramaPlugin extends Plugin {
     this.modelRuntime.lenteSearch = undefined;
     this.embeddingModel = undefined;
     this.runtimeLoaded = false;
-    const disposal = maintenance?.dispose() ?? Promise.resolve();
-    void Promise.all([load ?? Promise.resolve(), disposal])
-      .catch(() => undefined)
-      .finally(() => index?.disposeImmediately());
+    const disposal = maintenance?.dispose();
+    index?.disposeImmediately();
+    void disposal?.catch(() => undefined);
   }
 
   isDesktopLoaded(): boolean {
@@ -282,9 +395,11 @@ export class TramaPlugin extends Plugin {
 
       // Detach callbacks before awaiting any old asynchronous work.
       this.compositionRevision++;
+      this.publicationEventCheck = undefined;
       this.maintenance = undefined;
       this.index = undefined;
       this.indexLoad = undefined;
+      this.indexLoadResult = undefined;
       this.publicationManager = undefined;
       this.clearPublicationWarnings();
       this.relatedNotes?.cancel();
@@ -339,6 +454,7 @@ export class TramaPlugin extends Plugin {
   }
 
   private composeRuntime(app: any, settings: TramaSettings): void {
+    this.indexLoadResult = undefined;
     const compositionRevision = ++this.compositionRevision;
     const runtime = composePluginRuntime(
       {
@@ -395,11 +511,17 @@ export class TramaPlugin extends Plugin {
     revision: number
   ): void {
     if (this.index !== manager || revision !== this.compositionRevision) return;
+    this.indexLoadResult = loaded;
     this.updateIndexCapabilities(manager);
     const maintenance = this.maintenance?.snapshot;
-    if (maintenance && (maintenance.pending || maintenance.lane !== "idle")) {
-      if (maintenance.lane === "idle" && manager.hasUsableIndex())
-        this.indexStatus?.markStale(true);
+    if (
+      maintenance &&
+      (maintenance.pending ||
+        maintenance.lane !== "idle" ||
+        maintenance.suspended ||
+        maintenance.error !== undefined)
+    ) {
+      this.indexStatus?.setMaintenance(maintenance, manager.capabilities());
       return;
     }
     if (!loaded || !manager.isComplete()) {
@@ -474,10 +596,10 @@ export class TramaPlugin extends Plugin {
     return metrics ? { byteSize: metrics.byteSize, durationMs: metrics.durationMs } : undefined;
   }
 
-  async checkPublication(): Promise<void> {
+  async checkPublication(manual = true): Promise<void> {
     const scheduler = this.maintenance;
     const manager = this.index;
-    const result = await scheduler?.checkPublication();
+    const result = await scheduler?.checkPublication(manual);
     if (!scheduler || scheduler !== this.maintenance || manager !== this.index || !result) return;
     this.applyAdoptionResult(manager!, result);
   }
@@ -491,6 +613,8 @@ export class TramaPlugin extends Plugin {
     this.clearPublicationWarning("check");
     if (!result.adopted) return;
     this.updateIndexCapabilities(manager);
+    if (this.getSettings().automaticMaintenance && !this.maintenance?.snapshot.suspended)
+      this.maintenance?.invalidate();
     const snapshot = this.maintenance?.snapshot;
     if (snapshot?.pending || snapshot?.lane !== "idle") return;
     if (!manager.isComplete()) this.indexStatus?.markStale(manager.hasUsableIndex());
@@ -515,7 +639,8 @@ export class TramaPlugin extends Plugin {
 
   private applyMaintenanceSnapshot(manager: IndexManager, snapshot: MaintenanceSnapshot): void {
     if (this.index !== manager) return;
-    this.indexStatus?.setMaintenance(snapshot);
+    if (snapshot.lane === "update" || snapshot.lane === "rebuild") this.relatedNotes?.cancel();
+    this.indexStatus?.setMaintenance(snapshot, manager.capabilities());
   }
 
   private clearPublicationWarning(origin: "publication" | "check"): void {
@@ -533,8 +658,8 @@ export class TramaPlugin extends Plugin {
     }
     const message =
       origin === "check"
-        ? `Synchronized index ${warning.phase === "adopt" ? "adoption" : "check"} failed: ${warning.message}`
-        : `Index saved locally, but publication failed: ${warning.message}`;
+        ? `Shared embeddings check failed: ${warning.message}`
+        : `Search data saved locally, but sharing embeddings failed: ${warning.message}`;
     this.publicationWarnings[origin] = message;
     this.projectPublicationWarning();
   }
@@ -553,8 +678,62 @@ export class TramaPlugin extends Plugin {
   }
 
   private notifyPublicationFileEvent(path: string): void {
-    if (path === this.publicationManager?.store.path)
-      void this.checkPublication().catch(() => undefined);
+    const store = this.publicationManager?.store;
+    if (
+      path.startsWith(`${store?.cacheDirectory}/cache-`) &&
+      /^cache-[0-9a-f]{64}\.sqlite3$/.test(path.slice(path.lastIndexOf("/") + 1))
+    )
+      this.queuePublicationEventCheck();
+  }
+
+  private queuePublicationEventCheck(): void {
+    const scheduler = this.maintenance;
+    const manager = this.index;
+    if (!scheduler || !manager || this.compositionReplacement) return;
+    const current = this.publicationEventCheck;
+    if (
+      current &&
+      current.revision === this.compositionRevision &&
+      current.scheduler === scheduler &&
+      current.manager === manager
+    ) {
+      if (current.started) current.dirty = true;
+      return;
+    }
+    const check = {
+      revision: this.compositionRevision,
+      scheduler,
+      manager,
+      started: false,
+      dirty: false,
+    };
+    this.publicationEventCheck = check;
+    queueMicrotask(() => void this.runPublicationEventChecks(check));
+  }
+
+  private async runPublicationEventChecks(
+    check: NonNullable<TramaPlugin["publicationEventCheck"]>
+  ): Promise<void> {
+    const isCurrent = () =>
+      this.publicationEventCheck === check &&
+      this.compositionRevision === check.revision &&
+      this.maintenance === check.scheduler &&
+      this.index === check.manager &&
+      !this.compositionReplacement;
+    try {
+      if (!isCurrent()) return;
+      check.started = true;
+      do {
+        check.dirty = false;
+        try {
+          await this.checkPublication(false);
+        } catch {
+          // A later event still gets one check, even when this check fails.
+        }
+      } while (check.dirty && isCurrent());
+    } finally {
+      if (this.publicationEventCheck === check) this.publicationEventCheck = undefined;
+    }
   }
 
   private registerVaultEvents(vault: any): void {

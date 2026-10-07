@@ -59,8 +59,7 @@ export function corpusIdentityInput(input: CorpusIdentityInput): string {
 /** Stable JSON input for the configured semantic embedding space. */
 export function embeddingIdentityInput(input: EmbeddingIdentityInput): string {
   return canonical({
-    endpoint: normalizeEmbeddingEndpoint(input.embeddingBaseUrl),
-    modelId: input.modelId,
+    modelId: input.modelId.trim(),
     dimensions: input.dimensions,
     ...(input.preprocessingVersion === undefined
       ? {}

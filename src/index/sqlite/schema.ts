@@ -1,6 +1,6 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 9;
-export const SQLITE_PROTOCOL_VERSION = 9;
+export const SQLITE_SCHEMA_VERSION = 16;
+export const SQLITE_PROTOCOL_VERSION = 13;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
 export function schemaSql(dimensions: number): string {
@@ -29,8 +29,6 @@ CREATE TABLE IF NOT EXISTS index_state (
   change_counter INTEGER NOT NULL CHECK (change_counter >= 0),
   lexical_generation INTEGER NOT NULL DEFAULT 0 CHECK (lexical_generation >= 0),
   semantic_generation INTEGER NOT NULL DEFAULT 0 CHECK (semantic_generation >= 0),
-  publication_id TEXT,
-  snapshot_loaded INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_loaded IN (0,1)),
   reconciliation_summary TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE TABLE IF NOT EXISTS notes (
@@ -64,10 +62,7 @@ CREATE TABLE IF NOT EXISTS chunk_occurrences (
   start_line INTEGER NOT NULL CHECK (start_line >= 1),
   end_line INTEGER NOT NULL CHECK (end_line >= start_line),
   display_text TEXT NOT NULL,
-  heading_context TEXT NOT NULL,
-  embedding_input TEXT NOT NULL,
   embedding_input_digest TEXT COLLATE BINARY NOT NULL,
-  body TEXT NOT NULL,
   UNIQUE(revision_id, ordinal),
   UNIQUE(revision_id, chunk_id)
 ) STRICT;
@@ -87,22 +82,108 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
   action_key TEXT COLLATE BINARY NOT NULL UNIQUE,
   embedding_fingerprint TEXT COLLATE BINARY NOT NULL,
   preprocessing TEXT NOT NULL,
-  vector BLOB NOT NULL
+  vector BLOB NOT NULL,
+  task_kind TEXT NOT NULL DEFAULT 'document' CHECK (task_kind IN ('document','query')),
+  unused_since INTEGER,
+  created_at INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_artifact_receipts (
+  digest TEXT PRIMARY KEY COLLATE BINARY,
+  profile TEXT COLLATE BINARY NOT NULL,
+  received_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_shard_membership (
+  digest TEXT NOT NULL COLLATE BINARY,
+  action_key TEXT NOT NULL COLLATE BINARY,
+  task_kind TEXT NOT NULL CHECK(task_kind IN ('document','query')),
+  profile TEXT NOT NULL COLLATE BINARY,
+  PRIMARY KEY(digest,action_key,task_kind)
+) STRICT;
+CREATE INDEX IF NOT EXISTS cache_shard_membership_key ON cache_shard_membership(action_key,task_kind);
+CREATE TABLE IF NOT EXISTS cache_compaction_state (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  last_completed_at INTEGER NOT NULL DEFAULT 0
+) STRICT;
+INSERT OR IGNORE INTO cache_compaction_state(id,last_completed_at) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS cache_compaction_retirements (
+  source_digest TEXT PRIMARY KEY COLLATE BINARY,
+  replacement_set_id TEXT NOT NULL COLLATE BINARY,
+  retire_after INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cache_compaction_replacements (
+  replacement_set_id TEXT NOT NULL COLLATE BINARY,
+  digest TEXT NOT NULL COLLATE BINARY,
+  PRIMARY KEY(replacement_set_id,digest)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS embedding_cache_fingerprint ON embedding_cache(embedding_fingerprint);
-CREATE INDEX IF NOT EXISTS embedding_cache_lookup ON embedding_cache(input_digest, embedding_fingerprint, preprocessing);
-CREATE TABLE IF NOT EXISTS active_lexical (
-  occurrence_id INTEGER PRIMARY KEY REFERENCES chunk_occurrences(occurrence_id) ON DELETE CASCADE,
-  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+CREATE INDEX IF NOT EXISTS embedding_cache_lookup ON embedding_cache(input_digest, embedding_fingerprint, preprocessing, task_kind);
+CREATE TABLE IF NOT EXISTS embedding_profiles (
+  fingerprint TEXT PRIMARY KEY COLLATE BINARY,
+  dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+  model_id TEXT NOT NULL DEFAULT '',
+  endpoint_origin TEXT NOT NULL DEFAULT ''
+) STRICT;
+CREATE TABLE IF NOT EXISTS lexical_notes (
+  note_id INTEGER PRIMARY KEY REFERENCES notes(note_id) ON DELETE CASCADE,
   revision_id INTEGER NOT NULL REFERENCES note_revisions(revision_id) ON DELETE CASCADE,
   path_text TEXT COLLATE BINARY NOT NULL,
   filename TEXT COLLATE BINARY NOT NULL,
+  title TEXT NOT NULL,
+  headings TEXT NOT NULL,
   body TEXT NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS active_lexical_note ON active_lexical(note_id, revision_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS active_lexical_fts USING fts5(
-  body, path_text, filename, content='active_lexical', content_rowid='occurrence_id',
+CREATE INDEX IF NOT EXISTS lexical_notes_revision ON lexical_notes(revision_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS lexical_notes_fts USING fts5(
+  body, path_text, filename, title, headings,
+  content='lexical_notes', content_rowid='note_id',
   tokenize='unicode61 remove_diacritics 2'
 );
+CREATE TABLE IF NOT EXISTS lexical_passages (
+  occurrence_id INTEGER PRIMARY KEY REFERENCES chunk_occurrences(occurrence_id) ON DELETE CASCADE,
+  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+  token_count INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS lexical_passages_note ON lexical_passages(note_id);
+CREATE VIEW IF NOT EXISTS lexical_passage_content AS
+  SELECT p.occurrence_id,o.display_text,p.note_id
+  FROM lexical_passages p JOIN chunk_occurrences o ON o.occurrence_id=p.occurrence_id;
+CREATE VIRTUAL TABLE IF NOT EXISTS lexical_passages_fts USING fts5(
+  display_text, note_id UNINDEXED,
+  content='lexical_passage_content', content_rowid='occurrence_id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS lexical_passages_ai AFTER INSERT ON lexical_passages BEGIN
+  INSERT INTO lexical_passages_fts(rowid,display_text,note_id)
+  SELECT new.occurrence_id,display_text,new.note_id FROM chunk_occurrences WHERE occurrence_id=new.occurrence_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_passages_ad AFTER DELETE ON lexical_passages BEGIN
+  INSERT INTO lexical_passages_fts(lexical_passages_fts,rowid,display_text,note_id)
+  SELECT 'delete',old.occurrence_id,display_text,old.note_id FROM chunk_occurrences WHERE occurrence_id=old.occurrence_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_passages_before_chunk_delete BEFORE DELETE ON chunk_occurrences BEGIN
+  DELETE FROM lexical_passages WHERE occurrence_id=old.occurrence_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_notes_ai AFTER INSERT ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+  INSERT INTO lexical_passages(occurrence_id,note_id,token_count)
+  SELECT occurrence_id,note_id,trama_token_count(display_text) FROM chunk_occurrences
+  WHERE revision_id=new.revision_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_notes_ad AFTER DELETE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+  DELETE FROM lexical_passages WHERE note_id=old.note_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_notes_au AFTER UPDATE ON lexical_notes BEGIN
+  INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
+  VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+  INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
+  VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+  DELETE FROM lexical_passages WHERE note_id=old.note_id AND old.revision_id<>new.revision_id;
+  INSERT INTO lexical_passages(occurrence_id,note_id,token_count)
+  SELECT occurrence_id,note_id,trama_token_count(display_text) FROM chunk_occurrences
+  WHERE revision_id=new.revision_id AND old.revision_id<>new.revision_id;
+END;
 `;
 }

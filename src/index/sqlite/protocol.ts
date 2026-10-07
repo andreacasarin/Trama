@@ -23,7 +23,8 @@ export interface SqliteDiagnosticEventMessage {
   readonly record: TramaPerformanceRecord;
 }
 
-export const SQLITE_PROTOCOL_VERSION = 9 as const;
+export const SQLITE_PROTOCOL_VERSION = 13 as const;
+export const SQLITE_CACHE_SHARD_MAX_BYTES = 4_194_304;
 export const SQLITE_MAX_PATH = 4096;
 export const SQLITE_MAX_TEXT = 2_000_000;
 // Character bound is conservative; hashMarkdown enforces the exact 16 MiB UTF-8 bound.
@@ -35,7 +36,6 @@ export const SQLITE_MAX_RESULTS = 256;
 export const SQLITE_MAX_SEMANTIC_BATCH_ITEMS = 128;
 export const SQLITE_MAX_SEMANTIC_INPUT_BYTES = 4 * 1024 * 1024;
 export const SQLITE_MAX_SEMANTIC_VECTOR_BYTES = 8 * 1024 * 1024;
-export const SQLITE_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 /** Bounds for one additive bounded lexical operation. */
 export const SQLITE_MAX_LEXICAL_BATCH_NOTES = 16;
 export const SQLITE_MAX_LEXICAL_BATCH_MARKDOWN_BYTES = 8 * 1024 * 1024;
@@ -43,6 +43,7 @@ export const SQLITE_MAX_LEXICAL_BATCH_OCCURRENCES = 2_000;
 
 export const SQLITE_METHODS = [
   "boot",
+  "resetLocalDatabase",
   "getState",
   "markIncomplete",
   "beginLexicalRun",
@@ -52,13 +53,20 @@ export const SQLITE_METHODS = [
   "listLexicalSummaries",
   "prepareSemanticWork",
   "commitSemanticResults",
+  "lookupQueryVector",
+  "storeQueryVector",
+  "selectEmbeddingProfile",
   "clearSemanticCache",
   "retrieve",
   "findRelated",
-  "preparePublication",
-  "finalizePublication",
-  "inspectPublication",
-  "adoptPublication",
+  "prepareCacheShard",
+  "ingestCacheShard",
+  "listCacheReceipts",
+  "maintainCache",
+  "recordCacheShard",
+  "recordCacheRetirements",
+  "listCacheRetirements",
+  "completeCacheRetirement",
   "cancelQueued",
   "shutdown",
 ] as const;
@@ -81,6 +89,11 @@ export interface SqliteLexicalRevisionInput {
   readonly path: string;
   readonly revisionDigest: string;
   readonly blocks: readonly SqliteLexicalBlockInput[];
+  readonly lexical?: {
+    readonly title: string;
+    readonly headings: string;
+    readonly body: string;
+  };
 }
 /** Markdown supplied to the bounded lexical Worker operation. */
 export interface SqliteLexicalBatchNoteInput {
@@ -166,8 +179,8 @@ export interface SqliteState {
   readonly dimensions: number;
   readonly corpusFingerprint: string;
   readonly embeddingFingerprint: string;
+  readonly semanticRebuildRequired?: boolean;
   readonly incomplete: boolean;
-  readonly snapshotLoaded: boolean;
   readonly changeCounter: number;
   readonly lexicalGeneration: number;
   readonly semanticGeneration: number;
@@ -182,7 +195,6 @@ export interface SqliteState {
   readonly semanticHeadCount: number;
   readonly semanticLagCount: number;
   readonly semanticMissingCount: number;
-  readonly publicationId?: string;
 }
 export interface SqliteNoteSummary {
   readonly path: string;
@@ -224,29 +236,18 @@ export interface SqliteHit {
   readonly startLine: number;
   readonly endLine: number;
 }
-export interface PublicationPrepared {
-  readonly publicationId: string;
-  readonly state: SqliteState;
-  readonly bytes: ArrayBuffer;
-  readonly byteSize: number;
-  readonly durationMs: number;
-  readonly copyBytes: number;
-}
-export interface PublicationInspection {
-  readonly valid: true;
-  readonly publicationId: string;
-  readonly state: SqliteState;
-  readonly byteSize: number;
-}
 
 export interface SqliteRequestPayloads {
   boot: {
     readonly corpusFingerprint: string;
     readonly embeddingFingerprint?: string;
+    readonly profileModelId?: string;
+    readonly profileEndpointOrigin?: string;
     readonly buildIdentity?: string;
     readonly dimensions: number;
     readonly identity?: string;
   };
+  resetLocalDatabase: Record<string, never>;
   getState: Record<string, never>;
   markIncomplete: Record<string, never>;
   beginLexicalRun: {
@@ -277,6 +278,14 @@ export interface SqliteRequestPayloads {
     readonly expectedCount: number;
     readonly results: readonly SqliteEmbeddingResult[];
   };
+  lookupQueryVector: { readonly query: string; readonly embeddingFingerprint: string };
+  storeQueryVector: {
+    readonly query: string;
+    readonly embeddingFingerprint: string;
+    readonly dimensions: number;
+    readonly vector: Float32Array;
+  };
+  selectEmbeddingProfile: { readonly fingerprint: string };
   clearSemanticCache: Record<string, never>;
   retrieve: {
     readonly query?: string;
@@ -287,32 +296,34 @@ export interface SqliteRequestPayloads {
     readonly lexicalCandidateLimit?: number;
     readonly lexicalProfile?: "voce" | "lente";
     readonly resultShape?: "chunks" | "notes";
+    readonly expectedEmbeddingFingerprint?: string;
   };
   findRelated: { readonly path: string; readonly vector?: Float32Array; readonly limit: number };
-  preparePublication: { readonly publicationId: string };
-  finalizePublication: {
-    readonly publicationId: string;
-    readonly expectedChangeCounter: number;
-    readonly expectedLexicalGeneration: number;
-    readonly expectedSemanticGeneration: number;
+  prepareCacheShard: {
+    readonly afterActionKey?: string;
+    readonly taskKind?: "document" | "query";
+    readonly profile?: string;
+    readonly sourceDigests?: readonly string[];
+    readonly presentDigests?: readonly string[];
+    readonly maxPayloadBytes?: number;
+    readonly now?: number;
   };
-  inspectPublication: {
-    readonly bytes: ArrayBuffer;
-    readonly corpusFingerprint?: string;
-    readonly embeddingFingerprint?: string;
-    readonly buildIdentity?: string;
-    readonly dimensions?: number;
+  ingestCacheShard: { readonly bytes: ArrayBuffer; readonly digest: string };
+  listCacheReceipts: { readonly digests: readonly string[] };
+  maintainCache: { readonly now: number };
+  recordCacheShard: {
+    readonly digest: string;
+    readonly profile: string;
+    readonly taskKind: "document" | "query";
+    readonly actionKeys: readonly string[];
   };
-  adoptPublication: {
-    readonly bytes: ArrayBuffer;
-    readonly expectedPublicationId?: string;
-    /** Candidate was validated by inspectPublication on the same byte buffer. */
-    readonly inspection?: PublicationInspection;
-    readonly corpusFingerprint?: string;
-    readonly embeddingFingerprint?: string;
-    readonly buildIdentity?: string;
-    readonly dimensions?: number;
+  recordCacheRetirements: {
+    readonly sourceDigests: readonly string[];
+    readonly replacementDigests: readonly string[];
+    readonly now: number;
   };
+  listCacheRetirements: Record<string, never>;
+  completeCacheRetirement: { readonly sourceDigest: string; readonly now: number };
   cancelQueued: { readonly requestId?: number };
   shutdown: Record<string, never>;
 }

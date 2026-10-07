@@ -427,7 +427,6 @@ const PERFORMANCE_OPERATIONS = new Set<TramaPerformanceRecord["operation"]>([
   "adoption",
 ]);
 const PERFORMANCE_PHASE_LIST = [
-  "snapshotRead",
   "batch",
   "queryEmbedding",
   "resultShaping",
@@ -457,10 +456,15 @@ const PERFORMANCE_PHASE_LIST = [
   "affectedNoteCacheUpsert",
   "promotion",
   "cleanup",
+  "snapshotRead",
+  "lexicalInputPreparation",
+  "lexicalSqlMutation",
   "semanticCandidates",
   "lexicalCandidates",
   "fusion",
   "centroid",
+  "relatedCandidates",
+  "relatedRerank",
 ] as const;
 const PERFORMANCE_PHASES = new Set<string>([...PERFORMANCE_PHASE_LIST, ...SQLITE_METHODS]);
 function safePerformanceRecord(

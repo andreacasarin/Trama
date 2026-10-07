@@ -3,6 +3,9 @@ import { chunkMarkdownBlocks, type MarkdownBlock } from "@/index/chunking";
 import { compareCodeUnits } from "@/index/Identity";
 import {
   workloadProfile,
+  SIMPLE_BENCHMARK_NOTE_CHARACTERS,
+  SIMPLE_BENCHMARK_NOTE_COUNT,
+  SIMPLE_BENCHMARK_CORPUS_SHA256,
   WORKLOAD_DIMENSIONS,
   WORKLOAD_FINGERPRINT,
   WORKLOAD_SEED,
@@ -41,6 +44,38 @@ export interface Workload {
   readonly notes: readonly WorkloadNote[];
   readonly mutations: readonly WorkloadMutation[];
   readonly queries: readonly WorkloadQuery[];
+}
+
+export interface SimpleBenchmarkCorpus {
+  readonly notes: readonly { readonly path: string; readonly content: string }[];
+  readonly sha256: string;
+}
+
+/** The one-note-per-file corpus used by the current Obsidian benchmark. */
+export function createSimpleBenchmarkCorpus(): SimpleBenchmarkCorpus {
+  const notes = Array.from({ length: SIMPLE_BENCHMARK_NOTE_COUNT }, (_, index) => {
+    const path = `notes/${String(index).padStart(4, "0")}.md`;
+    const seed =
+      index === 0
+        ? "D5 lexical sentinel unique phrase."
+        : index === 1 || index === 2
+          ? "D5 semantic sentinel shared passage for related-note retrieval."
+          : `Trama benchmark note ${index}.`;
+    const content =
+      `${seed} ${"A fixed benchmark note with ordinary prose for indexing. ".repeat(12)}`
+        .slice(0, SIMPLE_BENCHMARK_NOTE_CHARACTERS)
+        .padEnd(SIMPLE_BENCHMARK_NOTE_CHARACTERS, "x");
+    return { path, content };
+  });
+  const hash = createHash("sha256");
+  for (const note of notes) {
+    updateLengthPrefixed(hash, note.path);
+    updateLengthPrefixed(hash, note.content);
+  }
+  const sha256 = hash.digest("hex");
+  if (sha256 !== SIMPLE_BENCHMARK_CORPUS_SHA256)
+    throw new Error("Simple benchmark corpus digest differs from its pinned identity.");
+  return { notes, sha256 };
 }
 
 export const PROVIDER_CHALLENGE_INPUTS_V1 = [

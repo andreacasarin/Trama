@@ -1,4 +1,9 @@
-import type { EmbeddingModel, IndexCapabilities, ProvenanceRecord } from "@/domain/contracts";
+import {
+  StructuredError,
+  type EmbeddingModel,
+  type IndexCapabilities,
+  type ProvenanceRecord,
+} from "@/domain/contracts";
 import { compareCodeUnits, normalizeEmbeddingEndpoint, normalizeVaultPath } from "@/index/Identity";
 import {
   CHUNK_ALGORITHM_VERSION,
@@ -8,11 +13,7 @@ import {
   INDEX_SCHEMA_VERSION,
 } from "@/index/chunking";
 import type { RetrievalResult } from "@/index/retrieval/contracts";
-import type {
-  PublicationInspection,
-  PublicationPrepared,
-  SqliteState,
-} from "@/index/sqlite/protocol";
+import type { SqliteState } from "@/index/sqlite/protocol";
 import { NOOP_TRAMA_DIAGNOSTICS, type TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
 import type { VaultRetrievalPort } from "@/index/VaultSearch";
 import type {
@@ -23,7 +24,6 @@ import type {
   IndexPathMutation,
   IndexSyncResult,
   IndexVaultPort,
-  PublicationInspector,
   RelatedIndexHit,
   RelatedIndexState,
   SemanticPrepareResult,
@@ -34,6 +34,7 @@ import { LexicalSnapshotService } from "./manager/lexical-snapshot";
 import { PublicationService } from "./manager/publication";
 import { RetrievalService } from "./manager/retrieval";
 import { IndexRuntime } from "./manager/runtime";
+import { EmbeddingResolver } from "./manager/embedding-resolver";
 import { SemanticCoordinator } from "./manager/semantic";
 
 export type {
@@ -44,7 +45,6 @@ export type {
   IndexSyncResult,
   IndexVaultDocument,
   IndexVaultPort,
-  PublicationInspector,
   RelatedIndexHit,
   RelatedIndexState,
   SemanticPrepareResult,
@@ -113,9 +113,10 @@ export class IndexManager implements VaultRetrievalPort {
     this.runtime = new IndexRuntime(vault, this.fingerprintValue, this.options, diagnostics);
     const snapshots = new LexicalSnapshotService(this.runtime, this.journal);
     this.lexical = new LexicalCoordinator(this.runtime, this.journal, snapshots);
-    this.semantic = new SemanticCoordinator(this.runtime, this.journal, this.embedding);
+    const resolver = new EmbeddingResolver(this.runtime, this.embedding);
+    this.semantic = new SemanticCoordinator(this.runtime, this.journal, resolver);
     this.publication = new PublicationService(this.runtime);
-    this.retrieval = new RetrievalService(this.runtime, this.embedding);
+    this.retrieval = new RetrievalService(this.runtime, resolver);
   }
 
   configureDiagnostics(): Promise<void> {
@@ -186,6 +187,18 @@ export class IndexManager implements VaultRetrievalPort {
     this.journal.requestFullRecovery();
     this.runtime.freshness = "unknown";
   }
+  async resetLocalDatabase(): Promise<SqliteState> {
+    if (!this.runtime.client)
+      throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+    const state = (await this.runtime.client.call("resetLocalDatabase", {})) as SqliteState;
+    this.runtime.setState(state);
+    this.runtime.freshness = "unknown";
+    this.runtime.unavailable = false;
+    this.runtime.loaded = true;
+    this.runtime.loadError = undefined;
+    this.runtime.loadPromise = Promise.resolve(true);
+    return state;
+  }
   hasPendingWork(): boolean {
     return this.journal.hasPendingWork(this.runtime.state);
   }
@@ -222,25 +235,57 @@ export class IndexManager implements VaultRetrievalPort {
   prepareSemanticCacheBatch(signal: AbortSignal): Promise<SemanticPrepareResult> {
     return this.semantic.prepareSemanticCacheBatch(signal);
   }
-  publishPublication<T>(
-    publicationId: string,
-    install: (prepared: PublicationPrepared, inspect?: PublicationInspector) => Promise<T>,
-    settle: (committed: boolean) => Promise<void> = async () => undefined
-  ): Promise<{ prepared: PublicationPrepared; installed: T }> {
-    return this.publication.publishPublication(publicationId, install, settle);
+  promoteCachedSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    return this.semantic.promoteCachedSemantic(signal);
   }
-  inspectPublication(
-    bytes: ArrayBuffer,
-    transferOwnership = false
-  ): Promise<PublicationInspection> {
-    return this.publication.inspectPublication(bytes, transferOwnership);
+  prepareCacheShard(
+    afterActionKey?: string,
+    taskKind: "document" | "query" = "document",
+    profile?: string,
+    sourceDigests?: readonly string[],
+    presentDigests?: readonly string[],
+    maxPayloadBytes?: number,
+    now?: number
+  ) {
+    return this.publication.prepareCacheShard(
+      afterActionKey,
+      taskKind,
+      profile,
+      sourceDigests,
+      presentDigests,
+      maxPayloadBytes,
+      now
+    );
   }
-  adoptPublication(
-    bytes: ArrayBuffer,
-    expectedPublicationId?: string,
-    inspection?: PublicationInspection
-  ): Promise<SqliteState> {
-    return this.publication.adoptPublication(bytes, expectedPublicationId, inspection);
+  listCacheReceipts(digests: readonly string[]) {
+    return this.publication.listCacheReceipts(digests);
+  }
+  ingestCacheShard(bytes: ArrayBuffer, digest: string) {
+    return this.publication.ingestCacheShard(bytes, digest);
+  }
+  maintainCache(now: number) {
+    return this.publication.maintainCache(now);
+  }
+  recordCacheShard(
+    digest: string,
+    profile: string,
+    taskKind: "document" | "query",
+    actionKeys: readonly string[]
+  ) {
+    return this.publication.recordCacheShard(digest, profile, taskKind, actionKeys);
+  }
+  recordCacheRetirements(
+    sourceDigests: readonly string[],
+    replacementDigests: readonly string[],
+    now: number
+  ) {
+    return this.publication.recordCacheRetirements(sourceDigests, replacementDigests, now);
+  }
+  listCacheRetirements() {
+    return this.publication.listCacheRetirements();
+  }
+  completeCacheRetirement(sourceDigest: string, now: number) {
+    return this.publication.completeCacheRetirement(sourceDigest, now);
   }
   search(
     query: string,
@@ -278,11 +323,13 @@ export class IndexManager implements VaultRetrievalPort {
     this.runtime.state = undefined;
   }
   async dispose(): Promise<void> {
+    this.runtime.terminallyDisposed = true;
     this.runtime.unavailable = true;
     await this.runtime.client?.shutdown().catch(() => undefined);
     this.runtime.client = undefined;
   }
   disposeImmediately(): void {
+    this.runtime.terminallyDisposed = true;
     this.runtime.unavailable = true;
     this.runtime.client?.terminateNow();
     this.runtime.client = undefined;

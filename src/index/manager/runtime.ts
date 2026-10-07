@@ -51,6 +51,7 @@ export class IndexRuntime {
   freshness: IndexFreshness = "unknown";
   loadPromise?: Promise<boolean>;
   buildPromise?: Promise<unknown>;
+  terminallyDisposed = false;
 
   private maintenance = false;
   private maintenanceFinished?: Promise<void>;
@@ -64,6 +65,8 @@ export class IndexRuntime {
   ) {}
 
   ensureClient(): SqliteWorkerClient {
+    if (this.terminallyDisposed)
+      throw new StructuredError("unavailable", "SQLite index is disposed.", true);
     if (!this.client) {
       if (this.options.sqliteClient) {
         this.client = this.options.sqliteClient;
@@ -98,6 +101,12 @@ export class IndexRuntime {
   }
 
   async embeddingFingerprintId(): Promise<string> {
+    if (this.state) return this.state.embeddingFingerprint;
+    return this.configuredEmbeddingFingerprintId();
+  }
+
+  async configuredEmbeddingFingerprintId(): Promise<string> {
+    if (!this.fingerprint.modelId.trim()) return "";
     return sha256Hex(
       embeddingIdentityInput({
         embeddingBaseUrl: this.fingerprint.embeddingBaseUrl,
@@ -105,6 +114,14 @@ export class IndexRuntime {
         dimensions: this.fingerprint.dimensions,
         preprocessingVersion: "normalized-float32-v1",
       })
+    );
+  }
+
+  async providerMatchesActiveProfile(): Promise<boolean> {
+    return Boolean(
+      this.fingerprint.modelId.trim() &&
+      this.state?.embeddingFingerprint &&
+      (await this.configuredEmbeddingFingerprintId()) === this.state.embeddingFingerprint
     );
   }
 
@@ -153,7 +170,6 @@ export class IndexRuntime {
       lexical: lexicalIndex.status(this.state, available, this.building),
       semantic: semanticIndex.status(this.state, available, this.preparing),
       freshness: this.freshness,
-      ...(this.state?.publicationId ? { publicationId: this.state.publicationId } : {}),
     };
   }
 
@@ -198,19 +214,25 @@ export class IndexRuntime {
           },
         });
       const sqliteIdentity = await (this.options.sqliteIdentity ?? "default-vault");
+      const configuredProfile = await this.configuredEmbeddingFingerprintId();
+      const endpointOrigin = (() => {
+        try {
+          return new URL(this.fingerprint.embeddingBaseUrl).origin;
+        } catch {
+          return "";
+        }
+      })();
       const state = (await this.ensureClient().call("boot", {
         corpusFingerprint: await this.corpusFingerprintId(),
-        embeddingFingerprint: await this.embeddingFingerprintId(),
+        ...(configuredProfile ? { embeddingFingerprint: configuredProfile } : {}),
+        profileModelId: this.fingerprint.modelId,
+        profileEndpointOrigin: endpointOrigin,
         buildIdentity: SQLITE_BUILD_IDENTITY,
         dimensions: this.fingerprint.dimensions,
         identity: await sha256Hex(sqliteIdentity),
       })) as SqliteState;
       this.setState(state);
-      this.freshness = state.snapshotLoaded
-        ? "snapshot-loaded"
-        : state.incomplete
-          ? "unknown"
-          : "locally-reconciled";
+      this.freshness = state.incomplete ? "unknown" : "locally-reconciled";
       this.unavailable = false;
       this.loadError = undefined;
       if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
@@ -228,6 +250,9 @@ export class IndexRuntime {
     } catch (error) {
       this.unavailable = true;
       this.loadError = error;
+      const failedClient = this.client;
+      failedClient?.terminateNow();
+      if (this.client === failedClient) this.client = undefined;
       if (observable && diagnosticsEnabled(this.diagnostics, "detailed"))
         this.emit({
           area: "index",

@@ -11,7 +11,6 @@ import {
   SQLITE_MAX_SEMANTIC_VECTOR_BYTES,
   SQLITE_MAX_TEXT,
   SQLITE_PROTOCOL_VERSION,
-  SQLITE_SNAPSHOT_MAX_BYTES,
   isSqliteMethod,
   sqliteError,
   type SqliteEmbeddingResult,
@@ -90,11 +89,6 @@ function validBatchNote(value: unknown): value is SqliteLexicalBatchNoteInput {
       (Number.isSafeInteger(note.size) && note.size >= 1 && note.size <= SQLITE_MAX_TEXT))
   );
 }
-function validPublicationId(value: unknown): value is string {
-  return (
-    typeof value === "string" && value.length > 0 && value.length <= 256 && !value.includes("\0")
-  );
-}
 function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean {
   return (
     value === undefined ||
@@ -103,9 +97,6 @@ function validOptionalText(value: unknown, maxLength = SQLITE_MAX_TEXT): boolean
 }
 function validOptionalGeneration(value: unknown): boolean {
   return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
-}
-function validGeneration(value: unknown): boolean {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 function validOptionalDimensions(value: unknown): boolean {
   return (
@@ -119,14 +110,6 @@ function validOptionalResultLimit(value: unknown): boolean {
     (Number.isSafeInteger(value) &&
       (value as number) >= 0 &&
       (value as number) <= SQLITE_MAX_RESULTS)
-  );
-}
-function validSnapshotExpectations(value: Record<string, any>): boolean {
-  return (
-    (value.corpusFingerprint === undefined || validHash(value.corpusFingerprint)) &&
-    (value.embeddingFingerprint === undefined || validHash(value.embeddingFingerprint)) &&
-    validOptionalText(value.buildIdentity, 256) &&
-    validOptionalDimensions(value.dimensions)
   );
 }
 function assertNever(value: never): never {
@@ -144,7 +127,21 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
         !validOptionalText(value.buildIdentity, 256) ||
         !validOptionalDimensions(value.dimensions) ||
         value.dimensions === undefined ||
-        (value.identity !== undefined && !validHash(value.identity))
+        (value.identity !== undefined && !validHash(value.identity)) ||
+        !validOptionalText(value.profileModelId, 256) ||
+        !validOptionalText(value.profileEndpointOrigin, 512) ||
+        (value.profileEndpointOrigin !== undefined &&
+          value.profileEndpointOrigin !== "" &&
+          (() => {
+            try {
+              const u = new URL(value.profileEndpointOrigin);
+              return (
+                u.origin !== value.profileEndpointOrigin || u.username !== "" || u.password !== ""
+              );
+            } catch {
+              return true;
+            }
+          })())
       )
         throw sqliteError("invalid_request", "Invalid boot payload");
       return;
@@ -152,6 +149,7 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
     case "markIncomplete":
     case "listLexicalSummaries":
     case "clearSemanticCache":
+    case "resetLocalDatabase":
     case "shutdown":
       return;
     case "beginLexicalRun": {
@@ -253,6 +251,29 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       }
       return;
     }
+    case "lookupQueryVector":
+      if (
+        typeof value.query !== "string" ||
+        value.query.length > SQLITE_MAX_TEXT ||
+        !validHash(value.embeddingFingerprint)
+      )
+        throw sqliteError("invalid_request", "Invalid query vector lookup");
+      return;
+    case "storeQueryVector":
+      if (
+        typeof value.query !== "string" ||
+        value.query.length > SQLITE_MAX_TEXT ||
+        !validHash(value.embeddingFingerprint) ||
+        !validOptionalDimensions(value.dimensions) ||
+        value.dimensions === undefined ||
+        !validVector(value.vector, value.dimensions)
+      )
+        throw sqliteError("invalid_request", "Invalid query vector result");
+      return;
+    case "selectEmbeddingProfile":
+      if (!validHash(value.fingerprint))
+        throw sqliteError("invalid_request", "Invalid embedding profile");
+      return;
     case "retrieve":
       if (
         (value.query !== undefined &&
@@ -269,7 +290,9 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
           value.lexicalProfile !== "lente") ||
         (value.resultShape !== undefined &&
           value.resultShape !== "chunks" &&
-          value.resultShape !== "notes")
+          value.resultShape !== "notes") ||
+        (value.expectedEmbeddingFingerprint !== undefined &&
+          !validHash(value.expectedEmbeddingFingerprint))
       )
         throw sqliteError("invalid_request", "Invalid retrieve payload");
       return;
@@ -283,41 +306,78 @@ function validatePayload(method: SqliteMethod, payload: unknown): void {
       )
         throw sqliteError("invalid_request", "Invalid related payload");
       return;
-    case "preparePublication":
-      if (!validPublicationId(value.publicationId))
-        throw sqliteError("invalid_request", "Invalid publication ID");
-      return;
-    case "finalizePublication":
+    case "prepareCacheShard":
       if (
-        !validPublicationId(value.publicationId) ||
-        !Number.isSafeInteger(value.expectedChangeCounter) ||
-        value.expectedChangeCounter < 0 ||
-        !validGeneration(value.expectedLexicalGeneration) ||
-        !validGeneration(value.expectedSemanticGeneration)
+        (value.afterActionKey !== undefined &&
+          (typeof value.afterActionKey !== "string" ||
+            value.afterActionKey.length > SQLITE_MAX_TEXT)) ||
+        (value.profile !== undefined && !validHash(value.profile)) ||
+        (value.sourceDigests !== undefined &&
+          (!Array.isArray(value.sourceDigests) ||
+            value.sourceDigests.length > 4096 ||
+            !value.sourceDigests.every(validHash))) ||
+        (value.presentDigests !== undefined &&
+          (!Array.isArray(value.presentDigests) ||
+            value.presentDigests.length > 10000 ||
+            !value.presentDigests.every(validHash))) ||
+        (value.maxPayloadBytes !== undefined &&
+          (!Number.isSafeInteger(value.maxPayloadBytes) ||
+            value.maxPayloadBytes < 1 ||
+            value.maxPayloadBytes > 16 * 1024 * 1024)) ||
+        (value.now !== undefined && (!Number.isSafeInteger(value.now) || value.now < 0))
       )
-        throw sqliteError("invalid_request", "Invalid publication finalization payload");
+        throw sqliteError("invalid_request", "Invalid cache shard cursor");
       return;
-    case "inspectPublication":
-    case "adoptPublication":
+    case "listCacheReceipts":
+      if (
+        !Array.isArray(value.digests) ||
+        value.digests.length > 512 ||
+        !value.digests.every(validHash)
+      )
+        throw sqliteError("invalid_request", "Invalid cache receipt digests");
+      return;
+    case "ingestCacheShard":
       if (
         !(value.bytes instanceof ArrayBuffer) ||
         value.bytes.byteLength === 0 ||
-        value.bytes.byteLength > SQLITE_SNAPSHOT_MAX_BYTES ||
-        (value.expectedPublicationId !== undefined &&
-          !validPublicationId(value.expectedPublicationId)) ||
-        (value.inspection !== undefined &&
-          (!value.inspection ||
-            typeof value.inspection !== "object" ||
-            value.inspection.valid !== true ||
-            !validPublicationId(value.inspection.publicationId) ||
-            !value.inspection.state ||
-            typeof value.inspection.state !== "object" ||
-            !Number.isSafeInteger(value.inspection.byteSize) ||
-            value.inspection.byteSize < 1 ||
-            value.inspection.byteSize > SQLITE_SNAPSHOT_MAX_BYTES)) ||
-        !validSnapshotExpectations(value)
+        value.bytes.byteLength > 4_194_304 ||
+        !validHash(value.digest)
       )
-        throw sqliteError("invalid_request", "Invalid publication bytes");
+        throw sqliteError("invalid_request", "Invalid cache shard payload");
+      return;
+    case "maintainCache":
+      if (!Number.isSafeInteger(value.now) || value.now < 0)
+        throw sqliteError("invalid_request", "Invalid cache maintenance time");
+      return;
+    case "recordCacheShard":
+      if (
+        !validHash(value.digest) ||
+        !validHash(value.profile) ||
+        (value.taskKind !== "document" && value.taskKind !== "query") ||
+        !Array.isArray(value.actionKeys) ||
+        value.actionKeys.length > 4096 ||
+        value.actionKeys.some((key) => typeof key !== "string" || key.length > SQLITE_MAX_TEXT)
+      )
+        throw sqliteError("invalid_request", "Invalid cache shard membership");
+      return;
+    case "recordCacheRetirements":
+      if (
+        !Number.isSafeInteger(value.now) ||
+        value.now < 0 ||
+        !Array.isArray(value.sourceDigests) ||
+        value.sourceDigests.length > 4096 ||
+        !value.sourceDigests.every(validHash) ||
+        !Array.isArray(value.replacementDigests) ||
+        value.replacementDigests.length > 4096 ||
+        !value.replacementDigests.every(validHash)
+      )
+        throw sqliteError("invalid_request", "Invalid cache retirement set");
+      return;
+    case "listCacheRetirements":
+      return;
+    case "completeCacheRetirement":
+      if (!validHash(value.sourceDigest) || !Number.isSafeInteger(value.now) || value.now < 0)
+        throw sqliteError("invalid_request", "Invalid cache retirement source");
       return;
     case "cancelQueued":
       if (

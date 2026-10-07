@@ -26,6 +26,8 @@ export interface SettingsTabCallbacks {
   rebuildIndex(): Promise<void>;
   stopIndex(): Promise<void>;
   publishIndex(): Promise<void>;
+  resetIndexes(): Promise<void>;
+  clearIndexesAndSharedCache(): Promise<void>;
   checkPublication?(): Promise<void>;
   getIndexStatus?():
     | {
@@ -250,7 +252,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       .setDesc(
         isChat
           ? "Click Discover to query the configured endpoint, then choose an AI model."
-          : "Used by Filo indexing and Hybrid Lente search; changing it requires Update or Rebuild. Click Discover to query the configured endpoint."
+          : "Used by Filo and hybrid Lente search. Changing the model requires a semantic rebuild and clears the shared embedding cache. Click Discover to query the configured endpoint."
       )
       .addDropdown((dropdown) => {
         if (!selectedModel) dropdown.addOption("", "Select a model");
@@ -318,7 +320,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Scheduled maintenance")
       .setDesc(
-        "Automatically updates the lexical index after vault changes, prepares semantic vectors when an embedding model is configured, and publishes the converged SQLite index for synchronization. Semantic preparation sends note excerpts to the configured embedding endpoint and may incur provider cost."
+        "Automatically updates local indexes after vault changes, reuses cached embeddings before requesting missing vectors, and publishes new embedding-cache entries for other devices. Semantic preparation sends note excerpts to the configured embedding endpoint and may incur provider cost."
       )
       .addToggle((toggle) => {
         toggle.setValue(draft.automaticMaintenance);
@@ -333,9 +335,9 @@ export class TramaSettingsTab extends PluginSettingTab {
         });
       });
     new Setting(this.containerEl)
-      .setName("Synchronized SQLite folder")
+      .setName("Shared embeddings folder")
       .setDesc(
-        "Vault-relative folder for index.sqlite3. Settings are synchronized across devices; loopback endpoints such as 127.0.0.1 normally refer to each device, so use an approved LAN origin for a service on another device."
+        "Vault-relative folder for computed embeddings shared between devices. Importing these files reuses embeddings without contacting the provider; search indexes remain local. Changing the embedding model requires rebuilding embeddings and clears the shared files."
       )
       .addText((text) => {
         text.setValue(draft.publicationDirectory ?? "Trama/index");
@@ -344,20 +346,21 @@ export class TramaSettingsTab extends PluginSettingTab {
         });
       });
     new Setting(this.containerEl)
-      .setName("Index maintenance")
+      .setClass("trama-settings__commands")
+      .setName("Index and cache commands")
       .setDesc(
-        "Update changed notes, publish the current index, or rebuild the index and its semantic vectors."
+        "Update search indexeses for changed notes or rebuild semantic vectors. Share sends computed embeddings to the shared folder; Import reads missing shared embeddings. Reset clears local search data and preserves shared files. Clear removes both local search data and shared embeddings."
       )
       .addButton((button) =>
         button
-          .setButtonText("Update")
+          .setButtonText("Update search indexes")
           .onClick(
             () => void this.run(() => this.runIndexMaintenance(() => this.controller.updateIndex()))
           )
       )
       .addButton((button) =>
         button
-          .setButtonText("Rebuild")
+          .setButtonText("Rebuild embeddings")
           .onClick(
             () =>
               void this.run(() => this.runIndexMaintenance(() => this.controller.rebuildIndex()))
@@ -365,7 +368,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button
-          .setButtonText("Publish")
+          .setButtonText("Share embeddings")
           .onClick(() => void this.run(() => this.controller.publishIndex()))
       )
       .addButton((button) =>
@@ -373,8 +376,18 @@ export class TramaSettingsTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button
-          .setButtonText("Check")
+          .setButtonText("Import shared embeddings")
           .onClick(() => void this.run(() => this.controller.checkPublication?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Reset local search data")
+          .onClick(() => void this.run(() => this.controller.resetIndexes?.()))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Clear local search data and shared embeddings")
+          .onClick(() => void this.run(() => this.controller.clearIndexesAndSharedCache?.()))
       );
     const status = this.controller.getIndexStatus?.();
     if (status?.capabilities) {
@@ -389,7 +402,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     const metrics = this.controller.getPublicationMetrics?.();
     if (metrics)
       this.containerEl.createEl("p", {
-        text: `Last publication: ${metrics.byteSize} bytes in ${metrics.durationMs} ms.`,
+        text: `Last shared embeddings: ${(metrics.byteSize / (1024 * 1024)).toFixed(2)} MiB shared in ${(metrics.durationMs / 1000).toFixed(2)} s.`,
         cls: "setting-item-description",
       });
     new Setting(this.containerEl)

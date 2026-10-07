@@ -51,7 +51,6 @@ export interface LenteBatch {
   /** Why hybrid retrieval was reduced to lexical-only results, when applicable. */
   readonly degradationReason?: "semantic-unavailable" | "query-embedding-failed";
   readonly freshness?: IndexFreshness;
-  readonly publicationId?: string;
   readonly displayLimit: number;
   readonly semanticPartial?: boolean;
   readonly results: readonly LenteResult[];
@@ -105,7 +104,6 @@ export class LenteSearch {
         ...(degradationReason ? { degradationReason } : {}),
         ...(state.freshness ? { freshness: state.freshness } : {}),
         ...(state.semantic.state === "partial" ? { semanticPartial: true } : {}),
-        ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         displayLimit,
         results,
         canonicalResults,

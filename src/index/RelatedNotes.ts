@@ -33,9 +33,14 @@ export interface RelatedNotesResult {
   readonly contentHash: string;
   readonly freshness?: IndexFreshness;
   readonly semanticPartial?: boolean;
-  readonly publicationId?: string;
   readonly unavailableReason?: "semantic-unavailable" | "incomplete-vectors";
   readonly results: readonly RelatedNoteResult[];
+}
+
+interface RelatedLookup {
+  readonly promise: Promise<RelatedNotesResult>;
+  readonly controller: AbortController;
+  consumers: number;
 }
 
 /** Shared, cancellable related-note lookup used by Filo and Voce. */
@@ -43,10 +48,7 @@ export class RelatedNotes {
   static readonly MAX_RESULTS = 20;
 
   private readonly cache = new Map<string, RelatedNotesResult>();
-  private readonly inFlight = new Map<
-    string,
-    { promise: Promise<RelatedNotesResult>; controller: AbortController }
-  >();
+  private readonly inFlight = new Map<string, RelatedLookup>();
   private latestResult?: RelatedNotesResult;
   private readonly listeners = new Set<(result: RelatedNotesResult) => void>();
 
@@ -94,7 +96,6 @@ export class RelatedNotes {
         results: [],
         ...(state?.freshness ? { freshness: state.freshness } : {}),
         ...(state?.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-        ...(state?.publicationId ? { publicationId: state.publicationId } : {}),
       };
       this.publish(result, state ? this.key(state) : "");
       return result;
@@ -108,7 +109,6 @@ export class RelatedNotes {
         contentHash: state.contentHash,
         ...(state.freshness ? { freshness: state.freshness } : {}),
         ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-        ...(state.publicationId ? { publicationId: state.publicationId } : {}),
         unavailableReason: readiness,
         results: [],
       };
@@ -124,7 +124,7 @@ export class RelatedNotes {
     }
     const existing = this.inFlight.get(key);
     if (existing && !existing.controller.signal.aborted && !refresh)
-      return this.forConsumer(existing.promise, signal, cap);
+      return this.forConsumer(existing, signal, cap);
     if (existing?.controller.signal.aborted) this.inFlight.delete(key);
     const controller = new AbortController();
     if (diagnosticsEnabled(this.diagnostics, "detailed"))
@@ -165,8 +165,9 @@ export class RelatedNotes {
       .finally(() => {
         if (this.inFlight.get(key)?.promise === run) this.inFlight.delete(key);
       });
-    this.inFlight.set(key, { promise: run, controller });
-    return this.forConsumer(run, signal, cap);
+    const lookup = { promise: run, controller, consumers: 0 };
+    this.inFlight.set(key, lookup);
+    return this.forConsumer(lookup, signal, cap);
   }
 
   cancel(): void {
@@ -179,13 +180,22 @@ export class RelatedNotes {
   }
 
   private forConsumer(
-    shared: Promise<RelatedNotesResult>,
+    lookup: RelatedLookup,
     signal: AbortSignal,
     limit: number
   ): Promise<RelatedNotesResult> {
     if (signal.aborted) return Promise.reject(new Error("Operation cancelled"));
+    lookup.consumers++;
     return new Promise((resolve, reject) => {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        lookup.consumers--;
+      };
       const onAbort = () => {
+        release();
+        if (!lookup.consumers) lookup.controller.abort();
         if (diagnosticsEnabled(this.diagnostics, "detailed"))
           this.emitDiagnostic({
             area: "filo",
@@ -197,12 +207,14 @@ export class RelatedNotes {
         reject(new Error("Operation cancelled"));
       };
       signal.addEventListener("abort", onAbort, { once: true });
-      shared.then(
+      lookup.promise.then(
         (result) => {
+          release();
           signal.removeEventListener("abort", onAbort);
           if (!signal.aborted) resolve({ ...result, results: result.results.slice(0, limit) });
         },
         (error) => {
+          release();
           signal.removeEventListener("abort", onAbort);
           if (!signal.aborted) {
             if (diagnosticsEnabled(this.diagnostics, "detailed"))
@@ -272,7 +284,6 @@ export class RelatedNotes {
       results,
       ...(state.freshness ? { freshness: state.freshness } : {}),
       ...(state.semantic?.state === "partial" ? { semanticPartial: true } : {}),
-      ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
 
@@ -282,11 +293,11 @@ export class RelatedNotes {
   }
 
   private key(state: RelatedIndexState): string {
-    return `${state.currentPath}\0${state.contentHash}\0${state.publicationId ?? ""}`;
+    return `${state.currentPath}\0${state.contentHash}`;
   }
 
   private keyOf(result: RelatedNotesResult): string {
-    return `${result.currentPath}\0${result.contentHash}\0${result.publicationId ?? ""}`;
+    return `${result.currentPath}\0${result.contentHash}`;
   }
 
   private publish(result: RelatedNotesResult, expectedKey: string): void {

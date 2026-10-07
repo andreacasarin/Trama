@@ -322,13 +322,109 @@ describe("SqliteWorkerClient", () => {
     expect(handshakeSent).toBe(true);
   });
 
-  it("terminates a worker that does not complete the runtime handshake", async () => {
+  it("waits the full runtime handshake deadline before terminating a quiet worker", async () => {
+    vi.useFakeTimers();
+    try {
+      const worker = new FakeWorker();
+      const client = new SqliteWorkerClient(worker);
+      let status = "pending";
+      const handshake = client.handshake(TRAMA_RUNTIME_BUILD_ID).then(
+        () => {
+          status = "resolved";
+          return { error: undefined };
+        },
+        (error) => {
+          status = "rejected";
+          return { error };
+        }
+      );
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(status).toBe("pending");
+      expect(worker.terminated).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(handshake).resolves.toMatchObject({
+        error: {
+          error: {
+            code: "storage_unavailable",
+            message: "SQLite Worker handshake timed out.",
+          },
+        },
+      });
+      expect(worker.terminated).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a valid runtime handshake delayed beyond one second and then boots", async () => {
+    vi.useFakeTimers();
+    try {
+      const worker = new FakeWorker();
+      const original = worker.postMessage.bind(worker);
+      worker.postMessage = ((value: any, transfer?: readonly ArrayBuffer[]) => {
+        if (value.type === "trama-runtime-handshake") {
+          worker.messages.push({ value, transfer });
+          setTimeout(
+            () =>
+              worker.emit("message", {
+                data: {
+                  type: value.type,
+                  id: value.id,
+                  buildId: TRAMA_RUNTIME_BUILD_ID,
+                  diagnosticsConfigured: true,
+                },
+              }),
+            1_500
+          );
+          return;
+        }
+        original(value, transfer);
+      }) as any;
+      const client = new SqliteWorkerClient(worker);
+      const handshake = client.handshake(TRAMA_RUNTIME_BUILD_ID);
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(handshake).resolves.toBe(TRAMA_RUNTIME_BUILD_ID);
+      await expect(
+        client.call("boot", { corpusFingerprint: "a", dimensions: 2 })
+      ).resolves.toMatchObject({
+        method: "boot",
+      });
+      expect(worker.messages[1].value.method).toBe("boot");
+      expect(worker.terminated).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a Worker bootstrap protocol error without waiting for the handshake timeout", async () => {
     const worker = new FakeWorker();
+    worker.postMessage = ((value: any) => {
+      queueMicrotask(() =>
+        worker.emit("message", {
+          data: {
+            v: SQLITE_PROTOCOL_VERSION,
+            id: value.id,
+            ok: false,
+            error: {
+              code: "storage_unavailable",
+              message: "unsafe worker startup detail",
+              retryable: true,
+            },
+          },
+        })
+      );
+    }) as any;
     const client = new SqliteWorkerClient(worker);
     await expect(client.handshake(TRAMA_RUNTIME_BUILD_ID)).rejects.toMatchObject({
-      error: { code: "storage_unavailable" },
+      error: {
+        code: "storage_unavailable",
+        message: "SQLite Worker module could not be started.",
+      },
     });
     expect(worker.terminated).toBe(true);
+    expect(worker.messages).toHaveLength(0);
   });
 
   it("terminates immediately when the Worker reports a mismatched build", async () => {
@@ -356,7 +452,7 @@ describe("SqliteWorkerClient", () => {
       worker.emit("error", { error: new Error("worker failed") });
       worker.emit("messageerror", { error: new Error("message failed") });
       await expect(handshake).rejects.toMatchObject({
-        error: { code: "storage_unavailable" },
+        error: { code: "storage_unavailable", message: "SQLite Worker failed during startup." },
       });
       expect(worker.terminated).toBe(true);
       vi.advanceTimersByTime(2_000);
@@ -410,17 +506,6 @@ describe("SqliteWorkerClient", () => {
 
     expect(worker.messages[0].transfer).toEqual([]);
     expect(worker.messages[0].value.payload.vectors[0].vector).not.toBe(vector);
-  });
-
-  it("transfers owned publication readback without copying it on the main thread", async () => {
-    const worker = new FakeWorker();
-    const client = new SqliteWorkerClient(worker);
-    const bytes = new Uint8Array([1, 2, 3]).buffer;
-
-    await client.call("inspectPublication", { bytes }, undefined, { transferOwnedBytes: true });
-
-    expect(worker.messages[0].value.payload.bytes).toBe(bytes);
-    expect(worker.messages[0].transfer).toEqual([bytes]);
   });
 
   it("rejects pending calls on a Worker crash", async () => {

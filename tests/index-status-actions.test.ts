@@ -1,17 +1,125 @@
+import { createTestIndexStatus } from "./index-status-fixture";
 import { describe, expect, it, vi } from "vitest";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaDiagnosticInput as TramaDiagnosticRecord } from "@/diagnostics/TramaDiagnostics";
 
+const notices = vi.hoisted(() => [] as string[]);
+vi.mock("obsidian", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("obsidian")>()),
+  Notice: class {
+    constructor(message: string) {
+      notices.push(message);
+    }
+  },
+}));
+
 describe("index maintenance actions", () => {
-  it("exposes only Update, Rebuild, and Stop commands", async () => {
-    const commands: { id: string; name: string }[] = [];
+  it("reports palette and Filo action failures without an unhandled rejection", async () => {
+    notices.length = 0;
+    const status = createTestIndexStatus({
+      update: async () => {
+        throw new Error("provider offline");
+      },
+      rebuild: async () => {
+        throw new Error("storage unavailable");
+      },
+    });
+    status.setReady();
+    await expect(status.run("index")).resolves.toBeUndefined();
+    await expect(status.run("reindex")).resolves.toBeUndefined();
+    expect(notices).toEqual([
+      "Trama index update failed: provider offline",
+      "Trama index rebuild failed: storage unavailable",
+    ]);
+  });
+
+  it.each(["lexical", "semantic", "publication"])(
+    "allows manual commands to supersede active %s work",
+    async (phase) => {
+      const update = vi.fn(async () => undefined);
+      const rebuild = vi.fn(async () => undefined);
+      const status = createTestIndexStatus({
+        update,
+        rebuild,
+      });
+      status.setMaintenance({ lane: "automatic", phase, pending: true, suspended: false });
+      await status.run("index");
+      await status.run("reindex");
+      expect(update).toHaveBeenCalledOnce();
+      expect(rebuild).toHaveBeenCalledOnce();
+    }
+  );
+
+  it("keeps semantic failure attribution through publication and accepts newer batch progress", () => {
+    const status = createTestIndexStatus();
+    status.setMaintenance({ lane: "update", phase: "semantic", pending: true, suspended: false });
+    const progress = {
+      operation: "incremental" as const,
+      phase: "build-vector" as const,
+      completed: 1,
+      total: 3,
+      unit: "chunks" as const,
+      determinate: true,
+      changeCounter: 1,
+    };
+    status.reportProgress(progress);
+    status.reportProgress({ ...progress, changeCounter: 2, completed: 2 });
+    expect(status.getStatus().progress?.completed).toBe(2);
+    status.reportProgress({ ...progress, changeCounter: 1, completed: 3 });
+    expect(status.getStatus().progress?.completed).toBe(2);
+    status.setMaintenance({
+      lane: "update",
+      phase: "publication",
+      pending: true,
+      suspended: false,
+    });
+    status.setMaintenance({
+      lane: "idle",
+      pending: true,
+      suspended: false,
+      error: new Error("provider offline"),
+    });
+    expect(status.getStatus()).toMatchObject({ kind: "error", channel: "semantic" });
+  });
+
+  it("routes Clear local search data and shared embeddings through the shared action", () => {
+    const commands: { id: string; callback?: () => void }[] = [];
+    const clearShared = vi.fn(async () => undefined);
+    const status = new IndexStatusController(
+      {
+        addCommand: (command: { id: string; callback?: () => void }) => commands.push(command),
+      } as any,
+      {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        reset: async () => undefined,
+        clearShared,
+        stop: () => undefined,
+      }
+    );
+    status.register();
+    commands.find(({ id }) => id === "clear-indexes-and-shared-cache")?.callback?.();
+    expect(clearShared).toHaveBeenCalledOnce();
+  });
+
+  it("exposes Update, Rebuild, Reset, and Stop commands", async () => {
+    const commands: { id: string; name: string; callback?: () => void }[] = [];
     const update = vi.fn(async () => undefined);
     const rebuild = vi.fn(async () => undefined);
+    const reset = vi.fn(async () => undefined);
+    const share = vi.fn(async () => undefined);
+    const importShared = vi.fn(async () => undefined);
     const status = new IndexStatusController(
-      { addCommand: (command: { id: string; name: string }) => commands.push(command) } as any,
+      {
+        addCommand: (command: { id: string; name: string; callback?: () => void }) =>
+          commands.push(command),
+      } as any,
       {
         update,
         rebuild,
+        reset,
+        share,
+        importShared,
         stop: () => undefined,
       }
     );
@@ -19,13 +127,47 @@ describe("index maintenance actions", () => {
     status.register();
 
     expect(commands.map(({ name }) => name)).toEqual([
-      "Update index",
-      "Rebuild index",
+      "Update search indexes",
+      "Clear local search data and shared embeddings",
+      "Rebuild embeddings",
+      "Reset local search data",
+      "Share embeddings",
+      "Import shared embeddings",
       "Stop index maintenance",
     ]);
+    commands.find(({ id }) => id === "publish-embeddings")?.callback?.();
+    commands.find(({ id }) => id === "import-shared-embeddings")?.callback?.();
+    expect(share).toHaveBeenCalledOnce();
+    expect(importShared).toHaveBeenCalledOnce();
     await status.run("reindex");
     expect(rebuild).toHaveBeenCalledOnce();
+    commands.find(({ id }) => id === "reset-all-indexes")?.callback?.();
+    expect(reset).toHaveBeenCalledOnce();
     expect(commands.map(({ id }) => id)).not.toContain("prepare-semantic-index");
+  });
+
+  it("handles reset rejection and shows the failure detail", async () => {
+    notices.length = 0;
+    const commands: { id: string; callback?: () => void }[] = [];
+    const status = new IndexStatusController(
+      {
+        addCommand: (command: { id: string; callback?: () => void }) => commands.push(command),
+      } as any,
+      {
+        update: async () => undefined,
+        rebuild: async () => undefined,
+        reset: () => Promise.reject(new Error("Index maintenance is active; retry reset.")),
+        stop: () => undefined,
+      }
+    );
+    status.register();
+
+    commands.find(({ id }) => id === "reset-all-indexes")?.callback?.();
+    await vi.waitFor(() =>
+      expect(notices).toEqual([
+        "Trama index reset failed: Index maintenance is active; retry reset.",
+      ])
+    );
   });
 
   it("retains lexical ETA when chunk and write progress alternate", () => {
@@ -35,6 +177,7 @@ describe("index maintenance actions", () => {
       {
         update: async () => undefined,
         rebuild: async () => undefined,
+        reset: async () => undefined,
         stop: () => undefined,
       },
       undefined,
@@ -97,6 +240,7 @@ describe("index maintenance actions", () => {
       {
         update,
         rebuild: async () => undefined,
+        reset: async () => undefined,
         stop: () => undefined,
       },
       { enabled: () => true, emit: (event) => events.push(event) }
@@ -116,22 +260,14 @@ describe("index maintenance actions", () => {
   });
 
   it("projects idle pending work as stale even when automatic maintenance is enabled", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "idle", pending: true, suspended: false });
     expect(status.getStatus()).toMatchObject({ kind: "stale", canIndex: true });
   });
 
   it("prioritizes an idle maintenance error over pending changes", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "update", pending: true, suspended: false });
     status.setMaintenance({
@@ -159,11 +295,7 @@ describe("index maintenance actions", () => {
   });
 
   it("projects the unified semantic phase and Stop capability", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({
       lane: "automatic",
@@ -181,11 +313,7 @@ describe("index maintenance actions", () => {
   });
 
   it("shows Stop suspension before pending stale state", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "update", pending: true, suspended: false });
     status.setMaintenance({ lane: "idle", pending: true, suspended: true });
@@ -197,11 +325,7 @@ describe("index maintenance actions", () => {
   });
 
   it("shows Stop when edits are only waiting for the automatic quiet period", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
-    });
+    const status = createTestIndexStatus();
     status.setReady();
     status.setMaintenance({ lane: "idle", pending: true, suspended: true });
     expect(status.getStatus()).toMatchObject({
@@ -210,12 +334,22 @@ describe("index maintenance actions", () => {
     });
   });
 
-  it("shows Check activity and projects an empty lexical index on completion", () => {
-    const status = new IndexStatusController({} as any, {
-      update: async () => undefined,
-      rebuild: async () => undefined,
-      stop: () => undefined,
+  it("keeps manual actions available during a cache check and acknowledges a queued click", async () => {
+    const update = vi.fn(async () => undefined);
+    const status = createTestIndexStatus({
+      update,
     });
+    status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
+    await status.run("index");
+    expect(update).toHaveBeenCalledOnce();
+    status.setMaintenance({ lane: "adoption", phase: "queued", pending: true, suspended: false });
+    expect(status.getStatus().message).toBe(
+      "Search update queued; finishing the current shared embeddings import…"
+    );
+  });
+
+  it("shows Check activity and projects an empty lexical index on completion", () => {
+    const status = createTestIndexStatus();
     status.setCapabilities({
       availability: "available",
       lexical: { state: "empty", activity: "idle", searchable: false },
@@ -224,8 +358,10 @@ describe("index maintenance actions", () => {
     });
     status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({
-      kind: "preparing",
-      message: "Checking synchronized index…",
+      kind: "stale",
+      message: "Importing shared embeddings…",
+      canIndex: true,
+      canReindex: true,
     });
     status.setMaintenance({ lane: "idle", pending: false, suspended: false });
     expect(status.getStatus()).toMatchObject({ kind: "empty", canIndex: true });
@@ -234,11 +370,7 @@ describe("index maintenance actions", () => {
   it.each(["missing", "same-id"] as const)(
     "restores the capability status after an ignored synchronized index check (%s)",
     () => {
-      const status = new IndexStatusController({} as any, {
-        update: async () => undefined,
-        rebuild: async () => undefined,
-        stop: () => undefined,
-      });
+      const status = createTestIndexStatus();
       status.setCapabilities({
         availability: "available",
         lexical: { state: "ready", activity: "idle", searchable: true },
@@ -246,7 +378,7 @@ describe("index maintenance actions", () => {
         freshness: "locally-reconciled",
       });
       status.setMaintenance({ lane: "adoption", pending: false, suspended: false });
-      expect(status.getStatus().message).toBe("Checking synchronized index…");
+      expect(status.getStatus().message).toBe("Importing shared embeddings…");
       status.setMaintenance({ lane: "idle", pending: false, suspended: false });
       expect(status.getStatus()).toMatchObject({ kind: "ready", message: undefined });
     }

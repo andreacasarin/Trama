@@ -1,6 +1,10 @@
 export const WORKLOAD_SEED = 0x5eed_768;
 export const WORKLOAD_DIMENSIONS = 768;
 export const WORKLOAD_FINGERPRINT = "a".repeat(64);
+export const SIMPLE_BENCHMARK_NOTE_COUNT = 3000;
+export const SIMPLE_BENCHMARK_NOTE_CHARACTERS = 400;
+export const SIMPLE_BENCHMARK_CORPUS_SHA256 =
+  "66d061b6c61c157587bf1dace04c6e72e7b0c5d3f8dd44393699d3b50f7b1c8a";
 
 export interface WorkloadProfile {
   readonly id: "trama-small" | "trama-10k" | "trama-large";

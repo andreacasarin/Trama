@@ -30,6 +30,13 @@ const sqlite = await initModule({
 });
 const db = new sqlite.oo1.DB(":memory:", "c");
 const runtimeChecks = {
+  nativeDot:
+    db.selectValue("SELECT trama_vector_dot(vector_as_f32('[1,0]'),vector_as_f32('[0.5,0.5]'))") ===
+    0.5,
+  nativeTokenizer: db.selectValue("SELECT trama_token_count('Café running')") === 2,
+  nativeCentroid:
+    db.selectValue("SELECT length(trama_vector_centroid(vector_as_f32('[1,0]')))") === 8,
+  pathCollation: db.selectValue("SELECT '😀' < '\ue000' COLLATE trama_code_units") === 1,
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,

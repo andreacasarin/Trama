@@ -5,54 +5,48 @@ Trama is an Obsidian plugin for local AI conversation and semantic connections o
 ## Setup
 
 1. Install and start [LM Studio](https://lmstudio.ai/) **0.3.29 or newer** on a device that can reach the configured endpoint, load a chat model and (when desired) an embedding model, and enable its local OpenAI-compatible server.
-2. Configure the chat model, embedding model, and optional publication folder in plugin settings. The default synchronized file is `Trama/index/index.sqlite3`.
-3. Use **Update index** for the initial index. It converges lexical state, adds semantic vectors when an embedding model is configured, and publishes the converged result. With no embedding model it remains network-silent. Then open **Voce**, **Filo**, or **Lente**.
+2. Configure the chat and embedding models in plugin settings. Embeddings are optional; lexical indexing and search work without a provider.
+3. Use **Update index** to build the local indexes and, when configured, prepare and share reusable semantic vectors. With no embedding model, indexing remains network-silent. Then open **Voce**, **Filo**, or **Lente**.
 
-The live index is one mutable SQLite WASM database persisted through the official
-OPFS SAH pool. Trama publishes exactly one synchronized artifact,
-`<publication folder>/index.sqlite3`, through Obsidian's `DataAdapter`. The
-folder is vault-relative, case-sensitive, and defaults to `Trama/index`; changing
-it affects future publications and does not move or delete the old folder. The
-publication folder is automatically excluded from Markdown indexing.
+The local SQLite/WASM index keeps one full-note lexical FTS entry per visible note
+and structural semantic blocks. Markdown remains authoritative. Semantic blocks use
+at most 384 characters of canonical serialized input, including heading context,
+with zero overlap. While changed inputs are prepared, the last complete compatible
+semantic state remains available; search stays available during indexing.
 
-One maintenance scheduler owns Update, Rebuild, Stop, automatic timing, publication,
-and synchronized-file adoption. Lexical, semantic, publication, and adoption remain
-separate executors. Semantic vectors are committed in bounded resumable batches.
-Search remains available while semantic coverage is none or partial. A loaded
-publication is immediately searchable and reports **snapshot loaded — not locally
-reconciled** until a user-triggered Update or Rebuild converges it with Markdown.
-The publication ID is used for equality only; there is no manifest, hash filename,
-device ordering, merge, compression, chunking, or sidecar metadata.
-
-For synchronized vaults, use a single-writer-in-time handoff: finish indexing and
-publication on device A, wait for Obsidian Sync or iCloud to converge, then index
-on device B. The provider chooses the last/authoritative file version (including
-its conflict behavior); Trama adopts any differing valid file and does not compare
-timestamps or invent a merge. Concurrent writers can lose derived work and may
-need a new Update.
+Only reusable computed vectors are shared. Immutable standalone SQLite cache shards
+are merged additively and deduplicated, without sharing FTS state, note heads, paths,
+or local IDs. Cache identity uses exact provider-input bytes and a proven compatible
+model/output space and task; endpoint reachability or matching dimensions alone do
+not establish compatibility. The complete cache and profile lifecycle is described
+in [SQLite cache details](docs/sqlite-snapshots.md).
 
 ## Filo related notes
 
-Filo always shows the seven strongest unique visible Markdown notes related to the
-active note, then extends the list up to twenty for additional notes with cosine
-similarity of at least 0.30. It opens a result with Obsidian's native navigation. Ranking uses the active note's
-signal against conservative 384-character chunks with 64-character overlap; chunk
-scores are aggregated to unique notes. The same ordered results appear as optional
-suggestions in Voce after the active-note suggestion. Suggestions never attach
-themselves to a prompt. Filo presents results as a native disclosure list: the note
-title opens the note, the caret reveals the winning indexed passage and source lines,
-and cosine similarity is summarized as High (at least 0.72), Medium (at least 0.50),
-or Low using constants owned by the view.
+Filo generates candidates from the source-note centroid and three diverse semantic
+block probes, retrieves up to 32 distinct notes per probe, and unions at most 128
+candidates. It then reranks each candidate against all compatible distinct semantic
+passages using the symmetric mean of the top two passage matches in each direction.
+This exact rerank can consider passages beyond the candidate probes; candidate
+generation remains bounded and can miss notes, and exact passage comparisons have no
+bounded-latency guarantee. Filo shows the seven strongest unique visible Markdown
+notes, then extends the list up to twenty for notes with cosine similarity of at
+least 0.30. The winning passage and source lines remain available in the disclosure
+list. The same ordered results appear as optional Voce suggestions and never attach
+themselves to a prompt.
 
 ## Lente search
 
 By default, Lente searches indexed visible Markdown only after Enter or Search is
 pressed. The separate **Automatic searches** toggle uses a fixed 500 ms debounce.
-Results are limited to twenty unique notes with their winning passage. Relevant uses deterministic
-hybrid vector/BM25 ranking; Updated uses live note modification times. If query
-embeddings are unavailable, Lente retries lexical filename, path, and body
-matching and labels the result degraded. Its derived FTS5 lexical index is maintained
-inside the mutable SQLite backend.
+Results are limited to twenty unique notes with their winning passage. Relevant uses
+hybrid ranking with up to 80 lexical and 80 semantic notes fused by reciprocal rank
+with k=60; each semantic note is ranked by its maximum compatible passage cosine.
+Updated uses live note modification times. Lente first checks the local query-vector
+cache; on a miss it requests a query embedding when a provider is available, and
+falls back to lexical filename, path, and body matching if that request is unavailable.
+The local FTS index weights body 1, path 2, filename 3, title 3, and headings 0.5
+without counting heading text twice.
 
 Indexing is explicit the first time. **Update index** runs finite lexical passes to
 convergence, finishes configured semantic work, then publishes. **Rebuild index**
@@ -70,13 +64,21 @@ keeps already committed batches when a provider request fails or is cancelled.
 
 Scheduled maintenance is opt-in. After vault changes, it automatically updates the
 lexical index, prepares semantic vectors when an embedding model is configured, and
-publishes the converged SQLite index for synchronization. Semantic preparation sends note excerpts to the configured
-embedding endpoint and may incur provider cost. Its adaptive quiet windows are 3, 9, then 20 seconds,
+publishes reusable cache contributions for synchronization. Semantic preparation sends structural note blocks to the configured embedding
+endpoint and may incur provider cost. Its adaptive quiet windows are 3, 9, then 20 seconds,
 with a 60-second maximum wait for an outstanding edit generation. Stop preserves pending
-intent, suspends automatic starts, and lets an already-started publication or adoption
+intent, suspends automatic starts, and lets an already-started cache publication or ingestion
 fence settle. Failures display an error and suspend automatic work; there is no hidden
 failure retry timer. Advanced settings expose **Update**, **Rebuild**, **Publish**,
-**Stop**, and **Check**.
+**Stop**, **Check**, and **Reset all indexes**. The **Reset all indexes** command
+and Advanced settings button use the same confirmation and clear only this vault's
+local lexical and semantic state while preserving reusable shared-cache contributions.
+It preserves notes, settings, credentials, and vault identity.
+Reset refuses while work is active; pending scheduled work alone does not prevent it.
+The Automatic maintenance setting is preserved: when enabled, reset schedules the
+usual recovery; when disabled, the index stays empty until Update, Rebuild, or
+re-enabling scheduled maintenance. If reset fails, the current runtime remains
+blocked until a retry succeeds.
 
 ## Voce chat
 
@@ -133,8 +135,9 @@ Off is the default. Performance writes bounded timing and count events to the
 developer console without note text, prompts, provider bodies, tool data,
 vectors, hashes, or serialized index data. Detailed includes the existing rich
 chat diagnostics, which may contain full prompts, selected-note contents,
-requests, SSE events, tool arguments/results, and errors. No diagnostic file is
-created. Worker phase durations are inclusive wall times; nested phases overlap
+requests, SSE events, tool arguments/results, and errors. Normal diagnostics do not
+create a file; the optional benchmark's bounded streaming capture is documented
+below. Worker phase durations are inclusive wall times; nested phases overlap
 their parent, so add SQL calls and callback rows only across top-level phases.
 Diagnostic operation IDs are unique per Worker incarnation; semantic and publication
 phases share parent/batch IDs across main-thread and Worker spans. Temporary
@@ -192,50 +195,64 @@ npm test
 npm run build
 ```
 
-### Optional performance workloads
+### Optional performance workload
 
-Performance measurements are opt-in. `npm run benchmark` generates a dedicated
-Obsidian vault under the ignored `.artifacts/test-vaults/benchmark/` directory, installs
-the current plugin build there, and runs the marker-gated benchmark command through
-Obsidian's CLI. Start Obsidian first, register the reported generated vault, enable the
-CLI and the Trama community plugin for that vault, then rerun. A pending run reuses
-the same generated vault path. The command refuses
-unmarked vaults and always targets the generated vault by name. See the
-[Obsidian benchmark guide](docs/obsidian-benchmark.md).
+The Obsidian benchmark uses one fixed, preprepared corpus of 3,000 notes with
+about 400 characters each. It uses the same chunking for every note; there are
+no note-type-specific rules.
+
+Prepare and install the generated benchmark vault once:
 
 ```sh
 npm ci
 npm run benchmark:prepare
-# Open the printed generated vault in Obsidian and enable Trama and the CLI.
+npm run install:plugin -- --test-vaults
+```
+
+Register the printed generated-vault path in Obsidian and enable the CLI there.
+Each CLI selector must prove the first vault is **Trama Benchmark Vault** at the
+exact registered path. Each run replaces only corpus Markdown, reloads the scoped
+window, and waits for a fresh `performance.timeOrigin` before dispatch. The same
+visible plugin clear-all handler resets local indexes, document and query caches,
+and shared cache files; reset waits for active work. The normal production lexical
+and semantic rebuild, Lente and Filo retrieval, related-note checks, publication,
+and Check then run. Obsidian settings, plugin installation, and vault registration
+remain in place. Only embedding requests use a loopback mock.
+
+Run the single benchmark command:
+
+```sh
 npm run benchmark
 ```
 
-`benchmark:prepare` builds and installs the generated vault without issuing
-Obsidian commands. Open `Trama Benchmark Vault` once: its name and folder stay
-the same across runs and profiles. After a report, preparation archives the old
-generated corpus and creates a new run in place, preserving Obsidian settings.
+The benchmark uses the normal production plugin runtime and does not run chat
+requests or an alternate runtime. The CLI evaluation calls the registered palette
+command and requires a synchronous invoked/running receipt; Obsidian's internal
+command-manager API is not available through this CLI. The compact correctness
+report is `trama-simple-benchmark-report-v1`. Production diagnostic streaming
+capture is the completeness authority, bounded to 10,000 records and 8 MiB, and
+is saved as raw JSONL. The `dev:console` log is a supporting tail, not a complete
+start-to-finish stream. Each artifact pair is saved as
+`.artifacts/benchmarks/trama-simple-<runId>.performance.jsonl` and
+`.artifacts/benchmarks/trama-simple-<runId>.console.log`.
 
-The command defaults to `trama-small`; select `trama-10k` or `trama-large` with
-`TRAMA_BENCHMARK_PROFILE`. Set `TRAMA_BENCHMARK_TIMEOUT_MS` for the run deadline.
-The generated vault's hidden report is archived under
-`.artifacts/benchmarks/`. Stable source material lives in `test-vaults/demo/` and
-`test-vaults/benchmark/`, outside the production release. For realistic screenshots
-and walkthroughs, run `npm run demo:prepare` after building; it installs the demo
-copy in `.artifacts/test-vaults/demo/Trama Test Vault`. See the
-[demo guide](docs/demo-vault.md). The older Node runner remains available as
-`npm run benchmark:legacy-node` until Obsidian small/10k/25k parity is established;
-its [v1 contract](docs/lifecycle-benchmark-contract.md) and
-[local evidence](docs/lifecycle-benchmark-baseline.md) are historical Node evidence.
-
+Two consecutive normal runs passed all 12 gates:
+`e6a84c53-9ce0-4c6b-afa5-c88e51d544a0` and
+`4c5357ca-7981-47ae-b0ad-a06f2b1336e6`. Each captured 2,684 raw timing records:
+adoption 4, semantic 1,914, lexical 753, publication 2, retrieval 8, and related
+notes 3. Cache publication checks actual non-empty bytes up to 4 MiB, then verifies
+stable inventory and generations after a normal warning-free Check. Interpret these
+as correctness evidence; do not sum operation or phase durations into wall time or
+claim speed or mobile results. See the [Obsidian benchmark guide](docs/obsidian-benchmark.md).
 Do not run `npm run dev`; Obsidian loads the production `main.js`. Current
 limitations include the cost of exact SQLite vector scans and maintaining FTS5 on large
 corpora. Hybrid retrieval uses reciprocal-rank fusion (RRF) over exact semantic and
 lexical candidates; there is no ANN/HNSW backend.
-The conservative 384/64 chunking is fingerprinted, so changing it requires an explicit
-full reindex. Filo and Voce use native (rather than React) UI. Trama is an independent,
+Semantic blocks use a 384-character serialized-input cap with zero overlap; changing
+segmentation requires a semantic refresh and relevance evaluation. Filo and Voce use native (rather than React) UI. Trama is an independent,
 clean-break plugin with no compatibility guarantees for other plugins or earlier identities.
 
-## Mobile and synchronized publication checklist
+## Mobile and shared cache checklist
 
 The mobile lifecycle and packaged asset URLs are covered by automated tests, but actual
 iOS WebView, OPFS, SQLite-Vector, LAN inference, and provider delivery still require
@@ -245,17 +262,18 @@ manual validation. Before relying on a synchronized vault, check the following:
   and verify there are no startup network requests.
 - Offline, build a lexical index, restart Obsidian, and confirm keyword Lente search still
   works without a publication or embedding provider.
-- On desktop, publish through both Obsidian Sync and iCloud; record publication size,
-  timing, temporary storage, and observed memory pressure.
-- On mobile, verify a same-ID file is ignored and a differing valid ID is adopted without
-  prompting, AI calls, Markdown reconciliation, or republishing. Search before local
-  reconciliation and confirm the freshness message.
-- After provider convergence, publish from mobile back to desktop. Test reachable LAN
-  Update/Hybrid/Filo/Voce, unreachable-AI lexical fallback, interrupted/invalid/
-  incompatible files, and sequential two-device handoff.
+- On desktop and mobile, verify Obsidian Sync or iCloud delivers standalone cache shards;
+  record transfer size, timing, temporary storage, and observed memory pressure.
+- Verify first receipt validates and merges compatible vectors, duplicate delivery is
+  harmless, incompatible profiles remain isolated, and local note visibility stays
+  controlled by current Markdown. Test offline lexical search, a cached query-vector hit,
+  query-provider failure fallback, and related-note search from the last complete head.
+- After provider convergence, test bidirectional contribution delivery, delayed or
+  duplicate shards, interruption recovery, deletion/exclusion without resurrection,
+  and sequential device use.
 
 These real-device, Obsidian Sync/iCloud, LAN, publication-size, and two-device conflict
 checks are pending user validation; automated tests do not claim them as successful.
 
-See [SQLite publication details](docs/sqlite-snapshots.md) for the file, adoption,
-compatibility, and crash-boundary contract.
+See [SQLite cache details](docs/sqlite-snapshots.md) for shard validation, merge,
+retention, compaction, and recovery behavior.

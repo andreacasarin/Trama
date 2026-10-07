@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { sha256Hex } from "@/index/Identity";
 import {
   PublicationStore,
   normalizePublicationDirectory,
@@ -20,6 +21,7 @@ function adapter() {
       files.set(path, new Uint8Array(bytes.slice(0)));
     },
     mkdir: async () => undefined,
+    stat: async (path) => (files.has(path) ? { size: files.get(path)!.byteLength } : null),
     rename: async (from, to) => {
       const bytes = files.get(from);
       if (!bytes) throw new Error("missing temp");
@@ -30,19 +32,12 @@ function adapter() {
     remove: async (path) => {
       files.delete(path);
     },
+    list: async (path) => ({
+      files: [...files.keys()].filter((name) => name.startsWith(`${path}/`)),
+      folders: [],
+    }),
   };
   return value;
-}
-
-async function install(store: PublicationStore, bytes: ArrayBuffer, token?: string) {
-  const staged = await store.stage(bytes, token);
-  try {
-    await store.replace(staged);
-    return staged;
-  } catch (error) {
-    await store.removeTemporary(staged.temporaryPath);
-    throw error;
-  }
 }
 
 describe("PublicationStore", () => {
@@ -51,96 +46,78 @@ describe("PublicationStore", () => {
     expect(normalizePublicationDirectory("/absolute")).toBe("Trama/index");
     const store = new PublicationStore(adapter(), { directory: " ./sync\\folder/" });
     expect(store.directory).toBe("sync/folder");
-    expect(store.path).toBe("sync/folder/index.sqlite3");
-    expect(store.temporaryPath("x/y")).toBe("sync/folder/index.sqlite3.trama-tmp-x_y");
   });
 
-  it("stages, reads back, and atomically installs through the adapter", async () => {
+  it("installs immutable digest-named shards after readback hashing and lists only final artifacts", async () => {
     const storage = adapter();
     const store = new PublicationStore(storage, {
       directory: "Trama/index",
       temporaryToken: () => "fixed",
     });
-    const result = await install(store, new Uint8Array([1, 2, 3]).buffer);
-    expect(result.byteSize).toBe(3);
-    expect(storage.files.has("Trama/index/index.sqlite3")).toBe(true);
-    expect(storage.files.has("Trama/index/index.sqlite3.trama-tmp-fixed")).toBe(false);
-    expect(storage.renamed).toEqual([
-      ["Trama/index/index.sqlite3.trama-tmp-fixed", "Trama/index/index.sqlite3"],
+    const bytes = new TextEncoder().encode("shard").buffer;
+    const digest = await sha256Hex(bytes);
+    await expect(store.installCacheShard(bytes, digest)).resolves.toBe(true);
+    await expect(store.installCacheShard(bytes, digest)).resolves.toBe(false);
+    expect(await store.listCacheShards()).toEqual([
+      { path: `Trama/index/cache-v1/cache-${digest}.sqlite3`, digest },
+    ]);
+    storage.files.set(
+      `${store.cacheDirectory}/cache-${"0".repeat(64)}.sqlite3.trama-tmp-x`,
+      new Uint8Array([1])
+    );
+    storage.files.set(`${store.cacheDirectory}/unrecognized.sqlite3`, new Uint8Array([1]));
+    expect(await store.listCacheShards()).toHaveLength(1);
+    expect([...storage.files.get(`Trama/index/cache-v1/cache-${digest}.sqlite3`)!]).toEqual([
+      ...new Uint8Array(bytes),
     ]);
   });
 
-  it("returns the read-back bytes for Worker validation without a main-thread comparison", async () => {
+  it.each([4_194_305, 0, -1, NaN])(
+    "rejects invalid shard metadata (%s) before reading bytes",
+    async (size) => {
+      const storage = adapter();
+      storage.stat = async () => ({ size });
+      const read = vi.spyOn(storage, "readBinary");
+      const store = new PublicationStore(storage);
+      await expect(
+        store.readCacheShard(`${store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`)
+      ).rejects.toThrow("Cache shard size is invalid");
+      expect(read).not.toHaveBeenCalled();
+    }
+  );
+
+  it("checks bytes again when a shard grows after the metadata check", async () => {
     const storage = adapter();
-    const original = storage.readBinary;
-    storage.readBinary = async (path) => {
-      const bytes = await original(path);
-      if (path.includes("trama-tmp")) new Uint8Array(bytes)[0] ^= 1;
-      return bytes;
-    };
-    const store = new PublicationStore(storage, { directory: "Trama/index" });
-    const staged = await store.stage(new Uint8Array([1]).buffer);
-    expect([...new Uint8Array(staged.bytes)]).toEqual([0]);
-    expect(storage.files.has(store.path)).toBe(false);
+    storage.stat = async () => ({ size: 1 });
+    storage.readBinary = vi.fn(async () => new ArrayBuffer(4_194_305));
+    const store = new PublicationStore(storage);
+    await expect(
+      store.readCacheShard(`${store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`)
+    ).rejects.toThrow("Cache shard size is invalid");
+    expect(storage.readBinary).toHaveBeenCalledOnce();
   });
 
-  it("removes the temporary file when read-back fails", async () => {
+  it("treats a missing cache directory as empty without listing it", async () => {
     const storage = adapter();
-    storage.readBinary = async () => {
-      throw new Error("read failed");
-    };
-    const store = new PublicationStore(storage, { directory: "Trama/index" });
+    storage.exists = vi.fn(async (path) => path !== "Trama/index/cache-v1");
+    const list = vi.fn(storage.list);
+    storage.list = list;
+    const store = new PublicationStore(storage);
 
-    await expect(store.stage(new Uint8Array([1]).buffer, "failed")).rejects.toThrow("read failed");
-    expect(storage.files.has(store.temporaryPath("failed"))).toBe(false);
+    await expect(store.listCacheShards()).resolves.toEqual([]);
+    await expect(store.clearCacheShards()).resolves.toBeUndefined();
+    expect(storage.exists).toHaveBeenCalledWith("Trama/index/cache-v1");
+    expect(list).not.toHaveBeenCalled();
   });
 
-  it("requires atomic rename and preserves the old target when it is unavailable", async () => {
+  it("propagates cache listing errors when the directory exists", async () => {
     const storage = adapter();
-    const store = new PublicationStore(storage, { directory: "Trama/index" });
-    storage.files.set(store.path, new Uint8Array([7, 7]));
-    storage.rename = undefined;
-
-    await expect(install(store, new Uint8Array([1, 2, 3]).buffer)).rejects.toMatchObject({
-      code: "internal",
-      retryable: true,
-    });
-    expect([...storage.files.get(store.path)!]).toEqual([7, 7]);
-  });
-
-  it("promotes over an existing target without rename-overwrite support", async () => {
-    const storage = adapter();
-    const rename = storage.rename!;
-    storage.rename = async (from, to) => {
-      if (storage.files.has(to)) throw new Error("destination exists");
-      return rename(from, to);
+    storage.exists = async () => true;
+    storage.list = async () => {
+      throw new Error("listing failed");
     };
-    const store = new PublicationStore(storage, { directory: "Trama/index" });
-    storage.files.set(store.path, new Uint8Array([7, 7]));
-    await install(store, new Uint8Array([1, 2, 3]).buffer, "next");
-    expect([...storage.files.get(store.path)!]).toEqual([1, 2, 3]);
-    expect(storage.files.has(store.backupPath)).toBe(false);
-  });
+    const store = new PublicationStore(storage);
 
-  it("restores the old target after promotion failure and recovers an interrupted backup", async () => {
-    const storage = adapter();
-    const rename = storage.rename!;
-    storage.rename = async (from, to) => {
-      if (from.includes("trama-tmp") && to === "Trama/index/index.sqlite3")
-        throw new Error("promote failed");
-      return rename(from, to);
-    };
-    const store = new PublicationStore(storage, { directory: "Trama/index" });
-    storage.files.set(store.path, new Uint8Array([7, 7]));
-    await expect(install(store, new Uint8Array([1, 2, 3]).buffer, "bad")).rejects.toThrow(
-      "promote failed"
-    );
-    expect([...storage.files.get(store.path)!]).toEqual([7, 7]);
-    expect(storage.files.has(store.backupPath)).toBe(false);
-
-    storage.files.set(store.backupPath, new Uint8Array([4, 5]));
-    storage.files.delete(store.path);
-    expect([...new Uint8Array((await store.read()) as ArrayBuffer)]).toEqual([4, 5]);
-    expect(storage.files.has(store.backupPath)).toBe(false);
+    await expect(store.clearCacheShards()).rejects.toThrow("listing failed");
   });
 });

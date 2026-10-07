@@ -1,6 +1,10 @@
 import { MutableSqliteDatabase, type SqliteConnection } from "./database";
 import { SqliteScheduler } from "./scheduler";
-import { closeWorkerDatabase, type WorkerStorageState } from "./worker-lifecycle";
+import {
+  closeWorkerDatabase,
+  resetWorkerDatabase,
+  type WorkerStorageState,
+} from "./worker-lifecycle";
 import {
   SQLITE_PROTOCOL_VERSION,
   SQLITE_DIAGNOSTICS_CONFIG_TYPE,
@@ -13,9 +17,8 @@ import {
   sqliteError,
 } from "./protocol";
 import { SQLITE_BUILD_IDENTITY, TRAMA_RUNTIME_BUILD_ID } from "../../build/identity";
-import { applyLexicalMarkdownBatch } from "./markdown";
+import { applyLexicalMarkdownBatch, type LexicalMarkdownPhase } from "./markdown";
 import { validateRequest } from "./request-validation";
-import { WorkerPublicationOperations } from "./worker-publication";
 import type { TramaDiagnostics, TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
 
 type SqliteModule = {
@@ -105,15 +108,39 @@ export function aggregateSemanticPhase(
   );
 }
 function observeRetrievalPhase(
-  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  phase:
+    | "semanticCandidates"
+    | "lexicalCandidates"
+    | "fusion"
+    | "centroid"
+    | "relatedCandidates"
+    | "relatedRerank",
   durationMs: number,
   itemCount: number
 ): void {
   emitPerformance(retrievalPhaseRecord(diagnosticMethod, phase, durationMs, itemCount));
 }
+function observeLexicalMarkdownPhase(phase: LexicalMarkdownPhase, durationMs: number): void {
+  emitPerformance({
+    tier: "performance",
+    facets: ["index", "lexical", "worker"],
+    area: "index",
+    event: "phase",
+    operation: "lexical",
+    phase,
+    durationMs,
+    nested: true,
+  });
+}
 export function retrievalPhaseRecord(
   method: SqliteRequest["method"] | undefined,
-  phase: "semanticCandidates" | "lexicalCandidates" | "fusion" | "centroid",
+  phase:
+    | "semanticCandidates"
+    | "lexicalCandidates"
+    | "fusion"
+    | "centroid"
+    | "relatedCandidates"
+    | "relatedRerank",
   durationMs: number,
   itemCount: number
 ): Omit<TramaPerformanceRecord, "context"> {
@@ -146,6 +173,8 @@ let bootConfig:
   | {
       corpusFingerprint: string;
       embeddingFingerprint: string;
+      profileModelId: string;
+      profileEndpointOrigin: string;
       buildIdentity: string;
       dimensions: number;
     }
@@ -304,7 +333,8 @@ async function openDatabase(identity = databaseIdentity): Promise<MutableSqliteD
         bootConfig.corpusFingerprint,
         bootConfig.dimensions,
         bootConfig.embeddingFingerprint,
-        bootConfig.buildIdentity
+        bootConfig.buildIdentity,
+        { modelId: bootConfig.profileModelId, endpointOrigin: bootConfig.profileEndpointOrigin }
       );
     } catch (error) {
       // Local databases are disposable when their persisted format or vector
@@ -329,52 +359,37 @@ function resetIncompatibleLocalDatabase(config: {
   embeddingFingerprint: string;
   buildIdentity: string;
   dimensions: number;
+  profileModelId: string;
+  profileEndpointOrigin: string;
 }): MutableSqliteDatabase {
   try {
-    closeConnection();
-    if (!storage.opfsPool) throw new Error("OPFS pool is unavailable");
-    storage.opfsPool.unlink("/index.sqlite3");
-    storage.connection = new storage.opfsPool.OpfsSAHPoolDb("/index.sqlite3", "c");
-    storage.database = new MutableSqliteDatabase(
-      storage.connection,
-      workerDiagnostics,
-      observeRetrievalPhase
-    );
-    storage.database.boot(
-      config.corpusFingerprint,
-      config.dimensions,
-      config.embeddingFingerprint,
-      config.buildIdentity
-    );
-    return storage.database;
+    const pool = storage.opfsPool;
+    if (!pool) throw new Error("OPFS pool is unavailable");
+    return resetWorkerDatabase(storage, pool, () => {
+      let connection: SqliteConnection | undefined;
+      let database: MutableSqliteDatabase | undefined;
+      try {
+        connection = new pool.OpfsSAHPoolDb("/index.sqlite3", "c");
+        database = new MutableSqliteDatabase(connection, workerDiagnostics, observeRetrievalPhase);
+        database.boot(
+          config.corpusFingerprint,
+          config.dimensions,
+          config.embeddingFingerprint,
+          config.buildIdentity,
+          { modelId: config.profileModelId, endpointOrigin: config.profileEndpointOrigin }
+        );
+        return { connection, database };
+      } catch (error) {
+        if (database) database.close();
+        else connection?.close();
+        throw error;
+      }
+    });
   } catch (error) {
     if (error && typeof error === "object" && "error" in error) throw error;
     storageFailure("incompatible database reset", error);
   }
 }
-function runtimeConfig(database: MutableSqliteDatabase) {
-  const state = database.getState();
-  return bootConfig
-    ? {
-        corpus: bootConfig.corpusFingerprint,
-        embedding: bootConfig.embeddingFingerprint,
-        dimensions: bootConfig.dimensions,
-        buildIdentity: bootConfig.buildIdentity,
-      }
-    : {
-        corpus: state.corpusFingerprint,
-        embedding: state.embeddingFingerprint,
-        dimensions: state.dimensions,
-        buildIdentity: state.buildIdentity,
-      };
-}
-const publication = new WorkerPublicationOperations({
-  storage,
-  openDatabase: () => openDatabase(),
-  closeConnection,
-  runtimeConfig,
-});
-
 async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unknown> {
   const p: any = request.payload;
   if (request.method === "boot") {
@@ -382,6 +397,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       corpusFingerprint: p.corpusFingerprint as string,
       dimensions: p.dimensions as number,
       embeddingFingerprint: (p.embeddingFingerprint ?? "") as string,
+      profileModelId: (p.profileModelId ?? "") as string,
+      profileEndpointOrigin: (p.profileEndpointOrigin ?? "") as string,
       buildIdentity: (p.buildIdentity ?? SQLITE_BUILD_IDENTITY) as string,
     };
     bootConfig = config;
@@ -390,7 +407,8 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
         config.corpusFingerprint,
         config.dimensions,
         config.embeddingFingerprint,
-        config.buildIdentity
+        config.buildIdentity,
+        { modelId: config.profileModelId, endpointOrigin: config.profileEndpointOrigin }
       );
     } catch (error) {
       if ((error as any)?.error?.code !== "incompatible_state") throw error;
@@ -404,12 +422,49 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     bootConfig = undefined;
     return { closed: true };
   }
-  if (request.method === "preparePublication") return publication.prepare(p.publicationId);
-  if (request.method === "finalizePublication") return publication.finalize(p);
-  if (request.method === "inspectPublication") return publication.inspect(p);
-  if (request.method === "adoptPublication") return publication.adopt(p);
+  if (request.method === "resetLocalDatabase") {
+    if (!bootConfig)
+      throw sqliteError("storage_unavailable", "SQLite index must be booted before reset", true);
+    return resetIncompatibleLocalDatabase(bootConfig).getState();
+  }
+  if (request.method === "prepareCacheShard") {
+    const database = await openDatabase();
+    return database.prepareCacheShard(
+      storage.opfsPool!,
+      p.afterActionKey,
+      p.taskKind ?? "document",
+      p.profile,
+      p.sourceDigests,
+      p.presentDigests,
+      p.maxPayloadBytes,
+      p.now
+    );
+  }
+  if (request.method === "ingestCacheShard") {
+    const database = await openDatabase();
+    return database.ingestCacheShard(storage.opfsPool!, p.bytes, p.digest);
+  }
+  if (request.method === "maintainCache") return (await openDatabase()).maintainCache(p.now);
+  if (request.method === "recordCacheShard") {
+    (await openDatabase()).recordCacheShard(p.digest, p.profile, p.taskKind, p.actionKeys);
+    return { recorded: true };
+  }
+  if (request.method === "recordCacheRetirements") {
+    await (
+      await openDatabase()
+    ).recordCacheRetirements(p.sourceDigests, p.replacementDigests, p.now);
+    return { recorded: true };
+  }
+  if (request.method === "listCacheRetirements")
+    return (await openDatabase()).listCacheRetirements();
+  if (request.method === "completeCacheRetirement") {
+    (await openDatabase()).completeCacheRetirement(p.sourceDigest, p.now);
+    return { completed: true };
+  }
   const db = await openDatabase();
   switch (request.method) {
+    case "listCacheReceipts":
+      return db.listCacheReceipts(p.digests);
     case "getState":
       return db.getState();
     case "markIncomplete":
@@ -422,7 +477,13 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
         scope: p.scope,
       });
     case "applyLexicalBatch":
-      return applyLexicalMarkdownBatch(db, p.runId, p.notes, signal);
+      return applyLexicalMarkdownBatch(
+        db,
+        p.runId,
+        p.notes,
+        signal,
+        diagnosticsEnabled ? observeLexicalMarkdownPhase : undefined
+      );
     case "finishLexicalRun":
       return db.finishLexicalRun(p.runId);
     case "abortLexicalRun":
@@ -439,12 +500,18 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
       );
     case "commitSemanticResults":
       return db.commitSemanticResults(p.results, p.embeddingFingerprint, p.preprocessing);
+    case "lookupQueryVector":
+      return db.lookupQueryVector(p.query, p.embeddingFingerprint);
+    case "storeQueryVector":
+      return db.storeQueryVector(p.query, p.embeddingFingerprint, p.dimensions, p.vector);
+    case "selectEmbeddingProfile":
+      return db.selectEmbeddingProfile(p.fingerprint);
     case "clearSemanticCache":
       return db.clearSemanticCache();
     case "retrieve":
       return db.retrieve(p.query, p.vector, p.limit, p.currentPath, p);
     case "findRelated":
-      return db.findRelated(p.path, p.vector, p.limit);
+      return db.findRelated(p.path, p.vector, p.limit, signal);
     default:
       throw sqliteError("invalid_request", "Unsupported SQLite method");
   }
@@ -507,10 +574,13 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
     return;
   }
   const isMaintenance = [
-    "preparePublication",
-    "finalizePublication",
-    "inspectPublication",
-    "adoptPublication",
+    "resetLocalDatabase",
+    "prepareCacheShard",
+    "maintainCache",
+    "recordCacheShard",
+    "recordCacheRetirements",
+    "listCacheRetirements",
+    "completeCacheRetirement",
   ].includes(request.method);
   if (isMaintenance) maintenance = true;
   void scheduler
@@ -523,10 +593,6 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
           "commitSemanticResults",
           "retrieve",
           "findRelated",
-          "preparePublication",
-          "finalizePublication",
-          "inspectPublication",
-          "adoptPublication",
         ].includes(request.method);
       if (measured) {
         diagnosticRequestId = request.id;
@@ -568,13 +634,9 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
                 ? "related"
                 : request.method === "retrieve"
                   ? "retrieve"
-                  : request.method === "adoptPublication"
-                    ? "adoption"
-                    : request.method.includes("Publication")
-                      ? "publication"
-                      : request.method.includes("Semantic")
-                        ? "semantic"
-                        : "lexical",
+                  : request.method.includes("Semantic")
+                    ? "semantic"
+                    : "lexical",
             ],
             area: request.method === "findRelated" ? "filo" : "index",
             event: "phase",
@@ -583,13 +645,9 @@ function post(reply: SqliteReply, transfer: ArrayBuffer[] = []): void {
                 ? "retrieve"
                 : request.method === "findRelated"
                   ? "related"
-                  : request.method === "adoptPublication"
-                    ? "adoption"
-                    : request.method.includes("Publication")
-                      ? "publication"
-                      : request.method.includes("Semantic")
-                        ? "semantic"
-                        : "lexical",
+                  : request.method.includes("Semantic")
+                    ? "semantic"
+                    : "lexical",
             phase: request.method,
             durationMs: Math.max(0, performance.now() - started),
           });

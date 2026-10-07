@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 import {
   emitTramaDiagnostic,
   diagnosticsEnabled,
@@ -36,8 +36,8 @@ export interface IndexStatus {
   /** Latest orthogonal capability snapshot, independent of the operation kind. */
   readonly capabilities?: IndexCapabilities;
   readonly freshness?: IndexFreshness;
-  readonly publicationId?: string;
   readonly publicationWarning?: string;
+  readonly maintenance?: MaintenanceSnapshot;
 }
 
 const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
@@ -47,7 +47,7 @@ const PHASE_LABELS: Record<IndexProgress["phase"], string> = {
   embed: "Embedding semantic index chunks",
   "encode-write": "Writing lexical index",
   validate: "Validating lexical index",
-  "build-vector": "Updating semantic index",
+  "build-vector": "Updating embeddings",
   "build-lexical": "Preparing lexical index",
   activate: "Activating lexical index",
   GC: "Cleaning up lexical index data",
@@ -66,7 +66,7 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
         : ` · about ${Math.ceil(etaSeconds / 60)} min remaining`;
   const label =
     progress.phase === "build-vector" && progress.operation === "full"
-      ? "Rebuilding semantic index"
+      ? "Rebuilding embeddings"
       : PHASE_LABELS[progress.phase];
   return `${label} — ${count}${eta}`;
 }
@@ -74,6 +74,10 @@ export function formatIndexProgress(progress: IndexProgress, etaSeconds?: number
 interface StatusActions {
   update(): Promise<void>;
   rebuild(): Promise<void>;
+  reset(): Promise<void>;
+  clearShared?(): Promise<void>;
+  share?(): Promise<void>;
+  importShared?(): Promise<void>;
   stop(): void;
 }
 interface StatusTiming {
@@ -88,6 +92,7 @@ type IndexAction = "index" | "reindex";
 export class IndexStatusController {
   private revision = 0;
   private operationChannel?: "lexical" | "semantic";
+  private maintenance?: MaintenanceSnapshot;
   private readonly listeners = new Set<(status: IndexStatus) => void>();
   private progressTimer?: ReturnType<typeof setTimeout>;
   private pendingProgress?: IndexProgress;
@@ -113,7 +118,7 @@ export class IndexStatusController {
   register(): void {
     this.plugin.addCommand({
       id: "update-index",
-      name: "Update index",
+      name: "Update search indexes",
       callback: () => void this.run("index"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canIndex) return false;
@@ -122,8 +127,19 @@ export class IndexStatusController {
       },
     });
     this.plugin.addCommand({
+      id: "clear-indexes-and-shared-cache",
+      name: "Clear local search data and shared embeddings",
+      callback: () => {
+        void this.actions.clearShared?.().catch((error) => {
+          new Notice(
+            `Trama index clear failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      },
+    });
+    this.plugin.addCommand({
       id: "rebuild-index",
-      name: "Rebuild index",
+      name: "Rebuild embeddings",
       callback: () => void this.run("reindex"),
       checkCallback: (checking: boolean) => {
         if (!this.status.canReindex) return false;
@@ -131,6 +147,35 @@ export class IndexStatusController {
         return true;
       },
     });
+    this.plugin.addCommand({
+      id: "reset-all-indexes",
+      name: "Reset local search data",
+      callback: () => {
+        void this.actions.reset().catch((error) => {
+          new Notice(
+            `Trama index reset failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      },
+    });
+    for (const [id, name, action] of [
+      ["publish-embeddings", "Share embeddings", this.actions.share],
+      ["import-shared-embeddings", "Import shared embeddings", this.actions.importShared],
+    ] as const) {
+      if (!action) continue;
+      this.plugin.addCommand({
+        id,
+        name,
+        callback: () => {
+          void action().catch(
+            (error) =>
+              new Notice(
+                `Trama ${name.toLowerCase()} failed: ${error instanceof Error ? error.message : String(error)}`
+              )
+          );
+        },
+      });
+    }
     this.plugin.addCommand({
       id: "stop-index-maintenance",
       name: "Stop index maintenance",
@@ -164,8 +209,8 @@ export class IndexStatusController {
     this.status = {
       ...this.status,
       capabilities,
+      hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
       freshness: capabilities.freshness,
-      publicationId: capabilities.publicationId,
       revision: ++this.revision,
     };
     for (const listener of [...this.listeners]) listener(this.status);
@@ -200,7 +245,7 @@ export class IndexStatusController {
     const previous = this.status.progress;
     if (
       previous?.changeCounter !== undefined && progress.changeCounter !== undefined
-        ? previous.changeCounter !== progress.changeCounter
+        ? progress.changeCounter < previous.changeCounter
         : previous?.generationId &&
           progress.generationId &&
           previous.generationId !== progress.generationId
@@ -219,6 +264,7 @@ export class IndexStatusController {
       !previous ||
       previous.phase !== progress.phase ||
       previous.operation !== progress.operation ||
+      previous.changeCounter !== progress.changeCounter ||
       previous.generationId !== progress.generationId;
     const elapsed = this.timing.now() - this.progressAt;
     if (!phaseChanged && elapsed < 125) {
@@ -269,18 +315,24 @@ export class IndexStatusController {
     for (const listener of [...this.listeners]) listener(this.status);
   }
 
-  setMaintenance(snapshot: MaintenanceSnapshot): void {
+  setMaintenance(snapshot: MaintenanceSnapshot, capabilities?: IndexCapabilities): void {
+    this.maintenance = snapshot;
+    if (capabilities)
+      this.status = {
+        ...this.status,
+        capabilities,
+        hasLastGood: capabilities.lexical.searchable || capabilities.semantic.searchable,
+        freshness: capabilities.freshness,
+      };
     if (snapshot.lane === "adoption") {
-      if (this.status.kind === "stale") {
-        this.status = {
-          ...this.status,
-          message: "Checking synchronized index…",
-          revision: ++this.revision,
-        };
-        for (const listener of [...this.listeners]) listener(this.status);
-        return;
-      }
-      this.set("preparing", this.status.hasLastGood, "Checking synchronized index…", false);
+      this.set(
+        "stale",
+        this.status.hasLastGood,
+        snapshot.phase === "queued"
+          ? "Search update queued; finishing the current shared embeddings import…"
+          : "Importing shared embeddings…",
+        false
+      );
       return;
     }
     if (snapshot.lane === "idle") {
@@ -299,16 +351,21 @@ export class IndexStatusController {
       this.projectCompletedMaintenance();
       return;
     }
-    this.operationChannel = snapshot.phase === "semantic" ? "semantic" : "lexical";
+    if (snapshot.phase === "semantic") this.operationChannel = "semantic";
+    else if (snapshot.phase !== "publication") this.operationChannel = "lexical";
     const kind = this.operationChannel === "semantic" ? "preparing" : "building";
     const label =
-      snapshot.phase === "publication"
-        ? "Publishing index…"
-        : snapshot.phase === "semantic"
-          ? "Updating semantic index…"
-          : snapshot.lane === "rebuild"
-            ? "Rebuilding index…"
-            : "Updating index…";
+      snapshot.phase === "reset"
+        ? "Resetting local search data…"
+        : snapshot.phase === "results"
+          ? "Updating related notes…"
+          : snapshot.phase === "publication"
+            ? "Sharing embeddings…"
+            : snapshot.phase === "semantic"
+              ? "Updating embeddings…"
+              : snapshot.lane === "rebuild"
+                ? "Rebuilding index…"
+                : "Updating index…";
     this.set(kind, this.status.hasLastGood, label, false);
   }
 
@@ -357,23 +414,17 @@ export class IndexStatusController {
       hasLastGood,
       changeCounter: this.status.changeCounter,
       message,
-      canIndex:
-        kind === "index-required" ||
-        kind === "ready" ||
-        kind === "stale" ||
-        kind === "cancelled" ||
-        kind === "error" ||
-        kind === "empty",
-      canReindex:
-        kind === "index-required" ||
-        kind === "ready" ||
-        kind === "stale" ||
-        ((kind === "cancelled" || kind === "error" || kind === "empty") && hasLastGood),
-      canCancel: kind === "building" || kind === "preparing",
+      canIndex: kind !== "loading",
+      canReindex: kind !== "loading",
+      canCancel:
+        kind === "building" ||
+        kind === "preparing" ||
+        this.maintenance?.lane === "adoption" ||
+        (this.maintenance?.pending === true && !this.maintenance.suspended),
       capabilities: this.status.capabilities,
       freshness: this.status.freshness,
-      publicationId: this.status.publicationId,
       publicationWarning: this.status.publicationWarning,
+      maintenance: this.maintenance,
     };
     if (emitDiagnostic && diagnosticsEnabled(this.diagnostics, "detailed"))
       this.emitDiagnostic({
@@ -403,6 +454,11 @@ export class IndexStatusController {
   run(kind: IndexAction): Promise<void> {
     if (kind === "index" && !this.status.canIndex) return Promise.resolve();
     if (kind === "reindex" && !this.status.canReindex) return Promise.resolve();
-    return kind === "index" ? this.actions.update() : this.actions.rebuild();
+    const action = kind === "index" ? this.actions.update() : this.actions.rebuild();
+    return action.catch((error) => {
+      new Notice(
+        `Trama index ${kind === "index" ? "update" : "rebuild"} failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
   }
 }

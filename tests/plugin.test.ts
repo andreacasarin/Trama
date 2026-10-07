@@ -16,7 +16,7 @@ describe("TramaPlugin module", () => {
         adapter: { getResourcePath: (path: string) => `app://local/${path}?timestamp=123` },
       },
     };
-    expect(runtime.workerUrl(app)).toMatch(/\?timestamp=123&v=9&nonce=/);
+    expect(runtime.workerUrl(app)).toMatch(/\?timestamp=123&v=13&nonce=/);
     let bootstrap: Blob | undefined;
     const worker = { postMessage: vi.fn(), addEventListener: vi.fn(), terminate: vi.fn() };
     vi.stubGlobal(
@@ -148,7 +148,7 @@ describe("TramaPlugin module", () => {
           expect(plugin.createSqliteWorker(app)).toBe(worker);
           expect(globalThis.Worker).toHaveBeenCalledWith(
             expect.stringMatching(
-              /^app:\/\/local\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=9&nonce=/
+              /^app:\/\/local\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=13&nonce=/
             ),
             { type: "module" }
           );

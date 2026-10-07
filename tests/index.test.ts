@@ -1,3 +1,4 @@
+import { deferred } from "./test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import { StructuredError, type IndexProgress } from "@/domain/contracts";
 import {
@@ -13,12 +14,6 @@ import { createTestSqliteClient } from "./sqlite-test-client";
 import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
 
 const signal = new AbortController().signal;
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => (resolve = done));
-  return { promise, resolve };
-}
 
 class HandshakeWorker {
   readonly messages: { value: any; transfer?: readonly ArrayBuffer[] }[] = [];
@@ -241,30 +236,61 @@ describe("semantic index module", () => {
   it("does not read or hash notes after a failed SQLite boot", async () => {
     const reads: string[] = [];
     const vault = {
-      listMarkdownPaths: async () => ["note.md"],
+      ...fixture({ "note.md": "alpha" }),
       readMarkdown: async (path: string) => {
         reads.push(path);
         return { path, content: "alpha" };
       },
-      isMarkdownAvailable: async () => true,
     };
-    const base = createTestSqliteClient({});
-    const methods: string[] = [];
-    const client = new SqliteWorkerClient(undefined, async (method, payload, requestSignal) => {
-      methods.push(method);
-      if (method === "boot") throw sqliteError("storage_unavailable", "SQLite boot failed", true);
-      return base.call(method, payload, requestSignal);
-    });
+    const worker = new HandshakeWorker();
+    worker.postMessage = ((value: any, transfer?: readonly ArrayBuffer[]) => {
+      worker.messages.push({ value, transfer });
+      if (value.type === "trama-runtime-handshake") {
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              type: value.type,
+              id: value.id,
+              buildId: TRAMA_RUNTIME_BUILD_ID,
+              diagnosticsConfigured: true,
+            },
+          })
+        );
+      } else {
+        queueMicrotask(() =>
+          worker.emit("message", {
+            data: {
+              v: SQLITE_PROTOCOL_VERSION,
+              id: value.id,
+              ok: false,
+              error: {
+                code: "storage_unavailable",
+                message: "SQLite boot failed",
+                retryable: true,
+              },
+            },
+          })
+        );
+      }
+    }) as any;
+    const client = new SqliteWorkerClient(worker);
     const setup = new IndexManager(vault, embeddings(), "http://127.0.0.1:1234/v1", "embed", {
       sqliteClient: client,
     });
 
     await expect(setup.load()).resolves.toBe(false);
+    expect(worker.terminated).toBe(true);
+    expect((client as any).closed).toBe(true);
+    expect(client.pendingCount).toBe(0);
+    expect((setup as any).runtime.client).toBeUndefined();
+    expect((setup as any).runtime.loadError).toMatchObject({
+      error: { code: "storage_unavailable", message: "SQLite boot failed", retryable: true },
+    });
     await expect(setup.synchronize(signal)).rejects.toMatchObject({
       error: { code: "storage_unavailable", message: "SQLite boot failed", retryable: true },
     });
     expect(reads).toEqual([]);
-    expect(methods).toEqual(["boot"]);
+    expect(worker.messages.map(({ value }) => value.method).filter(Boolean)).toEqual(["boot"]);
   });
 
   it("surfaces a safe actionable error when the SQLite Worker cannot start", async () => {
@@ -410,6 +436,126 @@ describe("semantic index module", () => {
       expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
     );
     expect(setup.model.embed).toHaveBeenCalledTimes(1);
+    setup.model.embed.mockClear();
+    setup.model.embed.mockRejectedValueOnce(new Error("provider offline"));
+    await expect(setup.manager.search("alpha", signal, 5)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
+    );
+    expect(setup.model.embed).not.toHaveBeenCalled();
+  });
+
+  it("keeps the full 80-per-channel hybrid candidate pool for Lente", async () => {
+    const contents = Object.fromEntries([
+      ...Array.from({ length: 90 }, (_, index) => [
+        `lexical-${String(index).padStart(3, "0")}.md`,
+        "needle lexical result",
+      ]),
+      ...Array.from({ length: 90 }, (_, index) => [
+        `semantic-${String(index).padStart(3, "0")}.md`,
+        "semantic-only-token result",
+      ]),
+    ]);
+    const model = {
+      dimensions: 2,
+      embed: vi.fn(async (texts: readonly string[]) =>
+        texts.map((text) =>
+          text === "needle" || text.includes("semantic-only-token") ? [1, 0] : [0, 1]
+        )
+      ),
+    };
+    const setup = manager(contents, {}, model);
+    await setup.manager.build(signal);
+    await setup.manager.prepareSemantic(signal);
+
+    const result = await new LenteSearch(setup.manager, { getMtime: () => 1 }).search("needle");
+    const expectedPaths = Array.from({ length: 80 }, (_, index) => [
+      `semantic-${String(index).padStart(3, "0")}.md`,
+      `lexical-${String(index).padStart(3, "0")}.md`,
+    ]).flat();
+
+    expect(result.mode).toBe("hybrid");
+    expect(result.canonicalResults).toHaveLength(160);
+    expect(result.canonicalResults?.map(({ path }) => path)).toEqual(expectedPaths);
+    expect(new Set(result.canonicalResults?.map(({ path }) => path)).size).toBe(160);
+    for (let index = 0; index < 80; index++) {
+      expect(result.canonicalResults?.[index * 2]).toMatchObject({
+        semanticScore: expect.any(Number),
+        fusedScore: 1 / (60 + index + 1),
+      });
+      expect(result.canonicalResults?.[index * 2 + 1]).toMatchObject({
+        lexicalScore: expect.any(Number),
+        fusedScore: 1 / (60 + index + 1),
+      });
+    }
+  });
+
+  it("packs unique misses across notes into full provider batches after mixed cache hits", async () => {
+    const contents: Record<string, string> = Object.fromEntries(
+      Array.from({ length: 8 }, (_, i) => [`note-${i}.md`, `# Topic ${i}\n\nalpha detail ${i}`])
+    );
+    const model = { ...embeddings(), batchLimits: { maxItems: 4 } };
+    model.embed.mockImplementation(async (inputs) => inputs.map(() => [1, 0]));
+    const index = new IndexManager(fixture(contents), model, "http://localhost:1234/v1", "embed", {
+      sqliteClient: createTestSqliteClient({}),
+    });
+    await index.build(signal);
+    await index.prepareSemantic(signal);
+    const cachedInputs = new Set(model.embed.mock.calls.flatMap((call) => [...call[0]]));
+    model.embed.mockClear();
+    for (let i = 8; i < 20; i++) contents[`note-${i}.md`] = `# Topic ${i}\n\nalpha detail ${i}`;
+    await index.build(signal);
+    const missing = (await index.getState())!.semanticMissingCount;
+    expect(missing).toBeGreaterThan(4);
+    await index.prepareSemantic(signal);
+    const calls = model.embed.mock.calls.map((call) => call[0]);
+    expect(calls.flat()).toHaveLength(missing);
+    expect(new Set(calls.flat()).size).toBe(missing);
+    expect(calls.flat().some((input) => cachedInputs.has(input))).toBe(false);
+    expect(calls.slice(0, -1).every((inputs) => inputs.length === 4)).toBe(true);
+    expect(index.capabilities().semantic.searchable).toBe(true);
+  });
+
+  it("reuses cached query embeddings offline without consulting the provider", async () => {
+    const identity = {};
+    const contents = { "a.md": "alpha", "b.md": "alpha beta" };
+    const original = manager(contents, identity);
+    await original.manager.build(signal);
+    await original.manager.prepareSemantic(signal);
+    await original.manager.search("alpha", signal, 5);
+    const provider = embeddings();
+    provider.embed.mockRejectedValue(new Error("offline"));
+    const offline = new IndexManager(fixture(contents), provider, "http://offline/v1", "", {
+      size: 100,
+      overlap: 10,
+      sqliteClient: createTestSqliteClient(identity),
+    });
+    await offline.load();
+    const hits = await offline.search("alpha", signal, 5);
+    expect(hits).toContainEqual(expect.objectContaining({ path: "a.md" }));
+    expect(provider.embed).not.toHaveBeenCalled();
+    await offline.search("uncached beta query", signal, 5);
+    expect(provider.embed).not.toHaveBeenCalled();
+  });
+
+  it("keeps the embedding identity stable across device endpoints", async () => {
+    const identity = {};
+    const original = manager({ "a.md": "alpha" }, identity);
+    await original.manager.build(signal);
+    await original.manager.prepareSemantic(signal);
+    const device = new IndexManager(
+      fixture({ "a.md": "alpha" }),
+      embeddings(),
+      "http://another-device:1234/v1",
+      "embed",
+      {
+        size: 100,
+        overlap: 10,
+        sqliteClient: createTestSqliteClient(identity),
+      }
+    );
+    await device.load();
+    expect(device.capabilities().semantic).toMatchObject({ state: "ready", searchable: true });
+    expect((await device.getState())?.semanticRebuildRequired).toBe(false);
   });
 
   it("reports semantic preparation against the whole missing-vector count", async () => {
@@ -594,55 +740,90 @@ describe("semantic index module", () => {
     expect(await changedModel.getState()).toMatchObject({ compatibleVectorCount: 0 });
   });
 
-  it("keeps partial vectors searchable during an embedding identity transition", async () => {
-    const identity = {};
-    const contents = { "a.md": `alpha ${"first ".repeat(100)}` };
-    const originalModel = embeddings();
-    originalModel.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));
-    const original = new IndexManager(
-      fixture(contents),
-      originalModel,
-      "http://127.0.0.1:1234/v1",
-      "embed-v1",
-      { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
-    );
-    await original.build(signal);
-    await original.prepareSemantic(signal);
+  it.each([
+    { modelId: "embed-v2", dimensions: 2 },
+    { modelId: "embed-v1", dimensions: 3 },
+  ])(
+    "requires explicit semantic rebuild for $modelId/$dimensions while preserving lexical search",
+    async ({ modelId, dimensions }) => {
+      const identity = {};
+      const contents = { "a.md": `alpha ${"first ".repeat(100)}` };
+      const originalModel = embeddings();
+      originalModel.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));
+      const original = new IndexManager(
+        fixture(contents),
+        originalModel,
+        "http://127.0.0.1:1234/v1",
+        "embed-v1",
+        { size: 100, overlap: 10, sqliteClient: createTestSqliteClient(identity) }
+      );
+      await original.build(signal);
+      await original.prepareSemantic(signal);
 
-    const currentModel = embeddings();
-    currentModel.embed.mockImplementation(async (texts) => texts.map(() => [1, 0]));
-    const changedModel = new IndexManager(
-      fixture(contents),
-      currentModel,
-      "http://127.0.0.1:1234/v1",
-      "embed-v2",
-      {
-        size: 100,
-        overlap: 10,
-        prepareBatchSize: 1,
-        sqliteClient: createTestSqliteClient(identity),
-      }
-    );
-    await changedModel.load();
-    expect(changedModel.hasCompatibleSemanticVectors()).toBe(false);
-    await expect(changedModel.prepareSemanticCacheBatch(signal)).resolves.toMatchObject({
-      converged: false,
-      stored: 1,
-    });
-
-    const state = await changedModel.getState();
-    expect(state!.semanticHeadCount).toBeGreaterThan(0);
-    expect(state!.semanticMissingCount).toBeGreaterThan(0);
-    expect(state!.semanticEligibleCount).toBeGreaterThan(0);
-    expect(changedModel.hasCompatibleSemanticVectors()).toBe(true);
-    expect(changedModel.capabilities().semantic).toMatchObject({
-      state: "partial",
-      searchable: true,
-    });
-    await expect(changedModel.search("alpha", signal, 5)).resolves.toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: "a.md" })])
-    );
-  });
+      const currentModel = embeddings(dimensions);
+      currentModel.embed.mockImplementation(async (texts) =>
+        texts.map(() => [1, ...Array(dimensions - 1).fill(0)])
+      );
+      const changedModel = new IndexManager(
+        fixture(contents),
+        currentModel,
+        "http://127.0.0.1:1234/v1",
+        modelId,
+        {
+          size: 100,
+          overlap: 10,
+          prepareBatchSize: 1,
+          sqliteClient: createTestSqliteClient(identity),
+        }
+      );
+      await changedModel.load();
+      expect(changedModel.hasCompatibleSemanticVectors()).toBe(false);
+      await expect(changedModel.prepareSemanticCacheBatch(signal)).resolves.toMatchObject({
+        stored: 0,
+      });
+      expect(currentModel.embed).not.toHaveBeenCalled();
+      expect(changedModel.capabilities()).toMatchObject({
+        lexical: { searchable: true },
+        semantic: { rebuildRequired: true, searchable: false },
+      });
+      await expect(changedModel.search("alpha", signal, 5)).resolves.toContainEqual(
+        expect.objectContaining({ path: "a.md" })
+      );
+      expect(currentModel.embed).not.toHaveBeenCalled();
+      const pendingRestart = new IndexManager(
+        fixture(contents),
+        currentModel,
+        "http://127.0.0.1:1234/v1",
+        modelId,
+        {
+          size: 100,
+          overlap: 10,
+          sqliteClient: createTestSqliteClient(identity),
+        }
+      );
+      await pendingRestart.load();
+      expect((await pendingRestart.getState())?.semanticRebuildRequired).toBe(true);
+      await changedModel.rebuildSemantic(signal);
+      expect(currentModel.embed).toHaveBeenCalled();
+      expect(changedModel.capabilities().semantic).toMatchObject({
+        state: "ready",
+        searchable: true,
+      });
+      const restarted = new IndexManager(
+        fixture(contents),
+        currentModel,
+        "http://127.0.0.1:1234/v1",
+        modelId,
+        {
+          size: 100,
+          overlap: 10,
+          sqliteClient: createTestSqliteClient(identity),
+        }
+      );
+      await restarted.load();
+      expect(restarted.capabilities().semantic).toMatchObject({ state: "ready", searchable: true });
+    }
+  );
 
   it("rebuilds semantic vectors without rebuilding the lexical index", async () => {
     const setup = manager({ "a.md": "alpha", "b.md": "beta" });
@@ -1295,88 +1476,6 @@ describe("semantic index module", () => {
     expect(createIndexFingerprint(" HTTP://127.0.0.1:1234/v1/ ", "m", 2)).toEqual(
       createIndexFingerprint("http://127.0.0.1:1234/v1", "m", 2)
     );
-  });
-
-  it("persists snapshot freshness through adoption and restart boundaries", async () => {
-    const sourceIdentity = {};
-    const source = manager({ "a.md": "alpha" }, sourceIdentity);
-    await source.manager.build(signal);
-    const { prepared } = await source.manager.publishPublication(
-      "remote-publication",
-      async () => undefined
-    );
-
-    const receiverIdentity = {};
-    const receiver = manager({ "a.md": "alpha" }, receiverIdentity);
-    await receiver.manager.load();
-    await receiver.manager.adoptPublication(prepared.bytes, "remote-publication");
-    expect((await receiver.manager.getState())?.snapshotLoaded).toBe(true);
-    expect(receiver.manager.capabilities().freshness).toBe("snapshot-loaded");
-
-    const adoptedRestart = manager({ "a.md": "alpha" }, receiverIdentity);
-    await adoptedRestart.manager.load();
-    expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(true);
-    expect(adoptedRestart.manager.capabilities().freshness).toBe("snapshot-loaded");
-
-    await expect(adoptedRestart.manager.synchronize(signal)).resolves.toEqual({
-      changed: false,
-      converged: true,
-    });
-    expect((await adoptedRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(adoptedRestart.manager.capabilities().freshness).toBe("locally-reconciled");
-
-    const afterNoOpRestart = manager({ "a.md": "alpha" }, receiverIdentity);
-    await afterNoOpRestart.manager.load();
-    expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(afterNoOpRestart.manager.capabilities().freshness).toBe("locally-reconciled");
-
-    const { prepared: localPrepared } = await afterNoOpRestart.manager.publishPublication(
-      "local-publication",
-      async () => undefined
-    );
-    expect((await afterNoOpRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(localPrepared.state.snapshotLoaded).toBe(false);
-
-    const reconciledRestart = manager({ "a.md": "alpha" }, receiverIdentity);
-    await reconciledRestart.manager.load();
-    expect((await reconciledRestart.manager.getState())?.snapshotLoaded).toBe(false);
-    expect(reconciledRestart.manager.capabilities().freshness).toBe("locally-reconciled");
-  });
-
-  it("blocks local writes and adoption until publication installs and stamps the same ID", async () => {
-    const setup = manager({ "a.md": "alpha" });
-    await setup.manager.build(signal);
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let entered!: () => void;
-    const installing = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const publishing = setup.manager.publishPublication("locked-publication", async (prepared) => {
-      entered();
-      await gate;
-      return prepared.bytes;
-    });
-    await installing;
-    expect(setup.manager.isInMaintenance()).toBe(true);
-    const updating = setup.manager.synchronize(signal);
-    let updateFinished = false;
-    void updating.then(() => {
-      updateFinished = true;
-    });
-    await Promise.resolve();
-    expect(updateFinished).toBe(false);
-    await expect(setup.manager.adoptPublication(new ArrayBuffer(1))).rejects.toMatchObject({
-      code: "busy",
-    });
-    release();
-    const result = await publishing;
-    await expect(updating).resolves.toMatchObject({ converged: true });
-    expect(result.prepared.publicationId).toBe("locked-publication");
-    expect((await setup.manager.getState())?.publicationId).toBe("locked-publication");
-    expect(setup.manager.isInMaintenance()).toBe(false);
   });
 
   it("projects hostile diagnostics to safe metadata", () => {

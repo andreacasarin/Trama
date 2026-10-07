@@ -17,6 +17,7 @@ import {
 import type { LexicalRevisionApplyResult, LexicalRunRegistry } from "./lexical-context";
 import type { SqliteLexicalBatchStore } from "./lexical-batch";
 import type { SqliteStateStore } from "./state";
+import { lexicalNoteText, pruneUnreferencedRevisions } from "./lexical-full-note";
 
 export class SqliteLexicalStagingStore {
   constructor(
@@ -95,8 +96,16 @@ export class SqliteLexicalStagingStore {
             throw sqliteError("busy", "A different lexical revision is already staged", true);
         } else {
           this.context.db.exec({
-            sql: "INSERT INTO lexical_stage_notes(run_id,path_text,revision_digest,expected_count) VALUES(?,?,?,?)",
-            bind: [runId, input.path, input.revisionDigest, input.blocks.length],
+            sql: "INSERT INTO lexical_stage_notes(run_id,path_text,revision_digest,expected_count,title,headings,body) VALUES(?,?,?,?,?,?,?)",
+            bind: [
+              runId,
+              input.path,
+              input.revisionDigest,
+              input.blocks.length,
+              lexicalNoteText(input).title,
+              lexicalNoteText(input).headings,
+              lexicalNoteText(input).body,
+            ],
           });
         }
       });
@@ -248,6 +257,9 @@ export class SqliteLexicalStagingStore {
         revision_digest TEXT NOT NULL,
         expected_count INTEGER NOT NULL CHECK(expected_count >= 0),
         received_count INTEGER NOT NULL DEFAULT 0 CHECK(received_count >= 0),
+        title TEXT NOT NULL,
+        headings TEXT NOT NULL,
+        body TEXT NOT NULL,
         PRIMARY KEY(run_id,path_text)
       );
       CREATE TEMP TABLE IF NOT EXISTS lexical_stage_occurrences(
@@ -305,6 +317,11 @@ export class SqliteLexicalStagingStore {
         [noteId, revisionDigest, EXTRACTION_VERSION, CHUNK_ALGORITHM_VERSION]
       )[0]?.revision_id ?? 0
     );
+    const staged = rows(
+      this.context.db,
+      "SELECT expected_count,title,headings,body FROM lexical_stage_notes WHERE run_id=? AND path_text=?",
+      [runId, path]
+    )[0];
     const expectedCount = Number(
       rows(
         this.context.db,
@@ -321,10 +338,9 @@ export class SqliteLexicalStagingStore {
       this.context.db.exec({
         sql: `INSERT INTO chunk_occurrences(
                 revision_id,note_id,chunk_id,ordinal,kind,start_line,end_line,display_text,
-                heading_context,embedding_input,embedding_input_digest,body
+                embedding_input_digest
               )
-              SELECT ?,?,? || ordinal,ordinal,kind,start_line,end_line,display_text,heading_context,
-                     embedding_input,embedding_input_digest,display_text
+              SELECT ?,?,? || ordinal,ordinal,kind,start_line,end_line,display_text,embedding_input_digest
               FROM lexical_stage_occurrences
               WHERE run_id=? AND path_text=? ORDER BY ordinal`,
         bind: [revisionId, noteId, `${revisionDigest}:`, runId, path],
@@ -347,30 +363,28 @@ export class SqliteLexicalStagingStore {
       if (existingCount !== expectedCount)
         throw sqliteError("integrity_failed", "Durable lexical revision has an unexpected count");
     }
-    if (priorRevision !== undefined && priorRevision !== revisionId) {
-      this.context.db.exec({
-        sql: `INSERT INTO active_lexical_fts(active_lexical_fts,rowid,body,path_text,filename)
-              SELECT 'delete',occurrence_id,body,path_text,filename FROM active_lexical WHERE note_id=?`,
-        bind: [noteId],
-      });
-      this.context.db.exec({ sql: "DELETE FROM active_lexical WHERE note_id=?", bind: [noteId] });
-    }
     const filename = path.slice(path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
-    this.context.db.exec({
-      sql: `INSERT INTO active_lexical(occurrence_id,note_id,revision_id,path_text,filename,body)
-            SELECT occurrence_id,note_id,revision_id,?,?,display_text
-            FROM chunk_occurrences WHERE revision_id=?`,
-      bind: [path, filename, revisionId],
-    });
-    this.context.db.exec({
-      sql: `INSERT INTO active_lexical_fts(rowid,body,path_text,filename)
-            SELECT occurrence_id,display_text,?,? FROM chunk_occurrences WHERE revision_id=?`,
-      bind: [path, filename, revisionId],
-    });
     this.context.db.exec({
       sql: "UPDATE notes SET lexical_revision_id=?,content_id=? WHERE note_id=?",
       bind: [revisionId, revisionDigest, noteId],
     });
+    this.context.db.exec({
+      sql: `INSERT INTO lexical_notes(note_id,revision_id,path_text,filename,title,headings,body)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(note_id) DO UPDATE SET revision_id=excluded.revision_id,
+              path_text=excluded.path_text,filename=excluded.filename,title=excluded.title,
+              headings=excluded.headings,body=excluded.body`,
+      bind: [
+        noteId,
+        revisionId,
+        path,
+        filename,
+        String(staged.title),
+        String(staged.headings),
+        String(staged.body),
+      ],
+    });
+    pruneUnreferencedRevisions(this.context.db);
     return {
       changed: 1,
       skipped: 0,

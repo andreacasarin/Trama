@@ -31,6 +31,7 @@ export class FiloView extends ItemView {
   private requestGeneration = 0;
   private requestAbort?: AbortController;
   private requestKey?: string;
+  private requestPromise?: Promise<void>;
   private activePath?: string;
   private related?: RelatedNotesResult;
   private relatedError = false;
@@ -45,7 +46,7 @@ export class FiloView extends ItemView {
     private relatedSource: RelatedSource | RelatedNotes | undefined,
     private readonly runIndex: (kind: "index" | "reindex") => Promise<void>,
     private readonly cancelIndex: () => void,
-    private readonly isEmbeddingConfigured: () => boolean = () => true
+    private readonly hasLocalSemanticProfile: () => boolean = () => true
   ) {
     super(leaf);
     this.status = statusSource.getStatus();
@@ -99,8 +100,10 @@ export class FiloView extends ItemView {
   }
 
   /** Refreshes the active note's suggestions after an index/prune settlement. */
-  refreshRelatedSuggestions(): void {
-    if (this.isViewOpen) this.refreshRelated();
+  refreshRelatedSuggestions(): Promise<void> {
+    if (!this.isViewOpen) return Promise.resolve();
+    this.refreshRelated();
+    return this.requestPromise ?? Promise.resolve();
   }
 
   private teardown(): void {
@@ -115,6 +118,7 @@ export class FiloView extends ItemView {
     this.related = undefined;
     this.relatedError = false;
     this.requestKey = undefined;
+    this.requestPromise = undefined;
   }
 
   private currentPath(): string | undefined {
@@ -124,12 +128,34 @@ export class FiloView extends ItemView {
 
   private refreshRelated(): void {
     const path = this.currentPath();
-    if (path !== this.activePath) this.expandedPaths.clear();
+    if (path !== this.activePath) {
+      this.expandedPaths.clear();
+      this.related = undefined;
+    }
     this.activePath = path;
-    if (!path || !this.relatedSource || !this.isEmbeddingConfigured() || !this.semanticReady()) {
+    if (
+      this.status.kind === "loading" ||
+      ((this.status.kind === "building" ||
+        this.status.kind === "preparing" ||
+        (this.status.maintenance && this.status.maintenance.lane !== "idle")) &&
+        this.status.maintenance?.phase !== "results")
+    ) {
+      this.requestGeneration++;
+      if (this.requestAbort) {
+        this.requestAbort.abort();
+        this.requestKey = undefined;
+        this.requestPromise = undefined;
+      }
+      this.requestAbort = undefined;
+      this.relatedError = false;
+      this.render();
+      return;
+    }
+    if (!path || !this.relatedSource || !this.hasLocalSemanticProfile() || !this.semanticReady()) {
       this.requestAbort?.abort();
       this.requestAbort = undefined;
       this.requestKey = undefined;
+      this.requestPromise = undefined;
       this.related = undefined;
       this.relatedError = false;
       this.render();
@@ -142,13 +168,12 @@ export class FiloView extends ItemView {
     }
     this.requestAbort?.abort();
     this.requestKey = key;
-    this.related = undefined;
     this.relatedError = false;
-    this.render();
     const generation = ++this.requestGeneration;
     const controller = new AbortController();
     this.requestAbort = controller;
-    void this.relatedSource
+    this.render();
+    this.requestPromise = this.relatedSource
       .find(path, controller.signal, FiloView.MAX_RESULT_COUNT)
       .then((result) => {
         if (generation !== this.requestGeneration || controller.signal.aborted) return;
@@ -160,6 +185,7 @@ export class FiloView extends ItemView {
       .catch(() => {
         if (generation === this.requestGeneration && !controller.signal.aborted) {
           this.requestAbort = undefined;
+          this.requestKey = undefined;
           this.relatedError = true;
           this.render();
         }
@@ -187,23 +213,21 @@ export class FiloView extends ItemView {
     const status = this.status;
     const capabilities = status.capabilities;
     if (status.kind === "loading") {
+      if (this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description trama-filo__message",
         text: "Loading lexical and semantic indexes…",
       });
       return;
     }
-    if (capabilities?.availability === "unavailable") {
+    if (
+      capabilities?.availability === "unavailable" &&
+      status.kind !== "building" &&
+      status.kind !== "preparing"
+    ) {
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
         text: "SQLite lexical and semantic indexes are unavailable. Related notes cannot be loaded.",
-      });
-      return;
-    }
-    if (!this.isEmbeddingConfigured()) {
-      this.root.createDiv({
-        cls: "setting-item-description mod-warning trama-filo__message",
-        text: "Select an embedding model in Trama settings, then update the index to discover related notes.",
       });
       return;
     }
@@ -212,10 +236,11 @@ export class FiloView extends ItemView {
         cls: "setting-item-description trama-filo__message",
         text: "Build the index to discover related notes.",
       });
-      if (status.canIndex) this.actionButton("Update index", "index");
+      if (status.canIndex) this.actionButton("Update search indexes", "index");
       return;
     }
     if (status.kind === "building" || status.kind === "preparing") {
+      if (this.related) this.renderRows();
       if (!this.renderProgress(status))
         this.root.createDiv({
           cls: "setting-item-description trama-filo__message",
@@ -224,14 +249,22 @@ export class FiloView extends ItemView {
       if (status.canCancel) this.actionButton("Stop", "cancel");
       return;
     }
+    if (capabilities?.semantic.rebuildRequired) {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: "Embedding model changed. Rebuild the semantic index. Lexical search remains available.",
+      });
+      if (status.canReindex) this.actionButton("Rebuild embeddings", "reindex");
+      return;
+    }
     if (status.kind === "stale") {
       if (status.hasLastGood && this.related) this.renderRows();
       this.root.createDiv({
         cls: "setting-item-description mod-warning trama-filo__message",
         text: status.message ?? "Index has changes; update required.",
       });
-      if (status.canIndex) this.actionButton("Update index", "index");
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
+      if (status.canIndex) this.actionButton("Update search indexes", "index");
+      if (status.canReindex) this.actionButton("Rebuild embeddings", "reindex");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -242,9 +275,9 @@ export class FiloView extends ItemView {
         text: status.message ?? "Lexical or semantic indexing failed.",
       });
       if (status.channel === "semantic") {
-        if (status.canIndex) this.actionButton("Update index", "index");
-      } else if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Update index", "index");
+        if (status.canIndex) this.actionButton("Update search indexes", "index");
+      } else if (status.canReindex) this.actionButton("Rebuild embeddings", "reindex");
+      else if (status.canIndex) this.actionButton("Update search indexes", "index");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -255,9 +288,9 @@ export class FiloView extends ItemView {
         text: status.message ?? "Lexical or semantic indexing cancelled.",
       });
       if (status.channel === "semantic") {
-        if (status.canIndex) this.actionButton("Update index", "index");
-      } else if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Update index", "index");
+        if (status.canIndex) this.actionButton("Update search indexes", "index");
+      } else if (status.canReindex) this.actionButton("Rebuild embeddings", "reindex");
+      else if (status.canIndex) this.actionButton("Update search indexes", "index");
       this.renderFreshnessWarning(status.freshness);
       return;
     }
@@ -266,14 +299,21 @@ export class FiloView extends ItemView {
         cls: "setting-item-description trama-filo__message",
         text: "No related notes found.",
       });
-      if (status.canReindex) this.actionButton("Rebuild index", "reindex");
-      else if (status.canIndex) this.actionButton("Update index", "index");
+      if (status.canReindex) this.actionButton("Rebuild embeddings", "reindex");
+      else if (status.canIndex) this.actionButton("Update search indexes", "index");
+      return;
+    }
+    if (!this.hasLocalSemanticProfile()) {
+      this.root.createDiv({
+        cls: "setting-item-description mod-warning trama-filo__message",
+        text: "No compatible semantic vectors are available locally. Configure the vault’s embedding model, then update the index.",
+      });
       return;
     }
     if (capabilities && !capabilities.semantic.searchable) {
       const message =
         capabilities.semantic.activity === "updating"
-          ? "Updating semantic index…"
+          ? "Updating embeddings…"
           : capabilities.semantic.state === "partial"
             ? "Semantic index is incomplete. Update the index to discover related notes."
             : capabilities.semantic.state === "incompatible"
@@ -284,7 +324,7 @@ export class FiloView extends ItemView {
         text: message,
       });
       if (capabilities.semantic.activity !== "updating" && status.canIndex)
-        this.actionButton("Update index", "index");
+        this.actionButton("Update search indexes", "index");
       this.renderFreshnessWarning(capabilities.freshness);
       return;
     }
@@ -305,11 +345,20 @@ export class FiloView extends ItemView {
             ? "Semantic coverage is incomplete. Update the index to discover related notes."
             : "Semantic related notes are unavailable. Update the index when available.",
       });
-      if (status.canIndex) this.actionButton("Update index", "index");
+      if (status.canIndex) this.actionButton("Update search indexes", "index");
       this.renderFreshnessWarning(this.related.freshness);
       return;
     }
     this.renderRows();
+    if (this.requestAbort || this.relatedError)
+      this.root.createDiv({
+        cls: this.relatedError
+          ? "setting-item-description mod-warning trama-filo__message"
+          : "setting-item-description trama-filo__message",
+        text: this.relatedError
+          ? "Related notes could not be refreshed. Showing previous results."
+          : "Updating related notes…",
+      });
     this.renderFreshnessWarning(capabilities?.freshness ?? this.related?.freshness);
   }
 
@@ -321,13 +370,10 @@ export class FiloView extends ItemView {
   }
 
   private renderFreshnessWarning(freshness?: string): void {
-    if (freshness !== "snapshot-loaded" && freshness !== "unknown") return;
+    if (freshness !== "unknown") return;
     this.root.createDiv({
       cls: "setting-item-description mod-warning trama-filo__message",
-      text:
-        freshness === "snapshot-loaded"
-          ? "Snapshot loaded — not locally reconciled. Related notes reflect the synchronized snapshot."
-          : "Index may be stale; related notes reflect the indexed content until an update.",
+      text: "Index may be stale; related notes reflect the indexed content until an update.",
     });
   }
 

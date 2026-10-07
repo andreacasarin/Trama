@@ -1,329 +1,269 @@
+import { deferred } from "./test-helpers";
+import { projectedApp, projectedPlugin, disposeProjectedPlugins } from "./plugin-fixture";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { request } from "node:http";
+import { Agent, request } from "node:http";
 import { Platform } from "obsidian";
-import { TramaPlugin } from "@/plugin/TramaPlugin";
-import { LenteSearch } from "@/index/LenteSearch";
+import { BENCHMARK_CORPUS_SHA256 } from "@/benchmark/Manifest";
+import { IndexManager } from "@/index/IndexManager";
+import type { EmbeddingModel } from "@/domain/contracts";
+import { TRAMA_RUNTIME_BUILD_ID } from "@/build/identity";
+import { SQLITE_PROTOCOL_VERSION } from "@/index/sqlite/protocol";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
-import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
-import { createTestSqliteClient } from "./sqlite-test-client";
-import { createWorkload, deterministicEmbeddingVector } from "../test-vaults/benchmark/generator";
+import { deterministicEmbeddingVector } from "../test-vaults/benchmark/generator";
 // @ts-expect-error Standalone Node fixture server has no emitted declaration.
 import { startFixtureProvider } from "../scripts/benchmark/fixture-provider.mjs";
-import {
-  sourceDigestsV1,
-  deterministicProviderChallengeSha256,
-  queryVectorSha256V1,
-  expectedOutputsV1ByProfile,
-} from "../test-vaults/benchmark/contract-v1";
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => (resolve = done));
-  return { promise, resolve };
-}
-
-interface Listener {
-  readonly event: string;
-  readonly callback: (...args: any[]) => void;
-  active: boolean;
-  unsubscribe(): void;
-}
-
-function projectedApp() {
-  const listeners: Listener[] = [];
-  const files = [
-    { path: "Note.md", name: "Note.md" },
-    { path: "Other.md", name: "Other.md" },
-  ];
-  const adapterFiles = new Map<string, string>();
-  const adapterBinary = new Map<string, ArrayBuffer>();
-  const vault = {
-    configDir: ".obsidian",
-    getName: () => "test-vault",
-    getMarkdownFiles: () => files,
-    getFileByPath: (path: string) => files.find((file) => file.path === path),
-    read: async (file: { path: string }) => `contents of ${file.path}`,
-    on: (event: string, callback: (...args: any[]) => void) => {
-      const ref = {
-        event,
-        callback,
-        active: true,
-        unsubscribe() {
-          this.active = false;
-        },
-      };
-      listeners.push(ref);
-      return ref;
-    },
-    adapter: {
-      exists: async (path: string) => adapterFiles.has(path) || adapterBinary.has(path),
-      read: async (path: string) => adapterFiles.get(path) ?? "",
-      mkdir: async () => undefined,
-      getResourcePath: function (path: string) {
-        return `app://local/${path}`;
-      },
-      write: async (path: string, value: string) => {
-        adapterFiles.set(path, value);
-      },
-      readBinary: async (path: string) => {
-        const value = adapterBinary.get(path);
-        if (!value) throw new Error("missing binary");
-        return value;
-      },
-      writeBinary: async (path: string, value: ArrayBuffer | Uint8Array) => {
-        const bytes = value instanceof Uint8Array ? value.slice().buffer : value.slice(0);
-        adapterBinary.set(path, bytes);
-      },
-      list: async (path: string) => ({
-        files: [...adapterFiles.keys(), ...adapterBinary.keys()]
-          .filter((file) => file.startsWith(path))
-          .map((file) => file.slice(path.length).replace(/^\//, "")),
-        folders: [],
-      }),
-      remove: async (path: string) => {
-        adapterFiles.delete(path);
-      },
-      activate: async (path: string, value: string) => {
-        adapterFiles.set(path, value);
-      },
-      rename: async (from: string, to: string) => {
-        if (adapterFiles.has(from)) {
-          adapterFiles.set(to, adapterFiles.get(from)!);
-          adapterFiles.delete(from);
-        }
-        if (adapterBinary.has(from)) {
-          adapterBinary.set(to, adapterBinary.get(from)!);
-          adapterBinary.delete(from);
-        }
-      },
-    },
-  };
-  const workspace = {
-    getActiveFile: () => files[0],
-    getLeavesOfType: () => [],
-    getLeaf: () => ({ setViewState: vi.fn() }),
-  };
-  return {
-    vault,
-    workspace,
-    metadataCache: { getFirstLinkpathDest: () => null, getFileCache: () => ({ links: [] }) },
-    listeners,
-  };
-}
-
-const projectedPlugins: TramaPlugin[] = [];
-
-function projectedPlugin(app: ReturnType<typeof projectedApp>, data = DEFAULT_SETTINGS) {
-  const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-  plugin.app = app;
-  plugin.manifest = { dir: ".obsidian/plugins/trama" };
-  plugin.loadData = vi.fn(async () => data);
-  plugin.saveData = vi.fn(async () => undefined);
-  plugin.sqliteRuntime.createClient = (storage: object) => createTestSqliteClient(storage);
-  plugin.addCommand = vi.fn();
-  plugin.addSettingTab = vi.fn();
-  plugin.registerView = vi.fn();
-  plugin.registerEvent = vi.fn();
-  projectedPlugins.push(plugin);
-  return plugin as TramaPlugin & { app: typeof app };
-}
 
 describe("TramaPlugin lifecycle integration", () => {
+  it("waits for the open Filo refresh before exporting shared embeddings", async () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const refresh = vi.spyOn(plugin.modelRuntime, "refreshOpenFilo").mockImplementation(() => gate);
+    const publish = vi.spyOn(plugin.publicationManager, "publish");
+    const updating = plugin.updateIndex();
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(publish).not.toHaveBeenCalled();
+    release();
+    await updating;
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("does not rescan local state for an unchanged cache shard", async () => {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+    };
+    const plugin = projectedPlugin(projectedApp(), settings) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, ...Array(settings.embedding.dimensions - 1).fill(0)])
+    );
+    await plugin.updateIndex();
+    const [shard] = await plugin.publicationManager.store.listCacheShards();
+    const bytes = await plugin.publicationManager.store.readCacheShard(shard.path);
+    // Published membership is recorded before the first receipt is imported.
+    await plugin.index.ingestCacheShard(bytes, shard.digest);
+    const call = vi.spyOn(plugin.index.runtime.ensureClient(), "call");
+    const result = await plugin.index.ingestCacheShard(bytes, shard.digest);
+    expect(result.duplicate).toBe(true);
+    expect(call.mock.calls.map(([method]) => method)).toEqual(["ingestCacheShard"]);
+  });
+
+  it("uses persisted publication receipts to avoid shard reads on a warm cache check", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "receipt-model", dimensions: 2 },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, 0])
+    );
+    await plugin.updateIndex();
+    const read = vi.spyOn(plugin.publicationManager.store, "readCacheShard");
+    const ingest = vi.spyOn(plugin.index, "ingestCacheShard");
+    await plugin.checkPublication();
+    expect(read).not.toHaveBeenCalled();
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("retries failed shared-cache deletion before switching the vault embedding model", async () => {
+    const app = projectedApp();
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "old-model", dimensions: 2 },
+    };
+    const plugin = projectedPlugin(app, settings) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(async (inputs) =>
+      inputs.map(() => [1, 0])
+    );
+    await plugin.updateIndex();
+    const oldShards = await plugin.publicationManager.store.listCacheShards();
+    expect(oldShards.length).toBeGreaterThan(0);
+    await plugin.saveSettings({
+      ...settings,
+      embedding: { ...settings.embedding, modelId: "new-model" },
+    });
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    const provider = vi
+      .spyOn(plugin.embeddingModel as EmbeddingModel, "embed")
+      .mockImplementation(async (inputs) => inputs.map(() => [0, 1]));
+    const store = plugin.publicationManager.store;
+    const clear = vi.spyOn(store, "clearCacheShards");
+    clear.mockRejectedValueOnce(new Error("cache deletion failed"));
+    await expect(plugin.rebuildIndex()).rejects.toThrow("cache deletion failed");
+    expect((await plugin.index.getState()).semanticRebuildRequired).toBe(true);
+    expect(provider).not.toHaveBeenCalled();
+    expect(await plugin.index.search("contents", new AbortController().signal, 5)).toHaveLength(2);
+    await plugin.rebuildIndex();
+    expect(clear).toHaveBeenCalledTimes(2);
+    expect((await plugin.index.getState()).semanticRebuildRequired).toBe(false);
+    expect(provider).toHaveBeenCalled();
+    for (const shard of oldShards) expect(await app.vault.adapter.exists(shard.path)).toBe(false);
+    expect((await plugin.publicationManager.store.listCacheShards()).length).toBeGreaterThan(0);
+    // An ordinary same-model rebuild preserves shared contributions.
+    await plugin.rebuildIndex();
+    expect(clear).toHaveBeenCalledTimes(2);
+  });
+
+  it("imports cache without promoting semantic heads or calling the provider", async () => {
+    const plugin = projectedPlugin(projectedApp(), {
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+    }) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+    const promote = vi.spyOn(plugin.index, "promoteCachedSemantic");
+    const prepare = vi.spyOn(plugin.index, "prepareSemantic");
+    const embed = vi.spyOn(plugin.embeddingModel, "embed");
+    vi.spyOn(plugin.publicationManager, "adoptCurrent").mockResolvedValue({ adopted: true });
+    await plugin.checkPublication(false);
+    expect(promote).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(plugin.maintenance.snapshot.pending).toBe(false);
+  });
+
+  it("keeps Stop effective through reset's follow-up cache import", async () => {
+    const plugin = projectedPlugin(projectedApp()) as any;
+    await plugin.onload();
+    await plugin.indexLoad;
+    const gate = deferred<void>();
+    vi.spyOn(plugin.index, "resetLocalDatabase").mockImplementationOnce(() => gate.promise);
+    const adopt = vi.spyOn(plugin.maintenance, "checkPublication");
+    adopt.mockClear();
+    const resetting = plugin.resetAllIndexes();
+    await vi.waitFor(() => expect(plugin.maintenance.snapshot.phase).toBe("reset"));
+    await plugin.stopIndex();
+    gate.resolve();
+    await resetting;
+    expect(adopt).not.toHaveBeenCalled();
+    expect(plugin.maintenance.snapshot).toMatchObject({
+      pending: true,
+      suspended: true,
+      lane: "idle",
+    });
+  });
+
+  it.each(["updateIndex", "rebuildIndex", "resetThenUpdate"] as const)(
+    "promotes reused cached vectors after providerless %s creates a lexical head",
+    async (command) => {
+      const app = projectedApp();
+      const settings = {
+        ...DEFAULT_SETTINGS,
+        embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "cached-model" },
+      };
+      const plugin = projectedPlugin(app, settings) as any;
+      await plugin.onload();
+      await plugin.indexLoad;
+      vi.spyOn(plugin.embeddingModel as EmbeddingModel, "embed").mockImplementation(
+        async (inputs) => inputs.map(() => [1, ...Array(settings.embedding.dimensions - 1).fill(0)])
+      );
+      await plugin.updateIndex();
+      expect((await plugin.index.getState()).semanticHeadCount).toBe(2);
+      await plugin.saveSettings({ ...settings, embedding: { ...settings.embedding, modelId: "" } });
+      await plugin.indexLoad;
+      await vi.waitFor(() => expect(plugin.maintenance.snapshot.lane).toBe("idle"));
+      const embed = vi.spyOn(plugin.embeddingModel, "embed");
+      if (command === "resetThenUpdate") await plugin.resetAllIndexes();
+      app.vault.getMarkdownFiles().push({ path: "Copied.md", name: "Copied.md" });
+      vi.spyOn(app.vault, "read").mockImplementation(async (file) =>
+        file.path === "Copied.md" ? "contents of Note.md" : `contents of ${file.path}`
+      );
+      plugin.index.requestFullRecovery();
+      await plugin[command === "resetThenUpdate" ? "updateIndex" : command]();
+      expect((await plugin.index.getState()).semanticHeadCount).toBe(3);
+      expect(embed).not.toHaveBeenCalled();
+      expect(plugin.getIndexStatus().capabilities.semantic.searchable).toBe(true);
+    }
+  );
+
   beforeEach(() => {
     Platform.isDesktopApp = true;
     vi.restoreAllMocks();
   });
   afterEach(async () => {
-    for (const plugin of projectedPlugins.splice(0)) {
-      const maintenance = (plugin as any).maintenance;
-      const load = (plugin as any).indexLoad;
-      const index = (plugin as any).index;
-      plugin.onunload();
-      await Promise.all([load?.catch(() => false), maintenance?.dispose()]);
-      index?.disposeImmediately();
-    }
+    await disposeProjectedPlugins();
     vi.restoreAllMocks();
   });
 
-  it("loads normal Trama in the benchmark vault and runs the fixed lifecycle through it", async () => {
+  it("closes the fixture provider while an HTTP keep-alive socket is held", async () => {
+    const provider = await startFixtureProvider(
+      "d802aace-b48f-4ce1-a0c3-e6d9224c9001",
+      deterministicEmbeddingVector
+    );
+    const agent = new Agent({ keepAlive: true });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const req = request(
+          `${provider.endpoint}/embeddings`,
+          { method: "POST", agent, headers: { "Content-Type": "application/json" } },
+          (res) => {
+            res.resume();
+            res.on("end", resolve);
+            res.on("error", reject);
+          }
+        );
+        req.on("error", reject);
+        req.end(JSON.stringify({ model: provider.modelId, input: ["held socket"] }));
+      });
+      await expect(provider.close()).resolves.toBeUndefined();
+    } finally {
+      agent.destroy();
+    }
+  });
+
+  it("uses one confirmed handler to clear local indexes and shared cache", async () => {
     const app = projectedApp();
-    const workload = createWorkload("trama-small");
     const marker = {
-      version: "trama-obsidian-vault-v1",
-      runId: "d802aace-b48f-4ce1-a0c3-e6d9224c9001",
+      version: "trama-simple-benchmark-v1",
+      corpusSha256: BENCHMARK_CORPUS_SHA256,
       vaultName: "Trama Benchmark Vault",
       expectedPath:
         "/Users/andreacasarin/Documents/Code/trama/.artifacts/test-vaults/benchmark/Trama Benchmark Vault",
-      profile: "trama-small",
-      noteCount: 24,
-      targetChunks: 128,
-      sourceDigest: sourceDigestsV1["trama-small"],
-      providerChallengeSha256: deterministicProviderChallengeSha256,
-      queryVectorSha256: queryVectorSha256V1,
-      timeoutMs: 300000,
-      mutations: workload.mutations
-        .filter((mutation) => mutation.kind !== "unchanged")
-        .map((mutation) => ({
-          kind: mutation.kind,
-          path: mutation.path,
-          ...(mutation.to ? { to: mutation.to } : {}),
-          ...(mutation.kind === "add" || mutation.kind === "modify"
-            ? { content: mutation.note!.content }
-            : {}),
-        })),
+      noteCount: 3000,
     };
-    const notes = new Map(workload.notes.map((note) => [note.path, note.content]));
-    app.vault.getMarkdownFiles = () =>
-      [...notes.keys()].map((path) => ({ path, name: path.split("/").pop()!, stat: { mtime: 0 } }));
-    app.vault.getFileByPath = (path) =>
-      app.vault.getMarkdownFiles().find((file) => file.path === path);
-    app.vault.read = async (file) => notes.get(file.path)!;
-    const emit = (event: string, ...args: any[]) => {
-      for (const listener of app.listeners)
-        if (listener.active && listener.event === event) listener.callback(...args);
-    };
-    Object.assign(app.vault, {
-      createFolder: async (path: string) => {
-        emit("create", { path, children: [] });
-      },
-      create: async (path: string, content: string) => {
-        notes.set(path, content);
-        emit("create", { path });
-      },
-      modify: async (file: { path: string }, content: string) => {
-        notes.set(file.path, content);
-        emit("modify", file);
-      },
-      delete: async (file: { path: string }) => {
-        notes.delete(file.path);
-        emit("delete", file);
-      },
-      rename: async (file: { path: string }, to: string) => {
-        const from = file.path;
-        notes.set(to, notes.get(from)!);
-        notes.delete(from);
-        emit("rename", { path: to }, from);
-      },
-    });
     (app.vault as any).getName = () => marker.vaultName;
     (app.vault.adapter as any).getBasePath = () => marker.expectedPath;
     const originalRead = app.vault.adapter.read;
     app.vault.adapter.read = async (path) =>
       path === ".trama-benchmark-vault" ? JSON.stringify(marker) : originalRead(path);
-    const provider = await startFixtureProvider(marker.runId, deterministicEmbeddingVector);
-    // Split a UTF-8 character between HTTP chunks: transport framing must not alter fixtures.
-    const body = Buffer.from(JSON.stringify({ model: provider.modelId, input: ["東京"] }));
-    const split = body.indexOf(Buffer.from("東京")) + 1;
-    const unicodeResponse = new Promise<string>((resolve, reject) => {
-      const req = request(`${provider.endpoint}/embeddings`, { method: "POST" }, (res) => {
-        let response = "";
-        res.setEncoding("utf8");
-        res.on("data", (part) => {
-          response += part;
-        });
-        res.on("end", () => resolve(response));
-        res.on("error", reject);
-      });
-      req.on("error", reject);
-      req.write(body.subarray(0, split));
-      setTimeout(() => req.end(body.subarray(split)), 20);
-    });
-    const plugin = projectedPlugin(app, {
-      ...DEFAULT_SETTINGS,
-      diagnosticsMode: "performance",
-      embedding: {
-        ...DEFAULT_SETTINGS.embedding,
-        endpoint: provider.endpoint,
-        modelId: provider.modelId,
-      },
-      chat: {
-        ...DEFAULT_SETTINGS.chat,
-        endpoint: provider.endpoint,
-        modelId: provider.modelId,
-      },
-    });
-    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
-    try {
-      expect(JSON.parse(await unicodeResponse).data[0].embedding).toEqual(
-        Array.from(deterministicEmbeddingVector("東京"))
-      );
-      await plugin.onload();
-      await (plugin as any).indexLoad;
-      const index = (plugin as any).index;
-      expect(index).toBeDefined();
-      expect((plugin as any).maintenance).toBeDefined();
-      expect((plugin.addSettingTab as ReturnType<typeof vi.fn>).mock.calls).toEqual([
-        [expect.any(TramaSettingsTab)],
-      ]);
-      expect(plugin.registerView).toHaveBeenCalledTimes(3);
-      expect(plugin.registerEvent).toHaveBeenCalled();
-      expect(
-        (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(([command]) => command.id)
-      ).toEqual(
-        expect.arrayContaining(["open-lente", "open-voce", "open-filo", "run-obsidian-benchmark"])
-      );
-      const rebuild = vi.spyOn(plugin, "rebuildIndex");
-      const fetchProbe = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        new Response(JSON.stringify({ runId: "another-run", calls: 0, texts: 0 }), {
-          status: 200,
-        })
-      );
-      try {
-        const refused = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
-        expect(refused.status).toBe("error");
-        expect(refused.error).toContain("provider identity mismatch");
-        expect(rebuild).not.toHaveBeenCalled();
-      } finally {
-        fetchProbe.mockRestore();
-      }
-      const failedUpdate = vi
-        .spyOn(plugin, "updateIndex")
-        .mockRejectedValueOnce(new Error("fixture update failure"));
-      try {
-        const failed = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
-        expect(failed.status).toBe("error");
-        expect(failed.error).toBe("fixture update failure");
-        expect(failed.provider.texts).toBeGreaterThan(0);
-        expect(plugin.getSettings().lente).toEqual(DEFAULT_SETTINGS.lente);
-      } finally {
-        failedUpdate.mockRestore();
-      }
-      const searches = vi.spyOn(LenteSearch.prototype, "search");
-      const report = await (plugin as any).runGeneratedVaultBenchmark(app, marker);
-      expect(searches).toHaveBeenCalledTimes(2);
-      for (const [, options] of searches.mock.calls)
-        expect(options?.signal).toBeInstanceOf(AbortSignal);
-      const query = 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)';
-      const hybrid = await (plugin as any).modelRuntime.lenteSearch.search(query);
-      expect(
-        hybrid.canonicalResults.map((hit: any) => ({
-          path: hit.path,
-          occurrenceOrdinal: hit.ordinal,
-        }))
-      ).toEqual(expectedOutputsV1ByProfile["trama-small"].probes.hybrid);
-      expect(report.status, report.error).toBe("completed");
-      expect(report.version).toBe("trama-obsidian-report-v2");
-      expect(Object.values(report.correctness).every((value) => value === true)).toBe(true);
-      expect(report.publication).toBe("vault-filesystem");
-      expect(report.phases["lexical.batch"].count).toBeGreaterThan(0);
-      expect(report.phases["semantic.overall"].count).toBeGreaterThan(0);
-      expect(report.provider.texts).toBeGreaterThan(0);
-      expect((plugin as any).index).toBe(index);
-      expect((plugin as any).modelRuntime.session).toBeDefined();
-      expect(
-        log.mock.calls.filter(([line]) => line === "[Trama] benchmark_completed")
-      ).toHaveLength(1);
-      const calls = rebuild.mock.calls.length;
-      app.vault.adapter.read = async (path) =>
-        path === ".trama-benchmark-vault" ? "{}" : originalRead(path);
-      await expect((plugin as any).runGeneratedVaultBenchmark(app, marker)).rejects.toThrow(
-        "marker changed"
-      );
-      expect(rebuild).toHaveBeenCalledTimes(calls);
-    } finally {
-      await provider.close();
-    }
-  }, 60_000);
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const commands = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([command]) => command as { id: string; callback: () => void }
+    );
+    expect(commands.map(({ id }) => id)).toContain("run-obsidian-benchmark");
+    expect(commands.map(({ id }) => id)).not.toContain("reset-all-indexes-benchmark");
+    expect(commands.map(({ id }) => id)).toContain("clear-indexes-and-shared-cache");
+
+    const index = (plugin as any).index;
+    const resetLocal = vi.spyOn(index, "resetLocalDatabase");
+    const clearShards = vi.spyOn((plugin as any).publicationManager.store, "clearCacheShards");
+    vi.spyOn((plugin as any).maintenance, "resetExclusive").mockImplementation((async (
+      run: () => Promise<void>
+    ) => run()) as any);
+    vi.stubGlobal("confirm", () => false);
+    await plugin.clearIndexesAndSharedCache();
+    expect(resetLocal).not.toHaveBeenCalled();
+    vi.stubGlobal("confirm", () => true);
+    await plugin.clearIndexesAndSharedCache();
+    expect(resetLocal).toHaveBeenCalledOnce();
+    expect(clearShards).toHaveBeenCalledOnce();
+    vi.unstubAllGlobals();
+    plugin.onunload();
+  });
 
   it("keeps the committed runtime untouched when settings persistence rejects", async () => {
     const app = projectedApp();
@@ -519,7 +459,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect((plugin as any).maintenance.snapshot.pending).toBe(true);
   });
 
-  it("does not reconcile a synchronized snapshot immediately after startup adoption", async () => {
+  it("reconciles local Markdown after startup cache adoption", async () => {
     const app = projectedApp();
     const IndexManager = (await import("@/index/IndexManager")).IndexManager;
     const MaintenanceScheduler = (await import("@/index/MaintenanceScheduler"))
@@ -528,16 +468,15 @@ describe("TramaPlugin lifecycle integration", () => {
     const invalidate = vi.spyOn(MaintenanceScheduler.prototype, "invalidate");
     vi.spyOn(MaintenanceScheduler.prototype, "checkPublication").mockResolvedValue({
       adopted: true,
-      publicationId: "remote",
     });
     const plugin = projectedPlugin(app, { ...DEFAULT_SETTINGS, automaticMaintenance: true });
 
     await plugin.onload();
     await (plugin as any).indexLoad;
 
-    expect(requestFullRecovery).not.toHaveBeenCalled();
-    expect(invalidate).not.toHaveBeenCalled();
-    expect((plugin as any).maintenance.snapshot.pending).toBe(false);
+    expect(requestFullRecovery).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect((plugin as any).maintenance.snapshot.pending).toBe(true);
   });
 
   it("routes eligible vault events and exact publication-file changes through maintenance", async () => {
@@ -561,9 +500,106 @@ describe("TramaPlugin lifecycle integration", () => {
     emit("modify", { path: "Note.md" });
     emit("modify", { path: "image.png" });
     expect(invalidate).toHaveBeenCalledTimes(1);
-    const publicationPath = (plugin as any).publicationManager.store.path;
+    const publicationPath = `${(plugin as any).publicationManager.store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`;
     emit("modify", { path: publicationPath });
+    await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledTimes(1));
+  });
+
+  it("coalesces shard events and checks again for a shard changed during adoption", async () => {
+    vi.spyOn(IndexManager.prototype, "load").mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.index.load();
+    const maintenance = plugin.maintenance;
+    const first = deferred<any>();
+    const followup = deferred<any>();
+    const checkPublication = vi
+      .spyOn(maintenance, "checkPublication")
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => followup.promise)
+      .mockResolvedValue({ adopted: false, ignored: "missing" });
+    const applyAdoptionResult = vi.spyOn(plugin, "applyAdoptionResult");
+    const emit = (event: string, ...args: any[]) => {
+      for (const ref of app.listeners.filter((item) => item.active && item.event === event))
+        ref.callback(...args);
+    };
+    const cacheDirectory = plugin.publicationManager.store.cacheDirectory;
+    for (let index = 0; index < 23; index++)
+      emit("modify", {
+        path: `${cacheDirectory}/cache-${index.toString(16).padStart(64, "0")}.sqlite3`,
+      });
+
+    await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledTimes(1));
+    expect(applyAdoptionResult).not.toHaveBeenCalled();
+    emit("modify", {
+      path: `${cacheDirectory}/cache-${"17".padStart(64, "0")}.sqlite3`,
+    });
     expect(checkPublication).toHaveBeenCalledTimes(1);
+
+    first.resolve({ adopted: false, ignored: "missing" });
+    await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledTimes(2));
+    followup.resolve({ adopted: true });
+    await vi.waitFor(() =>
+      expect(applyAdoptionResult).toHaveBeenCalledWith(
+        plugin.index,
+        expect.objectContaining({ adopted: true })
+      )
+    );
+    expect(checkPublication).toHaveBeenCalledTimes(2);
+
+    await plugin.checkPublication();
+    expect(checkPublication).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels a queued publication-event check when unloading", async () => {
+    vi.spyOn(IndexManager.prototype, "load").mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.index.load();
+    const checkPublication = vi
+      .spyOn(plugin.maintenance, "checkPublication")
+      .mockResolvedValue({ adopted: false, ignored: "missing" });
+
+    plugin.notifyPublicationFileEvent(
+      `${plugin.publicationManager.store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`
+    );
+    plugin.onunload();
+    await Promise.resolve();
+
+    expect(checkPublication).not.toHaveBeenCalled();
+  });
+
+  it("drops a dirty publication-event follow-up when replacing the runtime", async () => {
+    vi.spyOn(IndexManager.prototype, "load").mockResolvedValue(true);
+    const app = projectedApp();
+    const plugin = projectedPlugin(app) as any;
+    await plugin.onload();
+    await plugin.index.load();
+    const oldMaintenance = plugin.maintenance;
+    const first = deferred<any>();
+    const dispose = vi.spyOn(oldMaintenance, "dispose");
+    const checkPublication = vi
+      .spyOn(oldMaintenance, "checkPublication")
+      .mockImplementation(() => first.promise);
+
+    const cacheDirectory = plugin.publicationManager.store.cacheDirectory;
+    plugin.notifyPublicationFileEvent(`${cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`);
+    await vi.waitFor(() => expect(checkPublication).toHaveBeenCalledOnce());
+    plugin.notifyPublicationFileEvent(`${cacheDirectory}/cache-${"b".repeat(64)}.sqlite3`);
+
+    const replacement = plugin.saveSettings({
+      ...DEFAULT_SETTINGS,
+      embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "replacement-model" },
+    });
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    first.resolve({ adopted: false, ignored: "missing" });
+    await replacement;
+    await Promise.resolve();
+
+    expect(plugin.maintenance).not.toBe(oldMaintenance);
+    expect(checkPublication).toHaveBeenCalledOnce();
   });
 
   it("forwards explicit commands and Stop to the shared maintenance controller", async () => {
@@ -578,6 +614,7 @@ describe("TramaPlugin lifecycle integration", () => {
     const maintenance = (plugin as any).maintenance;
     const update = vi.spyOn(maintenance, "update").mockResolvedValue(undefined);
     const rebuild = vi.spyOn(maintenance, "rebuild").mockResolvedValue(undefined);
+    const reset = vi.spyOn(plugin, "resetIndexes").mockResolvedValue(undefined);
     const stop = vi.spyOn(maintenance, "stop");
     (plugin as any).indexStatus.setReady();
     const commands = (plugin.addCommand as ReturnType<typeof vi.fn>).mock.calls.map(
@@ -589,6 +626,8 @@ describe("TramaPlugin lifecycle integration", () => {
     (plugin as any).indexStatus.setReady();
     await byId("rebuild-index").callback();
     await vi.waitFor(() => expect(rebuild).toHaveBeenCalledOnce());
+    await byId("reset-all-indexes").callback();
+    expect(reset).toHaveBeenCalledOnce();
     // The maintenance methods are mocked, so project the ready state their
     // successful production completions would have reported.
     (plugin as any).indexStatus.setReady();
@@ -599,7 +638,40 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(commands.map((item) => item.id)).not.toContain("prepare-semantic-index");
   });
 
-  it("waits for deferred maintenance work before disposing index resources during unload", async () => {
+  it("resets local storage through one confirmed scheduler fence and preserves shared cache", async () => {
+    const app = projectedApp();
+    const plugin = projectedPlugin(app);
+    await plugin.onload();
+    await (plugin as any).indexLoad;
+    const manager = (plugin as any).index;
+    const scheduler = (plugin as any).maintenance;
+    const publication = (plugin as any).publicationManager;
+    const order: string[] = [];
+    vi.spyOn(manager, "resetLocalDatabase").mockImplementation(async () => {
+      order.push("local");
+      return {} as any;
+    });
+    const clearShared = vi.spyOn(publication.store, "clearCacheShards");
+    vi.spyOn(manager, "requestFullRecovery").mockImplementation(() => order.push("recovery"));
+    vi.spyOn(scheduler, "resetExclusive").mockImplementation((async (run: () => Promise<void>) => {
+      order.push("fence");
+      await run();
+    }) as any);
+    const confirmReset = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmReset);
+    try {
+      await plugin.resetIndexes();
+      expect(confirmReset).toHaveBeenCalledWith(
+        "Reset local search data for this vault? Notes and settings will be preserved, and shared embeddings will remain available. Scheduled maintenance will rebuild local search data if enabled."
+      );
+      expect(order).toEqual(["fence", "local", "recovery"]);
+      expect(clearShared).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("disposes index resources immediately while maintenance work is deferred during unload", async () => {
     const app = projectedApp();
     const plugin = projectedPlugin(app, {
       ...DEFAULT_SETTINGS,
@@ -625,7 +697,7 @@ describe("TramaPlugin lifecycle integration", () => {
     await semanticStarted;
     plugin.onunload();
     expect(disposeMaintenance).toHaveBeenCalledOnce();
-    expect(dispose).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
     expect((plugin as any).maintenance).toBeUndefined();
     expect((plugin as any).index).toBeUndefined();
     semantic.resolve({
@@ -636,11 +708,11 @@ describe("TramaPlugin lifecycle integration", () => {
       skipped: 0,
       state: {},
     });
-    await update;
-    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    await update.catch(() => undefined);
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
-  it("waits for startup load as well as maintenance before disposing on unload", async () => {
+  it("disposes index resources immediately while startup load is pending on unload", async () => {
     const app = projectedApp();
     const load = deferred<boolean>();
     vi.spyOn((await import("@/index/IndexManager")).IndexManager.prototype, "load").mockReturnValue(
@@ -658,11 +730,88 @@ describe("TramaPlugin lifecycle integration", () => {
     plugin.onunload();
     expect((plugin as any).index).toBeUndefined();
     expect((plugin as any).maintenance).toBeUndefined();
-    expect(dispose).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
     load.resolve(true);
-    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    expect(dispose).toHaveBeenCalledOnce();
     expect(check).not.toHaveBeenCalled();
     expect(status.getStatus().revision).toBe(revision);
+  });
+
+  it("does not recreate a worker when a pending load resumes after immediate disposal", async () => {
+    const corpus = deferred<string>();
+    const corpusStarted = deferred<void>();
+    const workers: {
+      postMessage(value: any): void;
+      terminate(): void;
+      addEventListener(type: string, listener: (event: any) => void): void;
+      removeEventListener(type: string, listener: (event: any) => void): void;
+    }[] = [];
+    const workerFactory = vi.fn(() => {
+      const listeners = new Map<string, (event: any) => void>();
+      const worker = {
+        postMessage(value: any) {
+          if (value.type === "trama-runtime-handshake") {
+            queueMicrotask(() =>
+              listeners.get("message")?.({
+                data: {
+                  type: value.type,
+                  id: value.id,
+                  buildId: TRAMA_RUNTIME_BUILD_ID,
+                  diagnosticsConfigured: true,
+                },
+              })
+            );
+          } else if (Number.isSafeInteger(value.id)) {
+            queueMicrotask(() =>
+              listeners.get("message")?.({
+                data: {
+                  v: SQLITE_PROTOCOL_VERSION,
+                  id: value.id,
+                  ok: false,
+                  error: { code: "storage_unavailable", message: "disposed test", retryable: true },
+                },
+              })
+            );
+          }
+        },
+        terminate() {},
+        addEventListener(type: string, listener: (event: any) => void) {
+          listeners.set(type, listener);
+        },
+        removeEventListener(type: string, listener: (event: any) => void) {
+          if (listeners.get(type) === listener) listeners.delete(type);
+        },
+      };
+      workers.push(worker);
+      return worker;
+    });
+    const index = new IndexManager(
+      {
+        listMarkdownPaths: async () => [],
+        readMarkdown: async (path) => ({ path, content: "" }),
+      },
+      { dimensions: 1, embed: async () => [] },
+      "http://127.0.0.1:1234/v1",
+      "test-model",
+      { workerFactory }
+    );
+    const runtime = (index as any).runtime;
+    runtime.corpusFingerprintId = () => {
+      corpusStarted.resolve();
+      return corpus.promise;
+    };
+
+    const loading = index.load();
+    const rebuildingSemantic = index.rebuildSemantic(new AbortController().signal);
+    await corpusStarted.promise;
+    index.disposeImmediately();
+    corpus.resolve("corpus");
+
+    await expect(loading).resolves.toBe(false);
+    await expect(rebuildingSemantic).rejects.toBeDefined();
+    expect(workerFactory).toHaveBeenCalledOnce();
+    expect(workers).toHaveLength(1);
   });
 
   it("waits for old startup load before recomposition and rejects its late callbacks", async () => {
@@ -681,6 +830,7 @@ describe("TramaPlugin lifecycle integration", () => {
     });
     const plugin = projectedPlugin(app);
     await plugin.onload();
+    expect((plugin as any).indexLoadResult).toBeUndefined();
     const oldIndex = (plugin as any).index;
     const oldMaintenance = (plugin as any).maintenance;
     (plugin as any).handlePublicationWarning(
@@ -695,6 +845,7 @@ describe("TramaPlugin lifecycle integration", () => {
       embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed-next" },
     });
     await vi.waitFor(() => expect(disposeMaintenance).toHaveBeenCalledOnce());
+    expect((plugin as any).indexLoadResult).toBeUndefined();
     expect(dispose).not.toHaveBeenCalled();
     expect((plugin as any).index).toBeUndefined();
     load.resolve(true);
@@ -705,6 +856,7 @@ describe("TramaPlugin lifecycle integration", () => {
     expect(check).not.toHaveBeenCalled();
     expect(loadSpy).toHaveBeenCalledTimes(2);
     await (plugin as any).indexLoad;
+    expect((plugin as any).indexLoadResult).toBe(true);
     await vi.waitFor(() => expect((plugin as any).maintenance.snapshot.lane).toBe("idle"));
   });
 });

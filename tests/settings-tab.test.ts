@@ -29,10 +29,15 @@ describe("settings projection", () => {
     const updateIndex = vi.fn(async () => undefined);
     const rebuildIndex = vi.fn(async () => undefined);
     const publishIndex = vi.fn(async () => undefined);
+    const resetIndexes = vi.fn(async () => undefined);
+    const clearIndexesAndSharedCache = vi.fn(async () => undefined);
     const stopIndex = vi.fn(async () => undefined);
+    const checkPublication = vi.fn(async () => undefined);
     const callbacks = new Map<string, () => unknown>();
     const toggleCallbacks = new Map<string, (value: boolean) => void>();
     const warnings: string[] = [];
+    const confirmation = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmation);
     const settingNames: string[] = [];
     let indexStatus: ReturnType<NonNullable<SettingsTabCallbacks["getIndexStatus"]>>;
     let settings = DEFAULT_SETTINGS;
@@ -45,6 +50,7 @@ describe("settings projection", () => {
     const originals = new Map<string, PropertyDescriptor | undefined>();
     const chain = [
       "setDesc",
+      "setClass",
       "setHeading",
       "setPlaceholder",
       "setLimits",
@@ -146,7 +152,10 @@ describe("settings projection", () => {
           updateIndex,
           rebuildIndex,
           publishIndex,
+          resetIndexes,
+          clearIndexesAndSharedCache,
           stopIndex,
+          checkPublication,
         } as any
       );
       (tab as any).containerEl = {
@@ -162,14 +171,23 @@ describe("settings projection", () => {
       };
       tab.display();
       expect(settingNames).toContain("Scheduled maintenance");
+      expect(settingNames).toContain("Shared embeddings folder");
       expect(settingNames).not.toContain("Automatic maintenance");
       expect(settingNames).not.toContain("Lexical & semantic indexes and sync");
-      await callbacks.get("Update")?.();
-      await callbacks.get("Rebuild")?.();
-      await callbacks.get("Publish")?.();
+      await callbacks.get("Update search indexes")?.();
+      await callbacks.get("Rebuild embeddings")?.();
+      await callbacks.get("Share embeddings")?.();
+      await callbacks.get("Import shared embeddings")?.();
+      await callbacks.get("Stop")?.();
+      await callbacks.get("Reset local search data")?.();
+      await callbacks.get("Clear local search data and shared embeddings")?.();
       expect(updateIndex).toHaveBeenCalledOnce();
       expect(rebuildIndex).toHaveBeenCalledOnce();
       expect(publishIndex).toHaveBeenCalledOnce();
+      expect(checkPublication).toHaveBeenCalledOnce();
+      expect(stopIndex).toHaveBeenCalledOnce();
+      expect(resetIndexes).toHaveBeenCalledOnce();
+      expect(clearIndexesAndSharedCache).toHaveBeenCalledOnce();
       expect(callbacks.has("Prepare")).toBe(false);
       toggleCallbacks.get("Automatic searches")?.(true);
       await vi.waitFor(() => expect(settings.lente.automaticSearches).toBe(true));
@@ -189,17 +207,22 @@ describe("settings projection", () => {
       expect(warnings).toContain("Index status: Lexical ready · idle; Semantic partial · idle.");
 
       indexStatus = { kind: "error", message: "Lexical write failed." };
-      await callbacks.get("Update")?.();
+      await callbacks.get("Update search indexes")?.();
       await vi.waitFor(() => expect(warnings).toContain("Lexical write failed."));
       indexStatus = { kind: "error", message: "Semantic service failed." };
-      await callbacks.get("Rebuild")?.();
+      await callbacks.get("Rebuild embeddings")?.();
       await vi.waitFor(() => expect(warnings).toContain("Semantic service failed."));
-      indexStatus = { publicationWarning: "Index saved locally, but publication failed: offline" };
-      await callbacks.get("Update")?.();
+      indexStatus = {
+        publicationWarning: "Search data saved locally, but sharing embeddings failed: offline",
+      };
+      await callbacks.get("Update search indexes")?.();
       await vi.waitFor(() =>
-        expect(warnings).toContain("Index saved locally, but publication failed: offline")
+        expect(warnings).toContain(
+          "Search data saved locally, but sharing embeddings failed: offline"
+        )
       );
     } finally {
+      vi.unstubAllGlobals();
       for (const [method, descriptor] of originals)
         if (descriptor) Object.defineProperty(proto, method, descriptor);
         else delete proto[method];

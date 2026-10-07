@@ -1,37 +1,38 @@
 # Test vaults
 
 These committed inputs are development material, not production plugin files.
+The demo and benchmark sources are not CLI targets. Run mutation workflows only
+in the marked generated benchmark vault under `.artifacts/test-vaults/`.
 
-- `demo/`: ten fictional daily notes and thirty linked Zettelkasten notes.
-- `benchmark/`: fixed workload definitions and the byte-exact small Markdown fixture.
+- `demo/`: fictional notes for interactive walkthroughs.
+- `benchmark/`: generator inputs for the one fixed benchmark corpus.
 
-Do not install Trama or run mutation benchmarks in these source directories.
-`npm run demo:prepare` and `npm run benchmark:prepare` prepare writable copies under
-`.artifacts/test-vaults/`. Reports and logs live under `.artifacts/benchmarks/`.
-Generated Obsidian settings and index state are ignored, not committed here.
-
-From a fresh clone (Node.js 24):
+Prepare the generated vault once from the repository checkout:
 
 ```sh
 npm ci
-# Demo: build, copy the notes, and install the plugin.
-npm run build
-npm run demo:prepare
-# Benchmark: build and install without touching Obsidian.
 npm run benchmark:prepare
+npm run install:plugin -- --test-vaults
 ```
 
-Open only the generated folder printed by the command in Obsidian and enable
-Trama there. Run Update in the demo vault before searching; use `npm run benchmark`
-after registering the prepared benchmark vault. Preparation never copies personal
-notes or provider settings. Existing generated demo edits are not overwritten.
+Register the printed generated benchmark path in Obsidian and enable the CLI. The
+generated vault is `.artifacts/test-vaults/benchmark/Trama Benchmark Vault`. Every
+CLI selector must prove that its first vault is **Trama Benchmark Vault** at this
+exact path, before each operation and after reload. Never rely on the active vault
+or target a personal vault.
 
-The runnable benchmark is always `.artifacts/test-vaults/benchmark/Trama Benchmark Vault`.
-Register it once; UUIDs identify reports and fixture-provider models, not vault folders.
-Both generated vaults load standard Trama with all commands and tabs. Benchmark
-runs use its normal persistent index and filesystem publication with Performance
-logging and a temporary local HTTP model fixture; there is no benchmark-only startup.
-Prior generated corpora are preserved in `.artifacts/test-vaults/archive/` and
-are not used by subsequent runs.
+Each run replaces only generated corpus Markdown, reloads the scoped window, and
+waits for a fresh `performance.timeOrigin` before dispatch. It clears local indexes,
+document and query caches, and shared cache files through the same visible plugin
+Clear All handler; reset waits for active work. It runs the production rebuild,
+Lente and Filo retrieval, related-note checks, publication, and Check. Only embedding
+requests use a loopback mock; chat requests are not part of the benchmark. Obsidian
+settings, plugin installation, and vault registration remain in place.
 
-See [demo setup](../docs/demo-vault.md) and [benchmark setup](../docs/obsidian-benchmark.md).
+The compact report is `trama-simple-benchmark-report-v1`; production streaming capture
+is the completeness authority, with raw JSONL and a supporting console tail. Two
+consecutive normal runs passed all 12 gates: `e6a84c53-9ce0-4c6b-afa5-c88e51d544a0`
+and `4c5357ca-7981-47ae-b0ad-a06f2b1336e6`. See the
+[current benchmark guide](../docs/obsidian-benchmark.md) for evidence limits.
+
+See [demo setup](../docs/demo-vault.md) for the interactive walkthrough.

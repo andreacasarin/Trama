@@ -1,4 +1,4 @@
-import { StructuredError, type EmbeddingModel } from "@/domain/contracts";
+import { StructuredError } from "@/domain/contracts";
 import { EMBEDDING_PREPROCESSING_VERSION } from "@/index/Identity";
 import { diagnosticsEnabled } from "@/diagnostics/TramaDiagnostics";
 import {
@@ -9,7 +9,8 @@ import {
   type SqliteSemanticWorkBatch,
   type SqliteState,
 } from "@/index/sqlite/protocol";
-import type { SemanticPrepareResult } from "./contracts";
+import { SemanticProviderError, type SemanticPrepareResult } from "./contracts";
+import { EmbeddingResolver } from "./embedding-resolver";
 import { IndexJournal } from "./journal";
 import { check, IndexRuntime } from "./runtime";
 
@@ -19,7 +20,7 @@ export class SemanticCoordinator {
   constructor(
     private readonly runtime: IndexRuntime,
     private readonly journal: IndexJournal,
-    private readonly embedding: EmbeddingModel
+    private readonly embedding: EmbeddingResolver
   ) {}
   /** Enriches the lexical corpus in bounded, resumable batches. */
   async prepareSemantic(
@@ -38,8 +39,7 @@ export class SemanticCoordinator {
 
   /** True only while this manager has usable stored vectors for its current embedding identity. */
   hasCompatibleSemanticVectors(): boolean {
-    const state = this.runtime.state;
-    return Boolean(this.runtime.loaded && state && state.semanticHeadCount > 0);
+    return this.runtime.capabilities().semantic.searchable;
   }
 
   /** True when the configured embedding provider has semantic work awaiting storage or promotion. */
@@ -48,6 +48,7 @@ export class SemanticCoordinator {
     if (
       !this.runtime.loaded ||
       !state ||
+      state.semanticRebuildRequired ||
       !state.embeddingFingerprint ||
       !this.runtime.fingerprint.modelId.trim()
     )
@@ -62,9 +63,21 @@ export class SemanticCoordinator {
     if (!this.semanticRebuildInProgress) {
       await this.runtime.waitForMaintenance(signal);
       if (!this.runtime.loaded) await this.runtime.load();
-      this.runtime.setState(
-        (await this.runtime.ensureClient().call("clearSemanticCache", {}, signal)) as SqliteState
-      );
+      if (this.runtime.state?.semanticRebuildRequired) {
+        this.runtime.setState(
+          (await this.runtime.ensureClient().call(
+            "selectEmbeddingProfile",
+            {
+              fingerprint: await this.runtime.configuredEmbeddingFingerprintId(),
+            },
+            signal
+          )) as SqliteState
+        );
+      } else {
+        this.runtime.setState(
+          (await this.runtime.ensureClient().call("clearSemanticCache", {}, signal)) as SqliteState
+        );
+      }
       this.semanticRebuildInProgress = true;
     }
     const result = await this.prepareSemantic(signal, shouldYield);
@@ -80,11 +93,28 @@ export class SemanticCoordinator {
     );
   }
 
+  async promoteCachedSemantic(signal: AbortSignal): Promise<SemanticPrepareResult> {
+    if (!this.runtime.loaded) await this.runtime.load();
+    const state = this.runtime.state;
+    if (!state) throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+    if (!state.embeddingFingerprint || state.semanticRebuildRequired)
+      return {
+        operation: "prepare",
+        changed: false,
+        converged: true,
+        state,
+        stored: 0,
+        skipped: 0,
+      };
+    return this.runSemanticPreparation(signal, 1, 0, undefined, true);
+  }
+
   private async runSemanticPreparation(
     signal: AbortSignal,
     maxBatches = Number.POSITIVE_INFINITY,
     batchSizeOverride?: number,
-    shouldYield?: () => boolean
+    shouldYield?: () => boolean,
+    cacheOnly = false
   ): Promise<SemanticPrepareResult> {
     await this.runtime.waitForMaintenance(signal);
     if (this.runtime.building || this.runtime.preparing)
@@ -105,10 +135,19 @@ export class SemanticCoordinator {
       if (!this.runtime.loaded) await this.runtime.load();
       if (this.runtime.unavailable || !this.runtime.state)
         throw new StructuredError("unavailable", "SQLite index is unavailable.", true);
+      if (this.runtime.state.semanticRebuildRequired)
+        return {
+          operation: "prepare",
+          changed: false,
+          converged: true,
+          state: this.runtime.state,
+          stored: 0,
+          skipped: 0,
+        };
       const overallOperationId = overallTimer
         ? this.runtime.ensureClient().diagnosticOperationId()
         : undefined;
-      const embeddingFingerprint = await this.runtime.embeddingFingerprintId();
+      const embeddingFingerprint = this.runtime.state.embeddingFingerprint;
       const providerLimits = this.embedding.batchLimits ?? {};
       const maxInputBytes = Math.min(
         SQLITE_MAX_SEMANTIC_INPUT_BYTES,
@@ -123,7 +162,12 @@ export class SemanticCoordinator {
       );
       const requestedItems = Math.min(
         SQLITE_MAX_SEMANTIC_BATCH_ITEMS,
-        Math.max(1, Math.floor(batchSizeOverride ?? this.runtime.options.prepareBatchSize ?? 128)),
+        cacheOnly
+          ? 0
+          : Math.max(
+              1,
+              Math.floor(batchSizeOverride ?? this.runtime.options.prepareBatchSize ?? 128)
+            ),
         Math.max(1, Math.floor(providerLimits.maxItems ?? SQLITE_MAX_SEMANTIC_BATCH_ITEMS)),
         Math.max(1, Math.floor(maxVectorBytes / (this.embedding.dimensions * 4)))
       );
@@ -151,8 +195,7 @@ export class SemanticCoordinator {
         const prepareTimer = this.runtime.performanceTimer();
         const prepareClient = this.runtime.ensureClient();
         const prepareOperationId = prepareTimer ? prepareClient.diagnosticOperationId() : undefined;
-        const work = (await prepareClient.call(
-          "prepareSemanticWork",
+        const work = (await this.embedding.prepareDocuments(
           {
             embeddingFingerprint,
             preprocessing: EMBEDDING_PREPROCESSING_VERSION,
@@ -183,22 +226,28 @@ export class SemanticCoordinator {
         if (!work.requests.length) break;
         const missing = work.requests;
         const providerTimer = this.runtime.performanceTimer();
-        const vectors = await this.embedding.embed(
-          missing.map((item) => item.serialization),
-          signal,
-          (progress) =>
-            this.runtime.reportProgress(
-              {
-                operation,
-                phase: "build-vector",
-                completed: stored + progress.completed,
-                total: Math.max(totalMissing, stored + missing.length),
-                unit: "chunks",
-                determinate: true,
-              },
-              false
-            )
-        );
+        let vectors: readonly number[][];
+        try {
+          vectors = await this.embedding.resolveMissing(
+            missing.map((item) => item.serialization),
+            signal,
+            (progress) =>
+              this.runtime.reportProgress(
+                {
+                  operation,
+                  phase: "build-vector",
+                  completed: stored + progress.completed,
+                  total: Math.max(totalMissing, stored + missing.length),
+                  unit: "chunks",
+                  determinate: true,
+                },
+                false
+              )
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          throw new SemanticProviderError(error);
+        }
         this.runtime.emitPhase(
           "semantic",
           "provider",

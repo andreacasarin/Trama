@@ -123,10 +123,23 @@ describe("Markdown-aware chunking", () => {
     expect(blocks[1].headingContext).toEqual(["Heading ".repeat(8).trim()]);
   });
 
-  it("rejects a bound that cannot contain its serialized heading context", () => {
-    expect(() => chunkMarkdownBlocks("# A heading\n\nbody", 8)).toThrow(
-      "serialized heading context"
-    );
+  it("bounds embedding context while retaining long heading metadata", () => {
+    const longHeading = "A heading ".repeat(20).trim();
+    const blocks = chunkMarkdownBlocks(`# ${longHeading}\n\nbody`, 64);
+    const body = blocks.find((block) => block.body === "body");
+    expect(body?.headingContext).toEqual([longHeading]);
+    expect(body?.embeddingInput).not.toContain(longHeading);
+    expect(blocks.every((block) => block.embeddingInput.length <= 64)).toBe(true);
+  });
+
+  it("drops only overlong ancestor context when a nearer heading fits", () => {
+    const ancestor = "Ancestor ".repeat(12).trim();
+    const blocks = chunkMarkdownBlocks(`# ${ancestor}\n\n## Nearest\n\nbody`, 64);
+    const body = blocks.find((block) => block.body === "body");
+    expect(body?.headingContext).toEqual([ancestor, "Nearest"]);
+    expect(body?.embeddingInput).toContain("Nearest");
+    expect(body?.embeddingInput).not.toContain(ancestor);
+    expect(body!.embeddingInput.length).toBeLessThanOrEqual(64);
   });
 
   it("keeps ordinary blocks separate without overlap", () => {

@@ -54,8 +54,6 @@ describe("plugin installer", () => {
             env: {
               ...process.env,
               OBSIDIAN_VAULT_PATH: "/never-access-personal-vault",
-              TRAMA_BENCHMARK_PROFILE: "trama-small",
-              TRAMA_BENCHMARK_TIMEOUT_MS: "900000",
             },
           }
         );
@@ -64,6 +62,12 @@ describe("plugin installer", () => {
       const benchmark = path.join(
         project,
         ".artifacts/test-vaults/benchmark/Trama Benchmark Vault"
+      );
+      expect(stdout).toContain(`Demo: ${demo}`);
+      expect(stdout).toContain(`Benchmark: ${benchmark}`);
+      expect(stdout).toContain("Enable Community plugins and Trama in both vaults.");
+      expect(stdout).toContain(
+        "In the benchmark vault, open Settings > General, enable Command line interface, and follow its registration prompt for benchmarks."
       );
       for (const vault of [demo, benchmark]) {
         expect(stdout).toContain(path.join(vault, ".obsidian/plugins/trama"));
@@ -78,7 +82,7 @@ describe("plugin installer", () => {
       expect(await readdir(path.join(demo, "journal"))).toHaveLength(10);
       expect(await readdir(path.join(demo, "zettelkasten"))).toHaveLength(30);
       const marker = await readFile(path.join(benchmark, ".trama-benchmark-vault"), "utf8");
-      expect(JSON.parse(marker).noteCount).toBe(24);
+      expect(JSON.parse(marker).noteCount).toBe(3000);
       const demoNote = path.join(demo, "journal", (await readdir(path.join(demo, "journal")))[0]);
       await writeFile(demoNote, "edited demo note");
       const report = path.join(benchmark, ".trama-benchmark-report.json");

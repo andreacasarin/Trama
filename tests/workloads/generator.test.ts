@@ -8,7 +8,6 @@ import {
   queryVectorSha256V1,
   REFERENCE_SOURCE_MANIFEST_PATHS,
   REFERENCE_SOURCE_MANIFEST_SHA256,
-  referenceBaselineV1,
   sourceDigestsV1,
   WORKLOAD_CONTRACT_VERSION,
 } from "../../test-vaults/benchmark/contract-v1";
@@ -82,10 +81,9 @@ describe("deterministic Trama workload generator", () => {
           : (files.get(path) as Uint8Array)
       )
     ).toThrow("Expected exactly one reference source manifest declaration.");
-    expect(referenceBaselineV1.referenceSourceManifestSha256).toBe(
+    expect(computeReferenceSourceManifestSha256((path) => readFileSync(path))).toBe(
       REFERENCE_SOURCE_MANIFEST_SHA256
     );
-    expect(referenceBaselineV1.referenceTreeStatus).toBe("uncommitted contract implementation");
   });
 
   it("uses real chunking, normalized 768d vectors, and stable mutations", () => {

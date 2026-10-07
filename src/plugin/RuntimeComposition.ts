@@ -1,4 +1,5 @@
 import type { TramaDiagnostics } from "@/diagnostics/TramaDiagnostics";
+import { diagnosticTimer, emitTramaDiagnostic } from "@/diagnostics/TramaDiagnostics";
 import { IndexManager, type IndexVaultPort } from "@/index/IndexManager";
 import { MaintenanceScheduler, type MaintenanceSnapshot } from "@/index/MaintenanceScheduler";
 import {
@@ -109,6 +110,8 @@ export function composeRuntime(
       semanticConfigured: settings.embedding.modelId.trim().length > 0,
       synchronize: async (signal) => {
         const result = await manager.reconcileQueuedChanges(signal);
+        if (result.converged && !settings.embedding.modelId.trim())
+          await manager.promoteCachedSemantic(signal);
         host.onIndexOperation(manager, result.changed);
         return result;
       },
@@ -116,6 +119,8 @@ export function composeRuntime(
         const revision = manager.journalSnapshot().revision;
         const result = await manager.build(signal);
         if (result.converged) manager.clearJournalIfCurrent(revision);
+        if (result.converged && !settings.embedding.modelId.trim())
+          await manager.promoteCachedSemantic(signal);
         host.onIndexOperation(manager, result.changed);
         return result;
       },
@@ -125,20 +130,57 @@ export function composeRuntime(
         return result;
       },
       rebuildSemantic: async (signal, shouldYield) => {
+        if ((await manager.getState())?.semanticRebuildRequired) {
+          // Delete shared data before switching the local model so failure remains retryable.
+          await publication.store.clearCacheShards();
+        }
         const result = await manager.rebuildSemantic(signal, shouldYield);
         host.onIndexOperation(manager, result.changed);
         return result;
       },
-      publish: async () => {
-        warningOrigin = "publication";
-        const result = await publication.publish();
-        if (result.published && !result.warning) host.onPublicationSuccess(manager);
-        return result;
+      refreshRelated: async () => {
+        if (host.isCurrent(manager)) await host.modelRuntime.refreshOpenFilo(app);
       },
-      adoptCurrent: async () => {
+      publish: async (shouldYield) => {
+        warningOrigin = "publication";
+        const elapsed = diagnosticTimer(host.diagnostics, "performance");
+        try {
+          const result = await publication.publish(shouldYield);
+          if (result.published && !result.warning) host.onPublicationSuccess(manager);
+          return result;
+        } finally {
+          if (elapsed)
+            emitTramaDiagnostic(host.diagnostics, {
+              tier: "performance",
+              facets: ["index", "publication"],
+              area: "index",
+              event: "phase",
+              operation: "publication",
+              phase: "overall",
+              durationMs: elapsed(),
+            });
+        }
+      },
+      adoptCurrent: async (shouldYield) => {
         warningOrigin = "check";
         try {
-          return await publication.adoptCurrent();
+          const elapsed = diagnosticTimer(host.diagnostics, "performance");
+          let result: AdoptionResult;
+          try {
+            result = await publication.adoptCurrent(shouldYield);
+          } finally {
+            if (elapsed)
+              emitTramaDiagnostic(host.diagnostics, {
+                tier: "performance",
+                facets: ["index", "adoption"],
+                area: "index",
+                event: "phase",
+                operation: "adoption",
+                phase: "overall",
+                durationMs: elapsed(),
+              });
+          }
+          return result;
         } finally {
           warningOrigin = "publication";
         }
@@ -168,18 +210,19 @@ export function composeRuntime(
       host.onInitialState(manager, loaded);
       const usable = loaded && manager.capabilities().availability !== "unavailable";
       if (usable && host.isCurrent(manager)) {
-        const result = await scheduler.checkPublication();
-        if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
-        // Catch vault changes missed while stopped; adoption and replacement already own convergence.
-        if (
-          host.isAutomaticMaintenanceEnabled() &&
-          host.isCurrent(manager) &&
-          !result.adopted &&
-          !result.replacementRequired
-        ) {
-          manager.requestFullRecovery();
-          scheduler.invalidate(result.ignored === "missing");
-        }
+        // Local SQLite lexical state is ready before synchronized cache ingestion
+        // starts. Shards add vectors but never replace local note heads or FTS.
+        void scheduler.checkPublication().then((result) => {
+          if (host.isCurrent(manager)) host.onAdoptionResult(manager, result);
+          if (
+            host.isAutomaticMaintenanceEnabled() &&
+            host.isCurrent(manager) &&
+            !scheduler.snapshot.suspended
+          ) {
+            manager.requestFullRecovery();
+            if (!scheduler.snapshot.pending) scheduler.invalidate(result.ignored === "missing");
+          }
+        });
       }
       return loaded;
     })

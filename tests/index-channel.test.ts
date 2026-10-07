@@ -10,7 +10,6 @@ const state: SqliteState = {
   corpusFingerprint: "corpus",
   embeddingFingerprint: "embedding",
   incomplete: false,
-  snapshotLoaded: false,
   changeCounter: 1,
   lexicalGeneration: 1,
   semanticGeneration: 1,
@@ -41,6 +40,16 @@ describe("search index channels", () => {
         searchable: true,
       });
     }
+  });
+
+  it("disables the old semantic space on a model change while retaining lexical search", () => {
+    const changed = { ...state, semanticRebuildRequired: true };
+    expect(lexicalIndex.status(changed, true, false)).toMatchObject({ searchable: true });
+    expect(semanticIndex.status(changed, true, false)).toMatchObject({
+      state: "incompatible",
+      searchable: false,
+      rebuildRequired: true,
+    });
   });
 
   it("keeps lexical search available during incomplete reconciliation", () => {

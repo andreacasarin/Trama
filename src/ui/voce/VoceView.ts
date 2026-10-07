@@ -449,11 +449,6 @@ export class VoceView extends ItemView {
             ? "Related-note suggestions are unavailable until semantic coverage is complete."
             : "Related-note suggestions are unavailable. Update the semantic index when available.",
       });
-    } else if (this.relatedResult?.freshness === "snapshot-loaded") {
-      this.attachments.createDiv({
-        cls: "setting-item-description mod-warning trama-voce__context-warning",
-        text: "Search suggestions reflect a synchronized snapshot that is not locally reconciled.",
-      });
     } else if (this.relatedResult?.freshness === "unknown") {
       this.attachments.createDiv({
         cls: "setting-item-description mod-warning trama-voce__context-warning",

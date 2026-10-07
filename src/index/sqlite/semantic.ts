@@ -19,8 +19,10 @@ import {
   vectorBytes,
 } from "./core";
 import type { SqliteStateStore } from "./state";
+import { pruneUnreferencedRevisions } from "./lexical-full-note";
 import {
   SEMANTIC_AFFECTED_PROMOTION_SQL,
+  SEMANTIC_AFFECTED_NOTES_SQL,
   SEMANTIC_MISSING_INPUTS_SQL,
   SEMANTIC_PROMOTION_SQL,
 } from "./hot-queries";
@@ -137,6 +139,7 @@ export class SqliteSemanticStore {
            ON ec.input_digest=ei.action_key
           AND ec.embedding_fingerprint=?
           AND ec.preprocessing=?
+          AND ec.task_kind='document'
          WHERE ec.cache_id IS NULL
          LIMIT 1`,
         [embeddingFingerprint, preprocessing]
@@ -330,6 +333,7 @@ export class SqliteSemanticStore {
             this.db.exec({
               sql: "UPDATE index_state SET semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
             });
+          pruneUnreferencedRevisions(this.db);
         }
       } finally {
         if (measured) this.phase("commit", "cleanup", () => this.cleanupSemanticResults());
@@ -364,10 +368,12 @@ export class SqliteSemanticStore {
     let promoted = 0;
     transaction(this.db, () => {
       promoted = this.promoteSemanticHeadsInTransaction(embeddingFingerprint, preprocessing);
-      if (promoted)
+      if (promoted) {
         this.db.exec({
           sql: "UPDATE index_state SET semantic_generation=semantic_generation+1,change_counter=change_counter+1 WHERE id=1",
         });
+        pruneUnreferencedRevisions(this.db);
+      }
     });
     return promoted;
   }
@@ -375,24 +381,21 @@ export class SqliteSemanticStore {
   private upsertAffectedNotes(embeddingFingerprint: string, preprocessing: string): void {
     this.db.exec(`CREATE TEMP TABLE semantic_affected_notes(note_id INTEGER PRIMARY KEY)`);
     this.db.exec({
-      sql: `INSERT INTO semantic_affected_notes(note_id)
-                SELECT DISTINCT n.note_id
-                FROM notes n
-                JOIN chunk_occurrences o ON o.note_id=n.note_id AND o.revision_id=n.lexical_revision_id
-                JOIN semantic_result_inputs r ON r.input_digest=o.embedding_input_digest
-                WHERE n.lexical_revision_id IS NOT NULL`,
+      sql: SEMANTIC_AFFECTED_NOTES_SQL,
     });
     this.db.exec({
-      sql: `INSERT INTO embedding_cache(input_digest,action_key,embedding_fingerprint,preprocessing,vector)
-                SELECT input_digest,action_key,?, ?,vector
+      sql: `INSERT INTO embedding_cache(input_digest,action_key,embedding_fingerprint,preprocessing,vector,task_kind,created_at)
+                SELECT input_digest,action_key,?, ?,vector,'document',?
                 FROM semantic_result_inputs
                 WHERE 1
                 ON CONFLICT(action_key) DO UPDATE SET
                   input_digest=excluded.input_digest,
                   embedding_fingerprint=excluded.embedding_fingerprint,
                   preprocessing=excluded.preprocessing,
-                  vector=excluded.vector`,
-      bind: [embeddingFingerprint, preprocessing],
+                  vector=excluded.vector,
+                  task_kind=excluded.task_kind,
+                  created_at=excluded.created_at`,
+      bind: [embeddingFingerprint, preprocessing, Date.now()],
     });
   }
 
@@ -426,8 +429,9 @@ export class SqliteSemanticStore {
       this.context.db.exec({
         sql: "UPDATE notes SET semantic_revision_id=NULL WHERE semantic_revision_id IS NOT NULL",
       });
+      pruneUnreferencedRevisions(this.context.db);
       this.context.db.exec({
-        sql: "DELETE FROM embedding_cache WHERE embedding_fingerprint=?",
+        sql: "DELETE FROM embedding_cache WHERE embedding_fingerprint=? AND task_kind='document'",
         bind: [this.context.embeddingFingerprint],
       });
       this.context.db.exec({

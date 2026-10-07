@@ -1,323 +1,226 @@
-import type { ChatSession } from "@/chat/ChatSession";
-import type { TramaPerformanceRecord } from "@/diagnostics/TramaDiagnostics";
 import type { IndexManager } from "@/index/IndexManager";
 import type { RelatedNotes } from "@/index/RelatedNotes";
 import type { PublicationManager } from "@/index/publications/PublicationManager";
 import type { LenteSearchPort } from "@/plugin/ModelRuntime";
-import type { TramaSettings } from "@/settings/Settings";
-import { SQLITE_BUILD_IDENTITY } from "@/build/identity";
-import { BENCHMARK_REPORT, readBenchmarkManifest, type BenchmarkManifest } from "./Manifest";
-import { expectedOutputsV1ByProfile } from "./Oracle";
+import { sha256Hex } from "@/index/Identity";
+import {
+  BENCHMARK_NOTE_COUNT,
+  BENCHMARK_REPORT,
+  readBenchmarkManifest,
+  type BenchmarkManifest,
+  type BenchmarkReport,
+} from "./Manifest";
 
-const ORACLE_COUNTS = {
-  "trama-small": { initial: 128, final: 125 },
-  "trama-10k": { initial: 10000, final: 9993 },
-  "trama-large": { initial: 25000, final: 24993 },
-} as const;
-
-/** References to the already-composed production runtime, not benchmark substitutes. */
+/** References to the already-composed production runtime. */
 export interface BenchmarkRuntime {
   readonly index: IndexManager;
   readonly publication: PublicationManager;
   readonly related: RelatedNotes;
-  readonly session: ChatSession;
-  getLenteSearch(): LenteSearchPort;
-  getSettings(): TramaSettings;
-  saveSettings(settings: TramaSettings): Promise<void>;
+  clearIndexesAndSharedCache(): Promise<void>;
   rebuild(): Promise<void>;
-  update(): Promise<void>;
   publish(): Promise<void>;
   checkPublication(): Promise<void>;
-  stop(): Promise<void>;
+  hasPublicationCheckWarning(): boolean;
+  getLenteSearch(): LenteSearchPort;
 }
 
-interface PhaseAggregate {
-  count: number;
-  durationMs: number;
-  sqlMs: number;
-  sqlCalls: number;
-  byteCount: number;
-  itemCount: number;
-}
-
-export interface BenchmarkReport {
-  readonly version: "trama-obsidian-report-v2";
-  readonly status: "completed" | "error" | "timeout";
-  readonly runId: string;
-  readonly profile: BenchmarkManifest["profile"];
-  readonly host: "obsidian-desktop";
-  readonly appVersion: string;
-  readonly pluginVersion: string;
-  readonly buildIdentity: string;
-  readonly runtime: "standard-trama-worker-wasm-opfs";
-  readonly storage: "vault-opfs-identity";
-  readonly transport: "browser-worker";
-  readonly providerTransport: "loopback-http-fixture";
-  readonly publication: "vault-filesystem";
-  readonly diagnosticsMode: "performance";
-  readonly sourceDigest: string;
-  readonly workloadContractVersion: "trama-workload-contract-v1";
-  readonly oracleVersion: "expected-outputs-v1";
-  readonly providerChallengeSha256: string;
-  readonly queryVectorSha256: string;
-  readonly memory: { readonly rssBytes: "unsupported"; readonly heapBytes: "unsupported" };
-  readonly boundaries: readonly string[];
-  readonly scenarios: Readonly<Record<string, { completed: boolean }>>;
-  readonly phases: Readonly<Record<string, PhaseAggregate>>;
-  readonly correctness: Readonly<Record<string, boolean>>;
-  readonly provider: { readonly calls: number; readonly texts: number };
-  readonly error?: string;
-}
-
-/** Fixed workload driver over normal Trama operations; timing comes from production diagnostics. */
-export async function runObsidianBenchmark(
-  app: { vault: any; version?: string },
+export async function writeBenchmarkFailureReport(
+  app: { vault: any },
   manifest: BenchmarkManifest,
-  pluginVersion: string,
+  failure: unknown
+): Promise<void> {
+  const adapter = app.vault.adapter;
+  const current = await readBenchmarkManifest(adapter, app.vault.getName?.() ?? "");
+  if (
+    !current ||
+    adapter.getBasePath?.() !== manifest.expectedPath ||
+    current.corpusSha256 !== manifest.corpusSha256
+  )
+    return;
+  if (await adapter.exists?.(BENCHMARK_REPORT)) return;
+  const report: BenchmarkReport = {
+    version: "trama-simple-benchmark-report-v1",
+    status: "error",
+    runId: globalThis.crypto.randomUUID(),
+    corpusSha256: manifest.corpusSha256,
+    noteCount: BENCHMARK_NOTE_COUNT,
+    correctness: {},
+    error: failure instanceof Error ? failure.message : String(failure),
+  };
+  await adapter.write(BENCHMARK_REPORT, `${JSON.stringify(report, null, 2)}\n`);
+}
+
+/** Runs a fixed correctness workflow through normal production operations. */
+export async function runObsidianBenchmark(
+  app: { vault: any },
+  manifest: BenchmarkManifest,
   runtime: BenchmarkRuntime
 ): Promise<BenchmarkReport> {
   const adapter = app.vault.adapter;
-  const ensureMarked = async () => {
-    const fresh = await readBenchmarkManifest(adapter, app.vault.getName());
+  if (adapter.exists && (await adapter.exists(BENCHMARK_REPORT)))
+    throw new Error("A benchmark report already exists; refusing to replace it.");
+  const verifyMarker = async () => {
+    const current = await readBenchmarkManifest(adapter, app.vault.getName?.() ?? "");
     if (
-      !fresh ||
+      !current ||
       adapter.getBasePath?.() !== manifest.expectedPath ||
-      JSON.stringify(fresh) !== JSON.stringify(manifest)
+      current.corpusSha256 !== manifest.corpusSha256
     )
       throw new Error("Benchmark vault marker changed; refusing mutation.");
   };
-  await ensureMarked();
-  const settings = runtime.getSettings();
-  const endpoint = settings.embedding.endpoint;
-  if (
-    !/^http:\/\/127\.0\.0\.1:[0-9]+\/v1$/.test(endpoint) ||
-    settings.chat.endpoint !== endpoint ||
-    settings.embedding.modelId !== `trama-benchmark-fixture-${manifest.runId}` ||
-    settings.chat.modelId !== settings.embedding.modelId ||
-    settings.embedding.dimensions !== 768 ||
-    settings.diagnosticsMode !== "performance" ||
-    settings.automaticMaintenance ||
-    settings.filo.excludedPaths.length > 0
-  )
-    throw new Error(
-      "Run npm run benchmark to configure the marked vault's fixture provider and Performance logging."
-    );
-  const initialPaths = app.vault.getMarkdownFiles().map((file: { path: string }) => file.path);
-  const expectedPaths = Array.from({ length: manifest.noteCount }, (_, index) =>
-    index === 0
-      ? "00-special/Ä.md"
-      : index === 1
-        ? "00-special/a.md"
-        : index === 2
-          ? "00-special/😀.md"
-          : `notes/${String(index).padStart(5, "0")}/note-${index}.md`
-  );
-  if (
-    initialPaths.length !== expectedPaths.length ||
-    initialPaths.some((path: string) => !expectedPaths.includes(path))
-  )
-    throw new Error("Generated benchmark vault note inventory changed; refusing mutation.");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => {
-    controller.abort();
-    void runtime.stop();
-    runtime.session.cancel();
-  }, manifest.timeoutMs);
-  const signal = controller.signal;
-  const phases: Record<string, PhaseAggregate> = {};
-  const scenarios: Record<string, { completed: boolean }> = {};
-  const correctness: Record<string, boolean> = {};
-  let provider = { calls: 0, texts: 0 };
-  let providerVerified = false;
-  const stats = async (requestSignal = signal): Promise<{ calls: number; texts: number }> => {
-    const response = await fetch(`${endpoint}/benchmark-stats`, { signal: requestSignal });
-    if (!response.ok) throw new Error("Benchmark fixture provider is unavailable.");
-    const value = await response.json();
-    if (
-      value.runId !== manifest.runId ||
-      !Number.isSafeInteger(value.calls) ||
-      !Number.isSafeInteger(value.texts)
-    )
-      throw new Error("Benchmark fixture provider identity mismatch.");
-    providerVerified = true;
-    provider = { calls: value.calls, texts: value.texts };
-    return provider;
-  };
-  const scenario = async (name: string, work: () => Promise<unknown>) => {
-    if (signal.aborted) throw new Error("Benchmark timed out.");
-    await ensureMarked();
-    await work();
-    if (signal.aborted) throw new Error("Benchmark timed out.");
-    scenarios[name] = { completed: true };
-  };
-  let status: BenchmarkReport["status"] = "completed";
-  let error: string | undefined;
-  try {
-    await stats();
-    await runtime.index.capturePerformance(
-      async () => {
-        await scenario("fullRebuild", () => runtime.rebuild());
-        const initial = await runtime.index.getState();
-        correctness.initialNoteCount = initial?.noteCount === manifest.noteCount;
-        correctness.initialOccurrenceCount =
-          initial?.chunkCount === ORACLE_COUNTS[manifest.profile].initial;
-        const beforeCached = await stats();
-        await scenario("cachedUpdate", () => runtime.update());
-        correctness.semanticCachedNoProviderWork = (await stats()).texts === beforeCached.texts;
-        for (const mutation of manifest.mutations) {
-          await scenario(
-            `scoped${mutation.kind[0].toUpperCase()}${mutation.kind.slice(1)}`,
-            async () => {
-              if (mutation.kind === "add") {
-                await app.vault.createFolder("mutations");
-                await app.vault.create(mutation.path, mutation.content);
-              } else {
-                const file = app.vault.getFileByPath(mutation.path);
-                if (!file) throw new Error("Benchmark mutation target missing.");
-                if (mutation.kind === "modify") await app.vault.modify(file, mutation.content);
-                else if (mutation.kind === "delete") await app.vault.delete(file);
-                else await app.vault.rename(file, mutation.to);
-              }
-              // The normal VaultEventRouter owns the journal; never inject benchmark mutations.
-              await runtime.update();
-            }
-          );
-        }
-        await scenario("publish", () => runtime.publish());
-        const bytes = await runtime.publication.store.read();
-        correctness.publicationCompleted = !!bytes;
-        correctness.publicationBytesPresent = !!bytes?.byteLength;
-        if (!bytes) throw new Error("Publication bytes missing.");
-        await scenario("publicationCheck", () => runtime.checkPublication());
-        const state = await runtime.index.getState();
-        correctness.finalNoteCount = state?.noteCount === manifest.noteCount;
-        correctness.finalOccurrenceCount =
-          state?.chunkCount === ORACLE_COUNTS[manifest.profile].final;
-        correctness.semanticEligibleCount = state?.semanticEligibleCount === manifest.noteCount;
-        correctness.semanticHeadCount = state?.semanticHeadCount === manifest.noteCount;
-        // Live storage retains reusable entries; convergence/missing-count gates verify current coverage.
-        correctness.compatibleVectorCoverage =
-          (state?.compatibleVectorCount ?? 0) >= ORACLE_COUNTS[manifest.profile].final;
-        correctness.semanticReady = state?.semanticReady === true;
-        correctness.semanticConverged =
-          state?.semanticLagCount === 0 && state?.semanticMissingCount === 0;
-        const query = 'alpha OR beta "quoted" -tag NEAR/3 (unsafe)';
-        const expected = expectedOutputsV1ByProfile[manifest.profile];
-        const identities = (results: readonly { path: string; ordinal: number }[]) =>
-          results.map((result) => ({ path: result.path, occurrenceOrdinal: result.ordinal }));
-        await scenario("lexicalRetrieval", async () => {
-          await runtime.saveSettings({
-            ...runtime.getSettings(),
-            lente: { ...settings.lente, searchMethod: "keyword" },
-          });
-          const batch = await runtime.getLenteSearch().search(query, { signal });
-          correctness.lexicalOracleMatches =
-            JSON.stringify(identities(batch.results)) === JSON.stringify(expected.probes.lexical);
-        });
-        await runtime.saveSettings({
-          ...runtime.getSettings(),
-          lente: { ...settings.lente, searchMethod: "hybrid" },
-        });
-        await scenario("hybridRetrieval", async () => {
-          const batch = await runtime.getLenteSearch().search(query, { signal });
-          correctness.hybridOracleMatches =
-            JSON.stringify(identities(batch.canonicalResults ?? [])) ===
-            JSON.stringify(expected.probes.hybrid);
-        });
-        await scenario("relatedRetrieval", async () => {
-          const batch = await runtime.related.find("00-special/a.md", signal, 7, true);
-          correctness.relatedOracleMatches =
-            JSON.stringify(batch.results.map(({ path }) => ({ path }))) ===
-            JSON.stringify(expected.probes.filo);
-        });
-        await scenario("chatToolTurn", async () => {
-          const result = await runtime.session.send({
-            content: "Find relevant notes",
-            attachmentPaths: [],
-          });
-          const answer = result.turns[result.turns.length - 1];
-          correctness.chatToolTurnCompleted =
-            answer?.role === "assistant" &&
-            answer.status === "complete" &&
-            answer.content === "done";
-          correctness.voceOracleMatches =
-            JSON.stringify(
-              answer?.role === "assistant"
-                ? (answer.provenance?.map(({ path }) => ({ path })) ?? [])
-                : []
-            ) === JSON.stringify(expected.probes.voce);
-        });
-        provider = await stats();
-      },
-      (record: TramaPerformanceRecord) => {
-        const key = `${record.operation}.${record.phase}`;
-        const value = (phases[key] ??= {
-          count: 0,
-          durationMs: 0,
-          sqlMs: 0,
-          sqlCalls: 0,
-          byteCount: 0,
-          itemCount: 0,
-        });
-        value.count++;
-        value.durationMs += record.durationMs;
-        value.sqlMs += record.sqlMs ?? 0;
-        value.sqlCalls += record.sqlCalls ?? 0;
-        value.byteCount += record.byteCount ?? 0;
-        value.itemCount += record.itemCount ?? 0;
-      }
-    );
-    const failed = Object.keys(correctness).filter((gate) => !correctness[gate]);
-    if (failed.length) throw new Error(`Benchmark correctness gate failed: ${failed.join(", ")}`);
-  } catch (caught) {
-    status = signal.aborted ? "timeout" : "error";
-    error = caught instanceof Error ? caught.message : String(caught);
-  } finally {
-    clearTimeout(timeout);
-    if (status !== "completed" && providerVerified)
-      await stats(AbortSignal.timeout(1000)).catch(() => undefined);
-    await ensureMarked();
-    await runtime.saveSettings({ ...runtime.getSettings(), lente: settings.lente });
-  }
   const report: BenchmarkReport = {
-    version: "trama-obsidian-report-v2",
-    status,
-    runId: manifest.runId,
-    profile: manifest.profile,
-    host: "obsidian-desktop",
-    appVersion: app.version ?? "unknown",
-    pluginVersion,
-    buildIdentity: SQLITE_BUILD_IDENTITY,
-    runtime: "standard-trama-worker-wasm-opfs",
-    storage: "vault-opfs-identity",
-    transport: "browser-worker",
-    providerTransport: "loopback-http-fixture",
-    publication: "vault-filesystem",
-    diagnosticsMode: "performance",
-    sourceDigest: manifest.sourceDigest,
-    workloadContractVersion: "trama-workload-contract-v1",
-    oracleVersion: "expected-outputs-v1",
-    providerChallengeSha256: manifest.providerChallengeSha256,
-    queryVectorSha256: manifest.queryVectorSha256,
-    memory: { rssBytes: "unsupported", heapBytes: "unsupported" },
-    boundaries: [
-      "publication filesystem adapter included",
-      "loopback provider transport included",
-      "host generation excluded",
-      "Obsidian startup excluded",
-      "memory unsupported",
-    ],
-    scenarios,
-    phases,
-    correctness,
-    provider,
-    ...(error ? { error } : {}),
+    version: "trama-simple-benchmark-report-v1",
+    status: "completed",
+    runId: globalThis.crypto.randomUUID(),
+    corpusSha256: manifest.corpusSha256,
+    noteCount: BENCHMARK_NOTE_COUNT,
+    startedAt: new Date().toISOString(),
+    correctness: {},
   };
-  await ensureMarked();
-  await adapter.write(BENCHMARK_REPORT, `${JSON.stringify(report, null, 2)}\n`);
-  if (status === "completed") {
-    // eslint-disable-next-line no-console
-    console.info("[Trama] benchmark_completed", { runId: report.runId, report: BENCHMARK_REPORT });
+  // eslint-disable-next-line no-console
+  console.info("[Trama] benchmark_started", { runId: report.runId });
+  const correctness: Record<string, boolean> = {};
+  let relatedLookup: BenchmarkReport["relatedLookup"];
+  let maintenanceBefore = false;
+  let maintenanceAfter = false;
+  try {
+    await verifyMarker();
+    const paths = app.vault
+      .getMarkdownFiles()
+      .map((file: { path: string }) => file.path)
+      .sort();
+    correctness.corpusNoteCount = paths.length === BENCHMARK_NOTE_COUNT;
+    correctness.corpusPaths = paths.every(
+      (path: string, index: number) => path === `notes/${String(index).padStart(4, "0")}.md`
+    );
+    if (!correctness.corpusNoteCount || !correctness.corpusPaths)
+      throw new Error("Benchmark corpus inventory does not match the fixed 3,000-note corpus.");
+
+    await verifyMarker();
+    await runtime.clearIndexesAndSharedCache();
+    const empty = await runtime.index.getState();
+    correctness.coldIndex = !empty || empty.noteCount === 0;
+    correctness.cacheCleared = (await runtime.publication.store.listCacheShards()).length === 0;
+    if (!correctness.coldIndex || !correctness.cacheCleared)
+      throw new Error("Benchmark indexes and shared cache were not empty after clear.");
+
+    await verifyMarker();
+    await runtime.rebuild();
+    const state = await runtime.index.getState();
+    correctness.indexedAllNotes = state?.noteCount === BENCHMARK_NOTE_COUNT;
+    correctness.semanticReady = state?.semanticReady === true;
+    if (!correctness.indexedAllNotes || !correctness.semanticReady)
+      throw new Error("Production index did not reach the expected 3,000-note semantic state.");
+
+    await verifyMarker();
+    const lente = await runtime.getLenteSearch().search("D5 lexical sentinel unique phrase");
+    correctness.lexicalSentinel = lente.results.some((result) => result.path === "notes/0000.md");
+    correctness.hybridSentinel = (lente.canonicalResults ?? []).some(
+      (result) => result.path === "notes/0000.md"
+    );
+    await verifyMarker();
+    maintenanceBefore = runtime.index.isInMaintenance();
+    const related = await runtime.related.find(
+      "notes/0001.md",
+      new AbortController().signal,
+      20,
+      true
+    );
+    maintenanceAfter = runtime.index.isInMaintenance();
+    relatedLookup = {
+      results: related.results
+        .slice(0, 20)
+        .filter((result) => /^notes\/\d{4}\.md$/.test(result.path) && Number.isFinite(result.score))
+        .map(({ path, score }) => ({ path, score })),
+      ...(related.unavailableReason ? { unavailableReason: related.unavailableReason } : {}),
+      semanticPartial: related.semanticPartial === true,
+      maintenanceBefore,
+      maintenanceAfter,
+    };
+    correctness.relatedSentinel = related.results.some((result) => result.path === "notes/0002.md");
+
+    await verifyMarker();
+    await runtime.publish();
+    const shards = await runtime.publication.store.listCacheShards();
+    correctness.cacheShardsPublished = shards.length > 0;
+    const publishedShards = [...shards].sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+    );
+    correctness.cacheShardHashesValid = publishedShards.length > 0;
+    for (const shard of publishedShards) {
+      const bytes = await runtime.publication.store.readCacheShard(shard.path);
+      if (
+        bytes.byteLength === 0 ||
+        bytes.byteLength > 4_194_304 ||
+        (await sha256Hex(bytes)) !== shard.digest
+      ) {
+        correctness.cacheShardHashesValid = false;
+        break;
+      }
+    }
+    const beforeCheckState = await runtime.index.getState();
+    await verifyMarker();
+    await runtime.checkPublication();
+    const checkedShards = [...(await runtime.publication.store.listCacheShards())].sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+    );
+    const checkedState = await runtime.index.getState();
+    correctness.cacheShardCheckStable =
+      !runtime.hasPublicationCheckWarning() &&
+      checkedShards.length === publishedShards.length &&
+      checkedShards.every(
+        (shard, index) =>
+          shard.path === publishedShards[index]?.path &&
+          shard.digest === publishedShards[index]?.digest
+      ) &&
+      beforeCheckState?.noteCount === BENCHMARK_NOTE_COUNT &&
+      beforeCheckState.semanticReady === true &&
+      checkedState?.noteCount === beforeCheckState.noteCount &&
+      checkedState.semanticReady === beforeCheckState.semanticReady &&
+      checkedState.lexicalGeneration === beforeCheckState.lexicalGeneration &&
+      checkedState.semanticGeneration === beforeCheckState.semanticGeneration &&
+      checkedState.embeddingFingerprint === beforeCheckState.embeddingFingerprint;
+    if (
+      !correctness.cacheShardsPublished ||
+      !correctness.cacheShardHashesValid ||
+      !correctness.cacheShardCheckStable
+    )
+      throw new Error(
+        "Cache shard publication was not present, valid, and stable after its check."
+      );
+    if (!correctness.lexicalSentinel || !correctness.hybridSentinel || !correctness.relatedSentinel)
+      throw new Error("Production retrieval did not return the fixed sentinel notes.");
+  } catch (error) {
+    return {
+      ...report,
+      finishedAt: new Date().toISOString(),
+      status: "error",
+      correctness,
+      ...(relatedLookup ? { relatedLookup } : {}),
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
-  return report;
+  return {
+    ...report,
+    finishedAt: new Date().toISOString(),
+    correctness,
+    ...(relatedLookup ? { relatedLookup } : {}),
+  };
+}
+
+export async function writeBenchmarkReport(
+  app: { vault: any },
+  manifest: BenchmarkManifest,
+  report: BenchmarkReport
+): Promise<void> {
+  const current = await readBenchmarkManifest(app.vault.adapter, app.vault.getName?.() ?? "");
+  if (
+    !current ||
+    app.vault.adapter.getBasePath?.() !== manifest.expectedPath ||
+    current.corpusSha256 !== manifest.corpusSha256
+  )
+    throw new Error("Benchmark marker or path changed; refusing report write.");
+  await app.vault.adapter.write(BENCHMARK_REPORT, `${JSON.stringify(report, null, 2)}\n`);
+  // eslint-disable-next-line no-console
+  console.info("[Trama] benchmark_finished", { runId: report.runId, status: report.status });
 }

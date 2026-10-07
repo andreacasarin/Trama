@@ -372,3 +372,28 @@
 .trama-filo__action {
   margin-top: 8px;
 }
+
+/* Keep maintenance commands readable in narrow desktop and mobile settings. */
+.trama-settings__commands {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.trama-settings__commands .setting-item-info {
+  margin-right: 0;
+}
+
+.trama-settings__commands .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.trama-settings__commands .setting-item-control button {
+  margin: 0;
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+}

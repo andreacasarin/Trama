@@ -378,9 +378,7 @@ export class LenteSearchModal extends SuggestModal<LenteResult> {
     } else if (mode === "lexical") {
       messages.push("Lexical search ready.");
     }
-    if (freshness === "snapshot-loaded")
-      messages.push("Snapshot loaded; not reconciled with the current vault.");
-    else if (freshness === "unknown") messages.push("Lexical index may be stale; update required.");
+    if (freshness === "unknown") messages.push("Lexical index may be stale; update required.");
     if (semanticPartial)
       messages.push("Semantic index is incomplete; search uses available vectors.");
     return messages.join(" ");

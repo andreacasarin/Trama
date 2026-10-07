@@ -24,6 +24,7 @@ export const SQLITE_VECTOR_NORMALIZATION_TOLERANCE = 1e-3;
 export class SqliteContext {
   dimensions = 0;
   embeddingFingerprint = "";
+  configuredEmbeddingFingerprint = "";
   closed = false;
 
   constructor(readonly db: SqliteConnection) {}

@@ -1,6 +1,5 @@
 import {
   StructuredError,
-  type EmbeddingModel,
   type IndexCapabilities,
   type IndexFreshness,
   type ProvenanceRecord,
@@ -12,12 +11,13 @@ import type { SqliteHit } from "@/index/sqlite/protocol";
 import type { RetrievalResult } from "@/index/retrieval/contracts";
 import { QueryEmbeddingError } from "@/index/retrieval/QueryEmbeddingError";
 import type { RelatedIndexHit, RelatedIndexState } from "./contracts";
+import { EmbeddingResolver } from "./embedding-resolver";
 import { check, IndexRuntime } from "./runtime";
 
 export class RetrievalService implements VaultRetrievalPort {
   constructor(
     private readonly runtime: IndexRuntime,
-    private readonly embedding: EmbeddingModel
+    private readonly embedding: EmbeddingResolver
   ) {}
   async search(
     query: string,
@@ -42,18 +42,15 @@ export class RetrievalService implements VaultRetrievalPort {
     readonly generationId: string;
     readonly semantic: IndexCapabilities["semantic"];
     readonly freshness: IndexFreshness;
-    readonly publicationId?: string;
   } | null {
     if (!this.runtime.hasUsableIndex()) return null;
     const changeCounter = this.runtime.changeCounter();
-    const state = this.runtime.state!;
     const capabilities = this.runtime.capabilities();
     return {
       changeCounter,
       generationId: indexIdentity(changeCounter),
       semantic: capabilities.semantic,
       freshness: this.runtime.freshness,
-      ...(state.publicationId ? { publicationId: state.publicationId } : {}),
     };
   }
   retrieveVaultCandidates(
@@ -94,34 +91,23 @@ export class RetrievalService implements VaultRetrievalPort {
           "Semantic vectors are not ready. Update the semantic index first.",
           true
         );
-      let queryVector = vector ? new Float32Array(vector) : undefined;
+      let queryVector: Float32Array | undefined = vector ? new Float32Array(vector) : undefined;
+      const queryProfile = this.runtime.state?.embeddingFingerprint;
       if (effectiveMode !== "lexical" && !queryVector) {
         const embeddingTimer = this.runtime.performanceTimer();
-        try {
-          const values = await this.embedding.embed([query], requestSignal);
-          queryVector = new Float32Array(values[0] ?? []);
-          this.runtime.emitPhase(
-            "retrieve",
-            "queryEmbedding",
-            embeddingTimer,
-            1,
-            undefined,
-            retrievalOperationId
-          );
-        } catch {
-          if (requestSignal.aborted)
-            throw new StructuredError("cancelled", "Search cancelled.", true);
-          throw new QueryEmbeddingError();
-        }
-        if (
-          queryVector &&
-          (queryVector.length !== this.embedding.dimensions ||
-            !queryVector.some((value) => value !== 0))
-        ) {
-          throw new QueryEmbeddingError();
-        }
+        queryVector = await this.embedding.resolveQuery(query, requestSignal);
+        this.runtime.emitPhase(
+          "retrieve",
+          "queryEmbedding",
+          embeddingTimer,
+          1,
+          undefined,
+          retrievalOperationId
+        );
       }
-      const candidateLimit = lexicalProfile === "lente" ? 160 : mode === "related" ? 128 : 80;
+      if (effectiveMode !== "lexical" && this.runtime.state?.embeddingFingerprint !== queryProfile)
+        throw new QueryEmbeddingError();
+      const candidateLimit = mode === "related" ? 128 : 80;
       const resultLimit = Math.max(0, Math.min(256, Math.floor(limit)));
       const retrievalTimer = this.runtime.performanceTimer();
       const retrievalClient = this.runtime.ensureClient();
@@ -130,6 +116,7 @@ export class RetrievalService implements VaultRetrievalPort {
         {
           ...(effectiveMode === "semantic" ? {} : { query }),
           ...(queryVector ? { vector: queryVector } : {}),
+          ...(queryVector && queryProfile ? { expectedEmbeddingFingerprint: queryProfile } : {}),
           limit: resultLimit,
           semanticCandidateLimit: candidateLimit,
           lexicalCandidateLimit: candidateLimit,
@@ -222,9 +209,6 @@ export class RetrievalService implements VaultRetrievalPort {
       contentHash: identity,
       semantic: this.runtime.capabilities().semantic,
       freshness: this.runtime.freshness,
-      ...(this.runtime.state?.publicationId
-        ? { publicationId: this.runtime.state.publicationId }
-        : {}),
     };
   }
   async findRelated(

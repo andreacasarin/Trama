@@ -46,15 +46,12 @@ export class LexicalSnapshotService {
           operation !== "rebuild" &&
           !this.journal.fullRecoveryRequested &&
           !this.runtime.state?.incomplete &&
-          !this.runtime.state?.snapshotLoaded &&
           (await this.lexicalSnapshotMatchesState(snapshot, signal))
         ) {
           this.journal.reconciledRevision = snapshot.revision;
           this.journal.changes.length = 0;
           this.journal.fullRecoveryRequested = false;
-          this.runtime.freshness = this.runtime.state?.snapshotLoaded
-            ? "snapshot-loaded"
-            : "locally-reconciled";
+          this.runtime.freshness = "locally-reconciled";
           return { changed, converged: true };
         }
         const before = this.runtime.state?.changeCounter ?? 0;
@@ -95,9 +92,7 @@ export class LexicalSnapshotService {
         this.journal.reconciledRevision = snapshot.revision;
         this.journal.changes.length = 0;
         this.journal.fullRecoveryRequested = false;
-        this.runtime.freshness = this.runtime.state?.snapshotLoaded
-          ? "snapshot-loaded"
-          : "locally-reconciled";
+        this.runtime.freshness = "locally-reconciled";
         return { changed, converged: this.runtime.state?.incomplete === false };
       } catch (error) {
         if (runId) {
