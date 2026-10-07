@@ -1,5 +1,5 @@
 export const SQLITE_APPLICATION_ID = 0x54524d41;
-export const SQLITE_SCHEMA_VERSION = 15;
+export const SQLITE_SCHEMA_VERSION = 16;
 export const SQLITE_PROTOCOL_VERSION = 13;
 export { SQLITE_BUILD_IDENTITY } from "../../build/identity";
 
@@ -138,19 +138,52 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lexical_notes_fts USING fts5(
   content='lexical_notes', content_rowid='note_id',
   tokenize='unicode61 remove_diacritics 2'
 );
+CREATE TABLE IF NOT EXISTS lexical_passages (
+  occurrence_id INTEGER PRIMARY KEY REFERENCES chunk_occurrences(occurrence_id) ON DELETE CASCADE,
+  note_id INTEGER NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+  token_count INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS lexical_passages_note ON lexical_passages(note_id);
+CREATE VIEW IF NOT EXISTS lexical_passage_content AS
+  SELECT p.occurrence_id,o.display_text,p.note_id
+  FROM lexical_passages p JOIN chunk_occurrences o ON o.occurrence_id=p.occurrence_id;
+CREATE VIRTUAL TABLE IF NOT EXISTS lexical_passages_fts USING fts5(
+  display_text, note_id UNINDEXED,
+  content='lexical_passage_content', content_rowid='occurrence_id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS lexical_passages_ai AFTER INSERT ON lexical_passages BEGIN
+  INSERT INTO lexical_passages_fts(rowid,display_text,note_id)
+  SELECT new.occurrence_id,display_text,new.note_id FROM chunk_occurrences WHERE occurrence_id=new.occurrence_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_passages_ad AFTER DELETE ON lexical_passages BEGIN
+  INSERT INTO lexical_passages_fts(lexical_passages_fts,rowid,display_text,note_id)
+  SELECT 'delete',old.occurrence_id,display_text,old.note_id FROM chunk_occurrences WHERE occurrence_id=old.occurrence_id;
+END;
+CREATE TRIGGER IF NOT EXISTS lexical_passages_before_chunk_delete BEFORE DELETE ON chunk_occurrences BEGIN
+  DELETE FROM lexical_passages WHERE occurrence_id=old.occurrence_id;
+END;
 CREATE TRIGGER IF NOT EXISTS lexical_notes_ai AFTER INSERT ON lexical_notes BEGIN
   INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
   VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+  INSERT INTO lexical_passages(occurrence_id,note_id,token_count)
+  SELECT occurrence_id,note_id,trama_token_count(display_text) FROM chunk_occurrences
+  WHERE revision_id=new.revision_id;
 END;
 CREATE TRIGGER IF NOT EXISTS lexical_notes_ad AFTER DELETE ON lexical_notes BEGIN
   INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
   VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
+  DELETE FROM lexical_passages WHERE note_id=old.note_id;
 END;
 CREATE TRIGGER IF NOT EXISTS lexical_notes_au AFTER UPDATE ON lexical_notes BEGIN
   INSERT INTO lexical_notes_fts(lexical_notes_fts,rowid,body,path_text,filename,title,headings)
   VALUES('delete',old.note_id,old.body,old.path_text,old.filename,old.title,old.headings);
   INSERT INTO lexical_notes_fts(rowid,body,path_text,filename,title,headings)
   VALUES(new.note_id,new.body,new.path_text,new.filename,new.title,new.headings);
+  DELETE FROM lexical_passages WHERE note_id=old.note_id AND old.revision_id<>new.revision_id;
+  INSERT INTO lexical_passages(occurrence_id,note_id,token_count)
+  SELECT occurrence_id,note_id,trama_token_count(display_text) FROM chunk_occurrences
+  WHERE revision_id=new.revision_id AND old.revision_id<>new.revision_id;
 END;
 `;
 }

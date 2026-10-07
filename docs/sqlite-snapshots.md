@@ -46,14 +46,28 @@ Stop during reset also cancels its follow-up cache import. Edits arriving during
 failed embedding request retain normal lexical scheduling instead of waiting for
 the provider retry.
 
-Related retrieval scores all probes in one corpus scan and loads exact reranking
-tiles through occurrence and cache lookup indexes. It retains the same symmetric
-passage scoring and 16-vector tile bound. Performance diagnostics distinguish
-`centroid`, `relatedCandidates`, and `relatedRerank`. When the last consumer cancels
-a related request, its Worker request yields and checks cancellation between reranking
-tiles using an eight-millisecond yield budget; an individual SQL step or tile finishes
-before yielding. Remaining consumers continue sharing the computation. Duplicate
-shard imports still validate SHA but
+Vector dot products, source centroids, probe selection, candidate ranking, exact
+related reranking, and reciprocal-rank fusion run inside SQLite/WASM. JavaScript
+prepares bounded query inputs and maps final rows; it does not scan corpus vectors.
+The runtime registers native double-precision functions that retain the previous
+Float32 input and accumulation behavior, plus UTF-16 path ordering for deterministic
+ties. A maintained passage FTS index selects lexical excerpts using each note's own
+BM25 statistics. Token counts are stored during lexical writes, and phrase document
+frequencies are shared across the excerpt query instead of rebuilding FTS per note.
+
+Related retrieval reads the source vectors once and each candidate note's vectors
+once into SQLite scratch tables. Its exact symmetric score uses batches of 16 source
+passages by 128 target passages, storing only per-passage maxima between batches.
+Candidate generation retains scalar metadata, not a corpus of vectors. Performance
+diagnostics distinguish `centroid`, `relatedCandidates`, and `relatedRerank`.
+When the last consumer cancels a related request, its Worker request yields and checks
+cancellation between SQL batches using an eight-millisecond yield budget; an
+individual SQL step finishes before yielding. Remaining consumers share the work.
+Scratch tables are removed on completion, cancellation, and error. Schema 16 adds the
+maintained passage index; earlier disposable local schemas reset and rebuild using
+ordinary shared-cache import and maintenance. Shared embedding shards do not change.
+
+Duplicate shard imports still validate SHA but
 skip profile reconciliation and unchanged local-state scans in both the Worker and
 the plugin. Profile reconciliation after a new shard updates profile selection
 without computing a discarded full corpus status. Semantic preparation is a separate

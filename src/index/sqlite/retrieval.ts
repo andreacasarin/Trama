@@ -4,96 +4,15 @@ import {
   EMBEDDING_PREPROCESSING_VERSION,
   normalizedVector,
   rows,
-  SQLITE_VECTOR_NORMALIZATION_TOLERANCE,
   type SqliteContext,
-  vectorOf,
+  vectorBytes,
 } from "./core";
 
 const RRF_K = 60;
 const RELATED_PROBE_COUNT = 3;
 const RELATED_NOTES_PER_PROBE = 32;
-const RELATED_VECTOR_TILE_SIZE = 16;
-
-interface SemanticCandidate {
-  readonly occurrenceId: number;
-  readonly id: string;
-  readonly path: string;
-  readonly ordinal: number;
-  readonly score: number;
-}
-
-interface RelatedPassageRef {
-  readonly occurrenceId: number;
-  readonly id: string;
-  readonly path: string;
-  readonly ordinal: number;
-  readonly inputDigest: string;
-}
-
-interface RelatedPassage extends RelatedPassageRef {
-  readonly vector: Float32Array;
-}
-
-function comparePassageRefs(left: RelatedPassageRef, right: RelatedPassageRef): number {
-  return left.ordinal - right.ordinal || compareCodeUnits(left.id, right.id);
-}
-
-function normalizedDot(left: Float32Array, right: Float32Array): number {
-  if (left.length !== right.length)
-    throw sqliteError("integrity_failed", "Stored vector dimensions mismatch");
-  let score = 0;
-  for (let index = 0; index < left.length; index++) score += left[index] * right[index];
-  return score;
-}
-
-function offerTopTwo(value: number, best: number[]): void {
-  if (value > best[0]) {
-    best[1] = best[0];
-    best[0] = value;
-  } else if (value > best[1]) best[1] = value;
-}
-
-function compareSemanticCandidates(left: SemanticCandidate, right: SemanticCandidate): number {
-  return (
-    right.score - left.score ||
-    compareCodeUnits(left.path, right.path) ||
-    left.ordinal - right.ordinal ||
-    compareCodeUnits(left.id, right.id)
-  );
-}
-
-/** Keep a bounded heap whose root is the worst retained candidate. */
-function offerTopK<T>(
-  heap: T[],
-  candidate: T,
-  limit: number,
-  compare: (left: T, right: T) => number
-): void {
-  if (heap.length < limit) {
-    let index = heap.length;
-    heap.push(candidate);
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (compare(heap[index], heap[parent]) <= 0) break;
-      [heap[index], heap[parent]] = [heap[parent], heap[index]];
-      index = parent;
-    }
-    return;
-  }
-  if (!limit || compare(candidate, heap[0]) >= 0) return;
-  heap[0] = candidate;
-  let index = 0;
-  for (;;) {
-    const left = index * 2 + 1;
-    const right = left + 1;
-    let worst = index;
-    if (left < heap.length && compare(heap[left], heap[worst]) > 0) worst = left;
-    if (right < heap.length && compare(heap[right], heap[worst]) > 0) worst = right;
-    if (worst === index) return;
-    [heap[index], heap[worst]] = [heap[worst], heap[index]];
-    index = worst;
-  }
-}
+const RELATED_SOURCE_TILE_SIZE = 16;
+const RELATED_TARGET_TILE_SIZE = 128;
 
 export class SqliteRetrieval {
   constructor(
@@ -171,88 +90,6 @@ export class SqliteRetrieval {
     };
   }
 
-  private relatedPassageRefs(path: string): RelatedPassageRef[] {
-    const query = this.relatedPassageCte(path);
-    return rows(
-      this.context.db,
-      `${query.sql} SELECT occurrenceId,id,path,ordinal,inputDigest FROM related_passages
-       ORDER BY ordinal,id COLLATE BINARY`,
-      query.bind
-    ).map((row) => ({
-      occurrenceId: Number(row.occurrenceId),
-      id: String(row.id),
-      path: String(row.path),
-      ordinal: Number(row.ordinal),
-      inputDigest: String(row.inputDigest),
-    }));
-  }
-
-  private relatedVectors(refs: readonly RelatedPassageRef[]): Float32Array[] {
-    if (!refs.length) return [];
-    const rowsById = rows(
-      this.context.db,
-      `SELECT o.occurrence_id AS occurrenceId,ec.vector
-       FROM chunk_occurrences o CROSS JOIN notes n ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
-       CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=o.embedding_input_digest
-         AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
-       WHERE o.occurrence_id IN (${refs.map(() => "?").join(",")})`,
-      [
-        this.context.embeddingFingerprint,
-        EMBEDDING_PREPROCESSING_VERSION,
-        ...refs.map(({ occurrenceId }) => occurrenceId),
-      ]
-    );
-    const vectors = new Map(
-      rowsById.map((row) => [Number(row.occurrenceId), this.relatedVector(row.vector)])
-    );
-    return refs.map(({ occurrenceId }) => {
-      const vector = vectors.get(occurrenceId);
-      if (!vector) throw sqliteError("integrity_failed", "Compatible semantic passage disappeared");
-      return vector;
-    });
-  }
-
-  private scanRelatedPassages(
-    path: string | undefined,
-    excludePath: string | undefined,
-    callback: (passage: RelatedPassage) => void
-  ): void {
-    const query = this.relatedPassageCte(path, excludePath);
-    this.context.db.exec({
-      sql: `${query.sql}
-        SELECT p.occurrenceId,p.id,p.path,p.ordinal,p.inputDigest,ec.vector
-        FROM related_passages p
-        CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=p.inputDigest
-          AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
-        ORDER BY p.path COLLATE BINARY,p.ordinal,p.id COLLATE BINARY`,
-      bind: [...query.bind, this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
-      rowMode: "object",
-      callback: (row) => callback(this.relatedPassageFromRow(row)),
-    });
-  }
-
-  private relatedPassageFromRow(row: Record<string, unknown>): RelatedPassage {
-    return {
-      occurrenceId: Number(row.occurrenceId),
-      id: String(row.id),
-      path: String(row.path),
-      ordinal: Number(row.ordinal),
-      inputDigest: String(row.inputDigest),
-      vector: this.relatedVector(row.vector),
-    };
-  }
-
-  private relatedVector(value: unknown): Float32Array {
-    const vector = vectorOf(value);
-    if (vector.length !== this.context.dimensions || !vector.every(Number.isFinite))
-      throw sqliteError("integrity_failed", "Stored vector dimensions mismatch");
-    let norm = 0;
-    for (const item of vector) norm += item * item;
-    if (Math.abs(norm - 1) > SQLITE_VECTOR_NORMALIZATION_TOLERANCE)
-      throw sqliteError("integrity_failed", "Stored semantic vector is not normalized");
-    return vector;
-  }
-
   /** Revision-head retrieval. Vectors are read only for active semantic heads.
    * This deliberately uses a scalar cosine pass: vector_full_scan applies its
    * LIMIT before a join can exclude inactive cache rows on some packaged builds.
@@ -293,31 +130,22 @@ export class SqliteRetrieval {
         sql += " WHERE n.path<>?";
         bind.push(currentPath);
       }
-      const top: SemanticCandidate[] = [];
-      const bestByPath = new Map<string, SemanticCandidate>();
-      this.context.db.exec({
-        sql,
-        bind,
-        rowMode: "object",
-        callback: (row) => {
-          const x = vectorOf(row.vector);
-          let score = 0;
-          for (let i = 0; i < q.length; i++) score += q[i] * x[i];
-          const candidate = {
-            occurrenceId: Number(row.occurrenceId),
-            id: String(row.id),
-            path: String(row.path),
-            ordinal: Number(row.ordinal),
-            score,
-          };
-          const prior = bestByPath.get(candidate.path);
-          if (!prior || compareSemanticCandidates(candidate, prior) < 0)
-            bestByPath.set(candidate.path, candidate);
-        },
-      });
-      for (const candidate of bestByPath.values())
-        offerTopK(top, candidate, semanticLimit, compareSemanticCandidates);
-      top.sort(compareSemanticCandidates);
+      const top = rows(
+        this.context.db,
+        `WITH scored AS MATERIALIZED (
+           SELECT occurrenceId,id,ordinal,path,trama_vector_dot(vector,?) AS score FROM (${sql})
+         ), ranked AS (
+           SELECT *,row_number() OVER (PARTITION BY path ORDER BY score DESC,ordinal,id COLLATE BINARY) AS position FROM scored
+         ) SELECT * FROM ranked WHERE position=1
+           ORDER BY score DESC,path COLLATE trama_code_units,ordinal,id COLLATE BINARY LIMIT ?`,
+        [vectorBytes(q), ...bind, semanticLimit]
+      ).map((row) => ({
+        occurrenceId: Number(row.occurrenceId),
+        id: String(row.id),
+        ordinal: Number(row.ordinal),
+        path: String(row.path),
+        score: Number(row.score),
+      }));
       if (top.length) {
         const selected = rows(
           this.context.db,
@@ -397,59 +225,39 @@ export class SqliteRetrieval {
         : "winners AS (SELECT * FROM scored)";
       const candidates = rows(
         this.context.db,
-        `WITH scored AS MATERIALIZED (${scored}), ${candidateSource}, ranked AS (
-           SELECT *,RANK() OVER (ORDER BY rank ASC) AS cutoffRank FROM winners
-         )
-         SELECT occurrenceId,id,ordinal,path,rank FROM ranked
-         WHERE cutoffRank<=? ORDER BY rank ASC`,
+        `WITH scored AS MATERIALIZED (${scored}), ${candidateSource},
+         normalized AS (SELECT *,min(rank) OVER () AS minRank FROM winners)
+         SELECT occurrenceId,id,ordinal,path,rank,
+           CASE WHEN minRank<0 THEN rank/minRank ELSE (1+minRank)/(1+rank) END AS score FROM normalized
+         ORDER BY rank ASC,path COLLATE trama_code_units,ordinal,id COLLATE BINARY LIMIT ?`,
         [scoped, ...filterBind, lexicalLimit]
-      )
-        .sort(
-          (left, right) =>
-            Number(left.rank) - Number(right.rank) ||
-            compareCodeUnits(String(left.path), String(right.path)) ||
-            Number(left.ordinal) - Number(right.ordinal) ||
-            compareCodeUnits(String(left.id), String(right.id))
-        )
-        .slice(0, lexicalLimit);
-      const minRank = Number(candidates[0]?.rank ?? 0);
+      );
       const details = candidates.length
         ? (() => {
             const paths = candidates.map(({ path }) => String(path));
-            const passageRows: Record<string, unknown>[] = [];
-            for (const path of paths) {
-              this.context.db.exec(
-                "CREATE VIRTUAL TABLE temp.note_passage_fts USING fts5(body,tokenize='unicode61 remove_diacritics 2')"
-              );
-              try {
-                this.context.db.exec({
-                  sql: `INSERT INTO temp.note_passage_fts(rowid,body)
-                          SELECT o.occurrence_id,o.display_text FROM chunk_occurrences o
-                          JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
-                          WHERE n.path=? ORDER BY o.ordinal,o.occurrence_id`,
-                  bind: [path],
-                });
-                passageRows.push(
-                  ...rows(
-                    this.context.db,
-                    `WITH scored AS MATERIALIZED (
-                         SELECT rowid AS occurrenceId,bm25(note_passage_fts) AS passageRank
-                         FROM note_passage_fts WHERE note_passage_fts MATCH ?
-                       )
-                       SELECT o.occurrence_id AS occurrenceId,o.chunk_id AS id,o.ordinal,n.path,
-                              r.content_id AS contentId,o.display_text AS text,
-                              o.start_line AS startLine,o.end_line AS endLine
-                       FROM scored s JOIN chunk_occurrences o ON o.occurrence_id=s.occurrenceId
-                       JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
-                       JOIN note_revisions r ON r.revision_id=o.revision_id
-                       ORDER BY s.passageRank,o.ordinal,o.chunk_id COLLATE BINARY LIMIT 1`,
-                    [expression]
-                  )
-                );
-              } finally {
-                this.context.db.exec("DROP TABLE IF EXISTS temp.note_passage_fts");
-              }
-            }
+            const passageRows = rows(
+              this.context.db,
+              `WITH stats AS MATERIALIZED (
+                 SELECT p.note_id,count(*) AS documents,sum(p.token_count) AS tokens
+                 FROM lexical_passages p JOIN notes n ON n.note_id=p.note_id
+                 WHERE n.path IN (${paths.map(() => "?").join(",")}) GROUP BY p.note_id
+               ), scored AS MATERIALIZED (
+                 SELECT f.rowid AS occurrenceId,
+                        trama_passage_bm25(lexical_passages_fts,s.note_id,s.documents,s.tokens) AS passageRank
+                 FROM lexical_passages_fts f JOIN lexical_passages p ON p.occurrence_id=f.rowid
+                 JOIN stats s ON s.note_id=p.note_id WHERE lexical_passages_fts MATCH ?
+               ), ranked AS (
+                 SELECT o.occurrence_id AS occurrenceId,o.chunk_id AS id,o.ordinal,n.path,
+                        r.content_id AS contentId,o.display_text AS text,
+                        o.start_line AS startLine,o.end_line AS endLine,
+                        row_number() OVER (PARTITION BY n.note_id
+                          ORDER BY s.passageRank,o.ordinal,o.chunk_id COLLATE BINARY) AS position
+                 FROM scored s JOIN chunk_occurrences o ON o.occurrence_id=s.occurrenceId
+                 JOIN notes n ON n.note_id=o.note_id AND n.lexical_revision_id=o.revision_id
+                 JOIN note_revisions r ON r.revision_id=o.revision_id
+               ) SELECT * FROM ranked WHERE position=1`,
+              [...paths, expression]
+            );
             const found = new Set(passageRows.map(({ path }) => String(path)));
             const fallbackRows = rows(
               this.context.db,
@@ -476,8 +284,7 @@ export class SqliteRetrieval {
       for (const candidate of candidates) {
         const row = detailsById.get(String(candidate.path));
         if (!row) continue;
-        const rank = Number(candidate.rank);
-        const score = minRank < 0 ? rank / minRank : (1 + minRank) / (1 + rank);
+        const score = Number(candidate.score);
         lexical.push({
           id: String(row.id ?? candidate.id),
           path: String(candidate.path),
@@ -495,33 +302,27 @@ export class SqliteRetrieval {
     if (!semantic.length) return lexical.slice(0, limit);
     if (!lexical.length) return semantic.slice(0, limit);
     const fusionTimer = this.startPhase();
-    const fused = new Map<string, SqliteHit & { fused: number; rank: number }>();
-    semantic.forEach((h, i) => {
-      const fusedScore = 1 / (RRF_K + i + 1);
-      fused.set(noteShape ? h.path : h.id, { ...h, fused: fusedScore, fusedScore, rank: i });
-    });
-    lexical.forEach((h, i) => {
-      const key = noteShape ? h.path : h.id;
-      const prior = fused.get(key);
-      const add = 1 / (RRF_K + i + 1);
-      if (prior)
-        fused.set(key, {
-          ...prior,
-          fused: prior.fused + add,
-          fusedScore: prior.fused + add,
-          lexicalScore: h.lexicalScore,
-        });
-      else fused.set(key, { ...h, fused: add, rank: i, fusedScore: add });
-    });
-    const result = [...fused.values()]
-      .sort(
-        (a, b) =>
-          b.fused - a.fused ||
-          compareCodeUnits(a.path, b.path) ||
-          a.ordinal - b.ordinal ||
-          compareCodeUnits(a.id, b.id)
-      )
-      .slice(0, limit);
+    const key = noteShape ? "path" : "id";
+    const result = rows(
+      this.context.db,
+      `WITH s AS MATERIALIZED (SELECT value AS hit,CAST(key AS INTEGER) AS rank,json_extract(value,'$.${key}') AS identity FROM json_each(?)),
+            l AS MATERIALIZED (SELECT value AS hit,CAST(key AS INTEGER) AS rank,json_extract(value,'$.${key}') AS identity FROM json_each(?)),
+            identities AS (SELECT identity FROM s UNION SELECT identity FROM l),
+            fused AS (
+              SELECT coalesce(s.hit,l.hit) AS hit,coalesce(s.rank,l.rank) AS rank,
+                json_extract(l.hit,'$.lexicalScore') AS lexicalScore,
+                coalesce(1.0/(${RRF_K}+s.rank+1),0)+coalesce(1.0/(${RRF_K}+l.rank+1),0) AS score
+              FROM identities k LEFT JOIN s ON s.identity=k.identity LEFT JOIN l ON l.identity=k.identity
+            ) SELECT * FROM fused ORDER BY score DESC,json_extract(hit,'$.path') COLLATE trama_code_units,
+              json_extract(hit,'$.ordinal'),json_extract(hit,'$.id') COLLATE trama_code_units LIMIT ?`,
+      [JSON.stringify(semantic), JSON.stringify(lexical), limit]
+    ).map((row) => ({
+      ...JSON.parse(String(row.hit)),
+      fused: Number(row.score),
+      fusedScore: Number(row.score),
+      rank: Number(row.rank),
+      ...(row.lexicalScore == null ? {} : { lexicalScore: Number(row.lexicalScore) }),
+    }));
     this.finishPhase("fusion", fusionTimer, result.length);
     return result;
   }
@@ -543,179 +344,6 @@ export class SqliteRetrieval {
     if (!resultLimit) return [];
     return this.retrieveRevisionHeads(query, vector, resultLimit, currentPath, options);
   }
-  private relatedCentroid(path: string): {
-    readonly vector?: Float32Array;
-    readonly count: number;
-  } {
-    const sum = new Float64Array(this.context.dimensions);
-    let count = 0;
-    this.scanRelatedPassages(path, undefined, ({ vector }) => {
-      for (let index = 0; index < sum.length; index++) sum[index] += vector[index];
-      count++;
-    });
-    let norm = 0;
-    for (const value of sum) norm += value * value;
-    if (!count || !(norm > 0)) return { count };
-    const scale = 1 / Math.sqrt(norm);
-    return {
-      count,
-      vector: Float32Array.from(sum, (value) => value * scale),
-    };
-  }
-
-  private relatedProbes(
-    path: string,
-    centroid: Float32Array | undefined,
-    count: number
-  ): RelatedPassage[] {
-    if (!count) return [];
-    let nearest: RelatedPassage | undefined;
-    this.scanRelatedPassages(path, undefined, (passage) => {
-      if (!nearest) {
-        nearest = passage;
-        return;
-      }
-      const score = centroid ? normalizedDot(passage.vector, centroid) : 0;
-      const nearestScore = centroid ? normalizedDot(nearest.vector, centroid) : 0;
-      if (
-        score > nearestScore ||
-        (score === nearestScore && comparePassageRefs(passage, nearest) < 0)
-      )
-        nearest = passage;
-    });
-    if (!nearest) return [];
-    const probes = [nearest];
-    while (probes.length < Math.min(RELATED_PROBE_COUNT, count)) {
-      let farthest: RelatedPassage | undefined;
-      let nearestSimilarity = Infinity;
-      this.scanRelatedPassages(path, undefined, (passage) => {
-        if (probes.some(({ inputDigest }) => inputDigest === passage.inputDigest)) return;
-        let maximumSimilarity = -Infinity;
-        for (const probe of probes)
-          maximumSimilarity = Math.max(
-            maximumSimilarity,
-            normalizedDot(passage.vector, probe.vector)
-          );
-        if (
-          maximumSimilarity < nearestSimilarity ||
-          (maximumSimilarity === nearestSimilarity &&
-            (!farthest || comparePassageRefs(passage, farthest) < 0))
-        ) {
-          nearestSimilarity = maximumSimilarity;
-          farthest = passage;
-        }
-      });
-      if (!farthest) break;
-      probes.push(farthest);
-    }
-    return probes;
-  }
-
-  private relatedNoteCandidates(
-    queries: readonly Float32Array[],
-    sourcePath: string
-  ): SemanticCandidate[] {
-    const queryCte = this.relatedPassageCte(undefined, sourcePath);
-    const top = queries.map(() => [] as SemanticCandidate[]);
-    let currentPath = "";
-    const best: (SemanticCandidate | undefined)[] = queries.map(() => undefined);
-    const flush = () => {
-      for (let index = 0; index < queries.length; index++) {
-        const candidate = best[index];
-        if (candidate)
-          offerTopK(top[index], candidate, RELATED_NOTES_PER_PROBE, compareSemanticCandidates);
-        best[index] = undefined;
-      }
-    };
-    this.context.db.exec({
-      sql: `${queryCte.sql}
-        SELECT p.occurrenceId,p.id,p.path,p.ordinal,ec.vector
-        FROM related_passages p
-        CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup ON ec.input_digest=p.inputDigest
-          AND ec.embedding_fingerprint=? AND ec.preprocessing=? AND ec.task_kind='document'
-        ORDER BY p.path COLLATE BINARY,p.ordinal,p.id COLLATE BINARY`,
-      bind: [...queryCte.bind, this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
-      rowMode: "object",
-      callback: (row) => {
-        const passagePath = String(row.path);
-        if (passagePath !== currentPath) {
-          flush();
-          currentPath = passagePath;
-        }
-        const vector = this.relatedVector(row.vector);
-        for (let index = 0; index < queries.length; index++) {
-          const candidate: SemanticCandidate = {
-            occurrenceId: Number(row.occurrenceId),
-            id: String(row.id),
-            path: passagePath,
-            ordinal: Number(row.ordinal),
-            score: normalizedDot(queries[index], vector),
-          };
-          const previous = best[index];
-          if (!previous || compareSemanticCandidates(candidate, previous) < 0)
-            best[index] = candidate;
-        }
-      },
-    });
-    flush();
-    return top.flatMap((candidates) => candidates.sort(compareSemanticCandidates));
-  }
-
-  private async symmetricRelatedScore(
-    source: readonly RelatedPassageRef[],
-    target: readonly RelatedPassageRef[],
-    checkpoint: () => Promise<void>
-  ): Promise<{ readonly score: number; readonly evidenceId: number } | undefined> {
-    const sourceCount = source.length;
-    if (!sourceCount || !target.length) return undefined;
-    const targetMax = new Float64Array(target.length).fill(-Infinity);
-    const sourceTop = [-Infinity, -Infinity];
-    for (
-      let sourceOffset = 0;
-      sourceOffset < sourceCount;
-      sourceOffset += RELATED_VECTOR_TILE_SIZE
-    ) {
-      const sourceVectors = this.relatedVectors(
-        source.slice(sourceOffset, sourceOffset + RELATED_VECTOR_TILE_SIZE)
-      );
-      const sourceMax = new Float64Array(sourceVectors.length).fill(-Infinity);
-      for (
-        let targetOffset = 0;
-        targetOffset < target.length;
-        targetOffset += RELATED_VECTOR_TILE_SIZE
-      ) {
-        await checkpoint();
-        const targetRefs = target.slice(targetOffset, targetOffset + RELATED_VECTOR_TILE_SIZE);
-        const targetVectors = this.relatedVectors(targetRefs);
-        for (let sourceIndex = 0; sourceIndex < sourceVectors.length; sourceIndex++) {
-          for (let targetIndex = 0; targetIndex < targetVectors.length; targetIndex++) {
-            const score = normalizedDot(sourceVectors[sourceIndex], targetVectors[targetIndex]);
-            if (score > sourceMax[sourceIndex]) sourceMax[sourceIndex] = score;
-            const targetIndexOverall = targetOffset + targetIndex;
-            if (score > targetMax[targetIndexOverall]) targetMax[targetIndexOverall] = score;
-          }
-        }
-      }
-      for (const score of sourceMax) offerTopTwo(score, sourceTop);
-    }
-    const targetTop = [-Infinity, -Infinity];
-    let evidenceIndex = 0;
-    for (let index = 0; index < targetMax.length; index++) {
-      offerTopTwo(targetMax[index], targetTop);
-      if (
-        targetMax[index] > targetMax[evidenceIndex] ||
-        (targetMax[index] === targetMax[evidenceIndex] &&
-          comparePassageRefs(target[index], target[evidenceIndex]) < 0)
-      )
-        evidenceIndex = index;
-    }
-    const sourceMean =
-      (sourceTop[0] + (sourceCount > 1 ? sourceTop[1] : 0)) / Math.min(2, sourceCount);
-    const targetMean =
-      (targetTop[0] + (target.length > 1 ? targetTop[1] : 0)) / Math.min(2, target.length);
-    return { score: (sourceMean + targetMean) / 2, evidenceId: target[evidenceIndex].occurrenceId };
-  }
-
   async findRelated(
     path: string,
     _vector: Float32Array | undefined,
@@ -729,71 +357,172 @@ export class SqliteRetrieval {
     const checkpoint = async () => {
       if (signal?.aborted) throw sqliteError("cancelled", "Related search cancelled", true);
       if (performance.now() >= yieldAt) {
-        // A macrotask lets the Worker receive cancellation messages between SQL steps.
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
         if (signal?.aborted) throw sqliteError("cancelled", "Related search cancelled", true);
         yieldAt = performance.now() + 8;
       }
     };
     await checkpoint();
-    const sourceTimer = this.startPhase();
-    const source = this.relatedCentroid(path);
-    if (!source.count) return [];
-    await checkpoint();
-    const probes = this.relatedProbes(path, source.vector, source.count);
-    this.finishPhase("centroid", sourceTimer, source.count);
-    const candidateQueries = [
-      ...(source.vector ? [source.vector] : []),
-      ...probes.map(({ vector }) => vector),
-    ];
-    await checkpoint();
-    const candidates = new Map<string, SemanticCandidate>();
-    const candidateTimer = this.startPhase();
-    for (const candidate of this.relatedNoteCandidates(candidateQueries, path))
-      if (!candidates.has(candidate.path)) candidates.set(candidate.path, candidate);
-    this.finishPhase("relatedCandidates", candidateTimer, candidates.size);
-    await checkpoint();
-    const rerankTimer = this.startPhase();
-    const sourceRefs = this.relatedPassageRefs(path);
-    const hits: SqliteHit[] = [];
-    for (const candidate of candidates.values()) {
-      await checkpoint();
-      const target = this.relatedPassageRefs(candidate.path);
-      const related = await this.symmetricRelatedScore(sourceRefs, target, checkpoint);
-      if (!related) continue;
-      const evidence = rows(
-        this.context.db,
-        `SELECT o.chunk_id AS id,o.ordinal,n.path,r.content_id AS contentId,
-                o.display_text AS text,o.start_line AS startLine,o.end_line AS endLine
-         FROM chunk_occurrences o JOIN notes n
-           ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
-         JOIN note_revisions r ON r.revision_id=o.revision_id
-         WHERE o.occurrence_id=? AND n.path=?`,
-        [related.evidenceId, candidate.path]
-      )[0];
-      if (!evidence) continue;
-      hits.push({
-        id: String(evidence.id),
-        path: String(evidence.path),
-        contentId: String(evidence.contentId),
-        ordinal: Number(evidence.ordinal),
-        score: related.score,
-        semanticScore: related.score,
-        text: String(evidence.text),
-        startLine: Number(evidence.startLine),
-        endLine: Number(evidence.endLine),
+    try {
+      const sourceTimer = this.startPhase();
+      const cte = this.relatedPassageCte(path);
+      this.context.db.exec({
+        sql: `CREATE TEMP TABLE related_source AS ${cte.sql}
+          SELECT p.*,ec.vector,row_number() OVER (ORDER BY p.ordinal,p.id COLLATE BINARY)-1 AS position
+          FROM related_passages p CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup
+            ON ec.input_digest=p.inputDigest AND ec.embedding_fingerprint=?
+            AND ec.preprocessing=? AND ec.task_kind='document'`,
+        bind: [...cte.bind, this.context.embeddingFingerprint, EMBEDDING_PREPROCESSING_VERSION],
       });
+      const source = rows(
+        this.context.db,
+        `SELECT count(*) AS count,trama_vector_centroid(vector) AS vector
+        FROM (SELECT vector FROM related_source ORDER BY position)`
+      )[0];
+      const sourceCount = Number(source.count);
+      if (!sourceCount) return [];
+      const probes: { occurrenceId: number; vector: unknown }[] = [];
+      for (let index = 0; index < Math.min(RELATED_PROBE_COUNT, sourceCount); index++) {
+        await checkpoint();
+        const probe = rows(
+          this.context.db,
+          `SELECT occurrenceId,vector FROM related_source
+           ${probes.length ? `WHERE occurrenceId NOT IN (${probes.map(() => "?").join(",")})` : ""}
+           ORDER BY ${probes.length ? probes.map(() => "trama_vector_dot(vector,?)").reduce((a, b) => `max(${a},${b})`) : source.vector ? "trama_vector_dot(vector,?) DESC" : "0+0"}
+             ${probes.length ? "ASC," : ","} ordinal,id COLLATE BINARY LIMIT 1`,
+          probes.length
+            ? [...probes.map((p) => p.occurrenceId), ...probes.map((p) => p.vector)]
+            : source.vector
+              ? [source.vector]
+              : []
+        )[0];
+        if (!probe) break;
+        probes.push({ occurrenceId: Number(probe.occurrenceId), vector: probe.vector });
+      }
+      this.finishPhase("centroid", sourceTimer, sourceCount);
+      await checkpoint();
+      const candidateTimer = this.startPhase();
+      const queries = [...(source.vector ? [source.vector] : []), ...probes.map((p) => p.vector)];
+      const corpus = this.relatedPassageCte(undefined, path);
+      const candidates = rows(
+        this.context.db,
+        `${corpus.sql},
+        probes(probe,vector) AS (VALUES ${queries.map((_, i) => `(${i},?)`).join(",")}),
+        scored AS MATERIALIZED (
+          SELECT p.*,q.probe,trama_vector_dot(ec.vector,q.vector) AS score
+          FROM related_passages p CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup
+            ON ec.input_digest=p.inputDigest AND ec.embedding_fingerprint=?
+            AND ec.preprocessing=? AND ec.task_kind='document' CROSS JOIN probes q
+        ), passages AS (
+          SELECT *,row_number() OVER (PARTITION BY probe,path ORDER BY score DESC,ordinal,id COLLATE BINARY) AS passageRank FROM scored
+        ), ranked AS (
+          SELECT *,row_number() OVER (PARTITION BY probe ORDER BY score DESC,path COLLATE trama_code_units,ordinal,id COLLATE BINARY) AS noteRank
+          FROM passages WHERE passageRank=1
+        ) SELECT DISTINCT path FROM ranked WHERE noteRank<=? ORDER BY path COLLATE trama_code_units`,
+        [
+          ...corpus.bind,
+          ...queries,
+          this.context.embeddingFingerprint,
+          EMBEDDING_PREPROCESSING_VERSION,
+          RELATED_NOTES_PER_PROBE,
+        ]
+      );
+      this.finishPhase("relatedCandidates", candidateTimer, candidates.length);
+      await checkpoint();
+      const rerankTimer = this.startPhase();
+      this.context.db.exec(
+        "CREATE TEMP TABLE related_maxima(direction INTEGER,id INTEGER,score REAL,PRIMARY KEY(direction,id)) WITHOUT ROWID"
+      );
+      this.context.db.exec(
+        "CREATE TEMP TABLE related_results(occurrenceId INTEGER PRIMARY KEY,score REAL)"
+      );
+      for (const candidate of candidates) {
+        await checkpoint();
+        const targetCte = this.relatedPassageCte(String(candidate.path));
+        this.context.db.exec({
+          sql: `CREATE TEMP TABLE related_target AS ${targetCte.sql}
+          SELECT p.*,ec.vector,row_number() OVER (ORDER BY p.ordinal,p.id COLLATE BINARY)-1 AS position
+          FROM related_passages p CROSS JOIN embedding_cache ec INDEXED BY embedding_cache_lookup
+            ON ec.input_digest=p.inputDigest AND ec.embedding_fingerprint=?
+            AND ec.preprocessing=? AND ec.task_kind='document'`,
+          bind: [
+            ...targetCte.bind,
+            this.context.embeddingFingerprint,
+            EMBEDDING_PREPROCESSING_VERSION,
+          ],
+        });
+        const targetCount = Number(
+          rows(this.context.db, "SELECT count(*) AS count FROM related_target")[0].count
+        );
+        this.context.db.exec("DELETE FROM related_maxima");
+        for (
+          let sourceOffset = 0;
+          sourceOffset < sourceCount;
+          sourceOffset += RELATED_SOURCE_TILE_SIZE
+        ) {
+          for (
+            let targetOffset = 0;
+            targetOffset < targetCount;
+            targetOffset += RELATED_TARGET_TILE_SIZE
+          ) {
+            await checkpoint();
+            this.context.db.exec({
+              sql: `WITH scores AS MATERIALIZED (
+              SELECT s.occurrenceId AS sourceId,t.occurrenceId AS targetId,trama_vector_dot(s.vector,t.vector) AS score
+              FROM related_source s CROSS JOIN related_target t
+              WHERE s.position>=? AND s.position<? AND t.position>=? AND t.position<?
+            ), maxima AS (
+              SELECT 0 AS direction,sourceId AS id,max(score) AS score FROM scores GROUP BY sourceId
+              UNION ALL SELECT 1,targetId,max(score) FROM scores GROUP BY targetId
+            ) INSERT INTO related_maxima SELECT * FROM maxima WHERE 1
+              ON CONFLICT(direction,id) DO UPDATE SET score=max(related_maxima.score,excluded.score)`,
+              bind: [
+                sourceOffset,
+                sourceOffset + RELATED_SOURCE_TILE_SIZE,
+                targetOffset,
+                targetOffset + RELATED_TARGET_TILE_SIZE,
+              ],
+            });
+          }
+        }
+        this.context.db.exec(
+          `WITH ranked AS (
+          SELECT *,row_number() OVER (PARTITION BY direction ORDER BY score DESC) AS position FROM related_maxima
+        ), means AS (SELECT direction,avg(score) AS mean FROM ranked WHERE position<=2 GROUP BY direction),
+        evidence AS (
+          SELECT t.occurrenceId FROM related_target t JOIN related_maxima m ON m.direction=1 AND m.id=t.occurrenceId
+          ORDER BY m.score DESC,t.ordinal,t.id COLLATE BINARY LIMIT 1
+        ) INSERT INTO related_results SELECT occurrenceId,(SELECT avg(mean) FROM means) FROM evidence`
+        );
+        this.context.db.exec("DROP TABLE related_target");
+      }
+      const hits = rows(
+        this.context.db,
+        `SELECT o.chunk_id AS id,n.path,r.content_id AS contentId,o.ordinal,o.display_text AS text,
+          o.start_line AS startLine,o.end_line AS endLine,s.score
+          FROM related_results s JOIN chunk_occurrences o ON o.occurrence_id=s.occurrenceId
+          JOIN notes n ON n.note_id=o.note_id AND n.semantic_revision_id=o.revision_id
+          JOIN note_revisions r ON r.revision_id=o.revision_id
+          ORDER BY s.score DESC,n.path COLLATE trama_code_units,o.ordinal,o.chunk_id COLLATE BINARY LIMIT ?`,
+        [resultLimit]
+      ).map((row) => ({
+        id: String(row.id),
+        path: String(row.path),
+        contentId: String(row.contentId),
+        ordinal: Number(row.ordinal),
+        text: String(row.text),
+        startLine: Number(row.startLine),
+        endLine: Number(row.endLine),
+        score: Number(row.score),
+        semanticScore: Number(row.score),
+      }));
+      this.finishPhase("relatedRerank", rerankTimer, candidates.length);
+      return hits;
+    } finally {
+      this.context.db.exec(
+        "DROP TABLE IF EXISTS temp.related_source; DROP TABLE IF EXISTS temp.related_target; DROP TABLE IF EXISTS temp.related_maxima; DROP TABLE IF EXISTS temp.related_results"
+      );
     }
-    this.finishPhase("relatedRerank", rerankTimer, hits.length);
-    return hits
-      .sort(
-        (left, right) =>
-          right.score - left.score ||
-          compareCodeUnits(left.path, right.path) ||
-          left.ordinal - right.ordinal ||
-          compareCodeUnits(left.id, right.id)
-      )
-      .slice(0, resultLimit);
   }
 }
 
@@ -805,9 +534,4 @@ export function literalTerms(query: string): readonly string[] {
       .match(/[\p{L}\p{N}_-]+/gu)
       ?.slice(0, 64) ?? []
   );
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  if (left === right) return 0;
-  return left < right ? -1 : 1;
 }

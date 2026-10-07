@@ -320,7 +320,7 @@ describe("revision cache database", () => {
     const client = createTestSqliteClient(identity, { persistMutations: true });
     await client.call("boot", { corpusFingerprint: digest("schema"), dimensions: 2 });
     const state = await client.call("getState", {});
-    expect(state.schemaVersion).toBe(15);
+    expect(state.schemaVersion).toBe(16);
     expect(state.noteCount).toBe(0);
     const columns = await inspectIndexStateColumns(await snapshotFor(identity));
     expect(columns).not.toContain("lexical_revision_count");

@@ -111,9 +111,9 @@ describe("SQLite protocol", () => {
         embeddingFingerprint: "b".repeat(64),
         dimensions: 2,
       })
-    ).resolves.toMatchObject({ schemaVersion: 15, protocolVersion: SQLITE_PROTOCOL_VERSION });
+    ).resolves.toMatchObject({ schemaVersion: 16, protocolVersion: SQLITE_PROTOCOL_VERSION });
     await expect(client.call("getState", {})).resolves.toMatchObject({
-      schemaVersion: 15,
+      schemaVersion: 16,
       protocolVersion: SQLITE_PROTOCOL_VERSION,
     });
   });
@@ -123,7 +123,7 @@ describe("SQLite protocol", () => {
     await client.call("boot", { corpusFingerprint: hash, dimensions: 2 });
     await expect(
       client.call("boot", { corpusFingerprint: hash, dimensions: 3 })
-    ).resolves.toMatchObject({ schemaVersion: 15, dimensions: 3, noteCount: 0 });
+    ).resolves.toMatchObject({ schemaVersion: 16, dimensions: 3, noteCount: 0 });
   });
 
   it("preserves current note/head/cache data on reopen", async () => {

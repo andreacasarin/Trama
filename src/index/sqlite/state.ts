@@ -293,6 +293,8 @@ export class SqliteStateStore {
         "body",
       ],
       lexical_notes_fts: ["body", "path_text", "filename", "title", "headings"],
+      lexical_passages: ["occurrence_id", "note_id", "token_count"],
+      lexical_passages_fts: ["display_text", "note_id"],
     };
     for (const [table, columns] of Object.entries(required)) {
       const object = rows(this.context.db, "SELECT type FROM sqlite_master WHERE name=?", [
@@ -344,6 +346,7 @@ export class SqliteStateStore {
         columns: ["input_digest", "embedding_fingerprint", "preprocessing", "task_kind"],
       },
       lexical_notes_revision: { table: "lexical_notes", columns: ["revision_id"] },
+      lexical_passages_note: { table: "lexical_passages", columns: ["note_id"] },
     };
     for (const [name, expected] of Object.entries(indexes)) {
       const entry = rows(this.context.db, `PRAGMA index_list(${expected.table})`).find(
