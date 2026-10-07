@@ -4,11 +4,10 @@ import {
   EMBEDDING_ACTION_OPTIONS,
   sha256Hex,
 } from "@/index/Identity";
-import { sqliteError } from "./protocol";
+import { sqliteError, SQLITE_CACHE_SHARD_MAX_BYTES } from "./protocol";
 import { rows, transaction, vectorOf } from "./core";
 import type { SqliteConnection } from "./core";
 
-export const SQLITE_CACHE_SHARD_MAX_BYTES = 4_194_304;
 const SQLITE_CACHE_SHARD_TARGET_BYTES = 3_500_000;
 const SQLITE_CACHE_SHARD_APPLICATION_ID = 0x54524348;
 const SQLITE_CACHE_SHARD_VERSION = 1;

@@ -53,6 +53,12 @@ export function projectedApp() {
       write: async (path: string, value: string) => {
         adapterFiles.set(path, value);
       },
+      stat: async (path: string) => {
+        const binary = adapterBinary.get(path);
+        if (binary) return { size: binary.byteLength };
+        const text = adapterFiles.get(path);
+        return text === undefined ? null : { size: new TextEncoder().encode(text).byteLength };
+      },
       readBinary: async (path: string) => {
         const value = adapterBinary.get(path);
         if (!value) throw new Error("missing binary");

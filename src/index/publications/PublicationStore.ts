@@ -1,5 +1,6 @@
 import { StructuredError } from "@/domain/contracts";
 import { sha256Hex } from "@/index/Identity";
+import { SQLITE_CACHE_SHARD_MAX_BYTES } from "@/index/sqlite/protocol";
 
 /** The small part of an Obsidian DataAdapter needed for one synchronized file. */
 export interface PublicationDataAdapter {
@@ -7,7 +8,7 @@ export interface PublicationDataAdapter {
   writeBinary(path: string, value: ArrayBuffer): Promise<void>;
   mkdir?(path: string): Promise<void>;
   exists?(path: string): Promise<boolean>;
-  stat?(path: string): Promise<{ readonly size: number } | null>;
+  stat(path: string): Promise<{ readonly size: number } | null>;
   rename?(oldPath: string, newPath: string): Promise<void>;
   remove?(path: string): Promise<void>;
   list?(
@@ -106,13 +107,28 @@ export class PublicationStore {
   }
 
   async cacheShardSize(path: string): Promise<number | undefined> {
-    return (await this.adapter.stat?.(path))?.size;
+    return (await this.adapter.stat(path))?.size;
   }
 
   async readCacheShard(path: string): Promise<ArrayBuffer> {
     if (!path.startsWith(`${this.cacheDirectory}/cache-`))
       throw new StructuredError("invalid_request", "Cache shard path is invalid.", false);
-    return this.adapter.readBinary(path);
+    return this.readBoundedShard(path);
+  }
+
+  private async readBoundedShard(path: string): Promise<ArrayBuffer> {
+    const size = await this.cacheShardSize(path);
+    if (
+      size === undefined ||
+      !Number.isSafeInteger(size) ||
+      size <= 0 ||
+      size > SQLITE_CACHE_SHARD_MAX_BYTES
+    )
+      throw new StructuredError("invalid_request", "Cache shard size is invalid.", false);
+    const bytes = await this.adapter.readBinary(path);
+    if (bytes.byteLength === 0 || bytes.byteLength > SQLITE_CACHE_SHARD_MAX_BYTES)
+      throw new StructuredError("invalid_request", "Cache shard size is invalid.", false);
+    return bytes;
   }
 
   async removeCacheShard(digest: string): Promise<void> {
@@ -128,7 +144,7 @@ export class PublicationStore {
     if (this.adapter.mkdir) await this.adapter.mkdir(this.cacheDirectory);
     const path = `${this.cacheDirectory}/cache-${digest}.sqlite3`;
     if (await this.existsPath(path)) {
-      if ((await sha256Hex(await this.adapter.readBinary(path))) !== digest)
+      if ((await sha256Hex(await this.readBoundedShard(path))) !== digest)
         throw new StructuredError(
           "internal",
           "Existing immutable cache shard failed its name hash.",
@@ -145,12 +161,12 @@ export class PublicationStore {
     const temporaryPath = `${path}.trama-tmp-${safeToken(this.token())}`;
     await this.adapter.writeBinary(temporaryPath, bytes);
     try {
-      const readback = await this.adapter.readBinary(temporaryPath);
+      const readback = await this.readBoundedShard(temporaryPath);
       if ((await sha256Hex(readback)) !== digest)
         throw new StructuredError("internal", "Cache shard readback hash mismatch.", true);
       if (await this.existsPath(path)) {
         await this.removeQuietly(temporaryPath);
-        if ((await sha256Hex(await this.adapter.readBinary(path))) !== digest)
+        if ((await sha256Hex(await this.readBoundedShard(path))) !== digest)
           throw new StructuredError(
             "internal",
             "Existing immutable cache shard failed its name hash.",
@@ -181,12 +197,7 @@ export class PublicationStore {
 
   private async existsPath(path: string): Promise<boolean> {
     if (this.adapter.exists) return this.adapter.exists(path);
-    try {
-      await this.adapter.readBinary(path);
-      return true;
-    } catch {
-      return false;
-    }
+    return (await this.adapter.stat(path)) !== null;
   }
 }
 

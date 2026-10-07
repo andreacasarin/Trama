@@ -185,6 +185,7 @@ export class FiloView extends ItemView {
       .catch(() => {
         if (generation === this.requestGeneration && !controller.signal.aborted) {
           this.requestAbort = undefined;
+          this.requestKey = undefined;
           this.relatedError = true;
           this.render();
         }

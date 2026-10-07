@@ -21,6 +21,7 @@ function adapter() {
       files.set(path, new Uint8Array(bytes.slice(0)));
     },
     mkdir: async () => undefined,
+    stat: async (path) => (files.has(path) ? { size: files.get(path)!.byteLength } : null),
     rename: async (from, to) => {
       const bytes = files.get(from);
       if (!bytes) throw new Error("missing temp");
@@ -69,6 +70,31 @@ describe("PublicationStore", () => {
     expect([...storage.files.get(`Trama/index/cache-v1/cache-${digest}.sqlite3`)!]).toEqual([
       ...new Uint8Array(bytes),
     ]);
+  });
+
+  it.each([4_194_305, 0, -1, NaN])(
+    "rejects invalid shard metadata (%s) before reading bytes",
+    async (size) => {
+      const storage = adapter();
+      storage.stat = async () => ({ size });
+      const read = vi.spyOn(storage, "readBinary");
+      const store = new PublicationStore(storage);
+      await expect(
+        store.readCacheShard(`${store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`)
+      ).rejects.toThrow("Cache shard size is invalid");
+      expect(read).not.toHaveBeenCalled();
+    }
+  );
+
+  it("checks bytes again when a shard grows after the metadata check", async () => {
+    const storage = adapter();
+    storage.stat = async () => ({ size: 1 });
+    storage.readBinary = vi.fn(async () => new ArrayBuffer(4_194_305));
+    const store = new PublicationStore(storage);
+    await expect(
+      store.readCacheShard(`${store.cacheDirectory}/cache-${"a".repeat(64)}.sqlite3`)
+    ).rejects.toThrow("Cache shard size is invalid");
+    expect(storage.readBinary).toHaveBeenCalledOnce();
   });
 
   it("treats a missing cache directory as empty without listing it", async () => {

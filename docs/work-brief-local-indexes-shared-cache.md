@@ -1,10 +1,12 @@
 # Work brief: local indexes and a shared embedding cache
 
-Status: the current implementation uses schema 15/protocol 13, with the approved resolver, single-model reset, and deletion cleanup applied. Latest verification after test cleanup and Filo display fix: 581 tests passed, none skipped; build, lint, and formatting passed. The generated 3,000-note Obsidian CLI benchmark passed all 12 gates in 52.696s with a complete 2,655-record capture (`8103c46b-5ef8-4c76-a52c-a6f2cbe70533`). The prior current-design run took 53.594s: cold-run performance is comparable. The final repeated unchanged cache check took 0.8 ms. The final build reloaded with cache preserved and the fixture provider stopped, reaching idle in 2.273s including CLI verification; evidence is in `.artifacts/benchmarks/cleanup-cache-reload.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
+Status: the current implementation uses schema 16/protocol 13, including SQLite-native retrieval scoring and the maintained SQLite-Vector dot-product kernel. Latest completed verification after the merge-review fixes: 596 tests passed, none skipped; build, lint, and formatting passed. The latest installed generated 3,000-note Obsidian CLI benchmark, run before these review fixes, passed all 12 gates in 52.222s (`1efacecd-9fa2-4215-b52e-43e2ea766ce4`). Production timings were 37.8 ms for retrieval RPC and 125.5 ms for related retrieval. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
+
+Historical verification before SQLite-native retrieval: 581 tests passed, none skipped; build, lint, and formatting passed. The generated 3,000-note Obsidian CLI benchmark passed all 12 gates in 52.696s with a complete 2,655-record capture (`8103c46b-5ef8-4c76-a52c-a6f2cbe70533`). The prior current-design run took 53.594s: cold-run performance is comparable. The final repeated unchanged cache check took 0.8 ms. The final build reloaded with cache preserved and the fixture provider stopped, reaching idle in 2.273s including CLI verification; evidence is in `.artifacts/benchmarks/cleanup-cache-reload.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
 
 ## Approved deletion cleanup (6 October 2026)
 
-Only the current schema (15) and protocol (13) are supported. Whole-database
+Only the current schema (16) and protocol (13) are supported. Whole-database
 publication/adoption and legacy extraction, schema migrations, profile selection modes,
 write-only chunk copies, and the old generated-corpus installer upgrade were removed. Current
 cache-shard VACUUM/SHA validation, local lexical/semantic heads, and providerless retrieval remain.
@@ -104,7 +106,7 @@ Remaining pre-adoption work is capability confirmation, implementation validatio
 
 ## Current implementation and verification status
 
-Builder reports B1/B2/B3 as implemented with schema 15/protocol 13. The local
+B1/B2/B3 are implemented; the current database uses schema 16/protocol 13. The local
 SQLite/WASM database maintains full-note lexical FTS separately from structural
 semantic blocks and current/last-complete semantic heads. Markdown remains the
 visibility authority. The current semantic input cap is 384 canonical serialized
@@ -142,7 +144,7 @@ establish large-profile completion, mobile performance, or judged relevance qual
 - Markdown remains authoritative; an arriving snapshot or cache contribution must not redefine current note visibility.
 - Shared-cache cleanup must not delete local index state. Preserve generation fences, transaction rollback, committed-batch resumability, and atomic publication/adoption guarantees.
 - Obsidian CLI operations may touch only the marked generated vault under .artifacts/test-vaults. Use an explicit selector first and verify the exact selected path before every CLI operation. Never enumerate, access, or fall back to personal/active vaults.
-- Relevant contracts: README.md; docs/sqlite-snapshots.md; docs/obsidian-benchmark.md; docs/lifecycle-benchmark-contract.md; MEMORY.md. Current task evidence is in .ai/work/maintenance-retrieval-performance.md; its newest design paragraphs supersede older assumptions. The earlier VACUUM/SHA proposal is not shipped.
+- Relevant contracts: README.md; docs/sqlite-snapshots.md; docs/obsidian-benchmark.md; docs/lifecycle-benchmark-contract.md; MEMORY.md. Current task evidence is in .ai/work/maintenance-retrieval-performance.md; its newest design paragraphs supersede older assumptions. The earlier whole-index database publication proposal is superseded; current cache-only shards use VACUUM and SHA validation.
 - This brief records the accepted implementation plan. Implementation is authorized and underway; the brief does not claim migration or shipping is complete.
 
 ## Approved V1 implementation contract

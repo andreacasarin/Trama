@@ -93,6 +93,24 @@ describe("PublicationManager cache shards", () => {
     expect(fixture.index.ingestCacheShard).not.toHaveBeenCalled();
   });
 
+  it("rejects oversized synchronized shards before reading or sending them to the Worker", async () => {
+    const fixture = setup();
+    const manager = new PublicationManager(fixture.index, fixture.adapter);
+    const digest = "a".repeat(64);
+    fixture.files.set(
+      `${manager.store.cacheDirectory}/cache-${digest}.sqlite3`,
+      new Uint8Array([1])
+    );
+    fixture.adapter.stat = async () => ({ size: 4_194_305 });
+    const read = vi.spyOn(fixture.adapter, "readBinary");
+    await expect(manager.adoptCurrent()).resolves.toMatchObject({
+      adopted: false,
+      warning: { phase: "inspect" },
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(fixture.index.ingestCacheShard).not.toHaveBeenCalled();
+  });
+
   it("checks receipt digests in bounded batches", async () => {
     const fixture = setup();
     const manager = new PublicationManager(fixture.index, fixture.adapter);

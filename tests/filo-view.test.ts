@@ -120,7 +120,7 @@ describe("Filo semantic index display", () => {
     }
   });
 
-  it("keeps previous results and reports a failed refresh underneath", async () => {
+  it("keeps previous results after failure and retries the same snapshot", async () => {
     const fixture = retainedResultsFixture();
     try {
       await vi.waitFor(() => expect(fixture.labels).toContain("Previous result"));
@@ -132,6 +132,22 @@ describe("Filo semantic index display", () => {
       expect(fixture.labels.indexOf("Previous result")).toBeLessThan(
         fixture.labels.indexOf(message)
       );
+      fixture.status.setMaintenance({
+        lane: "update",
+        phase: "semantic",
+        pending: false,
+        suspended: false,
+      });
+      fixture.find.mockResolvedValueOnce({
+        currentPath: "one.md",
+        contentHash: "updated",
+        results: [{ path: "Fresh result.md", score: 1 }],
+      });
+      fixture.status.setMaintenance({ lane: "idle", pending: false, suspended: false });
+      await vi.waitFor(() => expect(fixture.labels).toContain("Fresh result"));
+      expect(fixture.find).toHaveBeenCalledTimes(3);
+      expect(fixture.labels).not.toContain("Previous result");
+      expect(fixture.labels).not.toContain(message);
     } finally {
       fixture.unsubscribe();
       await fixture.view.onClose();

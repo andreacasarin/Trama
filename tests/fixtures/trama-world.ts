@@ -92,6 +92,10 @@ class FixtureVault implements IndexVaultPort, ReadonlyVault {
 class FixturePublicationAdapter implements PublicationDataAdapter {
   readonly files = new Map<string, Uint8Array>();
 
+  async stat(path: string): Promise<{ size: number } | null> {
+    const bytes = this.files.get(path);
+    return bytes ? { size: bytes.byteLength } : null;
+  }
   async exists(path: string): Promise<boolean> {
     return this.files.has(path);
   }
