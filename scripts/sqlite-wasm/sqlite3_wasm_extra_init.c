@@ -18,8 +18,7 @@ int sqlite3_wasm_extra_init(const char *z) {
 #include <stdlib.h>
 #include <string.h>
 
-/* Accumulate in double, in component order, matching the existing Float32 JS
-   scoring exactly. These operate on SQLite-owned blobs, without JS transfers. */
+/* SQL adapter for SQLite-Vector's maintained distance implementation. */
 static void trama_dot(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
   int bytes = sqlite3_value_bytes(argv[0]);
@@ -30,8 +29,7 @@ static void trama_dot(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
   const float *a = sqlite3_value_blob(argv[0]), *b = sqlite3_value_blob(argv[1]);
-  double sum = 0;
-  for (int i = 0; i < bytes / 4; ++i) sum += (double)a[i] * (double)b[i];
+  double sum = -dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_F32](a, b, bytes / 4);
   if (!isfinite(sum)) sqlite3_result_error(ctx, "Invalid vector values", -1);
   else sqlite3_result_double(ctx, sum);
 }

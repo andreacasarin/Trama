@@ -49,9 +49,11 @@ the provider retry.
 Vector dot products, source centroids, probe selection, candidate ranking, exact
 related reranking, and reciprocal-rank fusion run inside SQLite/WASM. JavaScript
 prepares bounded query inputs and maps final rows; it does not scan corpus vectors.
-The runtime registers native double-precision functions that retain the previous
-Float32 input and accumulation behavior, plus UTF-16 path ordering for deterministic
-ties. A maintained passage FTS index selects lexical excerpts using each note's own
+Dot products delegate to SQLite-Vector's maintained Float32 distance routine through
+an SQL adapter, including bounded passage pairs. This avoids full cache scans and
+connection-scoped dimension registration; model changes can rebuild on the same
+connection. Centroids retain double accumulation, and UTF-16 path ordering resolves
+deterministic ties. A maintained passage FTS index selects lexical excerpts using each note's own
 BM25 statistics. Token counts are stored during lexical writes, and phrase document
 frequencies are shared across the excerpt query instead of rebuilding FTS per note.
 

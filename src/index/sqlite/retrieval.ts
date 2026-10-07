@@ -90,9 +90,9 @@ export class SqliteRetrieval {
     };
   }
 
-  /** Revision-head retrieval. Vectors are read only for active semantic heads.
-   * This deliberately uses a scalar cosine pass: vector_full_scan applies its
-   * LIMIT before a join can exclude inactive cache rows on some packaged builds.
+  /** Score active semantic heads with SQLite-Vector's dot implementation.
+   * The SQL adapter also supports bounded passage pairs without rescanning the
+   * cache or fixing the connection to one model's dimensions.
    */
   private retrieveRevisionHeads(
     query: string | undefined,

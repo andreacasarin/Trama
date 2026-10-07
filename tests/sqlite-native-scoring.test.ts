@@ -4,7 +4,7 @@ import { normalizedVector, vectorOf } from "@/index/sqlite/core";
 
 describe("native SQLite scoring", () => {
   it.each([2, 768, 4096])(
-    "preserves double accumulation and centroid normalization at %i dimensions",
+    "uses SQLite-Vector scoring and preserves centroid normalization at %i dimensions",
     async (dimensions) => {
       const sqlite = await loadTestSqlite();
       const db = new sqlite.oo1.DB(":memory:", "c");
@@ -17,12 +17,25 @@ describe("native SQLite scoring", () => {
         );
         let dot = 0;
         for (let i = 0; i < dimensions; i++) dot += vectors[0][i] * vectors[1][i];
-        expect(
-          db.selectValue("SELECT trama_vector_dot(?,?)", [
-            new Uint8Array(vectors[0].buffer),
-            new Uint8Array(vectors[1].buffer),
+        const operands = vectors.map((vector) => new Uint8Array(vector.buffer));
+        const score = db.selectValue("SELECT trama_vector_dot(?,?)", operands.slice(0, 2));
+        expect(score).toBeCloseTo(dot, 5);
+        db.exec("CREATE TABLE scan_vectors(vector BLOB)");
+        db.exec({ sql: "INSERT INTO scan_vectors VALUES(?)", bind: [operands[0]] });
+        db.exec(
+          `SELECT vector_init('scan_vectors','vector','dimension=${dimensions},type=FLOAT32,distance=DOT')`
+        );
+        expect(score).toBe(
+          -db.selectValue("SELECT distance FROM vector_full_scan('scan_vectors','vector',?)", [
+            operands[1],
           ])
-        ).toBe(dot);
+        );
+        // A different model dimension on the same connection needs no scan registration.
+        expect(
+          db.selectValue(
+            "SELECT trama_vector_dot(vector_as_f32('[1,0,0]'),vector_as_f32('[1,0,0]'))"
+          )
+        ).toBe(1);
         const sum = new Float64Array(dimensions);
         for (const vector of vectors) for (let i = 0; i < dimensions; i++) sum[i] += vector[i];
         let norm = 0;

@@ -15,9 +15,10 @@ the Docker outputs, and atomically copies `sqlite3.mjs` and `sqlite3.wasm` to th
 ignored repository root. SQLite-Vector is statically registered; the build uses
 SQLite's canonical ES module without post-processing generated code.
 
-The same static initializer registers Trama's native vector dot product, centroid
+The same static initializer registers Trama's SQL adapter for SQLite-Vector dot products, centroid
 aggregate, Unicode token count, scoped passage BM25, and UTF-16 path collation.
-These keep database-backed retrieval computation inside SQLite. Vector arithmetic
-uses double accumulation in component order to preserve existing Float32 rankings.
+These keep database-backed retrieval computation inside SQLite. Dot products use
+SQLite-Vector's distance dispatch; the adapter validates blobs and converts distance
+to similarity. Centroid accumulation remains double precision.
 The build fingerprint includes this source; runtime verification checks the native
 functions alongside SQLite-Vector and FTS5.
