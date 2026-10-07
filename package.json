@@ -1,6 +1,6 @@
 {
   "name": "trama",
-  "version": "0.3.1",
+  "version": "0.4.0-beta.1",
   "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
   "main": "main.js",
   "engines": {
