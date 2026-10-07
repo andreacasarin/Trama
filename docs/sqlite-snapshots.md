@@ -50,8 +50,10 @@ Related retrieval scores all probes in one corpus scan and loads exact reranking
 tiles through occurrence and cache lookup indexes. It retains the same symmetric
 passage scoring and 16-vector tile bound. Performance diagnostics distinguish
 `centroid`, `relatedCandidates`, and `relatedRerank`. When the last consumer cancels
-a related request, its Worker request is cancelled as well; remaining consumers
-continue sharing the computation. Duplicate shard imports still validate SHA but
+a related request, its Worker request yields and checks cancellation between reranking
+tiles using an eight-millisecond yield budget; an individual SQL step or tile finishes
+before yielding. Remaining consumers continue sharing the computation. Duplicate
+shard imports still validate SHA but
 skip profile reconciliation and unchanged local-state scans in both the Worker and
 the plugin. Profile reconciliation after a new shard updates profile selection
 without computing a discarded full corpus status. Semantic preparation is a separate
@@ -100,10 +102,10 @@ identity of dirty shards after their expired local vectors have been deleted. If
 contribution file disappears, repair republishes only still-needed active,
 last-complete, pending, or in-flight document vectors and fresh query vectors.
 
-The ordinary **Reset all indexes** operation preserves shared cache contributions
-and imports them again before rebuilding local heads.
-The marker-gated benchmark reset may clear generated benchmark cache state for a
-fresh fixture run.
+**Reset local search data** preserves shared embeddings and imports them again
+before rebuilding local heads. **Clear local search data and shared embeddings**
+clears both local search data and shared contributions. Both actions preserve notes
+and settings. The benchmark uses its generated-vault reset for a fresh fixture run.
 
 ## Retrieval behavior
 
@@ -124,5 +126,5 @@ These settings are not evidence of relevance quality or mobile performance.
 Real-device indexing and query latency, provider compatibility guarantees, and
 Obsidian Sync/iCloud delivery, conflict, file-type, storage, and recovery behavior
 require their own validation. Desktop benchmark timings do not establish iPhone
-performance. The current generated-vault benchmark profiles measure 24, 1,100, and
-2,750 notes; the larger profiles are not 10,000-note or device-performance proof.
+performance. The current generated-vault benchmark measures 3,000 notes of roughly
+400 characters each; it is not 10,000-note or device-performance proof.

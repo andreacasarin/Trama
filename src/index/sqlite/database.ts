@@ -529,13 +529,18 @@ export class MutableSqliteDatabase {
     return this.retrieval.retrieve(query, currentVector, limit, currentPath, options);
   }
 
-  findRelated(path: string, vector: Float32Array | undefined, limit: number): readonly SqliteHit[] {
+  async findRelated(
+    path: string,
+    vector: Float32Array | undefined,
+    limit: number,
+    signal?: AbortSignal
+  ): Promise<readonly SqliteHit[]> {
     if (
       this.context.configuredEmbeddingFingerprint &&
       this.context.configuredEmbeddingFingerprint !== this.context.embeddingFingerprint
     )
       return [];
-    return this.retrieval.findRelated(path, vector, limit);
+    return this.retrieval.findRelated(path, vector, limit, signal);
   }
 
   close(): void {

@@ -47,7 +47,7 @@ export const sourceDigestsV1: Readonly<Record<WorkloadProfile["id"], string>> = 
 };
 
 // prettier-ignore
-export const REFERENCE_SOURCE_MANIFEST_SHA256 = "e223844d747a64b1fbb8a5e5c9b4fda22e429d2b2cf1b516eac795743cb531ee";
+export const REFERENCE_SOURCE_MANIFEST_SHA256 = "a2ad8ce35019ac68e7c84a0327acd878d06b59d67324795d87542ff145b6b7a6";
 
 export const REFERENCE_SOURCE_MANIFEST_PATHS = [
   "tests/workloads/expected-results.ts",

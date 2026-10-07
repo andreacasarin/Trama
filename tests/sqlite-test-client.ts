@@ -577,7 +577,7 @@ export function createTestSqliteClient(
             }
           );
         case "findRelated":
-          return opened.database.findRelated(value.path, value.vector, value.limit);
+          return opened.database.findRelated(value.path, value.vector, value.limit, signal);
         case "cancelQueued":
           return { cancelled: false };
         case "shutdown":

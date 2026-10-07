@@ -471,17 +471,7 @@ export class SqliteRetrieval {
             );
             return [...passageRows, ...fallbackRows];
           })()
-        : candidates.length
-          ? rows(
-              this.context.db,
-              `SELECT o.occurrence_id AS occurrenceId,o.chunk_id AS id,o.ordinal,o.start_line AS startLine,
-                    o.end_line AS endLine,o.display_text AS text,r.content_id AS contentId,n.path
-             FROM chunk_occurrences o JOIN notes n ON n.note_id=o.note_id
-             JOIN note_revisions r ON r.revision_id=o.revision_id
-             WHERE o.occurrence_id IN (${candidates.map(() => "?").join(",")})`,
-              candidates.map(({ occurrenceId }) => Number(occurrenceId))
-            )
-          : [];
+        : [];
       const detailsById = new Map(details.map((row) => [String(row.path), row]));
       for (const candidate of candidates) {
         const row = detailsById.get(String(candidate.path));
@@ -671,10 +661,11 @@ export class SqliteRetrieval {
     return top.flatMap((candidates) => candidates.sort(compareSemanticCandidates));
   }
 
-  private symmetricRelatedScore(
+  private async symmetricRelatedScore(
     source: readonly RelatedPassageRef[],
-    target: readonly RelatedPassageRef[]
-  ): { readonly score: number; readonly evidenceId: number } | undefined {
+    target: readonly RelatedPassageRef[],
+    checkpoint: () => Promise<void>
+  ): Promise<{ readonly score: number; readonly evidenceId: number } | undefined> {
     const sourceCount = source.length;
     if (!sourceCount || !target.length) return undefined;
     const targetMax = new Float64Array(target.length).fill(-Infinity);
@@ -693,6 +684,7 @@ export class SqliteRetrieval {
         targetOffset < target.length;
         targetOffset += RELATED_VECTOR_TILE_SIZE
       ) {
+        await checkpoint();
         const targetRefs = target.slice(targetOffset, targetOffset + RELATED_VECTOR_TILE_SIZE);
         const targetVectors = this.relatedVectors(targetRefs);
         for (let sourceIndex = 0; sourceIndex < sourceVectors.length; sourceIndex++) {
@@ -724,34 +716,50 @@ export class SqliteRetrieval {
     return { score: (sourceMean + targetMean) / 2, evidenceId: target[evidenceIndex].occurrenceId };
   }
 
-  findRelated(
+  async findRelated(
     path: string,
     _vector: Float32Array | undefined,
-    limit: number
-  ): readonly SqliteHit[] {
+    limit: number,
+    signal?: AbortSignal
+  ): Promise<readonly SqliteHit[]> {
     this.context.ensureOpen();
     const resultLimit = Math.min(SQLITE_MAX_RESULTS, Math.max(0, limit));
     if (!resultLimit || !this.context.embeddingFingerprint) return [];
+    let yieldAt = performance.now() + 8;
+    const checkpoint = async () => {
+      if (signal?.aborted) throw sqliteError("cancelled", "Related search cancelled", true);
+      if (performance.now() >= yieldAt) {
+        // A macrotask lets the Worker receive cancellation messages between SQL steps.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (signal?.aborted) throw sqliteError("cancelled", "Related search cancelled", true);
+        yieldAt = performance.now() + 8;
+      }
+    };
+    await checkpoint();
     const sourceTimer = this.startPhase();
     const source = this.relatedCentroid(path);
     if (!source.count) return [];
+    await checkpoint();
     const probes = this.relatedProbes(path, source.vector, source.count);
     this.finishPhase("centroid", sourceTimer, source.count);
     const candidateQueries = [
       ...(source.vector ? [source.vector] : []),
       ...probes.map(({ vector }) => vector),
     ];
+    await checkpoint();
     const candidates = new Map<string, SemanticCandidate>();
     const candidateTimer = this.startPhase();
     for (const candidate of this.relatedNoteCandidates(candidateQueries, path))
       if (!candidates.has(candidate.path)) candidates.set(candidate.path, candidate);
     this.finishPhase("relatedCandidates", candidateTimer, candidates.size);
+    await checkpoint();
     const rerankTimer = this.startPhase();
     const sourceRefs = this.relatedPassageRefs(path);
     const hits: SqliteHit[] = [];
     for (const candidate of candidates.values()) {
+      await checkpoint();
       const target = this.relatedPassageRefs(candidate.path);
-      const related = this.symmetricRelatedScore(sourceRefs, target);
+      const related = await this.symmetricRelatedScore(sourceRefs, target, checkpoint);
       if (!related) continue;
       const evidence = rows(
         this.context.db,

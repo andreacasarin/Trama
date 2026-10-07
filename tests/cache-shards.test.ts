@@ -3,6 +3,7 @@ import {
   createEmbeddingActionKey,
   createInputDigest,
   EMBEDDING_ACTION_OPTIONS,
+  sha256Hex,
 } from "@/index/Identity";
 import { MutableSqliteDatabase } from "@/index/sqlite/database";
 import { applyLexicalMarkdownBatch } from "@/index/sqlite/markdown";
@@ -563,6 +564,65 @@ describe("cache-only SQLite shards", () => {
       Number(local.raw.selectValue("SELECT count(*) FROM embedding_cache WHERE task_kind='query'"))
     ).toBe(1);
     local.db.close();
+  });
+
+  it.each([
+    [
+      "metadata view",
+      "ALTER TABLE cache_shard_meta RENAME TO backing_meta; CREATE VIEW cache_shard_meta AS SELECT * FROM backing_meta",
+    ],
+    [
+      "vector view",
+      "ALTER TABLE cache_vectors RENAME TO backing_vectors; CREATE VIEW cache_vectors AS SELECT * FROM backing_vectors",
+    ],
+    [
+      "virtual table",
+      "DROP TABLE cache_vectors; CREATE VIRTUAL TABLE cache_vectors USING fts5(action_key,input_digest,serialized_input,embedding_fingerprint,preprocessing,dimensions,task_kind,created_at,vector)",
+    ],
+    [
+      "altered table",
+      "ALTER TABLE cache_vectors ADD COLUMN calculated TEXT GENERATED ALWAYS AS (serialized_input || serialized_input) VIRTUAL",
+    ],
+  ])("rejects a %s before reading incoming cache rows", async (_kind, mutation) => {
+    const source = await database();
+    const target = await database();
+    const pool = createCachePool(source.sqlite);
+    try {
+      await insertCache(source.raw, "schema validation fixture");
+      const shard = await prepareCacheShard(source.raw, pool, profile, dimensions);
+      const name = "/altered-cache-shard";
+      pool.importDb(name, shard!.bytes);
+      const candidate = new pool.OpfsSAHPoolDb(name, "c");
+      candidate.exec(mutation);
+      candidate.close();
+      const exported = pool.exportFile(name);
+      const bytes = Uint8Array.from(new Uint8Array(exported)).buffer;
+      const digest = await sha256Hex(bytes);
+      const OpenDb = pool.OpfsSAHPoolDb;
+      const incoming = {
+        ...pool,
+        OpfsSAHPoolDb: class extends OpenDb {
+          constructor(name: string, mode: string) {
+            super(name, mode);
+            const exec = this.exec.bind(this);
+            this.exec = (options: any) => {
+              const sql = typeof options === "string" ? options : options.sql;
+              if (sql.includes("SELECT * FROM cache_"))
+                throw new Error("Incoming rows read before schema validation");
+              return exec(options);
+            };
+          }
+        },
+      };
+      await expect(
+        ingestCacheShard(target.raw, incoming, bytes, digest, dimensions, profile)
+      ).rejects.toThrow("Cache shard schema is incompatible");
+      expect(target.raw.selectValue("SELECT count(*) FROM embedding_cache")).toBe(0);
+      expect(target.raw.selectValue("SELECT count(*) FROM cache_artifact_receipts")).toBe(0);
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
   });
 
   it("rejects invalid digest and ignores vectors from another model", async () => {

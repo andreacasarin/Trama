@@ -511,7 +511,7 @@ async function handle(request: SqliteRequest, signal: AbortSignal): Promise<unkn
     case "retrieve":
       return db.retrieve(p.query, p.vector, p.limit, p.currentPath, p);
     case "findRelated":
-      return db.findRelated(p.path, p.vector, p.limit);
+      return db.findRelated(p.path, p.vector, p.limit, signal);
     default:
       throw sqliteError("invalid_request", "Unsupported SQLite method");
   }

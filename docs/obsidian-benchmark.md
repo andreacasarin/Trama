@@ -22,9 +22,8 @@ and plugin installation are one-time steps. The generated vault is
 Every CLI selector must prove that its first vault is **Trama Benchmark Vault** at
 that exact registered path. Verify the selected vault before each CLI operation,
 including after reload; never rely on the active vault or access a personal vault.
-The benchmark evaluates the registered palette command and requires a synchronous
-invoked/running receipt. Obsidian's internal command-manager API is not available
-through this CLI.
+The benchmark invokes the registered palette command through CLI evaluation of
+`app.commands.executeCommandById` and requires a synchronous invoked/running receipt.
 
 ## Run
 

@@ -64,13 +64,8 @@ function blobBytes(value: unknown): Uint8Array {
   return new Uint8Array();
 }
 
-function cacheShardSql(): string {
-  return `PRAGMA journal_mode=DELETE;
-PRAGMA synchronous=FULL;
-PRAGMA foreign_keys=ON;
-PRAGMA application_id=${SQLITE_CACHE_SHARD_APPLICATION_ID};
-PRAGMA user_version=${SQLITE_CACHE_SHARD_VERSION};
-CREATE TABLE cache_shard_meta (
+const CACHE_SHARD_TABLES = {
+  cache_shard_meta: `CREATE TABLE cache_shard_meta (
   id INTEGER PRIMARY KEY CHECK(id=1),
   profile TEXT NOT NULL,
   model_id TEXT NOT NULL,
@@ -78,8 +73,8 @@ CREATE TABLE cache_shard_meta (
   dimensions INTEGER NOT NULL,
   task_kind TEXT NOT NULL CHECK(task_kind IN ('document','query')),
   format_version INTEGER NOT NULL
-) STRICT;
-CREATE TABLE cache_vectors (
+) STRICT`,
+  cache_vectors: `CREATE TABLE cache_vectors (
   action_key TEXT PRIMARY KEY COLLATE BINARY,
   input_digest TEXT NOT NULL,
   serialized_input TEXT NOT NULL,
@@ -89,8 +84,32 @@ CREATE TABLE cache_vectors (
   task_kind TEXT NOT NULL CHECK(task_kind IN ('document','query')),
   created_at INTEGER NOT NULL,
   vector BLOB NOT NULL
-) STRICT;
+) STRICT`,
+};
+
+function cacheShardSql(): string {
+  return `PRAGMA journal_mode=DELETE;
+PRAGMA synchronous=FULL;
+PRAGMA foreign_keys=ON;
+PRAGMA application_id=${SQLITE_CACHE_SHARD_APPLICATION_ID};
+PRAGMA user_version=${SQLITE_CACHE_SHARD_VERSION};
+${CACHE_SHARD_TABLES.cache_shard_meta};
+${CACHE_SHARD_TABLES.cache_vectors};
 CREATE INDEX cache_vectors_profile ON cache_vectors(embedding_fingerprint,task_kind,action_key);`;
+}
+
+function validateCacheShardSchema(connection: SqliteConnection): void {
+  const objects = rows(
+    connection,
+    "SELECT name,type,sql FROM sqlite_schema WHERE name IN ('cache_shard_meta','cache_vectors')"
+  );
+  for (const [name, sql] of Object.entries(CACHE_SHARD_TABLES)) {
+    const object = objects.find((object) => object.name === name);
+    // Accept only the tables this format writes, never views, virtual tables or
+    // generated columns that could execute SQL while reading an incoming shard.
+    if (object?.type !== "table" || object.sql !== sql)
+      throw sqliteError("incompatible_state", "Cache shard schema is incompatible");
+  }
 }
 
 function insertRows(
@@ -346,6 +365,8 @@ export async function ingestCacheShard(
     const version = Number(rows(candidate, "PRAGMA user_version")[0]?.user_version ?? 0);
     if (app !== SQLITE_CACHE_SHARD_APPLICATION_ID || version !== SQLITE_CACHE_SHARD_VERSION)
       throw sqliteError("incompatible_state", "Cache shard format is incompatible");
+    candidate.exec("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;");
+    validateCacheShardSchema(candidate);
     const meta = rows(candidate, "SELECT * FROM cache_shard_meta WHERE id=1")[0];
     if (
       !meta ||
@@ -377,23 +398,6 @@ export async function ingestCacheShard(
         taskKind: meta.task_kind as "document" | "query",
       };
     }
-    const columns = new Set(
-      rows(candidate, "PRAGMA table_info(cache_vectors)").map((row) => String(row.name))
-    );
-    if (
-      [
-        "action_key",
-        "input_digest",
-        "serialized_input",
-        "embedding_fingerprint",
-        "preprocessing",
-        "dimensions",
-        "task_kind",
-        "created_at",
-        "vector",
-      ].some((column) => !columns.has(column))
-    )
-      throw sqliteError("incompatible_state", "Cache shard schema is incomplete");
     const imported = rows(candidate, "SELECT * FROM cache_vectors ORDER BY action_key");
     for (const row of imported) {
       const vector = vectorOf(row.vector);
