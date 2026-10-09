@@ -1,6 +1,6 @@
 import { FakeToolCallingModel } from "langchain";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ChatSession } from "@/chat/ChatSession";
 import type { VaultToolFactory } from "@/tools/VaultTools";
 import { createVaultTools } from "@/tools/VaultTools";
@@ -222,5 +222,163 @@ describe("Voce native agent session", () => {
       status: "failed",
       content: "partial answer",
     });
+  });
+
+  it("runs a real Responses SSE tool roundtrip without exposing the private tool payload", async () => {
+    const requests: Record<string, any>[] = [];
+    const responseEvents = [
+      [
+        {
+          type: "response.created",
+          response: { id: "resp_tool", model: "local-chat", status: "in_progress" },
+        },
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            id: "fc_1",
+            type: "function_call",
+            status: "in_progress",
+            call_id: "call_1",
+            name: "read_note",
+            arguments: "",
+          },
+        },
+        {
+          type: "response.function_call_arguments.delta",
+          item_id: "fc_1",
+          output_index: 0,
+          delta: '{"path":"Private.md"}',
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            id: "fc_1",
+            type: "function_call",
+            status: "completed",
+            call_id: "call_1",
+            name: "read_note",
+            arguments: '{"path":"Private.md"}',
+          },
+        },
+        {
+          type: "response.completed",
+          response: {
+            id: "resp_tool",
+            object: "response",
+            status: "completed",
+            model: "local-chat",
+            output: [
+              {
+                id: "fc_1",
+                type: "function_call",
+                status: "completed",
+                call_id: "call_1",
+                name: "read_note",
+                arguments: '{"path":"Private.md"}',
+              },
+            ],
+            usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 },
+          },
+        },
+      ],
+      [
+        {
+          type: "response.created",
+          response: { id: "resp_answer", model: "local-chat", status: "in_progress" },
+        },
+        {
+          type: "response.output_text.delta",
+          output_index: 0,
+          content_index: 0,
+          delta: "The private note is available.",
+        },
+        {
+          type: "response.completed",
+          response: {
+            id: "resp_answer",
+            object: "response",
+            status: "completed",
+            model: "local-chat",
+            output: [
+              {
+                id: "msg_answer",
+                type: "message",
+                status: "completed",
+                role: "assistant",
+                content: [
+                  { type: "output_text", text: "The private note is available.", annotations: [] },
+                ],
+              },
+            ],
+            usage: { input_tokens: 3, output_tokens: 5, total_tokens: 8 },
+          },
+        },
+      ],
+    ];
+    const fetcher: typeof fetch = async (input, init) => {
+      const body = JSON.parse(
+        input instanceof Request ? await input.clone().text() : String(init?.body)
+      );
+      requests.push(body);
+      const events = responseEvents[requests.length - 1];
+      const stream = events
+        .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+        .join("");
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const readNote = vi.fn(async (path: string) => ({
+      path,
+      content: "PRIVATE_READ_ONLY_PAYLOAD",
+    }));
+    const vault = {
+      readNote,
+      discoverLinks: async () => [],
+      resolveLink: async () => null,
+    };
+    const retrieval = new VaultRetrieval(
+      async () => ({ hits: [], mode: "lexical", degraded: false }),
+      undefined,
+      undefined,
+      async () => null
+    );
+    const session = new ChatSession(
+      createLocalChatModel(
+        { endpoint: "http://127.0.0.1:1234/v1", modelId: "local-chat", temperature: 0.2 },
+        undefined,
+        fetcher
+      ),
+      (observer) => createVaultTools(vault, retrieval, observer),
+      vault
+    );
+
+    const state = await session.send({ content: "Read the private note", attachmentPaths: [] });
+
+    expect(readNote).toHaveBeenCalledWith("Private.md", expect.any(AbortSignal));
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({ store: false, text: { format: { type: "text" } } });
+    expect(requests[0].tools).toHaveLength(4);
+    expect(requests[0].tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "vault_search", strict: false }),
+        expect.objectContaining({ name: "read_note", strict: false }),
+        expect.objectContaining({ name: "discover_links", strict: false }),
+        expect.objectContaining({ name: "follow_link", strict: false }),
+      ])
+    );
+    expect(requests[1].input).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "function_call_output", output: expect.any(String) }),
+      ])
+    );
+    expect(state.turns.at(-1)).toMatchObject({
+      status: "complete",
+      content: "The private note is available.",
+    });
+    expect(JSON.stringify(state.turns)).not.toContain("PRIVATE_READ_ONLY_PAYLOAD");
   });
 });

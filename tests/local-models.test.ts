@@ -11,10 +11,12 @@ const endpoint = "http://127.0.0.1:1234/v1";
 describe("guarded local OpenAI chat", () => {
   it("uses the Responses API without storing requests and preserves explicit reasoning none", async () => {
     let body: Record<string, unknown> | undefined;
+    let requestURL = "";
     const model = createLocalChatModel(
       { ...DEFAULT_SETTINGS.chat, modelId: "local-chat", reasoningEffort: "none" },
       undefined,
-      async (_input, init) => {
+      async (input, init) => {
+        requestURL = input instanceof Request ? input.url : String(input);
         body = JSON.parse(String(init?.body));
         return Response.json({
           id: "resp_test",
@@ -35,11 +37,31 @@ describe("guarded local OpenAI chat", () => {
     );
     const result = await model.invoke("hello");
     expect(result.text).toBe("ready");
+    expect(requestURL).toBe(`${endpoint}/responses`);
     expect(body).toMatchObject({
       store: false,
       model: "local-chat",
+      text: { format: { type: "text" } },
       reasoning: { effort: "none" },
     });
+  });
+
+  it("rejects redirects from the local chat endpoint", async () => {
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "http://127.0.0.1:1234/v1/other" },
+        })
+    );
+    const model = createLocalChatModel(
+      { ...DEFAULT_SETTINGS.chat, modelId: "local-chat" },
+      undefined,
+      fetcher
+    );
+    await expect(model.invoke("hello")).rejects.toBeDefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0][1]?.redirect).toBe("error");
   });
 
   it("discovers model IDs only on explicit request through the guarded endpoint", async () => {
@@ -50,6 +72,18 @@ describe("guarded local OpenAI chat", () => {
     await expect(pending).resolves.toEqual(["chat-local", "embed-local"]);
     expect(fetcher).toHaveBeenCalledOnce();
     expect(String(fetcher.mock.calls[0][0])).toContain("/v1/models");
+  });
+
+  it("allows explicit model discovery in the browser-like Obsidian renderer", async () => {
+    vi.stubGlobal("window", { document: {} });
+    vi.stubGlobal("navigator", { userAgent: "Obsidian" });
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ data: [{ id: "local" }] }));
+    try {
+      await expect(discoverLocalModels(endpoint, undefined, fetcher)).resolves.toEqual(["local"]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

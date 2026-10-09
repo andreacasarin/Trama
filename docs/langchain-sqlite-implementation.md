@@ -28,18 +28,18 @@ The plugin awaits worker client initialization before publishing services or UI 
 
 ## Agent and privacy boundaries
 
-Conversation history and turn attachments exist only for the current session or turn. Provider requests use `store: false`. Startup and settings loading work offline; provider access follows an explicit user action. Approved local private endpoints are guarded. Agent tools are read-only and return note links.
+Conversation history and turn attachments exist only for the current session or turn. Responses requests use plain-text `text.format`, `store: false`, and non-strict tool calling. Startup and settings loading work offline; provider access follows an explicit user action. Approved local private endpoints are guarded. Agent tools are read-only and return note links.
 
 V1 has no shared cache or publication path, scheduled maintenance, automatic vault-event indexing, background indexing jobs, migrations, or legacy graph subsystem. Compatibility is limited to the Obsidian adapters needed to integrate with the plugin host.
 
 ## Verification and evidence
 
-As of 2026-10-09, the implementation work reports 17 active files and 58 active tests, with build, strict-unused TypeScript, lint, SQLite, and formatting checks passing. Coverage includes production worker handling with real WASM, queued messages, cancellation rollback during indexing and reset, database isolation, search/reset, stable and malformed initialization, close/rebind behavior, stale callback isolation, independent indexing/query cancellation, related-note persistence and restart behavior, and tool payload privacy. The cleanup removed obsolete legacy test and helper code, benchmark-only fixtures, and formatter exclusions. Twenty-four Markdown notes remained byte-identical.
+As of 2026-10-09, the implementation work reports 17 active files and 61 active tests, with build, strict-unused TypeScript, lint, SQLite, and formatting checks passing. Coverage includes production worker handling with real WASM, queued messages, cancellation rollback during indexing and reset, database isolation, search/reset, stable and malformed initialization, close/rebind behavior, stale callback isolation, independent indexing/query cancellation, related-note persistence and restart behavior, and tool payload privacy. Regression coverage includes browser-renderer discovery, the Responses plain-text format option, and serialization of all four tools in the agent SSE path. A live local Responses hello-only request with an inert tool returned HTTP 200; it did not execute an agent tool or access vault content. The cleanup removed obsolete legacy test and helper code, benchmark-only fixtures, and formatter exclusions. Twenty-four Markdown notes remained byte-identical.
 
-The implementation has 4,453 source lines across 28 files, compared with 17,956 lines across 73 files before the rewrite, roughly 75% fewer lines.
+The post-cleanup measurement was 4,453 source lines across 28 files, compared with 17,956 lines across 73 files before the rewrite, roughly 75% fewer lines; source size was not remeasured after the latest fix.
 
 These counts describe repository checks, not device or live-provider validation.
 
-A small workload used 24 committed Trama notes and 48 vectors: the latest run reported 174.4 ms indexing, 8.7 ms query time, and 20 hydrated results. Its SQLite database was 98,304 bytes. Timing varied between runs, so this is one workload observation, not a performance guarantee. The reported built artifact sizes are 1,990,847 bytes for `main.js` (499,244 bytes gzip) and 514,496 bytes for the worker (138,438 bytes gzip). Real desktop and mobile behavior, Obsidian integration on a device, and live LM Studio compatibility remain unverified.
+A small workload used 24 committed Trama notes and 48 vectors: the latest run reported 174.4 ms indexing, 8.7 ms query time, and 20 hydrated results. Its SQLite database was 98,304 bytes. Timing varied between runs, so this is one workload observation, not a performance guarantee. The reported built artifact sizes are 1,990,847 bytes for `main.js` (499,244 bytes gzip) and 514,496 bytes for the worker (138,438 bytes gzip). Full Obsidian integration on a device, desktop/mobile behavior, and a live agent tool roundtrip remain unverified.
 
 Historical benchmark commands and reports describe earlier implementations. They are retained for context and do not define current V1 commands or performance guarantees.

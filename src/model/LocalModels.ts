@@ -18,13 +18,15 @@ export function createLocalChatModel(
     apiKey: "local-endpoint",
     useResponsesApi: true,
     zdrEnabled: true,
+    supportsStrictToolCalling: false,
     maxRetries: 0,
     temperature: settings.temperature,
     ...(settings.maxOutputTokens ? { maxTokens: settings.maxOutputTokens } : {}),
     ...(settings.reasoningEffort ? { reasoning: { effort: settings.reasoningEffort } } : {}),
-    ...(settings.reasoningEffort
-      ? { modelKwargs: { reasoning: { effort: settings.reasoningEffort } } }
-      : {}),
+    modelKwargs: {
+      text: { format: { type: "text" } },
+      ...(settings.reasoningEffort ? { reasoning: { effort: settings.reasoningEffort } } : {}),
+    },
     configuration: {
       baseURL,
       fetch: guardedFetch(baseURL, fetcher),
@@ -42,6 +44,7 @@ export async function discoverLocalModels(
     apiKey: "local-endpoint",
     baseURL,
     maxRetries: 0,
+    dangerouslyAllowBrowser: true,
     fetch: guardedFetch(baseURL, fetcher),
   });
   const result = await client.models.list();
