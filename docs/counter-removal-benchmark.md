@@ -1,8 +1,11 @@
 # SQLite counter removal benchmark
 
-Historical evidence: the in-memory runner referenced below has been retired. Use
-`npm run benchmark` for the current generated-vault Obsidian CLI workflow; its timings
-are not directly comparable to these measurements.
+> **Historical benchmark:** The in-memory runner described below has been retired. Its measurements are not current V1 performance claims. See the [current V1 implementation and evidence](langchain-sqlite-implementation.md); no active benchmark workflow is documented.
+
+Historical evidence: the in-memory runner referenced below has been retired. No
+active benchmark workflow is documented for V1. See the [current implementation
+and evidence](langchain-sqlite-implementation.md); these timings are not current
+V1 performance claims.
 
 ## Workload and conditions
 

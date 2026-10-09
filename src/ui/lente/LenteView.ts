@@ -1,46 +1,24 @@
-import { ItemView, Keymap, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
-import {
-  sortLenteResults,
-  type LenteBatch,
-  type LenteResult,
-  type LenteSearchOptions,
-  type LenteSearch,
-  type LenteSort,
-} from "@/index/LenteSearch";
+import { ItemView, Keymap, WorkspaceLeaf } from "obsidian";
+import type { Runnable } from "@langchain/core/runnables";
+import type { VaultRetrievalInput, VaultRetrievalOutput } from "@/index/VaultRetrieval";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
+export type SearchRunnable = Pick<Runnable<VaultRetrievalInput, VaultRetrievalOutput>, "invoke">;
 
-interface LenteSearchPort {
-  search(query: string, options?: LenteSearchOptions): Promise<LenteBatch>;
-}
-
-/** Native Obsidian view for explicit-submit hybrid vault search. */
 export class LenteView extends ItemView {
-  private root!: HTMLDivElement;
   private input!: HTMLInputElement;
-  private submitButton!: HTMLButtonElement;
-  private toolbar!: HTMLDivElement;
-  private resultCountEl!: HTMLSpanElement;
-  private sortGroup!: HTMLDivElement;
-  private statusEl!: HTMLDivElement;
-  private announcementEl!: HTMLDivElement;
-  private rowsEl!: HTMLDivElement;
-  private sort: LenteSort = "relevant";
-  private draft = "";
-  private submitted = "";
-  private batch?: LenteBatch;
-  private canonicalResults: readonly LenteResult[] = [];
-  private abort?: AbortController;
+  private status!: HTMLDivElement;
+  private rows!: HTMLDivElement;
+  private controller?: AbortController;
   private revision = 0;
+  private submitted = "";
+  private output?: VaultRetrievalOutput;
   private opened = false;
-  private lastError = false;
-  private errorMessage = "Search failed. Try again.";
-
   constructor(
     leaf: WorkspaceLeaf,
-    private searchSource: LenteSearchPort | LenteSearch
+    private search: SearchRunnable
   ) {
     super(leaf);
   }
@@ -53,277 +31,121 @@ export class LenteView extends ItemView {
   getIcon(): IconName {
     return TRAMA_ICONS.lente;
   }
-
-  setSearch(search: LenteSearchPort | LenteSearch): void {
+  setSearch(search: SearchRunnable): void {
     this.cancel();
-    this.searchSource = search;
-    this.batch = undefined;
-    this.canonicalResults = [];
-    this.lastError = false;
-    this.errorMessage = "Search failed. Try again.";
-    if (this.announcementEl) this.announcementEl.textContent = "";
-    if (this.opened) this.render();
+    this.search = search;
+    this.output = undefined;
+    this.render();
   }
-
-  /** Reruns the last submitted query after the mutable index changes. */
   refreshSubmitted(): void {
-    if (this.submitted && this.opened) void this.runQuery(this.submitted);
+    if (this.submitted && this.opened) void this.run(this.submitted);
   }
-
   override onOpen(): Promise<void> {
     this.opened = true;
     this.contentEl.empty();
-    this.root = this.contentEl.createDiv({ cls: "trama-lente" });
-    this.root.createEl("h1", { text: "Lente", cls: "trama-lente__title" });
-    const form = this.root.createDiv({ cls: "trama-lente__form" });
+    const root = this.contentEl.createDiv({ cls: "trama-lente" });
+    root.createEl("h1", { text: "Lente", cls: "trama-lente__title" });
+    const form = root.createDiv({ cls: "trama-lente__form" });
     this.input = form.createEl("input", {
-      cls: "trama-lente__input",
       attr: { type: "search", placeholder: "Search your vault", "aria-label": "Search your vault" },
     });
-    this.input.value = this.draft;
-    this.input.addEventListener("input", () => {
-      this.draft = this.input.value;
-    });
-    this.input.addEventListener("keydown", (event: KeyboardEvent) => {
+    this.input.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.isComposing) {
         event.preventDefault();
-        void this.submit();
-      } else if (event.key === "Escape") {
-        event.preventDefault();
-        this.clear();
-      } else if (event.key === "ArrowDown") {
-        event.preventDefault();
-        this.firstRow()?.focus();
+        this.submitted = this.input.value.trim();
+        void this.run(this.submitted);
+      }
+      if (event.key === "Escape") {
+        this.cancel();
+        this.output = undefined;
+        this.input.value = "";
+        this.render();
       }
     });
-    this.submitButton = form.createEl("button", {
-      cls: "clickable-icon trama-lente__submit",
-      text: "Search",
-      attr: { type: "button", "aria-label": "Search" },
+    const button = form.createEl("button", { text: "Search", attr: { type: "button" } });
+    button.addEventListener("click", () => {
+      this.submitted = this.input.value.trim();
+      void this.run(this.submitted);
     });
-    setIcon(this.submitButton, TRAMA_ICONS.lente);
-    this.submitButton.addEventListener("click", () => void this.submit());
-    this.toolbar = this.root.createDiv({
-      cls: "trama-lente__toolbar",
-      attr: { hidden: "true", "aria-hidden": "true" },
-    });
-    this.resultCountEl = this.toolbar.createSpan({
-      cls: "setting-item-description trama-lente__count",
-    });
-    this.sortGroup = this.toolbar.createDiv({
-      cls: "trama-lente__sort",
-      attr: { role: "group", "aria-label": "Sort results" },
-    });
-    for (const value of ["relevant", "updated"] as const) {
-      const button = this.sortGroup.createEl("button", {
-        cls: "clickable-icon trama-lente__sort-button",
-        text: value === "relevant" ? "Relevant" : "Updated",
-        attr: {
-          type: "button",
-          "aria-label": `Sort by ${value}`,
-          "aria-pressed": String(value === this.sort),
-        },
-      });
-      setTooltip(button, `Sort by ${value}`);
-      const icon = button.createSpan({
-        cls: "trama-lente__sort-icon",
-        attr: { "aria-hidden": "true" },
-      });
-      setIcon(icon, "arrow-up-down");
-      button.addEventListener("click", () => {
-        this.sort = value;
-        this.renderSort(this.sortGroup);
-        if (this.batch) {
-          this.batch = {
-            ...this.batch,
-            results: sortLenteResults(this.canonicalResults, this.sort, this.batch.displayLimit),
-          };
-          this.renderRows();
-        }
-      });
-    }
-    this.renderSort(this.sortGroup);
-    this.statusEl = this.root.createDiv({
+    this.status = root.createDiv({
       cls: "setting-item-description trama-lente__status",
+      attr: { "aria-live": "polite" },
     });
-    this.announcementEl = this.root.createDiv({
-      cls: "trama-lente__announcement",
-      attr: { "aria-live": "polite", "aria-atomic": "true" },
-    });
-    this.rowsEl = this.root.createDiv({ cls: "trama-lente__rows" });
+    this.rows = root.createDiv({ cls: "trama-lente__rows" });
     this.render();
     return Promise.resolve();
   }
-
   override onClose(): Promise<void> {
     this.opened = false;
     this.cancel();
     return Promise.resolve();
   }
-
-  private async submit(): Promise<void> {
-    const query = this.draft.trim();
+  private cancel(): void {
+    this.revision++;
+    this.controller?.abort();
+    this.controller = undefined;
+  }
+  private async run(query: string): Promise<void> {
     if (!query) {
-      this.clear();
+      this.output = undefined;
+      this.cancel();
+      this.render();
       return;
     }
-    this.submitted = query;
-    await this.runQuery(query);
-  }
-
-  private async runQuery(query: string): Promise<void> {
     this.cancel();
     const revision = ++this.revision;
     const controller = new AbortController();
-    this.abort = controller;
-    this.lastError = false;
-    this.errorMessage = "Search failed. Try again.";
-    this.announcementEl.textContent = "";
+    this.controller = controller;
     this.render();
     try {
-      const batch = await this.searchSource.search(query, {
-        sort: this.sort,
-        signal: controller.signal,
-      });
+      const output = await this.search.invoke(
+        { query, mode: "hybrid" },
+        { signal: controller.signal }
+      );
       if (revision !== this.revision || controller.signal.aborted) return;
-      this.abort = undefined;
-      this.canonicalResults = batch.canonicalResults ?? batch.results;
-      this.batch = {
-        ...batch,
-        results: sortLenteResults(this.canonicalResults, this.sort, batch.displayLimit),
-      };
-      this.announcementEl.textContent = this.batch.results.length
-        ? `${this.batch.results.length} results`
-        : "No matching notes found.";
-      this.render();
-    } catch (error) {
+      this.output = output;
+      this.controller = undefined;
+    } catch {
       if (revision !== this.revision || controller.signal.aborted) return;
-      this.abort = undefined;
-      this.lastError = true;
-      this.errorMessage = this.messageForError(error);
-      this.render();
+      this.output = undefined;
+      this.controller = undefined;
+      this.status.textContent = "Search failed. Try again.";
     }
-  }
-
-  private clear(): void {
-    this.cancel();
-    this.draft = "";
-    this.submitted = "";
-    this.batch = undefined;
-    this.canonicalResults = [];
-    this.lastError = false;
-    this.errorMessage = "Search failed. Try again.";
-    if (this.announcementEl) this.announcementEl.textContent = "";
-    if (this.input) this.input.value = "";
     this.render();
   }
-  private cancel(): void {
-    this.revision++;
-    this.abort?.abort();
-    this.abort = undefined;
-  }
   private render(): void {
-    if (!this.statusEl || !this.rowsEl) return;
-    const hasResults = Boolean(
-      this.batch && this.batch.results.length && !this.abort && !this.lastError
-    );
-    this.toolbar.hidden = !hasResults;
-    this.toolbar.setAttribute("aria-hidden", String(!hasResults));
-    if (hasResults) this.resultCountEl.textContent = `${this.batch!.results.length} results`;
-    this.statusEl.textContent = this.abort
-      ? "Searching…"
-      : this.lastError
-        ? this.errorMessage
-        : this.batch && this.submitted && this.batch.results.length === 0
-          ? this.searchStatus("No matching notes found.")
-          : this.batch
-            ? this.searchStatus()
-            : this.submitted
-              ? ""
-              : "Submit a query to search your vault.";
-    this.renderRows();
-  }
-  private searchStatus(prefix = ""): string {
-    if (!this.batch) return prefix;
-    const messages: string[] = [];
-    if (prefix) messages.push(prefix);
-    if (this.batch.degraded) {
-      messages.push(
-        this.batch.degradationReason === "query-embedding-failed"
-          ? "Lexical-only results (query embedding failed)."
-          : "Lexical-only results (semantic search unavailable)."
-      );
-    } else if (this.batch.mode === "lexical") {
-      messages.push("Lexical search ready.");
-    }
-    if (this.batch.freshness === "unknown")
-      messages.push("Lexical index may be stale; update required.");
-    if (this.batch.semanticPartial)
-      messages.push("Semantic index is incomplete; search uses available vectors.");
-    return messages.join(" ");
-  }
-  private messageForError(error: unknown): string {
-    const code =
-      error && typeof error === "object" && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    if (code === "busy") return "Lexical or semantic index operation in progress…";
-    if (code === "unavailable") return "Lexical index unavailable. Rebuild lexical index.";
-    return "Search failed. Try again.";
-  }
-  private renderRows(): void {
-    this.rowsEl.empty();
-    if (!this.batch) return;
-    if (!this.batch.results.length) {
-      this.rowsEl.createDiv({
-        cls: "setting-item-description trama-lente__message",
-        text: "No matching notes found.",
-      });
+    if (!this.status || !this.rows) return;
+    this.rows.empty();
+    if (this.controller) {
+      this.status.textContent = "Searching…";
       return;
     }
-    for (const result of this.batch.results) this.renderRow(result);
-  }
-  private renderRow(result: LenteResult): void {
-    const item = this.rowsEl.createDiv({ cls: "trama-lente__item" });
-    const link = item.createEl("a", {
-      cls: "internal-link trama-lente__link",
-      text: this.basename(result.path),
-      attr: { href: result.path, tabindex: "0" },
-    });
-    setTooltip(link, result.path);
-    link.addEventListener("click", (event: MouseEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void (this.app as any)?.workspace?.openLinkText?.(result.path, "", Keymap.isModEvent(event));
-    });
-    item.createDiv({
-      cls: "setting-item-description trama-lente__path",
-      text: `${result.path}${this.lineLabel(result.startLine, result.endLine)}`,
-    });
-    item.createDiv({ cls: "trama-lente__excerpt", text: result.excerpt });
-    if (result.mtime !== null)
-      item.createDiv({
-        cls: "setting-item-description trama-lente__mtime",
-        text: new Date(result.mtime).toLocaleString(),
-      });
-  }
-  private renderSort(group: HTMLDivElement): void {
-    for (const child of Array.from(group.children)) {
-      const active = (child.textContent ?? "").toLowerCase() === this.sort;
-      child.setAttribute("aria-pressed", String(active));
-      (child as HTMLButtonElement).disabled = active;
+    const output = this.output;
+    if (!output) {
+      if (!this.status.textContent.includes("failed"))
+        this.status.textContent = "Submit a query to search your vault.";
+      return;
     }
-  }
-  private firstRow(): HTMLAnchorElement | undefined {
-    const row = this.rowsEl?.children[0] as unknown as
-      { children?: ArrayLike<HTMLElement> } | undefined;
-    return row?.children?.[0] as HTMLAnchorElement | undefined;
-  }
-  private basename(path: string): string {
-    const name = path.slice(path.lastIndexOf("/") + 1);
-    return name.toLowerCase().endsWith(".md") ? name.slice(0, -3) : name;
-  }
-  private lineLabel(start: number, end: number): string {
-    return start === end ? ` · line ${start}` : ` · lines ${start}-${end}`;
+    this.status.textContent = output.status.degraded
+      ? output.status.degradationReason === "query-embedding-failed"
+        ? "Lexical results (query embedding failed)."
+        : "Lexical results (semantic search unavailable)."
+      : output.documents.length
+        ? `${output.documents.length} notes`
+        : "No matching notes found.";
+    for (const document of output.documents) {
+      const path = String(document.metadata.path ?? document.id ?? "");
+      if (!path) continue;
+      const link = this.rows.createEl("a", {
+        cls: "internal-link trama-lente__link",
+        text: path.split("/").pop()?.replace(/\.md$/i, "") ?? path,
+        attr: { href: path },
+      });
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
+      });
+      this.rows.createDiv({ cls: "setting-item-description trama-lente__path", text: path });
+    }
   }
 }

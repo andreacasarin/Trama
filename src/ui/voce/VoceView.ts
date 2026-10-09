@@ -11,8 +11,7 @@ import {
 } from "obsidian";
 import { AssistantConversationTurn, CHAT_LIMITS, ChatSession, ChatState } from "@/chat/ChatSession";
 import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReferences";
-import { ProvenanceRecord } from "@/domain/contracts";
-import { RelatedNotes, RelatedNotesResult } from "@/index/RelatedNotes";
+import type { ProvenanceRecord } from "@/domain/vault";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 
@@ -43,11 +42,8 @@ function errorMessage(error: ChatState["error"]): string {
   }
 }
 
-export function provenanceLabel(record: ProvenanceRecord): string {
-  const hasRange = record.startLine !== undefined || record.endLine !== undefined;
-  return hasRange
-    ? `${record.path} (lines ${record.startLine ?? record.endLine}-${record.endLine ?? record.startLine})`
-    : record.path;
+function provenanceLabel(record: ProvenanceRecord): string {
+  return record.path;
 }
 
 class AttachmentPickerModal extends FuzzySuggestModal<string> {
@@ -90,10 +86,6 @@ export class VoceView extends ItemView {
   private localError?: string;
   private attachmentPickerGeneration = 0;
   private isViewOpen = false;
-  private relatedUnsubscribe?: () => void;
-  private relatedAbort?: AbortController;
-  private relatedRequestGeneration = 0;
-  private relatedResult?: RelatedNotesResult;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -101,8 +93,7 @@ export class VoceView extends ItemView {
     private readonly noteCatalog: () => readonly string[] = () => [],
     private readonly noteSuggestions: () => readonly string[] = () => [],
     private readonly copyText: (content: string) => Promise<void> = (content) =>
-      navigator.clipboard.writeText(content),
-    private relatedNotes?: RelatedNotes
+      navigator.clipboard.writeText(content)
   ) {
     super(leaf);
   }
@@ -113,32 +104,6 @@ export class VoceView extends ItemView {
     this.session = session;
     this.expandedTurnIds.clear();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
-  }
-
-  /** Rebinds related-note suggestions when embedding settings replace the index graph. */
-  setRelatedNotes(relatedNotes?: RelatedNotes): void {
-    this.relatedUnsubscribe?.();
-    this.relatedUnsubscribe = undefined;
-    this.relatedAbort?.abort();
-    this.relatedAbort = undefined;
-    this.relatedRequestGeneration++;
-    this.relatedNotes = relatedNotes;
-    this.relatedResult = undefined;
-    if (!this.isViewOpen) return;
-    this.relatedUnsubscribe = relatedNotes?.subscribe((result: RelatedNotesResult) => {
-      if (this.acceptsRelatedResult(result)) {
-        this.relatedResult = result;
-        this.renderAttachments();
-      }
-    });
-    this.refreshRelated();
-    this.renderAttachments();
-  }
-
-  /** Refreshes suggestions after the index publishes a new committed generation. */
-  refreshRelatedSuggestions(): void {
-    if (!this.isViewOpen) return;
-    this.refreshRelated();
   }
 
   getViewType(): string {
@@ -199,16 +164,8 @@ export class VoceView extends ItemView {
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
         this.renderAttachments();
-        this.refreshRelated();
       })
     );
-    this.relatedUnsubscribe = this.relatedNotes?.subscribe((result: RelatedNotesResult) => {
-      if (this.acceptsRelatedResult(result)) {
-        this.relatedResult = result;
-        this.renderAttachments();
-      }
-    });
-    this.refreshRelated();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
     return Promise.resolve();
   }
@@ -220,15 +177,9 @@ export class VoceView extends ItemView {
     this.activeAttachmentPicker = undefined;
     if (this.markdownComponent) this.removeChild(this.markdownComponent);
     this.markdownComponent = undefined;
-    this.session.cancel();
+    this.session.reset();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
-    this.relatedUnsubscribe?.();
-    this.relatedUnsubscribe = undefined;
-    this.relatedRequestGeneration++;
-    this.relatedAbort?.abort();
-    this.relatedAbort = undefined;
-    this.relatedResult = undefined;
     return Promise.resolve();
   }
 
@@ -426,40 +377,14 @@ export class VoceView extends ItemView {
   private renderAttachments(): void {
     this.attachments.empty();
     const selected = new Set(this.selectedAttachmentPaths);
-    const relatedSuggestions = this.relatedNotes?.latest?.(this.activePath()) ?? [];
     const activeSuggestions = this.noteSuggestions().filter((path) =>
       this.noteCatalog().includes(path)
     );
-    const suggestions = [
-      ...new Set(
-        [...activeSuggestions, ...relatedSuggestions].filter((path) =>
-          this.noteCatalog().includes(path)
-        )
-      ),
-    ];
+    const suggestions = [...new Set(activeSuggestions)];
     const paths = [
       ...suggestions,
       ...this.selectedAttachmentPaths.filter((path) => !suggestions.includes(path)),
     ];
-    if (this.relatedResult?.unavailableReason) {
-      this.attachments.createDiv({
-        cls: "setting-item-description mod-warning trama-voce__context-warning",
-        text:
-          this.relatedResult.unavailableReason === "incomplete-vectors"
-            ? "Related-note suggestions are unavailable until semantic coverage is complete."
-            : "Related-note suggestions are unavailable. Update the semantic index when available.",
-      });
-    } else if (this.relatedResult?.freshness === "unknown") {
-      this.attachments.createDiv({
-        cls: "setting-item-description mod-warning trama-voce__context-warning",
-        text: "Index may be stale; suggestions reflect indexed content until an update.",
-      });
-    } else if (this.relatedResult?.semanticPartial) {
-      this.attachments.createDiv({
-        cls: "setting-item-description mod-warning trama-voce__context-warning",
-        text: "Semantic index is incomplete; suggestions use available vectors.",
-      });
-    }
     for (const path of paths) {
       const isSelected = selected.has(path);
       const button = this.attachments.createEl("button", {
@@ -495,37 +420,6 @@ export class VoceView extends ItemView {
     setIcon(addButton, "plus");
     setTooltip(addButton, "Choose note");
     addButton.addEventListener("click", () => this.openAttachmentPicker());
-  }
-
-  private refreshRelated(): void {
-    const path = this.activePath();
-    this.relatedAbort?.abort();
-    const generation = ++this.relatedRequestGeneration;
-    this.relatedResult = undefined;
-    this.renderAttachments();
-    if (!path || !this.relatedNotes) return;
-    const controller = new AbortController();
-    this.relatedAbort = controller;
-    void this.relatedNotes
-      .find(path, controller.signal, 7)
-      .then((result) => {
-        if (generation !== this.relatedRequestGeneration || controller.signal.aborted) return;
-        if (this.acceptsRelatedResult(result)) {
-          this.relatedResult = result;
-          this.renderAttachments();
-        }
-      })
-      .catch(() => undefined);
-  }
-
-  private acceptsRelatedResult(result: RelatedNotesResult): boolean {
-    // Counter changes invalidate the next cache lookup, but do not make an
-    // already hydrated result unusable to the current conversation.
-    return result.currentPath === this.activePath();
-  }
-
-  private activePath(): string {
-    return (this.app as any)?.workspace?.getActiveFile?.()?.path ?? "";
   }
 
   private noteLabel(path: string): string {

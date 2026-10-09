@@ -1,4 +1,4 @@
-import { StructuredError } from "@/domain/contracts";
+import { StructuredError } from "@/domain/errors";
 
 export interface EndpointApproval {
   readonly scheme: "http" | "https";

@@ -159,31 +159,13 @@ async function testVaultExists(vaultPath) {
 export async function installTestVaults(install = installPlugin) {
   const { demoVaultPath, validateDemoVault, prepareDemoVault } =
     await import("./benchmark/demo.mjs");
-  const { benchmarkVaultName, validateGeneratedVault, prepareVault, installBenchmarkPlugin } =
-    await import("./benchmark/obsidian.mjs");
-  const benchmarkPath = path.join(
-    projectRoot,
-    ".artifacts/test-vaults/benchmark",
-    benchmarkVaultName
-  );
-  // Check existing vaults and missing-path ancestors before preparing or updating either.
   const demoExists = await testVaultExists(demoVaultPath);
-  const benchmarkExists = await testVaultExists(benchmarkPath);
   if (demoExists) await validateDemoVault();
-  if (benchmarkExists) {
-    await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
-    await rejectSymlinks(benchmarkPath);
-  }
   if (!demoExists) await prepareDemoVault(); // Already installs Trama.
-  if (!benchmarkExists) await prepareVault();
   await validateDemoVault();
-  await validateGeneratedVault(benchmarkPath, benchmarkVaultName);
-  await rejectSymlinks(benchmarkPath);
+  await rejectSymlinks(demoVaultPath);
   if (demoExists) await install({ vaultPath: demoVaultPath, preserveExistingFiles: true });
-  await installBenchmarkPlugin(benchmarkPath, benchmarkVaultName, install);
-  return [demoVaultPath, benchmarkPath].map((vaultPath) =>
-    path.join(vaultPath, ".obsidian/plugins", PLUGIN_ID)
-  );
+  return [path.join(demoVaultPath, ".obsidian/plugins", PLUGIN_ID)];
 }
 
 async function main() {
@@ -195,12 +177,9 @@ async function main() {
       ? await installTestVaults()
       : [await installPlugin({ vaultPath: args[0] ?? process.env.OBSIDIAN_VAULT_PATH })];
   if (args[0] === "--test-vaults") {
-    process.stdout.write("\nGenerated test vaults (add both folders to Obsidian):\n");
+    process.stdout.write("\nDemo test vault (add this folder to Obsidian):\n");
     process.stdout.write(`Demo: ${path.resolve(installed[0], "../../..")}\n`);
-    process.stdout.write(`Benchmark: ${path.resolve(installed[1], "../../..")}\n`);
-    process.stdout.write(
-      "Enable Community plugins and Trama in both vaults. In the benchmark vault, open Settings > General, enable Command line interface, and follow its registration prompt for benchmarks.\n\n"
-    );
+    process.stdout.write("Enable Community plugins and Trama in the demo vault.\n\n");
   }
   for (const directory of installed)
     process.stdout.write(`Installed ${PLUGIN_ID} in ${directory}\n`);

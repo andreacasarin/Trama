@@ -19,11 +19,11 @@ await esbuild.build({
   sourcemap: production ? false : "inline",
   minify: production,
   logLevel: "info",
-  define: { __TRAMA_RUNTIME_BUILD_ID__: JSON.stringify(runtimeBuildId) },
+  banner: { js: `/* runtime-build:${runtimeBuildId} */` },
 });
 
 await esbuild.build({
-  entryPoints: ["src/index/sqlite/worker.ts"],
+  entryPoints: ["src/index/note-sqlite/worker.ts"],
   bundle: true,
   format: "esm",
   platform: "browser",
@@ -32,7 +32,7 @@ await esbuild.build({
   sourcemap: false,
   minify: production,
   logLevel: "info",
-  define: { __TRAMA_RUNTIME_BUILD_ID__: JSON.stringify(runtimeBuildId) },
+  banner: { js: `/* runtime-build:${runtimeBuildId} */` },
 });
 
 const root = dirname(fileURLToPath(import.meta.url));

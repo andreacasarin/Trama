@@ -1,27 +1,13 @@
-import {
-  ChatMessage,
-  ChatModel,
-  ChatToolDefinition,
-  ProvenanceRecord,
-  ReadonlyNote,
-  ReadonlyVault,
-  StructuredError,
-  ToolCall,
-} from "@/domain/contracts";
-import {
-  emitTramaDiagnostic,
-  diagnosticTimer,
-  diagnosticsEnabled,
-  NOOP_TRAMA_DIAGNOSTICS,
-  TramaDiagnostics,
-} from "@/diagnostics/TramaDiagnostics";
-import { ToolRegistry, ToolResult } from "@/tools/ToolRegistry";
+import { createAgent, modelCallLimitMiddleware, toolCallLimitMiddleware } from "langchain";
+import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
+import type { BaseMessage } from "@langchain/core/messages";
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { ProvenanceRecord, ReadonlyNote, ReadonlyVault } from "@/domain/vault";
+import { StructuredError } from "@/domain/errors";
+import type { VaultToolFactory } from "@/tools/VaultTools";
 
 export const CHAT_LIMITS = Object.freeze({
-  maxRounds: 4,
   maxToolCalls: 8,
-  maxConcurrentTools: 4,
-  maxToolContent: 32_000,
   maxAttachments: 8,
   maxConcurrentAttachmentReads: 4,
   maxAttachmentContent: 32_000,
@@ -52,22 +38,31 @@ export interface UserConversationTurn extends ConversationTurnBase {
 export interface AssistantConversationTurn extends ConversationTurnBase {
   readonly role: "assistant";
   readonly provenance: readonly ProvenanceRecord[];
-  readonly status: "working" | "complete";
+  readonly status: "working" | "complete" | "failed" | "stopped";
 }
 
 export type ConversationTurn = UserConversationTurn | AssistantConversationTurn;
 
-/** Immutable presentation state; model protocol messages and tool activity stay private. */
 export interface ChatState {
   readonly turns: readonly ConversationTurn[];
   readonly running: boolean;
   readonly error?: { readonly code: string; readonly message: string };
 }
 
-/** Removes duplicate source/range records while preserving first-seen order. */
 export function dedupeProvenance(records: readonly ProvenanceRecord[]): ProvenanceRecord[] {
   const seen = new Set<string>();
+  const rangedPaths = new Set(
+    records
+      .filter((record) => record.startLine !== undefined || record.endLine !== undefined)
+      .map((record) => record.path)
+  );
   return records.filter((record) => {
+    if (
+      record.startLine === undefined &&
+      record.endLine === undefined &&
+      rangedPaths.has(record.path)
+    )
+      return false;
     const key = `${record.path}\n${record.startLine ?? ""}\n${record.endLine ?? ""}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -92,44 +87,48 @@ function attachmentBlock(notes: readonly ReadonlyNote[]): string {
 function asAttachedNote(note: ReadonlyNote): AttachedNote {
   return Object.freeze({
     path: note.path,
-    startLine: note.startLine,
-    endLine: note.endLine,
+    ...(note.startLine === undefined ? {} : { startLine: note.startLine }),
+    ...(note.endLine === undefined ? {} : { endLine: note.endLine }),
     truncated: note.truncated,
   });
 }
 
 function asProvenance(note: ReadonlyNote): ProvenanceRecord {
-  return Object.freeze({ path: note.path, startLine: note.startLine, endLine: note.endLine });
+  return Object.freeze({
+    path: note.path,
+    ...(note.startLine === undefined ? {} : { startLine: note.startLine }),
+    ...(note.endLine === undefined ? {} : { endLine: note.endLine }),
+  });
 }
 
-/** Runs one bounded, cancellable model turn while keeping replay protocol state private. */
+/** Runs one bounded, cancellable LangChain agent turn and projects it into UI state. */
 export class ChatSession {
   private state: ChatState = EMPTY_STATE;
-  private readonly history: ChatMessage[] = [];
+  private readonly history: BaseMessage[] = [];
   private active: AbortController | undefined;
-  private activeElapsedMs?: () => number;
+  private activeTurnId?: string;
   private generation = 0;
   private nextTurnId = 0;
   private readonly listeners = new Set<(state: ChatState) => void>();
 
   constructor(
-    private model: ChatModel,
-    private readonly registry: ToolRegistry,
+    private model: BaseChatModel,
+    private readonly createTools: VaultToolFactory,
     private readonly vault: Pick<ReadonlyVault, "readNote">,
-    diagnostics: TramaDiagnostics = NOOP_TRAMA_DIAGNOSTICS
-  ) {
-    this.diagnostics = {
-      enabled: (tier) => diagnosticsEnabled(diagnostics, tier),
-      emit: (record) => emitTramaDiagnostic(diagnostics, record),
-    };
-  }
+    private readonly preflight: () => void = () => undefined
+  ) {}
 
-  private readonly diagnostics: TramaDiagnostics;
-
-  /** Replaces the model for subsequent turns while retaining this conversation and tools. */
-  replaceModel(model: ChatModel): void {
+  replaceModel(model: BaseChatModel): void {
     this.cancel();
     this.model = model;
+  }
+
+  reset(): void {
+    this.cancel();
+    this.history.length = 0;
+    this.state = EMPTY_STATE;
+    this.activeTurnId = undefined;
+    for (const listener of this.listeners) listener(this.state);
   }
 
   getState(): ChatState {
@@ -142,12 +141,12 @@ export class ChatSession {
     return () => this.listeners.delete(listener);
   }
 
-  /** Starts one structured turn after a cancellable attachment preflight. */
   async send(input: SendTurnInput): Promise<ChatState> {
+    this.preflight();
     if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
     if (!input.content.trim())
       throw new StructuredError("invalid_request", "Message cannot be empty.", false);
-    const paths = this.uniqueAttachmentPaths(input.attachmentPaths);
+    const paths = [...new Set(input.attachmentPaths)];
     if (paths.length > CHAT_LIMITS.maxAttachments)
       throw new StructuredError(
         "limit_exceeded",
@@ -157,258 +156,157 @@ export class ChatSession {
 
     const controller = new AbortController();
     const identity = ++this.generation;
-    const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
     this.active = controller;
-    this.activeElapsedMs = elapsedMs;
-    if (diagnosticsEnabled(this.diagnostics, "detailed"))
-      this.diagnostics.emit({ area: "chat", event: "session_started", generation: identity });
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
-      const notes = await this.readAttachments(paths, controller.signal, identity);
+      const notes = await this.readAttachments(paths, controller.signal);
       if (!this.isCurrent(identity)) return this.state;
       const references = attachmentBlock(notes);
-      if (references.length > CHAT_LIMITS.maxAttachmentContent) {
-        if (diagnosticsEnabled(this.diagnostics, "detailed"))
-          this.diagnostics.emit({
-            area: "chat",
-            event: "limit_reached",
-            generation: identity,
-            message: "Attached notes exceed the 32,000-character context limit.",
-          });
-        return this.preflightFailure(
-          identity,
+      if (references.length > CHAT_LIMITS.maxAttachmentContent)
+        throw new StructuredError(
           "limit_exceeded",
-          "Attached notes exceed the 32,000-character context limit."
+          "Attached notes exceed the 32,000-character context limit.",
+          false
         );
-      }
 
+      const turnId = this.turnId();
+      this.activeTurnId = turnId;
+      const provenance = notes.map(asProvenance);
       const userTurn: UserConversationTurn = Object.freeze({
         id: this.turnId(),
         role: "user",
         content: input.content,
         attachments: Object.freeze(notes.map(asAttachedNote)),
       });
-      const assistantTurnId = this.turnId();
-      const provenance: ProvenanceRecord[] = notes.map(asProvenance);
-      const userMessageIndex = this.history.length;
-      this.history.push(Object.freeze({ role: "user", content: input.content }));
-      const requestUserMessage = Object.freeze({
-        role: "user" as const,
-        content: references ? `${input.content}\n\n${references}` : input.content,
-      });
+      this.history.push(new HumanMessage(input.content));
       this.publish(identity, {
         turns: Object.freeze([
           ...this.state.turns,
           userTurn,
-          this.assistantTurn(assistantTurnId, "", provenance, "working"),
+          this.assistantTurn(turnId, "", provenance, "working"),
         ]),
         running: true,
       });
-      const state = await this.runTurn(
-        identity,
-        controller,
-        assistantTurnId,
-        provenance,
-        userMessageIndex,
-        requestUserMessage
+
+      const agent = createAgent({
+        model: this.model,
+        tools: this.createTools((_name, _call, result, _durationMs) => {
+          if (!this.isCurrent(identity)) return;
+          provenance.push(...result.provenance);
+          this.updateAssistant(identity, turnId, this.assistantContent(), provenance, "working");
+        }),
+        middleware: [
+          modelCallLimitMiddleware({ runLimit: 8, exitBehavior: "error" }),
+          toolCallLimitMiddleware({ runLimit: CHAT_LIMITS.maxToolCalls, exitBehavior: "error" }),
+        ],
+      });
+      let streamedText = "";
+      let latestMessages: BaseMessage[] | undefined;
+      const turnMessages = [...this.history];
+      turnMessages[turnMessages.length - 1] = new HumanMessage(
+        references ? `${input.content}\n\n${references}` : input.content
       );
-      if (this.isCurrent(identity) && !state.running && !state.error) {
-        if (diagnosticsEnabled(this.diagnostics, "detailed"))
-          this.diagnostics.emit({
-            area: "chat",
-            event: "session_completed",
-            generation: identity,
-            durationMs: elapsedMs?.() ?? 0,
-          });
+      const stream = await agent.stream(
+        { messages: turnMessages },
+        { signal: controller.signal, streamMode: ["messages", "values"] }
+      );
+      for await (const event of stream as AsyncIterable<any>) {
+        if (!this.isCurrent(identity)) return this.state;
+        const [mode, data] = event as [string, unknown];
+        if (mode === "messages") {
+          const [message] = data as [BaseMessage, Record<string, unknown>];
+          const isAssistantText = message instanceof AIMessage || message instanceof AIMessageChunk;
+          const text = isAssistantText ? messageText(message.content) : "";
+          if (text) {
+            streamedText += text;
+            this.updateAssistant(identity, turnId, streamedText, provenance, "working");
+          }
+        } else if (
+          mode === "values" &&
+          Array.isArray((data as { messages?: unknown[] }).messages)
+        ) {
+          latestMessages = (data as { messages: BaseMessage[] }).messages;
+        }
       }
-      return state;
+      if (latestMessages) {
+        const persistedMessages: BaseMessage[] = [];
+        for (const message of latestMessages) {
+          const value = message as BaseMessage & { role?: string; type?: string };
+          const hasAttachmentContext = String(value.content).includes(
+            "BEGIN UNTRUSTED ATTACHED NOTE:"
+          );
+          const isHuman =
+            message instanceof HumanMessage || value.type === "human" || value.role === "user";
+          const persisted =
+            isHuman && hasAttachmentContext ? new HumanMessage(input.content) : message;
+          const previous = persistedMessages.at(-1);
+          if (
+            persisted instanceof HumanMessage &&
+            previous instanceof HumanMessage &&
+            persisted.content === previous.content
+          )
+            continue;
+          persistedMessages.push(persisted);
+        }
+        this.history.splice(0, this.history.length, ...persistedMessages);
+      }
+      const final = [...this.history].reverse().find((message) => message instanceof AIMessage);
+      const content = typeof final?.content === "string" ? final.content : streamedText;
+      return this.finish(identity, turnId, content, provenance);
     } catch (error) {
-      if (
-        controller.signal.aborted ||
-        (error instanceof Error && /abort|cancel/i.test(error.message))
-      )
-        return this.cancelled(identity);
+      if (!this.isCurrent(identity)) return this.state;
       const message = error instanceof Error ? error.message : "Chat turn failed.";
-      const code = error instanceof StructuredError ? error.code : "internal";
-      if (diagnosticsEnabled(this.diagnostics, "detailed"))
-        this.diagnostics.emit({
-          area: "chat",
-          event: "error",
-          generation: identity,
-          code,
-          message,
-          error,
-          durationMs: elapsedMs?.() ?? 0,
-        });
+      const code = controller.signal.aborted
+        ? "cancelled"
+        : error instanceof StructuredError
+          ? error.code
+          : "unavailable";
+      if (this.activeTurnId) {
+        const partial = this.assistantContent();
+        this.updateAssistant(
+          identity,
+          this.activeTurnId,
+          partial,
+          this.currentProvenance(),
+          "failed"
+        );
+      }
       return this.failure(identity, code, message);
     } finally {
       if (this.active === controller) {
         this.active = undefined;
-        this.activeElapsedMs = undefined;
+        this.activeTurnId = undefined;
       }
     }
   }
 
   cancel(): void {
     if (!this.active) return;
-    const identity = ++this.generation;
+    ++this.generation;
     this.active.abort();
     this.active = undefined;
+    const turnId = this.activeTurnId;
+    const turns = turnId
+      ? this.state.turns.map((turn) =>
+          turn.id === turnId && turn.role === "assistant"
+            ? this.assistantTurn(turnId, turn.content, turn.provenance, "stopped")
+            : turn
+        )
+      : this.withoutWorkingAssistant();
     this.state = Object.freeze({
       ...this.state,
-      turns: this.withoutWorkingAssistant(),
+      turns: Object.freeze(turns),
       running: false,
       error: { code: "cancelled", message: "Chat turn cancelled." },
     });
-    if (diagnosticsEnabled(this.diagnostics, "detailed"))
-      this.diagnostics.emit({
-        area: "chat",
-        event: "cancelled",
-        generation: identity,
-        durationMs: this.activeElapsedMs?.() ?? 0,
-      });
-    this.activeElapsedMs = undefined;
+    this.activeTurnId = undefined;
     for (const listener of this.listeners) listener(this.state);
-  }
-
-  private async runTurn(
-    identity: number,
-    controller: AbortController,
-    assistantTurnId: string,
-    provenance: ProvenanceRecord[],
-    userMessageIndex: number,
-    requestUserMessage: ChatMessage
-  ): Promise<ChatState> {
-    const definitions: readonly ChatToolDefinition[] = Object.freeze(
-      this.registry.definitions.map((definition) =>
-        Object.freeze({
-          name: definition.name,
-          description: definition.description,
-          parameters: definition.inputSchema as unknown as Readonly<Record<string, unknown>>,
-        })
-      )
-    );
-    let toolCalls = 0;
-    let contentSize = 0;
-    for (let round = 0; round < CHAT_LIMITS.maxRounds; round++) {
-      let streamedText = "";
-      const roundElapsedMs = diagnosticTimer(this.diagnostics, "detailed");
-      if (diagnosticsEnabled(this.diagnostics, "detailed"))
-        this.diagnostics.emit({
-          area: "chat",
-          event: "model_round_started",
-          generation: identity,
-          round: round + 1,
-        });
-      const response = await this.model.complete(
-        this.requestHistory(userMessageIndex, requestUserMessage),
-        controller.signal,
-        definitions,
-        (text) => {
-          if (!this.isCurrent(identity)) return;
-          streamedText += text;
-          if (diagnosticsEnabled(this.diagnostics, "detailed"))
-            this.diagnostics.emit({
-              area: "chat",
-              event: "stream_delta",
-              generation: identity,
-              text,
-            });
-          this.updateAssistant(identity, assistantTurnId, streamedText, provenance, "working");
-        }
-      );
-      if (!this.isCurrent(identity)) return this.state;
-      if (diagnosticsEnabled(this.diagnostics, "detailed"))
-        this.diagnostics.emit({
-          area: "chat",
-          event: "model_round_completed",
-          generation: identity,
-          round: round + 1,
-          finishReason: response.finishReason,
-          durationMs: roundElapsedMs?.() ?? 0,
-        });
-      this.history.push(Object.freeze(response.message));
-      if (response.finishReason !== "tool_calls" || !response.message.toolCalls?.length)
-        return this.finish(
-          identity,
-          assistantTurnId,
-          response.message.content || streamedText,
-          provenance
-        );
-
-      this.updateAssistant(identity, assistantTurnId, "", provenance, "working");
-      const calls = response.message.toolCalls;
-      if (toolCalls + calls.length > CHAT_LIMITS.maxToolCalls)
-        return this.limit(
-          identity,
-          assistantTurnId,
-          provenance,
-          "The tool-call limit was reached; the answer may be incomplete."
-        );
-      toolCalls += calls.length;
-      for (let offset = 0; offset < calls.length; offset += CHAT_LIMITS.maxConcurrentTools) {
-        const batch = calls.slice(offset, offset + CHAT_LIMITS.maxConcurrentTools);
-        const results = await this.executeBatch(batch, controller.signal, identity);
-        if (!this.isCurrent(identity)) return this.state;
-        for (let index = 0; index < results.length; index++) {
-          const result = results[index];
-          provenance.push(...result.provenance);
-          const serialized = JSON.stringify(result.ok ? result.data : result.error) ?? "";
-          contentSize += serialized.length;
-          if (contentSize > CHAT_LIMITS.maxToolContent)
-            return this.limit(
-              identity,
-              assistantTurnId,
-              provenance,
-              "The tool-result content limit was reached; remaining evidence was not included."
-            );
-          this.history.push(
-            Object.freeze({ role: "tool", content: serialized, toolCallId: batch[index].id })
-          );
-        }
-      }
-    }
-    return this.limit(
-      identity,
-      assistantTurnId,
-      provenance,
-      "The model round limit was reached; the answer may be incomplete."
-    );
-  }
-
-  private uniqueAttachmentPaths(paths: readonly string[]): readonly string[] {
-    const seen = new Set<string>();
-    return paths.filter((path) => {
-      if (seen.has(path)) return false;
-      seen.add(path);
-      return true;
-    });
-  }
-
-  private requestHistory(
-    userMessageIndex: number,
-    requestUserMessage: ChatMessage
-  ): readonly ChatMessage[] {
-    return Object.freeze(
-      this.history.map((message, index) =>
-        index === userMessageIndex ? requestUserMessage : message
-      )
-    );
   }
 
   private async readAttachments(
     paths: readonly string[],
-    signal: AbortSignal,
-    identity: number
+    signal: AbortSignal
   ): Promise<readonly ReadonlyNote[]> {
-    const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
-    if (diagnosticsEnabled(this.diagnostics, "detailed"))
-      this.diagnostics.emit({
-        area: "chat",
-        event: "attachment_preflight_started",
-        generation: identity,
-        count: paths.length,
-      });
     const notes: ReadonlyNote[] = [];
     for (
       let offset = 0;
@@ -418,59 +316,22 @@ export class ChatSession {
       const batch = paths.slice(offset, offset + CHAT_LIMITS.maxConcurrentAttachmentReads);
       notes.push(...(await Promise.all(batch.map((path) => this.vault.readNote(path, signal)))));
     }
-    if (diagnosticsEnabled(this.diagnostics, "detailed"))
-      this.diagnostics.emit({
-        area: "chat",
-        event: "attachment_preflight_completed",
-        generation: identity,
-        count: notes.length,
-        durationMs: elapsedMs?.() ?? 0,
-      });
     return notes;
   }
 
-  private async executeBatch(
-    calls: readonly ToolCall[],
-    signal: AbortSignal,
-    identity: number
-  ): Promise<ToolResult[]> {
-    const cache = new Map<string, Promise<ToolResult>>();
-    return Promise.all(
-      calls.map(async (call) => {
-        const elapsedMs = diagnosticTimer(this.diagnostics, "detailed");
-        const key = `${call.name}\n${JSON.stringify(call.arguments)}`;
-        let result = cache.get(key);
-        if (!result) {
-          result = this.registry.execute(call.name, call.arguments, signal);
-          cache.set(key, result);
-        }
-        const resolved = await result;
-        if (diagnosticsEnabled(this.diagnostics, "detailed"))
-          this.diagnostics.emit({
-            area: "chat",
-            event: "tool_completed",
-            generation: identity,
-            name: call.name,
-            ok: resolved.ok,
-            call,
-            result: resolved,
-            durationMs: elapsedMs?.() ?? 0,
-          });
-        return resolved;
-      })
-    );
+  private assistantContent(): string {
+    return this.state.turns.at(-1)?.role === "assistant" ? this.state.turns.at(-1)!.content : "";
   }
 
   private turnId(): string {
-    this.nextTurnId++;
-    return `turn-${this.nextTurnId}`;
+    return `turn-${++this.nextTurnId}`;
   }
 
   private assistantTurn(
     id: string,
     content: string,
     provenance: readonly ProvenanceRecord[],
-    status: "working" | "complete"
+    status: AssistantConversationTurn["status"]
   ): AssistantConversationTurn {
     return Object.freeze({
       id,
@@ -486,7 +347,7 @@ export class ChatSession {
     id: string,
     content: string,
     provenance: readonly ProvenanceRecord[],
-    status: "working" | "complete"
+    status: AssistantConversationTurn["status"]
   ): void {
     this.publish(identity, {
       ...this.state,
@@ -510,33 +371,12 @@ export class ChatSession {
 
   private finish(
     identity: number,
-    assistantTurnId: string,
+    id: string,
     content: string,
     provenance: ProvenanceRecord[]
   ): ChatState {
-    this.updateAssistant(identity, assistantTurnId, content, provenance, "complete");
+    this.updateAssistant(identity, id, content, provenance, "complete");
     this.publish(identity, { ...this.state, running: false, error: undefined });
-    return this.state;
-  }
-
-  private limit(
-    identity: number,
-    assistantTurnId: string,
-    provenance: ProvenanceRecord[],
-    message: string
-  ): ChatState {
-    if (diagnosticsEnabled(this.diagnostics, "detailed"))
-      this.diagnostics.emit({
-        area: "chat",
-        event: "limit_reached",
-        generation: identity,
-        message,
-      });
-    return this.finish(identity, assistantTurnId, message, provenance);
-  }
-
-  private preflightFailure(identity: number, code: string, message: string): ChatState {
-    this.publish(identity, { ...this.state, running: false, error: { code, message } });
     return this.state;
   }
 
@@ -556,13 +396,28 @@ export class ChatSession {
     );
   }
 
-  private cancelled(identity: number): ChatState {
-    if (!this.isCurrent(identity)) return this.state;
-    this.publish(identity, {
-      ...this.state,
-      running: false,
-      error: { code: "cancelled", message: "Chat turn cancelled." },
-    });
-    return this.state;
+  private currentProvenance(): ProvenanceRecord[] {
+    const turn = this.state.turns.at(-1);
+    return turn?.role === "assistant" ? [...turn.provenance] : [];
   }
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (
+        part &&
+        typeof part === "object" &&
+        "type" in part &&
+        part.type === "text" &&
+        "text" in part &&
+        typeof part.text === "string"
+      )
+        return part.text;
+      return "";
+    })
+    .join("");
 }

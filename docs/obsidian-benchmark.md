@@ -1,5 +1,7 @@
 # Obsidian benchmark
 
+> **Historical benchmark guide:** The former 3,000-note workflow and commands below describe an earlier implementation. They are not current V1 commands or performance claims. See the [current V1 implementation and evidence](langchain-sqlite-implementation.md).
+
 The benchmark uses one fixed, prepared corpus and the normal production Obsidian
 plugin runtime. It contains 3,000 notes of about 400 characters each. Do not use
 the superseded profile matrix or historical report as a current benchmark result.

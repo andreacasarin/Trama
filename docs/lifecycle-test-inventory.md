@@ -1,5 +1,7 @@
 # Lifecycle integration test inventory
 
+> **Historical test inventory:** This lists the former lifecycle suite. Its 17 cases and archived tests are not the active V1 test suite. See the [current implementation and verification notes](langchain-sqlite-implementation.md).
+
 Inventory of the 17 test cases in the plugin lifecycle, deferred lifecycle, and maintenance integration suites before cleanup. Each row records the behavior and the ordering or assertions that make it distinct, plus the retained or replacement owner.
 
 | Original scenario                                                              | Purpose and critical ordering/assertions                                                                                                                                                                                                                | Coverage decision                                                                                                                              |

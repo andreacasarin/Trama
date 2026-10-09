@@ -1,5 +1,6 @@
-import { MetadataCache, TFile, Vault, Workspace } from "obsidian";
-import { ReadonlyNote, ReadonlyVault, StructuredError, VaultLink } from "@/domain/contracts";
+import { MetadataCache, TFile, Vault } from "obsidian";
+import type { ReadonlyNote, ReadonlyVault, VaultLink } from "@/domain/vault";
+import { StructuredError } from "@/domain/errors";
 
 export interface ReadLimits {
   readonly maxLines: number;
@@ -18,22 +19,11 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     private readonly vault: Pick<Vault, "getFileByPath" | "read" | "configDir"> & {
       getMarkdownFiles?: () => readonly TFile[];
     },
-    private readonly workspace: Pick<Workspace, "getActiveFile">,
     private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">,
     limits: Partial<ReadLimits> = {}
   ) {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.hidden = [".trama", this.vault.configDir || ".obsidian"];
-  }
-
-  async currentNotePath(signal: AbortSignal): Promise<string | null> {
-    this.checkCancelled(signal);
-    return this.workspace.getActiveFile()?.path ?? null;
-  }
-
-  async currentNote(signal: AbortSignal): Promise<ReadonlyNote | null> {
-    const path = await this.currentNotePath(signal);
-    return path ? this.readNote(path, signal) : null;
   }
 
   async readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote> {
