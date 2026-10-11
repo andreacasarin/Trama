@@ -189,25 +189,16 @@ export class NoteSqliteDatabase {
 
     if (vector !== undefined) vectorBytes(vector);
 
-    const semanticCount =
+    const stored =
       vector && profile
-        ? Number(
-            rows(
-              this.db,
-              "SELECT COUNT(*) AS count FROM note_index WHERE embedding_profile=? AND centroid IS NOT NULL",
-              [profile]
-            )[0].count
-          )
-        : 0;
+        ? rows(
+            this.db,
+            "SELECT length(centroid) AS bytes FROM note_index WHERE embedding_profile=? AND centroid IS NOT NULL LIMIT 1",
+            [profile]
+          )[0]
+        : undefined;
     checkAbort(signal);
-    const semanticAvailable = semanticCount > 0;
-    const stored = semanticAvailable
-      ? rows(
-          this.db,
-          "SELECT length(centroid) AS bytes FROM note_index WHERE embedding_profile=? AND centroid IS NOT NULL LIMIT 1",
-          [profile]
-        )[0]
-      : undefined;
+    const semanticAvailable = stored !== undefined;
     if (stored && Number(stored.bytes) !== vector!.length * 4)
       throw new TypeError("Query vector dimensions do not match the profile");
     const needle = semanticAvailable ? vectorBytes(vector!) : null;

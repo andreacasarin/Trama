@@ -29,6 +29,16 @@ export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
 
 export type NoteReader = (path: string) => Promise<string | null>;
 
+interface PendingNote {
+  readonly uid: string;
+  readonly path: string;
+  readonly profile: string;
+  readonly markdown: string;
+  readonly chunks: DocumentInterface[];
+}
+
+const MAX_BATCH_CHUNKS = 512;
+
 export class SqliteNoteVectorStore extends VectorStore {
   private readonly profile: string;
   private readonly dimensions: number;
@@ -83,38 +93,86 @@ export class SqliteNoteVectorStore extends VectorStore {
     documents: DocumentInterface[],
     options: { signal?: AbortSignal; ids?: string[] } = {}
   ): Promise<string[]> {
-    if (documents.length !== 1) throw new TypeError("Exactly one note must be indexed per call");
-    const note = documents[0];
-    const path = this.notePath(note);
-    const uid = options.ids?.[0] ?? note.id ?? path;
-    const profile =
-      typeof note.metadata.embeddingProfile === "string"
-        ? note.metadata.embeddingProfile
-        : this.profile;
+    if (options.ids && options.ids.length !== documents.length)
+      throw new TypeError("Document UIDs must match document count");
     const signal = options.signal ?? this.runSignal;
-    if (!uid) throw new TypeError("A native document UID is required");
-    checkAbort(signal);
-
-    const split = await this.splitter.splitDocuments([
-      new Document({ pageContent: note.pageContent, metadata: { path } }),
-    ]);
-    const chunks = split.map(
-      (chunk, ordinal) =>
-        new Document({ pageContent: chunk.pageContent, metadata: { path, ordinal } })
-    );
-    const vectors: number[][] = [];
-    for (let offset = 0; offset < chunks.length; offset += 512) {
+    const pending: PendingNote[] = [];
+    const uids: string[] = [];
+    let pendingChunkCount = 0;
+    const flush = async () => {
+      if (pending.length === 0) return;
       checkAbort(signal);
-      const batch = await this.embeddings.embedDocuments(
-        chunks.slice(offset, offset + 512).map(({ pageContent }) => pageContent)
+      const chunks = pending.flatMap((note) => note.chunks);
+      const vectors = await this.embeddings.embedDocuments(
+        chunks.map(({ pageContent }) => pageContent)
       );
-      if (batch.length !== Math.min(512, chunks.length - offset))
+      if (vectors.length !== chunks.length)
         throw new TypeError("Embedding count did not match chunk count");
-      vectors.push(...batch);
+      checkAbort(signal);
+      let vectorOffset = 0;
+      for (const note of pending) {
+        const noteVectors = vectors.slice(vectorOffset, vectorOffset + note.chunks.length);
+        vectorOffset += note.chunks.length;
+        await this.writeNote(
+          note.uid,
+          note.path,
+          note.profile,
+          note.markdown,
+          noteVectors,
+          note.chunks,
+          signal
+        );
+      }
+      pending.length = 0;
+      pendingChunkCount = 0;
+    };
+
+    for (let index = 0; index < documents.length; index++) {
+      checkAbort(signal);
+      const note = documents[index];
+      const path = this.notePath(note);
+      const uid = options.ids?.[index] ?? note.id ?? path;
+      const profile =
+        typeof note.metadata.embeddingProfile === "string"
+          ? note.metadata.embeddingProfile
+          : this.profile;
+      if (!uid) throw new TypeError("A native document UID is required");
+      const split = await this.splitter.splitDocuments([
+        new Document({ pageContent: note.pageContent, metadata: { path } }),
+      ]);
+      const chunks = split.map(
+        (chunk, ordinal) =>
+          new Document({ pageContent: chunk.pageContent, metadata: { path, ordinal } })
+      );
+      uids.push(uid);
+
+      if (chunks.length === 0) {
+        await flush();
+        checkAbort(signal);
+        await this.writeNote(uid, path, profile, note.pageContent, [], [], signal);
+      } else if (chunks.length > MAX_BATCH_CHUNKS) {
+        await flush();
+        const vectors: number[][] = [];
+        for (let offset = 0; offset < chunks.length; offset += MAX_BATCH_CHUNKS) {
+          checkAbort(signal);
+          const batchChunks = chunks.slice(offset, offset + MAX_BATCH_CHUNKS);
+          const batch = await this.embeddings.embedDocuments(
+            batchChunks.map(({ pageContent }) => pageContent)
+          );
+          if (batch.length !== batchChunks.length)
+            throw new TypeError("Embedding count did not match chunk count");
+          vectors.push(...batch);
+        }
+        checkAbort(signal);
+        await this.writeNote(uid, path, profile, note.pageContent, vectors, chunks, signal);
+      } else {
+        if (pendingChunkCount + chunks.length > MAX_BATCH_CHUNKS) await flush();
+        pending.push({ uid, path, profile, markdown: note.pageContent, chunks });
+        pendingChunkCount += chunks.length;
+      }
     }
-    checkAbort(signal);
-    await this.writeNote(uid, path, profile, note.pageContent, vectors, chunks, signal);
-    return [uid];
+    await flush();
+    return uids;
   }
 
   async addVectors(

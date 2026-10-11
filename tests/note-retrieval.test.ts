@@ -92,6 +92,14 @@ describe("SQLite note retrieval", () => {
       expect(result.documents[0].metadata.path).toBe("a.md");
       expect(result.documents[0].pageContent).toContain("alpha apple");
       expect(result.status).toEqual({ mode: "hybrid", degraded: false });
+      await expect(
+        f.database.call("noteStoreHybrid", {
+          query: "alpha",
+          vector: [1, 0, 0],
+          profile: f.store.embeddingProfile,
+          k: 5,
+        })
+      ).rejects.toThrow("Query vector dimensions do not match the profile");
       const lexical = await f.database.call("noteStoreHybrid", { query: "alpha +++", k: 5 });
       expect(lexical).toMatchObject({ mode: "lexical", hits: [{ path: "a.md" }] });
       expect(JSON.stringify(lexical)).not.toContain("vector");

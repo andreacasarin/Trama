@@ -4,6 +4,8 @@ import { StructuredError } from "@/domain/errors";
 import { SqliteNoteRecordManager } from "./SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "./SqliteNoteVectorStore";
 
+const INDEX_BATCH_SIZE = 100;
+
 export interface ManualIndexNote {
   readonly path: string;
   readonly content: string;
@@ -63,20 +65,25 @@ export class ManualIndex {
     let numUpdated = 0;
     let numSkipped = 0;
 
-    for (const path of paths) {
-      checkAbort(signal);
-      const note = await this.vault.readMarkdown(path, signal);
-      if (note.path !== path) throw new Error("Vault returned a note for a different path");
-      const result = await index({
-        docsSource: [
+    for (let offset = 0; offset < paths.length; offset += INDEX_BATCH_SIZE) {
+      const docs: Document[] = [];
+      for (const path of paths.slice(offset, offset + INDEX_BATCH_SIZE)) {
+        checkAbort(signal);
+        const note = await this.vault.readMarkdown(path, signal);
+        checkAbort(signal);
+        if (note.path !== path) throw new Error("Vault returned a note for a different path");
+        docs.push(
           new Document({
             pageContent: note.content,
             metadata: { path, embeddingProfile: this.store.embeddingProfile },
-          }),
-        ],
+          })
+        );
+      }
+      const result = await index({
+        docsSource: docs,
         recordManager: records,
         vectorStore: store,
-        options: { batchSize: 1, sourceIdKey: "path" },
+        options: { batchSize: INDEX_BATCH_SIZE, sourceIdKey: "path" },
       });
       numAdded += result.numAdded;
       numUpdated += result.numUpdated;

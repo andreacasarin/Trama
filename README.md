@@ -11,12 +11,14 @@ Trama uses LangChain components for embeddings, Markdown splitting, agents, and 
 3. Run **Update index** to prepare the local index. Run **Rebuild index** when you want to replace it.
 4. Use the available chat and search actions. Search results link to notes in the vault.
 
-Index updates are manual. Trama indexes notes one at a time and runs full cleanup only after every input succeeds, including when the vault is empty. If indexing fails, the run stops and cleanup is skipped, leaving existing lexical data available. Changes made to notes during an update are picked up on the next manual update. Cancellation rolls back the active note transaction and keeps earlier completed commits. Related-note results persist locally across restarts and refresh after an index update when the active note is opened; this does not call a provider.
+Index updates are manual. Trama sends notes to LangChain in bounded batches of up to 100; each note is prepared before its atomic commit, and embeddings are flushed in bounded groups of up to 512 chunks. Full cleanup runs only after every input succeeds, including when the vault is empty. If indexing fails, the run stops and cleanup is skipped, leaving existing lexical data available. Changes made to notes during an update are picked up on the next manual update. Cancellation rolls back the active note transaction and keeps earlier completed commits. Related-note results persist locally across restarts and refresh after an index update when the active note is opened; this does not call a provider.
 
 The agent uses session-only conversation history and turn attachments. Tools are read-only and return note links. Provider calls disable response storage. When semantic retrieval cannot run, search falls back to lexical results and reports that it is degraded.
 
 ## Development
 
 The packaged runtime consists of `main.js`, `sqlite-worker.mjs`, `sqlite3.mjs`, `sqlite3.wasm`, `manifest.json`, and `styles.css`. The repository includes a version hook and commands to build and install the plugin into the demo vault. The demo installer targets that vault only.
+
+Run `npm run benchmark:compare -- --baseline-tar path/to/baseline.tar --current-tar path/to/current.tar --output-dir path/to/report` for a paired before/after measurement. See [the LangChain performance assessment](docs/langchain-performance-assessment.md) for the method, findings, and limitations.
 
 The current implementation reference is [docs/langchain-sqlite-implementation.md](docs/langchain-sqlite-implementation.md). Historical design briefs, benchmark reports, and test inventories are labeled in their respective documents; they do not define current V1 behavior or performance claims.

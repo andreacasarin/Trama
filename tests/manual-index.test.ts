@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
+import { MarkdownTextSplitter } from "@langchain/textsplitters";
 import { ManualIndex, type ManualIndexNote, type ManualIndexVault } from "@/index/ManualIndex";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
@@ -11,11 +12,13 @@ import { loadTestSqlite } from "./note-sqlite-test-client";
 class TestEmbeddings implements EmbeddingsInterface<number[]> {
   calls = 0;
   fail = false;
+  batches: string[][] = [];
   async embedDocuments(texts: string[], signal?: AbortSignal): Promise<number[][]> {
     this.calls++;
+    this.batches.push([...texts]);
     if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
     if (this.fail) throw new Error("provider offline");
-    return texts.map(() => [1, 0]);
+    return texts.map(embeddingVector);
   }
   async embedQuery(): Promise<number[]> {
     return [1, 0];
@@ -142,6 +145,7 @@ describe("native LangChain note indexing", () => {
     try {
       const first = await manual.update();
       expect(first.numAdded).toBe(2);
+      expect(embeddings.calls).toBe(1);
       const calls = embeddings.calls;
       expect((await manual.update()).numSkipped).toBe(2);
       expect(embeddings.calls).toBe(calls);
@@ -162,6 +166,128 @@ describe("native LangChain note indexing", () => {
         await db.selectValue("SELECT group_path FROM note_records WHERE uid=?", [currentUid])
       ).toBe("b.md");
       expect(await records.exists([currentUid])).toEqual([true]);
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("embeds chunks across notes together and writes each vector to its source UID", async () => {
+    const notes = new Map([
+      ["alpha.md", "# alpha\n\nalpha uniquealpha searchable body"],
+      ["beta.md", "# beta\n\nbeta uniquebeta searchable body"],
+      ["gamma.md", "# gamma\n\ngamma uniquegamma searchable body"],
+    ]);
+    const { db, client, embeddings, manual } = await setup(notes);
+    try {
+      expect((await manual.update()).numAdded).toBe(3);
+      const splitter = new MarkdownTextSplitter();
+      const expected: string[] = [];
+      for (const [, markdown] of [...notes].sort(([left], [right]) => left.localeCompare(right)))
+        expected.push(...(await splitter.splitText(markdown)));
+      expect(embeddings.batches).toEqual([expected]);
+
+      for (const [path, markdown] of notes) {
+        const noteId = Number(
+          db.selectValue("SELECT note_id FROM note_index WHERE path=?", [path])
+        );
+        const uid = String(
+          db.selectValue("SELECT current_uid FROM note_index WHERE path=?", [path])
+        );
+        expect(db.selectValue("SELECT group_path FROM note_records WHERE uid=?", [uid])).toBe(path);
+        const chunks = await splitter.splitText(markdown);
+        expect(db.selectValue("SELECT count(*) FROM note_vectors WHERE note_id=?", [noteId])).toBe(
+          chunks.length
+        );
+        for (let ordinal = 0; ordinal < chunks.length; ordinal++)
+          expect(
+            db.selectValue("SELECT hex(vector) FROM note_vectors WHERE note_id=? AND ordinal=?", [
+              noteId,
+              ordinal,
+            ])
+          ).toBe(vectorHex(embeddingVector(chunks[ordinal])));
+        const token = path
+          .split(".")[0]
+          .replace("alpha", "uniquealpha")
+          .replace("beta", "uniquebeta")
+          .replace("gamma", "uniquegamma");
+        expect(
+          db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH ? AND rowid=?", [
+            token,
+            noteId,
+          ])
+        ).toBe(1);
+      }
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("flushes near the 512-chunk cap and slices an oversized note across provider calls", async () => {
+    const notes = new Map([
+      ["alpha.md", `# alphamarker\n\n${"w ".repeat(204_000)}`],
+      ["beta.md", `# betamarker\n\n${"x ".repeat(500)}`],
+      ["gamma.md", `# gammamarker\n\n${"y ".repeat(204_800)}`],
+    ]);
+    const { db, client, embeddings, manual } = await setup(notes);
+    try {
+      const splitter = new MarkdownTextSplitter();
+      const chunksByPath = new Map(
+        await Promise.all(
+          [...notes].map(
+            async ([path, markdown]) => [path, await splitter.splitText(markdown)] as const
+          )
+        )
+      );
+      expect([...chunksByPath.values()].map((chunks) => chunks.length)).toEqual([511, 3, 513]);
+
+      expect((await manual.update()).numAdded).toBe(3);
+      expect(embeddings.batches.map((batch) => batch.length)).toEqual([511, 3, 512, 1]);
+      for (const [path, chunks] of chunksByPath) {
+        const noteId = Number(
+          db.selectValue("SELECT note_id FROM note_index WHERE path=?", [path])
+        );
+        const uid = String(
+          db.selectValue("SELECT current_uid FROM note_index WHERE path=?", [path])
+        );
+        expect(db.selectValue("SELECT group_path FROM note_records WHERE uid=?", [uid])).toBe(path);
+        expect(db.selectValue("SELECT count(*) FROM note_vectors WHERE note_id=?", [noteId])).toBe(
+          chunks.length
+        );
+        for (const ordinal of [0, chunks.length - 1])
+          expect(
+            db.selectValue("SELECT hex(vector) FROM note_vectors WHERE note_id=? AND ordinal=?", [
+              noteId,
+              ordinal,
+            ])
+          ).toBe(vectorHex(embeddingVector(chunks[ordinal])));
+        expect(
+          db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH ? AND rowid=?", [
+            `${path.split(".")[0]}marker`,
+            noteId,
+          ])
+        ).toBe(1);
+      }
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("flushes native indexing at the 100-note boundary", async () => {
+    const notes = new Map(
+      Array.from({ length: 101 }, (_, index) => {
+        const path = `note-${String(index).padStart(3, "0")}.md`;
+        return [path, `# note ${index}\n\nshort single-chunk content ${index}`] as const;
+      })
+    );
+    const { db, client, embeddings, manual } = await setup(notes);
+    try {
+      expect((await manual.update()).numAdded).toBe(101);
+      expect(embeddings.batches.map((batch) => batch.length)).toEqual([100, 1]);
+      expect(db.selectValue("SELECT count(*) FROM note_index")).toBe(101);
+      expect(db.selectValue("SELECT count(*) FROM note_records")).toBe(101);
     } finally {
       await client.close();
       db.close();
@@ -304,16 +430,13 @@ describe("native LangChain note indexing", () => {
   });
 
   it("keeps earlier committed notes when a later note is cancelled and skips final cleanup", async () => {
-    const notes = new Map([
-      ["a.md", "# a\n\ncommitted first note"],
-      ["b.md", "# b\n\nhold the second note"],
-    ]);
+    const notes = new Map([["stale.md", "# stale\n\nretain until cleanup"]]);
     const embeddings = new TestEmbeddings();
     let entered!: () => void;
     const blocked = new Promise<void>((resolve) => (entered = resolve));
     embeddings.embedDocuments = async (texts, signal) => {
       embeddings.calls++;
-      if (texts.some((text) => text.includes("hold the second"))) {
+      if (texts.some((text) => text.includes("hold the second batch"))) {
         entered();
         return await new Promise<number[][]>((_resolve, reject) =>
           signal?.addEventListener(
@@ -329,13 +452,20 @@ describe("native LangChain note indexing", () => {
     };
     const { db, client, manual } = await setup(notes, embeddings);
     try {
+      await manual.update();
+      notes.clear();
+      for (let index = 0; index < 100; index++) {
+        const path = `note-${String(index).padStart(3, "0")}.md`;
+        notes.set(path, `# note ${index}\n\ncommitted in first batch ${index}`);
+      }
+      notes.set("z.md", "# z\n\nhold the second batch");
       const run = manual.update();
       await blocked;
       manual.cancel();
       await expect(run).rejects.toMatchObject({ name: "AbortError" });
-      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
-      expect(await db.selectValue("SELECT path FROM note_index")).toBe("a.md");
-      expect(await db.selectValue("SELECT count(*) FROM note_records")).toBe(1);
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(101);
+      expect(await db.selectValue("SELECT count(*) FROM note_records")).toBe(101);
+      expect(await db.selectValue("SELECT count(*) FROM note_index WHERE path='stale.md'")).toBe(1);
     } finally {
       await client.close();
       db.close();
@@ -376,3 +506,19 @@ describe("native LangChain note indexing", () => {
     }
   });
 });
+
+function embeddingVector(text: string): number[] {
+  let hash = 0;
+  for (const character of text) hash = (hash * 31 + character.charCodeAt(0)) % 10_000;
+  return [hash + 1, text.length + 1];
+}
+
+function vectorHex(vector: number[]): string {
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+  return Array.from(
+    new Uint8Array(Float32Array.from(vector.map((value) => value / norm)).buffer),
+    (value) => value.toString(16).padStart(2, "0")
+  )
+    .join("")
+    .toUpperCase();
+}
