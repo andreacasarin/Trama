@@ -1,5 +1,11 @@
-import { createAgent, modelCallLimitMiddleware, toolCallLimitMiddleware } from "langchain";
-import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
+import {
+  createAgent,
+  createMiddleware,
+  modelCallLimitMiddleware,
+  toolCallLimitMiddleware,
+  type AnyAgentMiddleware,
+} from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ProvenanceRecord, ReadonlyNote, ReadonlyVault } from "@/domain/vault";
@@ -188,6 +194,39 @@ export class ChatSession {
         running: true,
       });
 
+      const middleware: AnyAgentMiddleware[] = [];
+      if (references) {
+        middleware.push(
+          createMiddleware({
+            name: "turn_attachments",
+            wrapModelCall: async (request, handler) => {
+              const messages = request.messages.slice();
+              const humanIndex = messages.findLastIndex(
+                (message) => message instanceof HumanMessage
+              );
+              const current = messages[humanIndex];
+              if (
+                humanIndex >= 0 &&
+                current instanceof HumanMessage &&
+                typeof current.content === "string"
+              ) {
+                messages[humanIndex] = new HumanMessage({
+                  content: `${current.content}\n\n${references}`,
+                  id: current.id,
+                  name: current.name,
+                  additional_kwargs: current.additional_kwargs,
+                  response_metadata: current.response_metadata,
+                });
+              }
+              return handler({ ...request, messages });
+            },
+          })
+        );
+      }
+      middleware.push(
+        modelCallLimitMiddleware({ runLimit: 8, exitBehavior: "error" }),
+        toolCallLimitMiddleware({ runLimit: CHAT_LIMITS.maxToolCalls, exitBehavior: "error" })
+      );
       const agent = createAgent({
         model: this.model,
         tools: this.createTools((_name, _call, result, _durationMs) => {
@@ -195,63 +234,30 @@ export class ChatSession {
           provenance.push(...result.provenance);
           this.updateAssistant(identity, turnId, this.assistantContent(), provenance, "working");
         }),
-        middleware: [
-          modelCallLimitMiddleware({ runLimit: 8, exitBehavior: "error" }),
-          toolCallLimitMiddleware({ runLimit: CHAT_LIMITS.maxToolCalls, exitBehavior: "error" }),
-        ],
+        middleware,
       });
+      const run = await agent.streamEvents(
+        { messages: this.history },
+        { version: "v3", signal: controller.signal }
+      );
+      const output = run.output;
+      void output.catch(() => undefined);
       let streamedText = "";
-      let latestMessages: BaseMessage[] | undefined;
-      const turnMessages = [...this.history];
-      turnMessages[turnMessages.length - 1] = new HumanMessage(
-        references ? `${input.content}\n\n${references}` : input.content
-      );
-      const stream = await agent.stream(
-        { messages: turnMessages },
-        { signal: controller.signal, streamMode: ["messages", "values"] }
-      );
-      for await (const event of stream as AsyncIterable<any>) {
+      for await (const message of run.messages) {
         if (!this.isCurrent(identity)) return this.state;
-        const [mode, data] = event as [string, unknown];
-        if (mode === "messages") {
-          const [message] = data as [BaseMessage, Record<string, unknown>];
-          const isAssistantText = message instanceof AIMessage || message instanceof AIMessageChunk;
-          const text = isAssistantText ? messageText(message.content) : "";
-          if (text) {
-            streamedText += text;
-            this.updateAssistant(identity, turnId, streamedText, provenance, "working");
-          }
-        } else if (
-          mode === "values" &&
-          Array.isArray((data as { messages?: unknown[] }).messages)
-        ) {
-          latestMessages = (data as { messages: BaseMessage[] }).messages;
+        streamedText = "";
+        for await (const text of message.text) {
+          if (!this.isCurrent(identity)) return this.state;
+          streamedText += text;
+          this.updateAssistant(identity, turnId, streamedText, provenance, "working");
         }
       }
+      const latestMessages = (await output).messages;
       if (latestMessages) {
-        const persistedMessages: BaseMessage[] = [];
-        for (const message of latestMessages) {
-          const value = message as BaseMessage & { role?: string; type?: string };
-          const hasAttachmentContext = String(value.content).includes(
-            "BEGIN UNTRUSTED ATTACHED NOTE:"
-          );
-          const isHuman =
-            message instanceof HumanMessage || value.type === "human" || value.role === "user";
-          const persisted =
-            isHuman && hasAttachmentContext ? new HumanMessage(input.content) : message;
-          const previous = persistedMessages.at(-1);
-          if (
-            persisted instanceof HumanMessage &&
-            previous instanceof HumanMessage &&
-            persisted.content === previous.content
-          )
-            continue;
-          persistedMessages.push(persisted);
-        }
-        this.history.splice(0, this.history.length, ...persistedMessages);
+        this.history.splice(0, this.history.length, ...latestMessages);
       }
       const final = [...this.history].reverse().find((message) => message instanceof AIMessage);
-      const content = typeof final?.content === "string" ? final.content : streamedText;
+      const content = final?.text || streamedText;
       return this.finish(identity, turnId, content, provenance);
     } catch (error) {
       if (!this.isCurrent(identity)) return this.state;
@@ -400,24 +406,4 @@ export class ChatSession {
     const turn = this.state.turns.at(-1);
     return turn?.role === "assistant" ? [...turn.provenance] : [];
   }
-}
-
-function messageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (
-        part &&
-        typeof part === "object" &&
-        "type" in part &&
-        part.type === "text" &&
-        "text" in part &&
-        typeof part.text === "string"
-      )
-        return part.text;
-      return "";
-    })
-    .join("");
 }

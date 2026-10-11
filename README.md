@@ -11,7 +11,7 @@ Trama uses LangChain components for embeddings, Markdown splitting, agents, and 
 3. Run **Update index** to prepare the local index. Run **Rebuild index** when you want to replace it.
 4. Use the available chat and search actions. Search results link to notes in the vault.
 
-Index updates are manual. A note's content is prepared before its index changes are committed. If a note changes while preparation is running, Trama checks it again and repeats preparation as needed. Cancellation rolls back the active note transaction and keeps earlier completed commits. If embedding fails, the latest lexical index remains available, semantic data for the affected note is cleared, and the next manual update can retry. Related-note results persist locally across restarts and refresh after an index update when the active note is opened; this does not call a provider.
+Index updates are manual. Trama indexes notes one at a time and runs full cleanup only after every input succeeds, including when the vault is empty. If indexing fails, the run stops and cleanup is skipped, leaving existing lexical data available. Changes made to notes during an update are picked up on the next manual update. Cancellation rolls back the active note transaction and keeps earlier completed commits. Related-note results persist locally across restarts and refresh after an index update when the active note is opened; this does not call a provider.
 
 The agent uses session-only conversation history and turn attachments. Tools are read-only and return note links. Provider calls disable response storage. When semantic retrieval cannot run, search falls back to lexical results and reports that it is degraded.
 

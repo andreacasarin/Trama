@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { ManualIndex, type ManualIndexVault } from "@/index/ManualIndex";
+import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
@@ -81,10 +82,13 @@ describe("V1 same-corpus indexing and retrieval workload", () => {
       const vault: ManualIndexVault = {
         listMarkdownPaths: async () => [...notes.keys()].sort(),
         readMarkdown: async (path) => ({ path, content: notes.get(path)! }),
-        isMarkdownAvailable: async (path) => notes.has(path),
       };
       const started = performance.now();
-      const indexed = await new ManualIndex(vault, store).update();
+      const indexed = await new ManualIndex(
+        vault,
+        store,
+        new SqliteNoteRecordManager(client.call)
+      ).update();
       const indexMs = performance.now() - started;
       expect(indexed.visited).toBe(24);
       expect(indexed.deleted).toBe(0);

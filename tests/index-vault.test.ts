@@ -69,7 +69,7 @@ describe("ObsidianIndexVault", () => {
     ]);
   });
 
-  it("reports whether a Markdown path is still available after a move", async () => {
+  it("rejects a listed path that has moved before its note is read", async () => {
     const file = { path: "new.md" } as any;
     const vault = new ObsidianIndexVault(
       {
@@ -80,11 +80,11 @@ describe("ObsidianIndexVault", () => {
       () => true
     );
 
-    await expect(vault.isMarkdownAvailable("old.md", new AbortController().signal)).resolves.toBe(
-      false
+    await expect(vault.readMarkdown("old.md", new AbortController().signal)).rejects.toThrow(
+      /unavailable/
     );
-    await expect(vault.isMarkdownAvailable("new.md", new AbortController().signal)).resolves.toBe(
-      true
+    await expect(vault.readMarkdown("new.md", new AbortController().signal)).resolves.toMatchObject(
+      { path: "new.md", content: "content" }
     );
   });
 });

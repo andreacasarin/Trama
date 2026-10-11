@@ -23,8 +23,4 @@ export class ObsidianIndexVault implements ManualIndexVault {
     if (!file || !this.isEligible(path)) throw new Error(`Markdown note is unavailable: ${path}`);
     return { path, content: await this.vault.read(file) };
   }
-  async isMarkdownAvailable(path: string, signal: AbortSignal): Promise<boolean> {
-    if (signal.aborted) throw new DOMException("Indexing cancelled", "AbortError");
-    return this.isEligible(path) && this.vault.getFileByPath(path) !== null;
-  }
 }

@@ -30,7 +30,12 @@ describe("Voce native agent session", () => {
     }
     const model = new RecordingModel({ toolCalls: [[]] });
     const session = new ChatSession(model, tools, {
-      readNote: async (path) => ({ path, content: "private note body", startLine: 4, endLine: 7 }),
+      readNote: async (path) => ({
+        path,
+        content: path === "source.md" ? "first private note body" : "second private note body",
+        startLine: 4,
+        endLine: 7,
+      }),
     });
     const first = await session.send({ content: "first question", attachmentPaths: ["source.md"] });
     expect(first.turns[0]).toMatchObject({
@@ -40,11 +45,12 @@ describe("Voce native agent session", () => {
       provenance: [{ path: "source.md", startLine: 4, endLine: 7 }],
     });
 
-    await session.send({ content: "second question", attachmentPaths: [] });
-    expect(model.inputs[0].join("\n")).toContain("private note body");
+    await session.send({ content: "second question", attachmentPaths: ["new-source.md"] });
+    expect(model.inputs[0].join("\n")).toContain("first private note body");
     const secondTurn = model.inputs.at(-1)?.join("\n") ?? "";
     expect(secondTurn).toContain("first question");
-    expect(secondTurn).not.toContain("private note body");
+    expect(secondTurn).toContain("second private note body");
+    expect(secondTurn).not.toContain("first private note body");
 
     session.reset();
     expect(session.getState().turns).toEqual([]);
@@ -52,13 +58,81 @@ describe("Voce native agent session", () => {
     expect(model.inputs.at(-1)).toEqual(["fresh question"]);
   });
 
-  it("projects a cancelled stream as stopped and rejects concurrent sends", async () => {
-    let release!: () => void;
-    class PendingModel extends FakeToolCallingModel {
+  it("does not carry attachments from a failed turn into the next model request", async () => {
+    class FailThenAnswerModel extends FakeToolCallingModel {
+      readonly inputs: string[][] = [];
+      private calls = 0;
       override bindTools() {
         return this;
       }
-      override _generate(_messages: BaseMessage[]) {
+      override _generate(messages: BaseMessage[]) {
+        this.inputs.push(messages.map((message) => String(message.content)));
+        if (this.calls++ === 0) throw new Error("failed attached turn");
+        return Promise.resolve({
+          generations: [{ text: "fresh answer", message: new AIMessage("fresh answer") }],
+          llmOutput: {},
+        });
+      }
+    }
+    const model = new FailThenAnswerModel({ toolCalls: [[], []] });
+    const session = new ChatSession(model, tools, {
+      readNote: async (path) => ({ path, content: "failed turn private body" }),
+    });
+
+    const failed = await session.send({ content: "fail", attachmentPaths: ["private.md"] });
+    expect(failed.turns.at(-1)).toMatchObject({ status: "failed" });
+    const next = await session.send({ content: "continue", attachmentPaths: [] });
+
+    expect(next.turns.at(-1)).toMatchObject({ status: "complete", content: "fresh answer" });
+    expect(model.inputs[0].join("\n")).toContain("failed turn private body");
+    expect(model.inputs[1].join("\n")).toContain("fail");
+    expect(model.inputs[1].join("\n")).not.toContain("failed turn private body");
+  });
+
+  it("still attaches notes when the user's prompt contains the attachment marker", async () => {
+    class RecordingModel extends FakeToolCallingModel {
+      readonly inputs: string[][] = [];
+      override bindTools() {
+        return this;
+      }
+      override _generate(messages: BaseMessage[]) {
+        this.inputs.push(messages.map((message) => String(message.content)));
+        return Promise.resolve({
+          generations: [{ text: "answer", message: new AIMessage("answer") }],
+          llmOutput: {},
+        });
+      }
+    }
+    const model = new RecordingModel({ toolCalls: [[]] });
+    const session = new ChatSession(model, tools, {
+      readNote: async (path) => ({ path, content: "attached private body" }),
+    });
+
+    await session.send({
+      content: "Please include BEGIN UNTRUSTED ATTACHED NOTE: as literal text.",
+      attachmentPaths: ["source.md"],
+    });
+
+    const modelInput = model.inputs[0].join("\n");
+    expect(modelInput).toContain("Please include BEGIN UNTRUSTED ATTACHED NOTE: as literal text.");
+    expect(modelInput).toContain("attached private body");
+  });
+
+  it("projects a cancelled stream as stopped and rejects concurrent sends", async () => {
+    let release!: () => void;
+    class PendingModel extends FakeToolCallingModel {
+      readonly inputs: string[][] = [];
+      private calls = 0;
+      override bindTools() {
+        return this;
+      }
+      override _generate(messages: BaseMessage[]) {
+        this.inputs.push(messages.map((message) => String(message.content)));
+        if (this.calls++ > 0)
+          return Promise.resolve({
+            generations: [{ text: "fresh answer", message: new AIMessage("fresh answer") }],
+            llmOutput: {},
+          });
         return new Promise<Awaited<ReturnType<FakeToolCallingModel["_generate"]>>>((resolve) => {
           release = () =>
             resolve({
@@ -67,11 +141,12 @@ describe("Voce native agent session", () => {
         });
       }
     }
-    const session = new ChatSession(new PendingModel({ toolCalls: [[]] }), tools, {
-      readNote: async (path) => ({ path, content: "" }),
+    const model = new PendingModel({ toolCalls: [[], []] });
+    const session = new ChatSession(model, tools, {
+      readNote: async (path) => ({ path, content: "cancelled private body" }),
     });
-    const pending = session.send({ content: "cancel me", attachmentPaths: [] });
-    await Promise.resolve();
+    const pending = session.send({ content: "cancel me", attachmentPaths: ["cancel.md"] });
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
     await expect(session.send({ content: "busy", attachmentPaths: [] })).rejects.toThrow(
       "already running"
     );
@@ -82,6 +157,10 @@ describe("Voce native agent session", () => {
     expect(state.turns.some((turn) => turn.role === "assistant" && turn.status === "stopped")).toBe(
       true
     );
+    await session.send({ content: "after cancel", attachmentPaths: [] });
+    expect(model.inputs[0].join("\n")).toContain("cancelled private body");
+    expect(model.inputs[1].join("\n")).toContain("cancel me");
+    expect(model.inputs[1].join("\n")).not.toContain("cancelled private body");
   });
 
   it("executes a real native tool call and projects its source into the answer", async () => {
@@ -233,6 +312,12 @@ describe("Voce native agent session", () => {
           response: { id: "resp_tool", model: "local-chat", status: "in_progress" },
         },
         {
+          type: "response.output_text.delta",
+          output_index: 0,
+          content_index: 0,
+          delta: "intermediate model text",
+        },
+        {
           type: "response.output_item.added",
           output_index: 0,
           item: {
@@ -289,6 +374,13 @@ describe("Voce native agent session", () => {
           response: { id: "resp_answer", model: "local-chat", status: "in_progress" },
         },
         {
+          type: "response.reasoning_summary_text.delta",
+          item_id: "reasoning_1",
+          output_index: 0,
+          summary_index: 0,
+          delta: "PRIVATE_REASONING",
+        },
+        {
           type: "response.output_text.delta",
           output_index: 0,
           content_index: 0,
@@ -302,6 +394,11 @@ describe("Voce native agent session", () => {
             status: "completed",
             model: "local-chat",
             output: [
+              {
+                id: "reasoning_1",
+                type: "reasoning",
+                summary: [{ type: "summary_text", text: "PRIVATE_REASONING" }],
+              },
               {
                 id: "msg_answer",
                 type: "message",
@@ -333,7 +430,8 @@ describe("Voce native agent session", () => {
     };
     const readNote = vi.fn(async (path: string) => ({
       path,
-      content: "PRIVATE_READ_ONLY_PAYLOAD",
+      content:
+        path === "Attached.md" ? "ATTACHMENT_ONLY_PRIVATE_PAYLOAD" : "PRIVATE_READ_ONLY_PAYLOAD",
     }));
     const vault = {
       readNote,
@@ -356,10 +454,27 @@ describe("Voce native agent session", () => {
       vault
     );
 
-    const state = await session.send({ content: "Read the private note", attachmentPaths: [] });
+    const state = await session.send({
+      content: "Read the private note",
+      attachmentPaths: ["Attached.md"],
+    });
 
     expect(readNote).toHaveBeenCalledWith("Private.md", expect.any(AbortSignal));
+    expect(readNote).toHaveBeenCalledWith("Attached.md", expect.any(AbortSignal));
     expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      const userMessages = request.input.filter(
+        (item: Record<string, unknown>) => item.role === "user"
+      );
+      expect(JSON.stringify(userMessages)).toContain("ATTACHMENT_ONLY_PRIVATE_PAYLOAD");
+    }
+    expect(
+      JSON.stringify(
+        requests[1].input.filter(
+          (item: Record<string, unknown>) => item.type === "function_call_output"
+        )
+      )
+    ).not.toContain("ATTACHMENT_ONLY_PRIVATE_PAYLOAD");
     expect(requests[0]).toMatchObject({ store: false, text: { format: { type: "text" } } });
     expect(requests[0].tools).toHaveLength(4);
     expect(requests[0].tools).toEqual(
@@ -380,5 +495,7 @@ describe("Voce native agent session", () => {
       content: "The private note is available.",
     });
     expect(JSON.stringify(state.turns)).not.toContain("PRIVATE_READ_ONLY_PAYLOAD");
+    expect(JSON.stringify(state.turns)).not.toContain("PRIVATE_REASONING");
+    expect(state.turns.at(-1)?.content).not.toContain("intermediate model text");
   });
 });

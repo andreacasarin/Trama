@@ -14,13 +14,6 @@ export interface SqliteConnection {
   close(): void;
 }
 
-export interface NoteStoreEntry {
-  readonly hash: string;
-  readonly profile: string | null;
-  readonly chunkCount: number;
-  readonly vectorCount: number;
-}
-
 export interface NoteStoreHit {
   readonly path: string;
   readonly score: number;
@@ -41,17 +34,29 @@ export interface NoteStoreRelatedResult {
 }
 
 export interface NoteStoreRpc {
-  noteStoreGet: { readonly path: string };
   noteStoreReplace: {
+    readonly uid: string;
     readonly path: string;
-    readonly hash: string;
     readonly profile: string | null;
     readonly markdown: string;
     readonly vectors: readonly NoteVector[];
   };
-  noteStoreDelete: { readonly paths: readonly string[] };
-  noteStoreListPaths: { readonly afterPath?: string; readonly limit: number };
+  noteStoreDelete: { readonly uids: readonly string[] };
   noteStoreReset: Record<string, never>;
+  recordManagerGetTime: Record<string, never>;
+  recordManagerUpdate: {
+    readonly keys: readonly string[];
+    readonly groupIds?: readonly (string | null)[];
+    readonly timeAtLeast?: number;
+  };
+  recordManagerExists: { readonly keys: readonly string[] };
+  recordManagerListKeys: {
+    readonly before?: number;
+    readonly after?: number;
+    readonly groupIds?: readonly (string | null)[];
+    readonly limit: number;
+  };
+  recordManagerDeleteKeys: { readonly keys: readonly string[] };
   noteStoreSemantic: {
     readonly vector: NoteVector;
     readonly profile: string;

@@ -77,8 +77,8 @@ class QueuedWorkerHarness implements NoteStoreWorkerLike {
 const namespaceA = "a".repeat(64);
 const namespaceB = "b".repeat(64);
 const entry = (path: string, markdown: string) => ({
+  uid: path,
   path,
-  hash: "1".repeat(64),
   profile: null,
   markdown,
   vectors: [],
@@ -127,7 +127,7 @@ describe("SQLite note worker transport", () => {
         return { database: new NoteSqliteDatabase(db), close: () => db.close() };
       });
     const uninitialized = createWorker();
-    uninitialized.postMessage({ id: 70, method: "noteStoreGet", payload: { path: "a.md" } });
+    uninitialized.postMessage({ id: 70, method: "noteStoreHybrid", payload: { query: "a", k: 1 } });
     expect((await uninitialized.response(70)).error.message).toMatch(/not initialized/);
     expect(opened).toEqual([]);
 
@@ -140,32 +140,25 @@ describe("SQLite note worker transport", () => {
       second.call("noteStoreReplace", entry("beta.md", "# beta\n\nbeta note")),
     ]);
     expect(opened).toEqual([namespaceA, namespaceB]);
-    expect(await first.call("noteStoreGet", { path: "alpha.md" })).toMatchObject({
-      hash: "1".repeat(64),
-    });
-    expect(await first.call("noteStoreGet", { path: "beta.md" })).toBeNull();
-    expect(await second.call("noteStoreGet", { path: "alpha.md" })).toBeNull();
     expect(await first.call("noteStoreHybrid", { query: "alpha", k: 10 })).toMatchObject({
       hits: [{ path: "alpha.md" }],
     });
     expect(await second.call("noteStoreHybrid", { query: "alpha", k: 10 })).toMatchObject({
       hits: [],
     });
-    expect(await second.call("noteStoreGet", { path: "beta.md" })).toMatchObject({
-      hash: "1".repeat(64),
+    expect(await second.call("noteStoreHybrid", { query: "beta", k: 10 })).toMatchObject({
+      hits: [{ path: "beta.md" }],
     });
 
     firstWorker.postMessage({ id: 71, method: "init", payload: { namespace: namespaceB } });
     expect((await firstWorker.response(71)).error.message).toMatch(/cannot change vault namespace/);
     await first.call("noteStoreReset", {});
-    expect(await first.call("noteStoreGet", { path: "alpha.md" })).toBeNull();
     expect(await first.call("noteStoreHybrid", { query: "alpha", k: 10 })).toMatchObject({
       hits: [],
     });
     expect(await second.call("noteStoreHybrid", { query: "beta", k: 10 })).toMatchObject({
       hits: [{ path: "beta.md" }],
     });
-    expect(await second.call("noteStoreGet", { path: "beta.md" })).not.toBeNull();
     const firstClose = first.close();
     expect(first.close()).toBe(firstClose);
     await Promise.all([firstClose, second.close()]);
@@ -214,8 +207,8 @@ describe("SQLite note worker transport", () => {
     const replacement = client.call(
       "noteStoreReplace",
       {
+        uid: "note-v2",
         path: "note.md",
-        hash: "2".repeat(64),
         profile: "local-model",
         markdown,
         vectors: chunks.map(() => [1, 0]),
@@ -223,14 +216,10 @@ describe("SQLite note worker transport", () => {
       controller.signal
     );
     await firstInsertSeen;
-    const queuedLookup = client.call("noteStoreGet", { path: "note.md" });
+    const queuedLookup = client.call("noteStoreHybrid", { query: "prior", k: 1 });
     controller.abort();
     await expect(replacement).rejects.toMatchObject({ name: "AbortError" });
-    expect(await queuedLookup).toMatchObject({
-      hash: "1".repeat(64),
-      profile: null,
-      vectorCount: 0,
-    });
+    expect(await queuedLookup).toMatchObject({ hits: [{ path: "note.md" }] });
     await client.close();
     expect(worker.closed).toBe(true);
     expect(worker.terminated).toBe(true);
@@ -264,16 +253,22 @@ describe("SQLite note worker transport", () => {
     );
     await Promise.all(
       paths.map((path) =>
-        client.call("noteStoreReplace", entry(path, `# ${path}\n\nshared searchable body`))
+        client.call("noteStoreReplace", {
+          ...entry(path, `# ${path}\n\nshared searchable body`),
+          profile: "worker-test",
+          vectors: [[1, 0]],
+        })
       )
     );
 
     const deleteController = new AbortController();
     cancelNextYield = () => deleteController.abort();
     await expect(
-      client.call("noteStoreDelete", { paths }, deleteController.signal)
+      client.call("noteStoreDelete", { uids: paths }, deleteController.signal)
     ).rejects.toMatchObject({ name: "AbortError" });
-    for (const path of paths) expect(await client.call("noteStoreGet", { path })).not.toBeNull();
+    expect(await client.call("noteStoreHybrid", { query: "shared", k: 100 })).toMatchObject({
+      hits: expect.arrayContaining(paths.map((path) => expect.objectContaining({ path }))),
+    });
 
     const resetController = new AbortController();
     cancelNextYield = () => resetController.abort();

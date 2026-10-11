@@ -1,6 +1,7 @@
 import { Notice, Plugin } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { ManualIndex } from "@/index/ManualIndex";
+import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { noteEmbeddingProfile, SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteStoreClient } from "@/index/note-sqlite/client";
@@ -122,7 +123,11 @@ export class TramaPlugin extends Plugin {
       },
       profile
     );
-    this.manualIndex = new ManualIndex(noteVault, store);
+    this.manualIndex = new ManualIndex(
+      noteVault,
+      store,
+      new SqliteNoteRecordManager(candidate.call)
+    );
     this.retrieval = new VaultRetrieval(
       candidate.call,
       settings.embedding.modelId ? embeddings : undefined,
@@ -232,9 +237,7 @@ export class TramaPlugin extends Plugin {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
         this.status?.setStatus({
           kind: "ready",
-          message: result.lexicalOnly
-            ? "Updated with lexical search; embeddings are unavailable."
-            : `Indexed ${result.visited} notes.`,
+          message: `Indexed ${result.visited} notes.`,
           canIndex: true,
           canReindex: true,
           canCancel: false,

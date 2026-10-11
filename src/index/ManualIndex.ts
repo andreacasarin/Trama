@@ -1,6 +1,8 @@
+import { index } from "@langchain/core/indexing";
 import { Document } from "@langchain/core/documents";
-import { EmbeddingProviderError } from "@/model/LocalModels";
-import { noteContentHash, SqliteNoteVectorStore } from "./SqliteNoteVectorStore";
+import { StructuredError } from "@/domain/errors";
+import { SqliteNoteRecordManager } from "./SqliteNoteRecordManager";
+import { SqliteNoteVectorStore } from "./SqliteNoteVectorStore";
 
 export interface ManualIndexNote {
   readonly path: string;
@@ -10,13 +12,14 @@ export interface ManualIndexNote {
 export interface ManualIndexVault {
   listMarkdownPaths(signal: AbortSignal): Promise<readonly string[]>;
   readMarkdown(path: string, signal: AbortSignal): Promise<ManualIndexNote>;
-  isMarkdownAvailable(path: string, signal: AbortSignal): Promise<boolean>;
 }
 
 export interface ManualIndexResult {
   readonly visited: number;
   readonly deleted: number;
-  readonly lexicalOnly: boolean;
+  readonly numAdded: number;
+  readonly numUpdated: number;
+  readonly numSkipped: number;
 }
 
 export class ManualIndex {
@@ -27,7 +30,8 @@ export class ManualIndex {
 
   constructor(
     private readonly vault: ManualIndexVault,
-    private readonly store: SqliteNoteVectorStore
+    private readonly store: SqliteNoteVectorStore,
+    private readonly records: SqliteNoteRecordManager
   ) {}
 
   update(): Promise<ManualIndexResult> {
@@ -39,6 +43,7 @@ export class ManualIndex {
   cancel(): void {
     this.active?.controller.abort();
   }
+
   private start(rebuild: boolean): Promise<ManualIndexResult> {
     if (this.active) return Promise.reject(new Error("An indexing run is already active"));
     const controller = new AbortController();
@@ -50,93 +55,51 @@ export class ManualIndex {
   }
 
   private async run(rebuild: boolean, signal: AbortSignal): Promise<ManualIndexResult> {
-    if (rebuild) await this.store.reset(signal);
-    const listed = await this.vault.listMarkdownPaths(signal);
-    const livePaths = new Set(listed);
-    let lexicalOnly = false;
-    for (const path of listed) {
-      checkAbort(signal);
-      if (!(await this.vault.isMarkdownAvailable(path, signal))) {
-        livePaths.delete(path);
-        continue;
-      }
-      if (lexicalOnly) {
-        await this.indexLatestLexically(path, livePaths, signal);
-      } else {
-        try {
-          await this.indexLatest(path, livePaths, signal);
-        } catch (error) {
-          if (!(error instanceof EmbeddingProviderError) || signal.aborted) throw error;
-          lexicalOnly = true;
-          await this.indexLatestLexically(path, livePaths, signal);
-        }
-      }
-    }
+    const store = this.store.withSignal(signal);
+    if (rebuild) await store.reset(signal);
+    const paths = await this.vault.listMarkdownPaths(signal);
+    const records = this.records.forRun(await this.records.getTime(signal), signal);
+    let numAdded = 0;
+    let numUpdated = 0;
+    let numSkipped = 0;
 
-    let deleted = 0;
-    for await (const page of this.store.indexedPathPages(signal)) {
-      const stale = page.filter((path) => !livePaths.has(path));
-      if (stale.length) {
-        await this.store.deleteNotes(stale, signal);
-        deleted += stale.length;
-      }
-    }
-    return { visited: listed.length, deleted, lexicalOnly };
-  }
-
-  private async indexLatest(
-    path: string,
-    livePaths: Set<string>,
-    signal: AbortSignal
-  ): Promise<void> {
-    for (;;) {
+    for (const path of paths) {
       checkAbort(signal);
-      if (!(await this.vault.isMarkdownAvailable(path, signal))) {
-        livePaths.delete(path);
-        return;
-      }
       const note = await this.vault.readMarkdown(path, signal);
       if (note.path !== path) throw new Error("Vault returned a note for a different path");
-      await this.store.addDocuments([toDocument(note)], { signal });
-      checkAbort(signal);
-      if (!(await this.vault.isMarkdownAvailable(path, signal))) {
-        livePaths.delete(path);
-        return;
-      }
-      const latest = await this.vault.readMarkdown(path, signal);
-      if ((await noteContentHash(latest.content)) === (await noteContentHash(note.content))) return;
+      const result = await index({
+        docsSource: [
+          new Document({
+            pageContent: note.content,
+            metadata: { path, embeddingProfile: this.store.embeddingProfile },
+          }),
+        ],
+        recordManager: records,
+        vectorStore: store,
+        options: { batchSize: 1, sourceIdKey: "path" },
+      });
+      numAdded += result.numAdded;
+      numUpdated += result.numUpdated;
+      numSkipped += result.numSkipped;
     }
-  }
 
-  private async indexLatestLexically(
-    path: string,
-    livePaths: Set<string>,
-    signal: AbortSignal
-  ): Promise<void> {
-    for (;;) {
-      checkAbort(signal);
-      if (!(await this.vault.isMarkdownAvailable(path, signal))) {
-        livePaths.delete(path);
-        return;
-      }
-      const note = await this.vault.readMarkdown(path, signal);
-      if (note.path !== path) throw new Error("Vault returned a note for a different path");
-      await this.store.replaceLexical(toDocument(note), signal);
-      checkAbort(signal);
-      if (!(await this.vault.isMarkdownAvailable(path, signal))) {
-        livePaths.delete(path);
-        return;
-      }
-      const latest = await this.vault.readMarkdown(path, signal);
-      if ((await noteContentHash(latest.content)) === (await noteContentHash(note.content))) return;
-    }
+    checkAbort(signal);
+    const cleanup = await index({
+      docsSource: [],
+      recordManager: records,
+      vectorStore: store,
+      options: { cleanup: "full", cleanupBatchSize: 1000, sourceIdKey: "path" },
+    });
+    return {
+      visited: paths.length,
+      deleted: cleanup.numDeleted,
+      numAdded,
+      numUpdated,
+      numSkipped,
+    };
   }
-}
-
-function toDocument(note: ManualIndexNote): Document {
-  return new Document({ id: note.path, pageContent: note.content, metadata: { path: note.path } });
 }
 
 function checkAbort(signal: AbortSignal): void {
-  if (signal.aborted) throw new DOMException("Indexing cancelled", "AbortError");
+  if (signal.aborted) throw new StructuredError("cancelled", "Indexing cancelled.", false);
 }

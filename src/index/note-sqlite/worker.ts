@@ -55,7 +55,7 @@ async function open(namespace: string): Promise<OpenDatabase> {
       return {};
     },
   });
-  const directory = `trama-note-v1-${namespace}`;
+  const directory = `trama-note-v2-${namespace}`;
   const pool = await sqlite.installOpfsSAHPoolVfs({
     name: directory,
     directory,

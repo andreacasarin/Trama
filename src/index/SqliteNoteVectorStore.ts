@@ -2,7 +2,7 @@ import { Document, type DocumentInterface } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { VectorStore } from "@langchain/core/vectorstores";
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
-import type { NoteStoreCall, NoteStoreEntry } from "./note-sqlite/protocol";
+import type { NoteStoreCall } from "./note-sqlite/protocol";
 
 interface ScopedEmbeddings extends EmbeddingsInterface<number[]> {
   withSignal?(signal?: AbortSignal): EmbeddingsInterface<number[]>;
@@ -29,28 +29,24 @@ export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
 
 export type NoteReader = (path: string) => Promise<string | null>;
 
-export async function noteContentHash(markdown: string): Promise<string> {
-  const digest = await globalThis.crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(markdown)
-  );
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 export class SqliteNoteVectorStore extends VectorStore {
   private readonly profile: string;
   private readonly dimensions: number;
   private readonly splitter = new MarkdownTextSplitter();
+  private readonly runSignal?: AbortSignal;
 
   constructor(
     embeddings: ScopedEmbeddings,
     private readonly call: NoteStoreCall,
     private readonly readNote: NoteReader,
-    profile: NoteEmbeddingProfile | string
+    profile: NoteEmbeddingProfile | string,
+    runSignal?: AbortSignal,
+    knownDimensions?: number
   ) {
     super(embeddings, {});
     this.profile = typeof profile === "string" ? profile : noteEmbeddingProfile(profile);
-    this.dimensions = typeof profile === "string" ? 0 : profile.dimensions;
+    this.dimensions = typeof profile === "string" ? (knownDimensions ?? 0) : profile.dimensions;
+    this.runSignal = runSignal;
     if (
       typeof profile !== "string" &&
       (!Number.isSafeInteger(profile.dimensions) || profile.dimensions < 1)
@@ -66,79 +62,38 @@ export class SqliteNoteVectorStore extends VectorStore {
     return this.profile;
   }
 
-  getEntry(path: string, signal?: AbortSignal): Promise<NoteStoreEntry | null> {
-    return this.call("noteStoreGet", { path }, signal) as Promise<NoteStoreEntry | null>;
-  }
-
-  async *indexedPathPages(signal?: AbortSignal): AsyncGenerator<readonly string[]> {
-    let afterPath: string | undefined;
-    for (;;) {
-      checkAbort(signal);
-      const page = (await this.call(
-        "noteStoreListPaths",
-        { afterPath, limit: 512 },
-        signal
-      )) as string[];
-      if (page.length === 0) return;
-      yield page;
-      if (page.length < 512) return;
-      afterPath = page[page.length - 1];
-    }
+  withSignal(signal: AbortSignal): SqliteNoteVectorStore {
+    const embeddings =
+      (this.embeddings as ScopedEmbeddings).withSignal?.(signal) ?? this.embeddings;
+    return new SqliteNoteVectorStore(
+      embeddings,
+      this.call,
+      this.readNote,
+      this.profile,
+      signal,
+      this.dimensions
+    );
   }
 
   reset(signal?: AbortSignal): Promise<unknown> {
-    return this.call("noteStoreReset", {}, signal);
-  }
-
-  async replaceLexical(note: DocumentInterface, signal?: AbortSignal): Promise<void> {
-    const path = typeof note.metadata.path === "string" ? note.metadata.path : note.id;
-    if (
-      !path ||
-      note.id !== path ||
-      note.metadata.path !== path ||
-      typeof note.pageContent !== "string"
-    )
-      throw new TypeError("A note document must use its path as id and metadata.path");
-    checkAbort(signal);
-    await this.call(
-      "noteStoreReplace",
-      {
-        path,
-        hash: await noteContentHash(note.pageContent),
-        profile: null,
-        markdown: note.pageContent,
-        vectors: [],
-      },
-      signal
-    );
+    return this.call("noteStoreReset", {}, signal ?? this.runSignal);
   }
 
   async addDocuments(
     documents: DocumentInterface[],
-    options: { signal?: AbortSignal } = {}
+    options: { signal?: AbortSignal; ids?: string[] } = {}
   ): Promise<string[]> {
     if (documents.length !== 1) throw new TypeError("Exactly one note must be indexed per call");
     const note = documents[0];
-    const path = typeof note.metadata.path === "string" ? note.metadata.path : note.id;
-    if (
-      !path ||
-      note.id !== path ||
-      note.metadata.path !== path ||
-      typeof note.pageContent !== "string"
-    )
-      throw new TypeError("A note document must use its path as id and metadata.path");
-    const hash = await noteContentHash(note.pageContent);
-    const existing = (await this.call(
-      "noteStoreGet",
-      { path },
-      options.signal
-    )) as NoteStoreEntry | null;
-    if (
-      existing?.hash === hash &&
-      existing.profile === this.profile &&
-      existing.chunkCount === existing.vectorCount
-    )
-      return [path];
+    const path = this.notePath(note);
+    const uid = options.ids?.[0] ?? note.id ?? path;
+    const profile =
+      typeof note.metadata.embeddingProfile === "string"
+        ? note.metadata.embeddingProfile
+        : this.profile;
+    const signal = options.signal ?? this.runSignal;
+    if (!uid) throw new TypeError("A native document UID is required");
+    checkAbort(signal);
 
     const split = await this.splitter.splitDocuments([
       new Document({ pageContent: note.pageContent, metadata: { path } }),
@@ -148,52 +103,57 @@ export class SqliteNoteVectorStore extends VectorStore {
         new Document({ pageContent: chunk.pageContent, metadata: { path, ordinal } })
     );
     const vectors: number[][] = [];
-    const embeddings =
-      (this.embeddings as ScopedEmbeddings).withSignal?.(options.signal) ?? this.embeddings;
     for (let offset = 0; offset < chunks.length; offset += 512) {
-      checkAbort(options.signal);
-      const batch = await embeddings.embedDocuments(
+      checkAbort(signal);
+      const batch = await this.embeddings.embedDocuments(
         chunks.slice(offset, offset + 512).map(({ pageContent }) => pageContent)
       );
       if (batch.length !== Math.min(512, chunks.length - offset))
         throw new TypeError("Embedding count did not match chunk count");
       vectors.push(...batch);
     }
-    checkAbort(options.signal);
-    await this.writeNote(hash, note, vectors, chunks, options.signal);
-    return [path];
+    checkAbort(signal);
+    await this.writeNote(uid, path, profile, note.pageContent, vectors, chunks, signal);
+    return [uid];
   }
 
   async addVectors(
     vectors: number[][],
     documents: DocumentInterface[],
-    options: { note?: DocumentInterface; signal?: AbortSignal } = {}
+    options: { note?: DocumentInterface; signal?: AbortSignal; ids?: string[] } = {}
   ): Promise<void> {
     const note = options.note;
     if (!note) throw new TypeError("The source note is required");
+    const path = this.notePath(note);
+    const split = await this.splitter.splitDocuments([
+      new Document({ pageContent: note.pageContent, metadata: { path } }),
+    ]);
+    if (split.length !== documents.length) throw new TypeError("Chunk and vector counts differ");
+    const uid = options.ids?.[0] ?? note.id ?? path;
+    if (!uid) throw new TypeError("A native document UID is required");
     await this.writeNote(
-      await noteContentHash(note.pageContent),
-      note,
+      uid,
+      path,
+      typeof note.metadata.embeddingProfile === "string"
+        ? note.metadata.embeddingProfile
+        : this.profile,
+      note.pageContent,
       vectors,
       documents,
-      options.signal
+      options.signal ?? this.runSignal
     );
   }
 
   private async writeNote(
-    hash: string,
-    note: DocumentInterface,
+    uid: string,
+    path: string,
+    profile: string,
+    markdown: string,
     vectors: number[][],
     documents: DocumentInterface[],
     signal?: AbortSignal
   ): Promise<void> {
-    const path = note.metadata.path;
-    if (
-      typeof path !== "string" ||
-      !path ||
-      note.id !== path ||
-      vectors.length !== documents.length
-    )
+    if (!path || !uid || vectors.length !== documents.length)
       throw new TypeError("Note path and vector count are invalid");
     for (let index = 0; index < documents.length; index++) {
       if (documents[index].metadata.path !== path || documents[index].metadata.ordinal !== index)
@@ -206,23 +166,26 @@ export class SqliteNoteVectorStore extends VectorStore {
     await this.call(
       "noteStoreReplace",
       {
+        uid,
         path,
-        hash,
-        profile: this.profile,
-        markdown: note.pageContent,
+        profile,
+        markdown,
         vectors,
       },
       signal
     );
   }
 
-  async delete(params: { ids?: string[] }): Promise<void> {
-    if (!params.ids) throw new TypeError("Note paths are required for deletion");
-    await this.call("noteStoreDelete", { paths: params.ids });
+  private notePath(note: DocumentInterface): string {
+    const path = note.metadata.path;
+    if (typeof path !== "string" || !path || typeof note.pageContent !== "string")
+      throw new TypeError("A note document needs a path and markdown content");
+    return path;
   }
 
-  async deleteNotes(paths: readonly string[], signal?: AbortSignal): Promise<void> {
-    await this.call("noteStoreDelete", { paths }, signal);
+  async delete(params: { ids?: string[] }): Promise<void> {
+    if (!params.ids) throw new TypeError("Document UIDs are required for deletion");
+    await this.call("noteStoreDelete", { uids: params.ids }, this.runSignal);
   }
 
   async similaritySearchVectorWithScore(

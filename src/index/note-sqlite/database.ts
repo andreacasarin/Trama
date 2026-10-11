@@ -1,7 +1,4 @@
-import { MarkdownTextSplitter } from "@langchain/textsplitters";
-import { Document } from "@langchain/core/documents";
 import type {
-  NoteStoreEntry,
   NoteStoreHit,
   NoteStoreHybridResult,
   NoteStoreRelatedResult,
@@ -24,6 +21,11 @@ function checkAbort(signal?: AbortSignal): void {
 function validPath(path: unknown): asserts path is string {
   if (typeof path !== "string" || path.length === 0)
     throw new TypeError("A non-empty note path is required");
+}
+
+function validKeys(keys: unknown): asserts keys is readonly string[] {
+  if (!Array.isArray(keys) || keys.length > 1000 || keys.some((key) => typeof key !== "string"))
+    throw new TypeError("Invalid record keys");
 }
 
 function vectorBytes(values: readonly number[], dimensions?: number): Uint8Array {
@@ -53,9 +55,8 @@ export class NoteSqliteDatabase {
     db.exec(`CREATE TABLE IF NOT EXISTS note_index(
       note_id INTEGER PRIMARY KEY,
       path TEXT NOT NULL UNIQUE,
-      source_hash TEXT NOT NULL,
+      current_uid TEXT NOT NULL UNIQUE,
       embedding_profile TEXT,
-      chunk_count INTEGER NOT NULL CHECK(chunk_count>=0),
       centroid BLOB
     )`);
     db.exec(`CREATE TABLE IF NOT EXISTS note_vectors(
@@ -68,6 +69,16 @@ export class NoteSqliteDatabase {
       body,path_text,content='',contentless_delete=1,
       tokenize='unicode61 remove_diacritics 2'
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS note_records(
+      uid TEXT PRIMARY KEY,
+      group_path TEXT,
+      updated_at INTEGER NOT NULL
+    ) WITHOUT ROWID`);
+    db.exec(`CREATE TABLE IF NOT EXISTS note_record_clock(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      value INTEGER NOT NULL
+    )`);
+    db.exec("INSERT INTO note_record_clock(id,value) VALUES(1,0) ON CONFLICT(id) DO NOTHING");
   }
 
   async call<M extends NoteStoreMethod>(
@@ -77,43 +88,28 @@ export class NoteSqliteDatabase {
   ): Promise<unknown> {
     checkAbort(signal);
     switch (method) {
-      case "noteStoreGet": {
-        const { path } = payload as NoteStoreRpc["noteStoreGet"];
-        validPath(path);
-        const row = rows(
-          this.db,
-          `SELECT n.source_hash AS hash,n.embedding_profile AS profile,
-          n.chunk_count AS chunkCount,COUNT(v.ordinal) AS vectorCount FROM note_index n
-          LEFT JOIN note_vectors v USING(note_id) WHERE n.path=? GROUP BY n.note_id`,
-          [path]
-        )[0];
-        return row
-          ? ({
-              hash: String(row.hash),
-              profile: row.profile as string | null,
-              chunkCount: Number(row.chunkCount),
-              vectorCount: Number(row.vectorCount),
-            } satisfies NoteStoreEntry)
-          : null;
-      }
       case "noteStoreReplace":
         return this.replace(payload as NoteStoreRpc["noteStoreReplace"], signal);
       case "noteStoreDelete": {
-        const { paths } = payload as NoteStoreRpc["noteStoreDelete"];
-        if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string"))
-          throw new TypeError("Invalid note paths");
+        const { uids } = payload as NoteStoreRpc["noteStoreDelete"];
+        validKeys(uids);
         this.db.exec("BEGIN IMMEDIATE");
         try {
-          for (let index = 0; index < paths.length; index++) {
-            const path = paths[index];
+          for (let index = 0; index < uids.length; index++) {
+            const uid = uids[index];
             checkAbort(signal);
-            const row = rows(this.db, "SELECT note_id FROM note_index WHERE path=?", [path])[0];
+            const row = rows(this.db, "SELECT note_id FROM note_index WHERE current_uid=?", [
+              uid,
+            ])[0];
             if (row) {
               const id = Number(row.note_id);
               this.db.exec({ sql: "DELETE FROM note_fts WHERE rowid=?", bind: [id] });
-              this.db.exec({ sql: "DELETE FROM note_index WHERE note_id=?", bind: [id] });
+              this.db.exec({
+                sql: "DELETE FROM note_index WHERE note_id=? AND current_uid=?",
+                bind: [id, uid],
+              });
             }
-            if ((index + 1) % 16 === 0 && index + 1 < paths.length) {
+            if ((index + 1) % 16 === 0 && index + 1 < uids.length) {
               await new Promise<void>((resolve) => setTimeout(resolve, 0));
               checkAbort(signal);
             }
@@ -131,29 +127,13 @@ export class NoteSqliteDatabase {
           throw error;
         }
       }
-      case "noteStoreListPaths": {
-        const { afterPath, limit } = payload as NoteStoreRpc["noteStoreListPaths"];
-        if (
-          !Number.isSafeInteger(limit) ||
-          limit < 1 ||
-          limit > 512 ||
-          (afterPath !== undefined && typeof afterPath !== "string")
-        )
-          throw new TypeError("Invalid indexed path page");
-        const found = rows(
-          this.db,
-          `SELECT path FROM note_index
-          WHERE ? IS NULL OR path COLLATE BINARY > ? COLLATE BINARY
-          ORDER BY path COLLATE BINARY LIMIT ?`,
-          [afterPath ?? null, afterPath ?? null, limit]
-        );
-        return found.map((row) => String(row.path));
-      }
       case "noteStoreReset": {
         this.db.exec("BEGIN IMMEDIATE");
         try {
           checkAbort(signal);
           this.db.exec("DELETE FROM note_fts");
+          this.db.exec("DELETE FROM note_records");
+          this.db.exec("UPDATE note_record_clock SET value=0 WHERE id=1");
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
           checkAbort(signal);
           this.db.exec("DELETE FROM note_index");
@@ -170,6 +150,16 @@ export class NoteSqliteDatabase {
           throw error;
         }
       }
+      case "recordManagerGetTime":
+        return this.reserveRecordTime();
+      case "recordManagerUpdate":
+        return this.updateRecords(payload as NoteStoreRpc["recordManagerUpdate"]);
+      case "recordManagerExists":
+        return this.recordExists(payload as NoteStoreRpc["recordManagerExists"]);
+      case "recordManagerListKeys":
+        return this.listRecordKeys(payload as NoteStoreRpc["recordManagerListKeys"]);
+      case "recordManagerDeleteKeys":
+        return this.deleteRecords(payload as NoteStoreRpc["recordManagerDeleteKeys"]);
       case "noteStoreSemantic": {
         const { vector, profile, k } = payload as NoteStoreRpc["noteStoreSemantic"];
         return (await this.hybridSearch({ vector, profile, k }, signal)).hits;
@@ -320,24 +310,16 @@ export class NoteSqliteDatabase {
     input: NoteStoreRpc["noteStoreReplace"],
     signal?: AbortSignal
   ): Promise<{ path: string }> {
-    const { path, hash, profile, markdown, vectors } = input;
+    const { uid, path, profile, markdown, vectors } = input;
     validPath(path);
     if (
-      !/^[0-9a-f]{64}$/i.test(hash) ||
+      typeof uid !== "string" ||
+      !uid ||
       (profile !== null && typeof profile !== "string") ||
       typeof markdown !== "string" ||
       !Array.isArray(vectors)
     )
       throw new TypeError("Invalid note replacement");
-    const splitter = new MarkdownTextSplitter();
-    const chunks = await splitter.splitDocuments([
-      new Document({ pageContent: markdown, metadata: { path } }),
-    ]);
-    if (
-      (profile === null && vectors.length !== 0) ||
-      (profile !== null && chunks.length !== vectors.length)
-    )
-      throw new TypeError("Chunk and vector counts differ");
     const dimensions = vectors[0]?.length;
     const normalized = vectors.map((vector) => vectorBytes(vector, dimensions));
     checkAbort(signal);
@@ -350,13 +332,13 @@ export class NoteSqliteDatabase {
         id = Number(existing.note_id);
         this.db.exec({ sql: "DELETE FROM note_fts WHERE rowid=?", bind: [id] });
         this.db.exec({
-          sql: "UPDATE note_index SET source_hash=?,embedding_profile=?,chunk_count=?,centroid=NULL WHERE note_id=?",
-          bind: [hash, profile, chunks.length, id],
+          sql: "UPDATE note_index SET current_uid=?,embedding_profile=?,centroid=NULL WHERE note_id=?",
+          bind: [uid, profile, id],
         });
       } else {
         this.db.exec({
-          sql: "INSERT INTO note_index(path,source_hash,embedding_profile,chunk_count) VALUES(?,?,?,?)",
-          bind: [path, hash, profile, chunks.length],
+          sql: "INSERT INTO note_index(path,current_uid,embedding_profile) VALUES(?,?,?)",
+          bind: [path, uid, profile],
         });
         id = Number(rows(this.db, "SELECT last_insert_rowid() AS id")[0].id);
       }
@@ -384,6 +366,12 @@ export class NoteSqliteDatabase {
         sql: "INSERT INTO note_fts(rowid,body,path_text) VALUES(?,?,?)",
         bind: [id, markdown, path],
       });
+      const updatedAt = this.tickRecordClock();
+      this.db.exec({
+        sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES(?,?,?)
+          ON CONFLICT(uid) DO UPDATE SET group_path=excluded.group_path,updated_at=excluded.updated_at`,
+        bind: [uid, path, updatedAt],
+      });
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       checkAbort(signal);
       this.db.exec("COMMIT");
@@ -396,5 +384,149 @@ export class NoteSqliteDatabase {
       }
       throw error;
     }
+  }
+
+  private async updateRecords(input: NoteStoreRpc["recordManagerUpdate"]): Promise<void> {
+    const { keys, groupIds, timeAtLeast } = input;
+    validKeys(keys);
+    if (
+      (groupIds !== undefined &&
+        (!Array.isArray(groupIds) ||
+          groupIds.length !== keys.length ||
+          groupIds.some((group) => group !== null && typeof group !== "string"))) ||
+      (timeAtLeast !== undefined && !Number.isSafeInteger(timeAtLeast))
+    )
+      throw new TypeError("Invalid record update");
+    if (!keys.length) return;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = Number(
+        rows(this.db, "SELECT value FROM note_record_clock WHERE id=1")[0].value
+      );
+      if (timeAtLeast !== undefined && current < timeAtLeast)
+        throw new Error("Record manager time is earlier than timeAtLeast");
+      const updatedAt = Math.max(current + 1, (timeAtLeast ?? 0) + 1);
+      if (!Number.isSafeInteger(updatedAt)) throw new Error("Record manager clock is exhausted");
+      this.db.exec({
+        sql: "UPDATE note_record_clock SET value=? WHERE id=1",
+        bind: [updatedAt],
+      });
+      for (let index = 0; index < keys.length; index++) {
+        if (groupIds === undefined) {
+          this.db.exec({
+            sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES(?,NULL,?)
+              ON CONFLICT(uid) DO UPDATE SET updated_at=excluded.updated_at`,
+            bind: [keys[index], updatedAt],
+          });
+        } else {
+          this.db.exec({
+            sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES(?,?,?)
+              ON CONFLICT(uid) DO UPDATE SET group_path=excluded.group_path,updated_at=excluded.updated_at`,
+            bind: [keys[index], groupIds[index], updatedAt],
+          });
+        }
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* preserve original error */
+      }
+      throw error;
+    }
+  }
+
+  private reserveRecordTime(): number {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const next = this.tickRecordClock();
+      this.db.exec("COMMIT");
+      return next;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* preserve original error */
+      }
+      throw error;
+    }
+  }
+
+  private tickRecordClock(): number {
+    const current = Number(
+      rows(this.db, "SELECT value FROM note_record_clock WHERE id=1")[0].value
+    );
+    const next = current + 1;
+    if (!Number.isSafeInteger(next)) throw new Error("Record manager clock is exhausted");
+    this.db.exec({ sql: "UPDATE note_record_clock SET value=? WHERE id=1", bind: [next] });
+    return next;
+  }
+
+  private recordExists(input: NoteStoreRpc["recordManagerExists"]): boolean[] {
+    const { keys } = input;
+    validKeys(keys);
+    if (!keys.length) return [];
+    const found = rows(
+      this.db,
+      `SELECT r.uid FROM note_records r JOIN note_index n ON n.current_uid=r.uid
+      WHERE r.uid IN (${keys.map(() => "?").join(",")})`,
+      keys
+    );
+    const existing = new Set(found.map((row) => String(row.uid)));
+    return keys.map((key) => existing.has(key));
+  }
+
+  private listRecordKeys(input: NoteStoreRpc["recordManagerListKeys"]): string[] {
+    const { before, after, groupIds, limit } = input;
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 1000 ||
+      (before !== undefined && !Number.isSafeInteger(before)) ||
+      (after !== undefined && !Number.isSafeInteger(after)) ||
+      (groupIds !== undefined &&
+        (!Array.isArray(groupIds) ||
+          groupIds.length > 1000 ||
+          groupIds.some((group) => group !== null && typeof group !== "string")))
+    )
+      throw new TypeError("Invalid record key page");
+    if (groupIds?.length === 0) return [];
+    const clauses: string[] = [];
+    const binds: unknown[] = [];
+    if (before !== undefined) {
+      clauses.push("updated_at<?");
+      binds.push(before);
+    }
+    if (after !== undefined) {
+      clauses.push("updated_at>?");
+      binds.push(after);
+    }
+    if (groupIds !== undefined) {
+      const values = groupIds.filter((group): group is string => group !== null);
+      const hasNull = values.length !== groupIds.length;
+      clauses.push(
+        `(${values.length ? `group_path IN (${values.map(() => "?").join(",")})` : "0"}${hasNull ? " OR group_path IS NULL" : ""})`
+      );
+      binds.push(...values);
+    }
+    binds.push(limit);
+    return rows(
+      this.db,
+      `SELECT uid FROM note_records${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY uid COLLATE BINARY LIMIT ?`,
+      binds
+    ).map((row) => String(row.uid));
+  }
+
+  private deleteRecords(input: NoteStoreRpc["recordManagerDeleteKeys"]): void {
+    const { keys } = input;
+    validKeys(keys);
+    if (!keys.length) return;
+    this.db.exec({
+      sql: `DELETE FROM note_records WHERE uid IN (${keys.map(() => "?").join(",")})`,
+      bind: keys,
+    });
   }
 }
