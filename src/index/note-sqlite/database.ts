@@ -64,7 +64,7 @@ export class NoteSqliteDatabase {
       ordinal INTEGER NOT NULL CHECK(ordinal>=0),
       vector BLOB NOT NULL,
       PRIMARY KEY(note_id,ordinal)
-    ) WITHOUT ROWID`);
+    )`);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
       body,path_text,content='',contentless_delete=1,
       tokenize='unicode61 remove_diacritics 2'

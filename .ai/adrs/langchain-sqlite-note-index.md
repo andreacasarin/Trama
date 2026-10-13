@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-09
-- Updated: 2026-10-11
+- Updated: 2026-10-13
 
 ## Decision
 
@@ -18,9 +18,15 @@ The production worker processes SQL requests in FIFO order. Cancellation message
 
 Session history and turn attachments are ephemeral. Provider calls disable response storage. Startup and settings loading do not call providers. Tools are read-only and return note links. Worker initialization completes before UI/services are published; worker errors reject initialization and close the candidate. Plugin load, settings persistence, and configuration changes are serialized through one promise chain. Disposed checks after awaits prevent stale clients or UI after unload, and a client created by a pending run closes if unload happens before completion. Closing aborts active work, waits for rollback, closes the database, and pauses the VFS non-destructively to release its storage pool. Settings changes await close before reopening the index; each instance owns its run callbacks. Compatibility covers Obsidian adapters only. V1 excludes shared caches, publication, scheduled maintenance, automatic vault-event indexing, background jobs, migrations, and the legacy graph system.
 
+### Table storage layout
+
+Use the storage layout per table: `note_index` is an ordinary rowid table with an integer primary key and retains the centroid with note metadata; `note_vectors` retains rowids and composite key constraints for large vector BLOBs; `note_records` uses `WITHOUT ROWID` for small text-UID metadata; `note_record_clock` is an ordinary rowid table with a singleton integer primary key; the FTS virtual table keeps its native storage. This does not change the native retrieval or privacy boundaries.
+
 ## Context and rationale
 
 The approved goal is a small, local V1 with a complete rewrite and no compatibility burden beyond Obsidian integration. Adopting LangChain's native index lifecycle minimizes custom hashing, skip/refresh, and stale cleanup policy. Registering the prepared note and its RecordManager UID/path/clock tick in the same transaction as FTS and vectors closes the write-before-native-update orphan gap. A custom SQLite adapter remains necessary to keep vector scoring and retrieval in SQLite and avoid persisting bounded vault text. Omitting raw note bodies from the index limits stored corpus content, while hydrating winners from the live vault keeps current note text authoritative. Per-vault identity and isolated storage keep each vault's index separate; stable identity reload preserves that namespace. Per-note atomic commits and bounded SQL work retain transactional cancellation boundaries; cross-note embedding batches reduce provider requests. The lexical fallback preserves a usable search path during query-time embedding or vector-query failures.
+
+Using `WITHOUT ROWID` for the small text-UID `note_records` rows avoids the extra rowid storage, while keeping ordinary rowids for large vector BLOB rows avoids the overflow pages and excess allocation observed in the `WITHOUT ROWID` layout. In a paired fresh 3,000-note database experiment, removing `WITHOUT ROWID` from `note_vectors` reduced exported size from 41,312,256 to 25,583,616 bytes (38.1%) and reduced vector overflow pages to zero; this result is specific to that workload, not a general performance claim. The centroid-bearing `note_index` table remained unchanged. Existing tables are not converted by `CREATE TABLE IF NOT EXISTS`; no migration or live-vault reset is part of this decision. See [SQLite WITHOUT ROWID tables](https://www.sqlite.org/withoutrowid.html) and the [measured performance assessment](../../docs/langchain-performance-assessment.md).
 
 The choice of LangChain defaults, rank constant 60, and the centroid plus maximum-chunk scoring are approved V1 defaults; no separate rationale for tuning those individual values was supplied. They can be reconsidered with measured evidence without changing the privacy and storage boundaries above.
 

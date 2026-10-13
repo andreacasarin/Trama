@@ -114,3 +114,46 @@ This rerun compares the prior batching snapshot with a newer working-tree snapsh
 The 300- and 3,000-note profiles used five fresh-index samples and three fresh-index samples respectively, after one warmup; queries used five warmups and 30 queries per run. The 24-note profile was a single smoke run. Cold-index embedding calls remained 1, 3, and 30 for the 24-, 300-, and 3,000-note profiles; text/vector counts and exported database sizes were unchanged at 24/425,984 bytes, 300/4,235,264 bytes, and 3,000/41,312,256 bytes. Query sentinels, result bounds, and counts passed.
 
 Hybrid-search medians were lower in this snapshot, consistent with removing the redundant scan, but this historical comparison does not establish causation. Cold indexing and 3,000-note edits were slightly slower. Measurements use real in-memory SQLite WASM and a deterministic zero-delay provider in a headless runner; they do not validate LM Studio, Obsidian, OPFS, or end-to-end provider latency.
+
+## Fresh committed comparison — 2026-10-12
+
+This fresh paired comparison builds baseline `e03133025f3acb68b75514dfbf18448e903cbbf0` and current `66ebd201e0c69945709445d00d632cd8df698abe` from exact source archives. It uses the same corpus, 768-dimensional deterministic zero-delay provider, in-memory SQLite WASM, M1 Max, and Node 24, with each revision's own lockfile and matching SQLite asset hashes. Builds used a temporary current-revision label override and type-only `number[][]` assertions in both adapters; these did not change runtime vectors or tracked source. The harness records declared labels and archive provenance but does not independently validate them against Git. The ignored raw report is `.ai/bench/langchain-final-comparison/run-20261012/report.json`.
+
+The 300-note profile used five fresh-index samples and the 3,000-note profile used three, each after one warmup. Queries used five warmups and 30 queries per run; the 24-note profile was a single smoke run.
+
+| 3,000-note operation         |                Baseline |              Current | Observed comparison |
+| ---------------------------- | ----------------------: | -------------------: | ------------------: |
+| Cold index, median (range)   | 20.67 s (20.48–21.78 s) | 5.80 s (5.70–5.82 s) |        3.57× faster |
+| No-op update                 |               133.63 ms |            188.52 ms |          41% slower |
+| Edit                         |             1,707.46 ms |            194.08 ms |        8.80× faster |
+| Delete                       |             1,263.32 ms |            192.43 ms |        6.57× faster |
+| Lexical query, median (p95)  |     32.48 ms (37.48 ms) |    1.09 ms (6.59 ms) | 29.8× faster median |
+| Hybrid query, median (p95)   |     49.48 ms (67.90 ms) |  12.07 ms (17.07 ms) | 4.10× faster median |
+| Related lookup, median (p95) |   122.07 ms (128.59 ms) |    3.03 ms (3.70 ms) | 40.2× faster median |
+
+At 300 notes, cold indexing was 266.26 ms versus 490.29 ms (1.84× slower), and no-op update was 14.46 ms versus 19.12 ms (32% slower). These are measurements of this workload, not general performance guarantees.
+
+The compared work is not semantically equivalent. The baseline generated 6,000 structural chunks and 3,005 deduplicated cache-compatible vectors; the current implementation uses 3,000 default Markdown chunks and vectors. Cold indexing used 24 provider calls and 3,005 texts at baseline versus 30 calls and 3,000 texts currently. Hybrid queries made 6 calls for 90 queries at baseline and 90 calls for 90 queries currently; the baseline forced related-note refresh, bypassing its old result cache. These differences affect both work and results, and the benchmark does not measure semantic quality.
+
+Exported database size at 3,000 notes increased from 23,371,776 to 41,312,256 bytes (1.77×). Across the six packaged assets, raw size increased from 2,761,782 to 4,423,170 bytes (60%); the sum of individual gzip sizes increased from 945,875 to 1,363,819 bytes (44%). `main.js` changed from 217,257 to 1,990,378 bytes, and the worker from 125,726 to 13,993 bytes. Sentinels, counts, result bounds, and vector-transfer checks passed. The zero-delay provider and headless in-memory SQLite setup do not validate live LM Studio latency, Obsidian, OPFS, or result quality.
+
+## Vector rowid experiment — 2026-10-12
+
+This experiment compares fresh copies of `66ebd201e0c69945709445d00d632cd8df698abe`: the control and a candidate that removes `WITHOUT ROWID` only from `note_vectors`. Composite primary-key constraints, centroids, and native UID behavior are retained. Both runs use the same corpus (SHA-256 `66d061b6c61c157587bf1dace04c6e72e7b0c5d3f8dd44393699d3b50f7b1c8a`), SQLite assets, and deterministic zero-delay 768-dimensional provider. Snapshot hashes and provenance are in `.ai/bench/vector-rowid/run-20261012/summary.json` and `.ai/bench/vector-rowid/run-20261012/storage-summary.json`.
+
+The 300-note profile used five fresh-index samples and the 3,000-note profile used three, each after one warmup. Queries used five warmups and 30 queries per run; the 24-note profile was a smoke run only.
+
+| 3,000-note operation       |              Control |             Candidate |
+| -------------------------- | -------------------: | --------------------: |
+| Exported database size     |         41,312,256 B | 25,583,616 B (-38.1%) |
+| Cold index                 |              5.005 s |               4.811 s |
+| No-op update               |            173.15 ms |             184.12 ms |
+| Edit                       |            182.05 ms |             188.94 ms |
+| Delete                     |            180.59 ms |             198.81 ms |
+| Lexical query              |             0.928 ms |              0.999 ms |
+| Hybrid query, median (p95) | 11.226 ms (14.51 ms) |    5.252 ms (8.88 ms) |
+| Related lookup             |             2.875 ms |              2.654 ms |
+
+The vector payload is identical at 9,236,872 bytes. Vector allocation decreased from 28,090,368 to 12,312,576 bytes; vector pages fell from 3,429 to 1,503, and overflow pages fell from 3,000 to zero. The candidate added a 49,152-byte unique index. Total pages decreased from 5,043 to 3,123 at 8,192 bytes per page, with no freelist pages. The centroid-bearing `note_index` table was unchanged at 12,312,576 bytes. At 300 notes, exported database size fell from 4,235,264 to 2,662,400 bytes (37.1%); cold indexing was 465.68 versus 480.52 ms, and hybrid lookup was 1.690 versus 1.201 ms.
+
+This fresh-database experiment shows a storage reduction and a lower observed hybrid-query median, while no-op updates and writes were slightly slower and delete timing varied. It does not guarantee improvement across operations. The candidate's `CREATE TABLE IF NOT EXISTS` behavior does not convert existing databases; no vault database was changed and no migration or automatic reset was tested. The synthetic provider and in-memory SQLite run do not measure live LM Studio, Obsidian, OPFS, or semantic quality. This experiment records evidence, not a migration policy.
