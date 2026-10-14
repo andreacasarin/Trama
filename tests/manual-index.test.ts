@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
 import { ManualIndex, type ManualIndexNote, type ManualIndexVault } from "@/index/ManualIndex";
@@ -297,16 +297,117 @@ describe("native LangChain note indexing", () => {
   it("stops on embedding errors and retries on the next native index run", async () => {
     const notes = new Map([["a.md", "# alpha\n\nretry me"]]);
     const embeddings = new TestEmbeddings();
-    const { db, client, store, manual } = await setup(notes, embeddings);
+    const { db, client, store, records, vault } = await setup(notes, embeddings);
+    let publishCalls = 0;
+    const manual = new ManualIndex(vault, store, records, {
+      importAvailable: async () => undefined,
+      publishAvailable: async () => {
+        publishCalls++;
+      },
+    });
     try {
       embeddings.fail = true;
       await expect(manual.update()).rejects.toThrow("provider offline");
       expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(0);
+      expect(publishCalls).toBe(0);
       embeddings.fail = false;
-      expect((await manual.update()).numAdded).toBe(1);
+      const result = await manual.update();
+      expect(result.numAdded).toBe(1);
+      expect(result.sharing).toBe("complete");
+      expect(publishCalls).toBe(1);
       expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
       expect(await db.selectValue("SELECT count(*) FROM note_vectors")).toBeGreaterThan(0);
       expect(store.embeddingProfile).toContain("manual-test");
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("does not publish when native cleanup fails", async () => {
+    const notes = new Map([["stale.md", "# stale\n\nremove during cleanup"]]);
+    const { db, client, store, records, vault, manual } = await setup(notes);
+    let publishCalls = 0;
+    try {
+      await manual.update();
+      notes.clear();
+      vi.spyOn(SqliteNoteVectorStore.prototype, "delete").mockRejectedValue(
+        new Error("cleanup failed")
+      );
+      const interrupted = new ManualIndex(vault, store, records, {
+        importAvailable: async () => undefined,
+        publishAvailable: async () => {
+          publishCalls++;
+        },
+      });
+      await expect(interrupted.update()).rejects.toThrow("cleanup failed");
+      expect(publishCalls).toBe(0);
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("keeps local indexing successful and retries sharing after a partial publication failure", async () => {
+    const notes = new Map([["a.md", "# alpha\n\nkeep local index"]]);
+    const { db, client, store, records, vault } = await setup(notes);
+    const artifacts = new Set<string>();
+    let publishCalls = 0;
+    const manual = new ManualIndex(vault, store, records, {
+      importAvailable: async () => undefined,
+      publishAvailable: async () => {
+        publishCalls++;
+        artifacts.add("valid immutable artifact");
+        if (publishCalls === 1) throw new Error("sharing write failed");
+        artifacts.add("remaining artifact");
+      },
+    });
+    try {
+      const first = await manual.update();
+      expect(first.numAdded).toBe(1);
+      expect(first.sharing).toBe("incomplete");
+      expect(artifacts).toEqual(new Set(["valid immutable artifact"]));
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
+
+      const retry = await manual.update();
+      expect(retry.numSkipped).toBe(1);
+      expect(retry.sharing).toBe("complete");
+      expect(publishCalls).toBe(2);
+      expect(artifacts).toEqual(new Set(["valid immutable artifact", "remaining artifact"]));
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("reports sharing cancellation after cleanup as a successful local index and retries explicitly", async () => {
+    const notes = new Map([["a.md", "# alpha\n\nkeep local index"]]);
+    const { db, client, store, records, vault } = await setup(notes);
+    const runControl: { manual?: ManualIndex } = {};
+    let publishCalls = 0;
+    const manual = new ManualIndex(vault, store, records, {
+      importAvailable: async () => undefined,
+      publishAvailable: async () => {
+        publishCalls++;
+        if (publishCalls === 1) {
+          runControl.manual?.cancel();
+          throw new DOMException("Cancelled", "AbortError");
+        }
+      },
+    });
+    runControl.manual = manual;
+    try {
+      const first = await manual.update();
+      expect(first.numAdded).toBe(1);
+      expect(first.sharing).toBe("cancelled");
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
+
+      const retry = await manual.update();
+      expect(retry.numSkipped).toBe(1);
+      expect(retry.sharing).toBe("complete");
+      expect(publishCalls).toBe(2);
     } finally {
       await client.close();
       db.close();
@@ -450,7 +551,14 @@ describe("native LangChain note indexing", () => {
       }
       return texts.map(() => [1, 0]);
     };
-    const { db, client, manual } = await setup(notes, embeddings);
+    const { db, client, manual, vault, store, records } = await setup(notes, embeddings);
+    let publishCalls = 0;
+    const withArtifacts = new ManualIndex(vault, store, records, {
+      importAvailable: async () => undefined,
+      publishAvailable: async () => {
+        publishCalls++;
+      },
+    });
     try {
       await manual.update();
       notes.clear();
@@ -459,10 +567,11 @@ describe("native LangChain note indexing", () => {
         notes.set(path, `# note ${index}\n\ncommitted in first batch ${index}`);
       }
       notes.set("z.md", "# z\n\nhold the second batch");
-      const run = manual.update();
+      const run = withArtifacts.update();
       await blocked;
-      manual.cancel();
+      withArtifacts.cancel();
       await expect(run).rejects.toMatchObject({ name: "AbortError" });
+      expect(publishCalls).toBe(0);
       expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(101);
       expect(await db.selectValue("SELECT count(*) FROM note_records")).toBe(101);
       expect(await db.selectValue("SELECT count(*) FROM note_index WHERE path='stale.md'")).toBe(1);

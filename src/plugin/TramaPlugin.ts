@@ -2,6 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { ManualIndex } from "@/index/ManualIndex";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
+import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import { noteEmbeddingProfile, SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteStoreClient } from "@/index/note-sqlite/client";
@@ -13,6 +14,7 @@ import {
 } from "@/model/LocalModels";
 import { createVaultTools } from "@/tools/VaultTools";
 import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
+import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
 import { DEFAULT_SETTINGS, SettingsStore, type TramaSettings } from "@/settings/Settings";
@@ -109,9 +111,24 @@ export class TramaPlugin extends Plugin {
       modelId: settings.embedding.modelId,
       dimensions: settings.embedding.dimensions,
     };
-    const embeddings = settings.embedding.modelId
+    const providerEmbeddings = settings.embedding.modelId
       ? createLocalEmbeddings({ ...profile, policy })
+      : undefined;
+    const embeddings = providerEmbeddings
+      ? new SqliteEmbeddingCache(
+          providerEmbeddings,
+          candidate.call,
+          embeddingCacheIdentity(profile.modelId, profile.dimensions),
+          profile.dimensions
+        )
       : unavailableEmbeddings();
+    const sharedEmbeddingCache = providerEmbeddings
+      ? new VaultEmbeddingCache(
+          app.vault.adapter,
+          embeddings as SqliteEmbeddingCache,
+          profile.dimensions
+        )
+      : undefined;
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.metadataCache);
     const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isVisibleMarkdown(path));
     const store = new SqliteNoteVectorStore(
@@ -126,7 +143,8 @@ export class TramaPlugin extends Plugin {
     this.manualIndex = new ManualIndex(
       noteVault,
       store,
-      new SqliteNoteRecordManager(candidate.call)
+      new SqliteNoteRecordManager(candidate.call),
+      sharedEmbeddingCache
     );
     this.retrieval = new VaultRetrieval(
       candidate.call,
@@ -235,9 +253,15 @@ export class TramaPlugin extends Plugin {
     run.promise = (rebuild ? manualIndex.rebuild() : manualIndex.update())
       .then((result) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
+        const message =
+          result.sharing === "incomplete"
+            ? "Index updated; sharing incomplete."
+            : result.sharing === "cancelled"
+              ? "Index updated; sharing cancelled."
+              : `Indexed ${result.visited} notes.`;
         this.status?.setStatus({
           kind: "ready",
-          message: `Indexed ${result.visited} notes.`,
+          message,
           canIndex: true,
           canReindex: true,
           canCancel: false,

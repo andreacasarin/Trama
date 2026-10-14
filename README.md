@@ -4,6 +4,10 @@ Trama is an Obsidian plugin for local AI conversation and semantic connections. 
 
 Trama uses LangChain components for embeddings, Markdown splitting, agents, and tools. Each vault has a stable local index identity, and its SQLite database is stored in that vault's OPFS namespace. SQLite stores note metadata, chunk vectors, lexical search data, and a normalized note centroid. Search filters and ranks indexed data in SQLite; matching note content is loaded from the current vault when results are returned. The index does not persist raw Markdown bodies. Copying a vault's identity file copies its index namespace too.
 
+On an explicit **Update index** or **Rebuild index**, Trama imports compatible document embeddings before indexing and publishes immutable document-only SQLite files after indexing and cleanup succeed. Files are stored under `Trama/embedding-cache-v2/<profileHash>/<contentHash>.sqlite3`; they contain vectors and cache metadata, never note text, queries, chat, or attachments. Cache identity uses the trimmed model ID, embedding dimensions, and exact input, but not the endpoint address. Reuse across endpoints assumes the same model ID and dimensions produce the same weights; Trama does not verify weight equivalence. The files can be carried by the vault's ordinary file-sync service, while each device keeps its own SQLite index. If sharing is interrupted after indexing succeeds, already published files remain and Trama reports that sharing is incomplete; the next explicit update retries. Trama does not upload cache entries at startup. Query embeddings stay local, with up to 1,000 entries per model/dimension profile for 30 days.
+
+If indexing or cleanup fails or is cancelled, Trama publishes no cache files. If indexing and cleanup succeed but sharing is interrupted, completed immutable files remain and Trama reports “Index updated; sharing incomplete/cancelled.” The next explicit Update retries unfinished sharing; there is no background retry.
+
 ## Use
 
 1. Install and enable Trama in Obsidian.

@@ -125,6 +125,41 @@ describe("V1 plugin composition", () => {
     await expect(runtime.resolveNamespace(first.app)).rejects.toThrow(/identity is invalid/);
   });
 
+  it("shows successful indexing separately from incomplete or cancelled sharing", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = new IndexStatusController();
+    const results = ["incomplete", "cancelled"];
+    plugin.manualIndex = {
+      update: async () => ({
+        visited: 3,
+        deleted: 0,
+        numAdded: 1,
+        numUpdated: 0,
+        numSkipped: 2,
+        sharing: results.shift(),
+      }),
+      rebuild: async () => {
+        throw new Error("unused");
+      },
+      cancel: vi.fn(),
+    };
+
+    await plugin.updateIndex();
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "ready",
+      message: "Index updated; sharing incomplete.",
+      canIndex: true,
+      canReindex: true,
+    });
+    await plugin.updateIndex();
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "ready",
+      message: "Index updated; sharing cancelled.",
+      canIndex: true,
+      canReindex: true,
+    });
+  });
+
   it("allows a replacement index run while an old run settles and fences stale status callbacks", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.status = new IndexStatusController();

@@ -3,12 +3,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { ManualIndex, type ManualIndexVault } from "@/index/ManualIndex";
+import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import type { NoteStoreMethod, NoteStoreRpc } from "@/index/note-sqlite/protocol";
+import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 // @ts-expect-error The copied benchmark fixture is plain ESM shared with the runner.
 import { deterministicVector } from "../scripts/benchmark/performance-fixture.mjs";
@@ -62,6 +64,80 @@ class FixtureEmbeddings implements EmbeddingsInterface<number[]> {
   }
   snapshot(): ProviderStats {
     return { ...this.stats };
+  }
+}
+
+class FixtureAdapter {
+  readonly files = new Map<string, Uint8Array>();
+  private readonly folders = new Set<string>();
+  writeCount = 0;
+  writeBytes = 0;
+  async exists(path: string): Promise<boolean> {
+    return this.files.has(path) || this.folders.has(path);
+  }
+  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    return {
+      files: [...this.files.keys()].filter((file) => file.startsWith(`${path}/`)),
+      folders: [],
+    };
+  }
+  async mkdir(path: string): Promise<void> {
+    this.folders.add(path);
+  }
+  async stat(path: string) {
+    if (this.folders.has(path)) return { type: "folder" as const, ctime: 0, mtime: 0, size: 0 };
+    const bytes = this.files.get(path);
+    return bytes ? { type: "file" as const, ctime: 0, mtime: 0, size: bytes.byteLength } : null;
+  }
+  async readBinary(path: string): Promise<ArrayBuffer> {
+    const bytes = this.files.get(path);
+    if (!bytes) throw new Error(`Missing artifact ${path}`);
+    return bytes.slice().buffer;
+  }
+  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    const bytes = new Uint8Array(data.slice(0));
+    this.writeCount++;
+    this.writeBytes += bytes.byteLength;
+    this.files.set(path, bytes);
+  }
+  async rename(from: string, to: string): Promise<void> {
+    const bytes = this.files.get(from);
+    if (!bytes) throw new Error(`Missing temporary artifact ${from}`);
+    this.files.delete(from);
+    this.files.set(to, bytes);
+  }
+  async remove(path: string): Promise<void> {
+    this.files.delete(path);
+  }
+  get totalBytes(): number {
+    return [...this.files.values()].reduce((sum, bytes) => sum + bytes.byteLength, 0);
+  }
+}
+
+class MeasuredVaultEmbeddingCache extends VaultEmbeddingCache {
+  lastPublication = { elapsedMs: 0, temporaryFileWrites: 0, temporaryBytesWritten: 0 };
+
+  constructor(
+    private readonly measuredAdapter: FixtureAdapter,
+    cache: SqliteEmbeddingCache,
+    dimensions: number
+  ) {
+    super(measuredAdapter, cache, dimensions);
+  }
+
+  async publishAvailable(signal: AbortSignal): Promise<void> {
+    const started = performance.now();
+    const writesBefore = this.measuredAdapter.writeCount;
+    const bytesBefore = this.measuredAdapter.writeBytes;
+    try {
+      await super.publishAvailable(signal);
+    } finally {
+      this.lastPublication = {
+        elapsedMs: performance.now() - started,
+        temporaryFileWrites: this.measuredAdapter.writeCount - writesBefore,
+        temporaryBytesWritten: this.measuredAdapter.writeBytes - bytesBefore,
+      };
+    }
   }
 }
 
@@ -149,8 +225,20 @@ async function runSample(
     modelId: plan.modelId,
     dimensions: plan.dimensions,
   };
-  const store = new SqliteNoteVectorStore(
+  const cachedEmbeddings = new SqliteEmbeddingCache(
     embeddings,
+    client.call,
+    embeddingCacheIdentity(profile.modelId, profile.dimensions),
+    plan.dimensions
+  );
+  const artifactAdapter = new FixtureAdapter();
+  const sharedEmbeddings = new MeasuredVaultEmbeddingCache(
+    artifactAdapter,
+    cachedEmbeddings,
+    plan.dimensions
+  );
+  const store = new SqliteNoteVectorStore(
+    cachedEmbeddings,
     client.call,
     async (path) => contents.get(path) ?? null,
     profile
@@ -163,18 +251,32 @@ async function runSample(
       return { path, content };
     },
   };
-  const manager = new ManualIndex(vault, store, new SqliteNoteRecordManager(client.call));
-  await manager.update();
+  const manager = new ManualIndex(
+    vault,
+    store,
+    new SqliteNoteRecordManager(client.call),
+    sharedEmbeddings
+  );
+  requireSharingComplete(await manager.update(), "cold index");
   const coldIndexMs = performance.now() - started;
+  const coldPublication = { ...sharedEmbeddings.lastPublication };
   const initialProvider = embeddings.snapshot();
   const initial = readCounts(db);
   const initialDatabaseExportBytes = sqlite.capi.sqlite3_js_db_export(db.pointer).byteLength;
+  const sharedBootstrap = await runSharedBootstrap(
+    sqlite,
+    sourceNotes,
+    artifactAdapter,
+    embeddings,
+    profile,
+    plan.namespace
+  );
   if (initial.noteCount !== sourceNotes.length)
     throw new Error(`Current index contains ${initial.noteCount}/${sourceNotes.length} notes`);
 
   const retrieval = new VaultRetrieval(
     client.call,
-    embeddings,
+    cachedEmbeddings,
     store.embeddingProfile,
     async (path) => {
       const content = contents.get(path);
@@ -212,32 +314,35 @@ async function runSample(
   const operations: Record<string, unknown> = {};
   let before = embeddings.snapshot();
   let operationStart = performance.now();
-  await manager.update();
+  requireSharingComplete(await manager.update(), "unchanged update");
   operations.unchanged = operationResult(
     performance.now() - operationStart,
     before,
-    embeddings.snapshot()
+    embeddings.snapshot(),
+    sharedEmbeddings.lastPublication
   );
 
   const firstPath = sourceNotes[0].path;
   contents.set(firstPath, `${sourceNotes[0].content.slice(0, -1)}y`);
   before = embeddings.snapshot();
   operationStart = performance.now();
-  await manager.update();
+  requireSharingComplete(await manager.update(), "edit update");
   operations.oneEdit = operationResult(
     performance.now() - operationStart,
     before,
-    embeddings.snapshot()
+    embeddings.snapshot(),
+    sharedEmbeddings.lastPublication
   );
 
   contents.delete(sourceNotes.at(-1)!.path);
   before = embeddings.snapshot();
   operationStart = performance.now();
-  await manager.update();
+  requireSharingComplete(await manager.update(), "delete update");
   operations.oneDelete = operationResult(
     performance.now() - operationStart,
     before,
-    embeddings.snapshot()
+    embeddings.snapshot(),
+    sharedEmbeddings.lastPublication
   );
 
   const final = readCounts(db);
@@ -250,6 +355,10 @@ async function runSample(
       ...initial,
       databaseExportBytes: initialDatabaseExportBytes,
       provider: initialProvider,
+      publication: coldPublication,
+      artifactCount: artifactAdapter.files.size,
+      artifactBytes: artifactAdapter.totalBytes,
+      sharedBootstrap,
     },
     operations,
     queries,
@@ -257,10 +366,81 @@ async function runSample(
   };
 }
 
+async function runSharedBootstrap(
+  sqlite: any,
+  sourceNotes: readonly { path: string; content: string }[],
+  artifactAdapter: FixtureAdapter,
+  embeddings: FixtureEmbeddings,
+  profile: { endpoint: string; modelId: string; dimensions: number },
+  namespace: string
+) {
+  const contents = new Map(sourceNotes.map((note) => [note.path, note.content]));
+  const providerBefore = embeddings.snapshot();
+  const started = performance.now();
+  const db = new sqlite.oo1.DB(":memory:", "c");
+  const database = new NoteSqliteDatabase(db);
+  const client = new NoteStoreClient(new Worker(db, database), namespace);
+  try {
+    await client.initialize();
+    const cache = new SqliteEmbeddingCache(
+      embeddings,
+      client.call,
+      embeddingCacheIdentity(profile.modelId, profile.dimensions),
+      profile.dimensions
+    );
+    const store = new SqliteNoteVectorStore(
+      cache,
+      client.call,
+      async (path) => contents.get(path) ?? null,
+      profile
+    );
+    const vault: ManualIndexVault = {
+      listMarkdownPaths: async () => [...contents.keys()].sort(),
+      readMarkdown: async (path) => ({ path, content: contents.get(path)! }),
+    };
+    const artifacts = new VaultEmbeddingCache(artifactAdapter, cache, profile.dimensions);
+    const result = await new ManualIndex(
+      vault,
+      store,
+      new SqliteNoteRecordManager(client.call),
+      artifacts
+    ).update();
+    requireSharingComplete(result, "shared bootstrap");
+    const providerAfter = embeddings.snapshot();
+    const counts = readCounts(db);
+    const output = {
+      elapsedMs: performance.now() - started,
+      artifactFiles: artifactAdapter.files.size,
+      artifactBytes: artifactAdapter.totalBytes,
+      noteCount: counts.noteCount,
+      vectorCount: counts.vectorCount,
+      providerCalls: providerAfter.calls - providerBefore.calls,
+      providerTexts: providerAfter.texts - providerBefore.texts,
+      numAdded: result.numAdded,
+      transport: "in-memory vault-adapter fixture",
+    };
+    if (
+      output.noteCount !== sourceNotes.length ||
+      output.providerCalls !== 0 ||
+      output.providerTexts !== 0
+    )
+      throw new Error("Shared artifact bootstrap did not populate the native index from cache");
+    return output;
+  } finally {
+    await client.close();
+  }
+}
+
 function readCounts(db: any) {
   return {
     noteCount: Number(db.selectValue("SELECT count(*) FROM note_index")),
     vectorCount: Number(db.selectValue("SELECT count(*) FROM note_vectors")),
+    documentCacheCount: Number(
+      db.selectValue("SELECT count(*) FROM embedding_cache WHERE task='document'")
+    ),
+    queryCacheCount: Number(
+      db.selectValue("SELECT count(*) FROM embedding_cache WHERE task='query'")
+    ),
   };
 }
 
@@ -318,9 +498,15 @@ async function querySuite(
   return results;
 }
 
-function operationResult(elapsedMs: number, before: ProviderStats, after: ProviderStats) {
+function operationResult(
+  elapsedMs: number,
+  before: ProviderStats,
+  after: ProviderStats,
+  publication: MeasuredVaultEmbeddingCache["lastPublication"]
+) {
   return {
     elapsedMs,
+    publication: { ...publication },
     provider: {
       calls: after.calls - before.calls,
       texts: after.texts - before.texts,
@@ -328,6 +514,11 @@ function operationResult(elapsedMs: number, before: ProviderStats, after: Provid
       elapsedMs: after.elapsedMs - before.elapsedMs,
     },
   };
+}
+
+function requireSharingComplete(result: { sharing: string }, phase: string): void {
+  if (result.sharing !== "complete")
+    throw new Error(`${phase} completed indexing with sharing ${result.sharing}`);
 }
 
 function xorshift(value: number): number {

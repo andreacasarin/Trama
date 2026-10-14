@@ -64,7 +64,7 @@ export function validateSqliteAssetHashes(baseline, current) {
   }
 }
 
-function validateSample(sample, noteCount) {
+function validateSample(sample, noteCount, requireQuerySamples = true) {
   if (sample.initial.noteCount !== noteCount || sample.finalNoteCount !== noteCount - 1)
     throw new Error("Benchmark sample has unexpected indexed note counts");
   if (!Number.isFinite(sample.coldIndexMs) || sample.coldIndexMs < 0)
@@ -72,13 +72,55 @@ function validateSample(sample, noteCount) {
   for (const operation of ["unchanged", "oneEdit", "oneDelete"])
     if (!Number.isFinite(sample.operations[operation]?.elapsedMs))
       throw new Error(`Benchmark sample is missing ${operation} timing`);
+  for (const [label, publication] of [
+    ["cold", sample.initial.publication],
+    ...["unchanged", "oneEdit", "oneDelete"].map((name) => [
+      name,
+      sample.operations[name]?.publication,
+    ]),
+  ]) {
+    if (publication === undefined) continue;
+    for (const field of ["elapsedMs", "temporaryFileWrites", "temporaryBytesWritten"])
+      if (!Number.isFinite(publication[field]) || publication[field] < 0)
+        throw new Error(`Benchmark sample has invalid ${label} publication ${field}`);
+  }
   for (const query of ["lexical", "hybrid", "related"]) {
     const result = sample.queries[query];
     if (!result || result.timingsMs.some((value) => !Number.isFinite(value)))
       throw new Error(`Benchmark sample has invalid ${query} timings`);
-    if (result.timingsMs.length === 0)
+    if (requireQuerySamples && result.timingsMs.length === 0)
       throw new Error(`Benchmark sample has no ${query} timing measurements`);
   }
+}
+
+function validateCurrentRuns(runs, plan) {
+  for (const run of plan.runs) {
+    const result = runs.find((item) => item.count === run.count);
+    if (!result || result.samples.length !== run.samples || result.warmups.length !== run.warmups)
+      throw new Error(`Current report has incomplete ${run.count}-note samples`);
+    for (const sample of result.warmups) {
+      validateSample(sample, run.count, false);
+      validatePublication(sample.initial.publication, "cold");
+      for (const name of ["unchanged", "oneEdit", "oneDelete"])
+        validatePublication(sample.operations[name]?.publication, name);
+    }
+    for (const sample of result.samples) {
+      validateSample(sample, run.count);
+      validatePublication(sample.initial.publication, "cold");
+      for (const name of ["unchanged", "oneEdit", "oneDelete"])
+        validatePublication(sample.operations[name]?.publication, name);
+    }
+  }
+}
+
+function validatePublication(publication, phase) {
+  if (!publication) throw new Error(`Current ${phase} sample is missing publication metrics`);
+  if (!Number.isFinite(publication.elapsedMs) || publication.elapsedMs < 0)
+    throw new Error(`Current ${phase} publication time is invalid`);
+  if (!Number.isInteger(publication.temporaryFileWrites) || publication.temporaryFileWrites < 0)
+    throw new Error(`Current ${phase} publication write count is invalid`);
+  if (!Number.isFinite(publication.temporaryBytesWritten) || publication.temporaryBytesWritten < 0)
+    throw new Error(`Current ${phase} publication byte count is invalid`);
 }
 
 async function main() {
@@ -117,6 +159,57 @@ async function main() {
 
   const scratch = await mkdtemp(path.join(os.tmpdir(), "trama-performance-"));
   try {
+    if (args.currentOnly) {
+      const currentDir = args.currentDir
+        ? path.resolve(args.currentDir)
+        : await unpackSnapshot(
+            args.currentTar ??
+              process.env.TRAMA_BENCHMARK_CURRENT_TAR ??
+              "/private/tmp/trama-benchmark-inputs/current.tar",
+            path.join(scratch, "current")
+          );
+      const currentOut = path.join(outputDir, "current-raw.json");
+      const browserReport = await runBrowserAdapter(currentDir, planPath, corpusPath, currentOut, {
+        label: args.currentLabel ?? "current",
+        archive: args.currentTar ?? process.env.TRAMA_BENCHMARK_CURRENT_TAR,
+        smoke: args.smoke,
+      });
+      const currentRuns = JSON.parse(await readFile(currentOut, "utf8"));
+      validateCurrentRuns(currentRuns, plan);
+      const current = {
+        revision: args.currentLabel ?? "current snapshot",
+        corpusSha256: corpus.sha256,
+        runs: currentRuns,
+      };
+      const report = {
+        schema: "trama-opfs-performance-v1",
+        generatedAt: new Date().toISOString(),
+        revisions: { current: current.revision },
+        corpus: { sha256: corpus.sha256, noteCount: corpus.notes.length, noteCharacters: 400 },
+        plan,
+        comparisonNotes: [
+          "Current-only actual-browser OPFS run; publication time is included in operation totals and reported as a subset.",
+        ],
+        provenance: {
+          benchmarkHarness: browserReport,
+          node: browserReport.runtime.node,
+          platform: browserReport.runtime.platform,
+          cpu: browserReport.runtime.cpu,
+          browser: browserReport.browser,
+          snapshots: await snapshotInputs(args, undefined, currentDir),
+        },
+        builds: { current: browserReport.bundles.current },
+        bundles: { current: browserReport.bundles.current },
+        measurements: { current: summarizeRuns(current) },
+        raw: { current: currentRuns },
+      };
+      const reportPath = path.join(outputDir, "report.json");
+      await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+      process.stdout.write(
+        `${JSON.stringify({ reportPath, corpusSha256: corpus.sha256, summary: report.measurements }, null, 2)}\n`
+      );
+      return;
+    }
     const baselineDir = args.baselineDir
       ? path.resolve(args.baselineDir)
       : await unpackSnapshot(
@@ -137,11 +230,6 @@ async function main() {
       baselineDir,
       path.join(root, "scripts/benchmark/baseline-adapter.ts"),
       "legacy"
-    );
-    await prepareAdapter(
-      currentDir,
-      path.join(root, "scripts/benchmark/current-adapter.ts"),
-      "native"
     );
     const buildCommands = [];
     if (!args.prepared) {
@@ -165,7 +253,11 @@ async function main() {
     const baselineOut = path.join(outputDir, "baseline-raw.json");
     const currentOut = path.join(outputDir, "current-raw.json");
     await runAdapter(baselineDir, planPath, corpusPath, baselineOut);
-    await runAdapter(currentDir, planPath, corpusPath, currentOut);
+    const browserReport = await runBrowserAdapter(currentDir, planPath, corpusPath, currentOut, {
+      label: "current",
+      archive: args.currentTar ?? process.env.TRAMA_BENCHMARK_CURRENT_TAR,
+      smoke: args.smoke,
+    });
     const baselineRuns = JSON.parse(await readFile(baselineOut, "utf8"));
     const currentRuns = JSON.parse(await readFile(currentOut, "utf8"));
     const baseline = {
@@ -185,11 +277,13 @@ async function main() {
       comparisonNotes: [
         "Baseline vectors count is compatible, deduplicated embedding-cache entries; legacy chunk count counts structural chunks. Repeated embedding inputs share cached vectors, so those values are not expected to match.",
         "Current vectors count is persisted note vectors, one per default-splitter chunk.",
+        "Current publication runs in an actual browser OPFS worker; the legacy baseline adapter uses its historical test VFS, so storage and publication timing comparisons belong in the dedicated paired OPFS report.",
         "Baseline related-note timings call RelatedNotes.find with refresh=true to bypass its cached result path; current timings use the SQL related lookup.",
         "Hybrid timing includes observed embedding calls: the baseline may reuse its query-embedding cache, while the current adapter performs query embeddings through the production interface.",
       ],
       provenance: {
         ...(await provenance(baselineDir, currentDir, buildCommands)),
+        currentBrowser: browserReport,
         snapshots: await snapshotInputs(args, baselineDir, currentDir),
       },
       builds: { baseline: baselineBuild, current: currentBuild },
@@ -218,8 +312,36 @@ async function prepareAdapter(workspace, sourcePath, kind) {
     path.join(folder, "performance-fixture.mjs")
   );
   const destination = path.join(workspace, "tests/performance-benchmark.test.ts");
-  await copyFile(sourcePath, destination);
+  let adapterSource = await readFile(sourcePath, "utf8");
+  const adapterSourceSha256 = createHash("sha256").update(adapterSource).digest("hex");
+  const archivedAdapter = path.join(workspace, "scripts/benchmark/current-adapter.ts");
+  let archivedAdapterSha256 = null;
+  try {
+    archivedAdapterSha256 = await fileDigest(archivedAdapter);
+  } catch {
+    archivedAdapterSha256 = null;
+  }
+  if (kind === "native") {
+    const vectorMapping = "const vectors = texts.map(deterministicVector);";
+    if (!adapterSource.includes(vectorMapping))
+      throw new Error("Native benchmark adapter vector mapping changed unexpectedly");
+    adapterSource = adapterSource.replace(
+      vectorMapping,
+      "const vectors = texts.map(deterministicVector) as number[][];"
+    );
+  }
+  await writeFile(destination, adapterSource);
   if (kind !== "legacy" && kind !== "native") throw new Error("Unknown adapter kind");
+  return {
+    archivedAdapterSha256,
+    adapterSourceSha256,
+    sourceAdapterMatchesArchive: archivedAdapterSha256 === adapterSourceSha256,
+    injectedTestSha256: await fileDigest(destination),
+    injectedTypeOnlyTransform:
+      kind === "native"
+        ? "deterministicVector map asserted as number[][]; no runtime conversion"
+        : null,
+  };
 }
 
 async function runAdapter(workspace, planPath, corpusPath, outputPath) {
@@ -234,6 +356,32 @@ async function runAdapter(workspace, planPath, corpusPath, outputPath) {
     },
     60 * 60 * 1000
   );
+}
+
+async function runBrowserAdapter(workspace, planPath, corpusPath, outputPath, options) {
+  const browserReportPath = `${outputPath}.browser.json`;
+  const commandArgs = [
+    path.join(root, "scripts/benchmark/sqlite-opfs-performance.mjs"),
+    "--workspace",
+    workspace,
+    "--label",
+    "current",
+    "--plan",
+    planPath,
+    "--corpus",
+    corpusPath,
+    "--output",
+    browserReportPath,
+  ];
+  if (options.smoke) commandArgs.push("--smoke");
+  if (options.archive) commandArgs.push("--archive", path.resolve(options.archive));
+  runCommand(process.execPath, commandArgs, root, {}, 30 * 60 * 1000);
+  const report = JSON.parse(await readFile(browserReportPath, "utf8"));
+  const runs = report.report.current;
+  if (!Array.isArray(runs))
+    throw new Error("Actual-browser benchmark did not produce current runs");
+  await writeFile(outputPath, JSON.stringify(runs, null, 2));
+  return report;
 }
 
 async function instrumentBuild(workspace) {
@@ -351,6 +499,27 @@ async function validateSharedSqliteAssets(baselineDir, currentDir) {
 }
 
 async function snapshotInputs(args, baselineDir, currentDir) {
+  if (args.currentOnly) {
+    const archive = path.resolve(
+      args.currentTar ??
+        process.env.TRAMA_BENCHMARK_CURRENT_TAR ??
+        "/private/tmp/trama-benchmark-inputs/current.tar"
+    );
+    let archiveDetails;
+    try {
+      archiveDetails = { path: archive, sha256: await fileDigest(archive) };
+    } catch {
+      archiveDetails = { path: archive, sha256: null };
+    }
+    return {
+      revisionLabels: { current: args.currentLabel ?? "current snapshot" },
+      revisionLabelsAreDeclaredNotGitValidated: true,
+      workspaceMode: args.prepared ? "prepared-directories" : "extracted-tar-archives",
+      workspaceDirectories: { current: currentDir },
+      workspaceContentsVerifiedAgainstArchives: !args.prepared,
+      archives: { current: archiveDetails },
+    };
+  }
   const archives = {
     baseline: path.resolve(
       args.baselineTar ??
@@ -386,10 +555,13 @@ function summarizeRuns(report) {
     const measured = run.samples;
     const coldIndex = measured.map((sample) => sample.coldIndexMs);
     const operations = Object.fromEntries(
-      ["unchanged", "oneEdit", "oneDelete"].map((name) => [
-        name,
-        summarize(measured.map((sample) => sample.operations[name].elapsedMs)),
-      ])
+      ["unchanged", "oneEdit", "oneDelete"].map((name) => {
+        const samples = measured.map((sample) => sample.operations[name]);
+        const summary = summarize(samples.map((sample) => sample.elapsedMs));
+        if (samples.every((sample) => sample.publication))
+          summary.publication = summarizePublication(samples.map((sample) => sample.publication));
+        return [name, summary];
+      })
     );
     const queries = Object.fromEntries(
       ["lexical", "hybrid", "related"].map((name) => {
@@ -405,7 +577,7 @@ function summarizeRuns(report) {
         return [name, { ...summarize(values), provider }];
       })
     );
-    return {
+    const summary = {
       count: run.count,
       samples: measured.length,
       coldIndex: summarize(coldIndex),
@@ -415,9 +587,24 @@ function summarizeRuns(report) {
         (sample) => sample.initial.chunkCount ?? sample.initial.vectorCount
       ),
       vectors: measured.map((sample) => sample.initial.vectorCount),
-      databaseExportBytes: measured.map((sample) => sample.initial.databaseExportBytes),
+      mainDatabaseBytes: measured.map(
+        (sample) => sample.initial.sqlite?.mainDatabaseBytes ?? sample.initial.databaseExportBytes
+      ),
     };
+    if (measured.every((sample) => sample.initial.publication))
+      summary.coldPublication = summarizePublication(
+        measured.map((sample) => sample.initial.publication)
+      );
+    return summary;
   });
+}
+
+function summarizePublication(samples) {
+  return {
+    elapsedMs: summarize(samples.map((sample) => sample.elapsedMs)),
+    temporaryFileWrites: summarize(samples.map((sample) => sample.temporaryFileWrites)),
+    temporaryBytesWritten: summarize(samples.map((sample) => sample.temporaryBytesWritten)),
+  };
 }
 
 function percentile(sorted, fraction) {
@@ -499,12 +686,14 @@ function parseArgs(args) {
   for (let index = 0; index < args.length; index++) {
     const key = args[index];
     if (key === "--smoke") result.smoke = true;
+    else if (key === "--current-only") result.currentOnly = true;
     else if (key === "--prepared") result.prepared = true;
     else if (key === "--keep-scratch") result.keepScratch = true;
     else if (key === "--baseline-dir") result.baselineDir = args[++index];
     else if (key === "--current-dir") result.currentDir = args[++index];
     else if (key === "--baseline-tar") result.baselineTar = args[++index];
     else if (key === "--current-tar") result.currentTar = args[++index];
+    else if (key === "--current-label") result.currentLabel = args[++index];
     else if (key === "--output-dir") result.outputDir = args[++index];
     else throw new Error(`Unknown benchmark option ${key}`);
   }

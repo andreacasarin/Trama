@@ -1,0 +1,141 @@
+import type { DataAdapter } from "obsidian";
+import {
+  EMBEDDING_ARTIFACT_MAX_ENTRIES,
+  EMBEDDING_ARTIFACT_MAX_FILE_BYTES,
+  EMBEDDING_ARTIFACT_MAX_VECTOR_BYTES,
+} from "@/index/note-sqlite/protocol";
+import type { SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
+
+type SharedShardCache = Pick<
+  SqliteEmbeddingCache,
+  | "profileFingerprint"
+  | "unimportedSqliteShards"
+  | "importDocumentShard"
+  | "exportNextDocumentShard"
+  | "markDocumentShardPublished"
+>;
+
+const ROOT = "Trama/embedding-cache-v2";
+
+export class VaultEmbeddingCache {
+  private readonly folder: string;
+
+  constructor(
+    private readonly adapter: Pick<
+      DataAdapter,
+      "exists" | "list" | "mkdir" | "stat" | "readBinary" | "writeBinary" | "rename" | "remove"
+    >,
+    private readonly cache: SharedShardCache,
+    private readonly dimensions: number
+  ) {
+    this.folder = `${ROOT}/${cache.profileFingerprint}`;
+  }
+
+  async importAvailable(signal: AbortSignal): Promise<void> {
+    checkAbort(signal);
+    await this.ensureFolder();
+    const { files } = await this.adapter.list(this.folder);
+    const checksums = files
+      .map((path) => path.slice(path.lastIndexOf("/") + 1))
+      .filter((name) => /^[0-9a-f]{64}\.sqlite3$/.test(name))
+      .map((name) => name.slice(0, 64));
+    for (let offset = 0; offset < checksums.length; offset += EMBEDDING_ARTIFACT_MAX_ENTRIES) {
+      const page = checksums.slice(offset, offset + EMBEDDING_ARTIFACT_MAX_ENTRIES);
+      const pending = new Set(await this.cache.unimportedSqliteShards(page, signal));
+      for (const checksum of page) {
+        checkAbort(signal);
+        if (!pending.has(checksum)) continue;
+        const bytes = await this.readBoundedArtifact(`${this.folder}/${checksum}.sqlite3`, signal);
+        if (!bytes || (await sha256Bytes(bytes)) !== checksum) continue;
+        try {
+          await this.cache.importDocumentShard(checksum, bytes, signal);
+        } catch {
+          checkAbort(signal);
+        }
+      }
+    }
+  }
+
+  async publishAvailable(signal: AbortSignal): Promise<void> {
+    checkAbort(signal);
+    await this.ensureFolder();
+    const perArtifact = Math.min(
+      EMBEDDING_ARTIFACT_MAX_ENTRIES,
+      Math.floor(EMBEDDING_ARTIFACT_MAX_VECTOR_BYTES / (this.dimensions * 4))
+    );
+    if (perArtifact < 1) throw new Error("Embedding vectors exceed the shared shard size limit.");
+    while (true) {
+      checkAbort(signal);
+      const shard = await this.cache.exportNextDocumentShard(perArtifact, signal);
+      if (!shard) return;
+      if (
+        shard.hashes.length < 1 ||
+        shard.hashes.length > EMBEDDING_ARTIFACT_MAX_ENTRIES ||
+        shard.bytes.byteLength >= EMBEDDING_ARTIFACT_MAX_FILE_BYTES
+      )
+        throw new Error("SQLite embedding shard exceeds its bounds.");
+      const checksum = await sha256Bytes(shard.bytes);
+      const finalPath = `${this.folder}/${checksum}.sqlite3`;
+      if (await this.adapter.exists(finalPath)) {
+        const existing = await this.readBoundedArtifact(finalPath, signal);
+        if (!existing || (await sha256Bytes(existing)) !== checksum)
+          throw new Error("Existing SQLite embedding shard failed its checksum.");
+      } else {
+        const temporaryPath = `${this.folder}/.tmp-${checksum}-${randomSuffix()}`;
+        try {
+          checkAbort(signal);
+          await this.adapter.writeBinary(temporaryPath, exactArrayBuffer(shard.bytes));
+          checkAbort(signal);
+          await this.adapter.rename(temporaryPath, finalPath);
+        } finally {
+          if (await this.adapter.exists(temporaryPath))
+            await this.adapter.remove(temporaryPath).catch(() => undefined);
+        }
+        checkAbort(signal);
+        const published = await this.readBoundedArtifact(finalPath, signal);
+        if (!published || (await sha256Bytes(published)) !== checksum)
+          throw new Error("Published SQLite embedding shard failed its checksum.");
+      }
+      await this.cache.markDocumentShardPublished(checksum, shard.hashes, signal);
+    }
+  }
+
+  private async ensureFolder(): Promise<void> {
+    const root = "Trama";
+    const shared = `${root}/embedding-cache-v2`;
+    for (const path of [root, shared, this.folder]) {
+      if (!(await this.adapter.exists(path))) await this.adapter.mkdir(path);
+    }
+  }
+
+  private async readBoundedArtifact(
+    path: string,
+    signal: AbortSignal
+  ): Promise<Uint8Array | undefined> {
+    checkAbort(signal);
+    const stat = await this.adapter.stat(path);
+    checkAbort(signal);
+    if (!stat || stat.type !== "file" || stat.size >= EMBEDDING_ARTIFACT_MAX_FILE_BYTES) return;
+    const bytes = new Uint8Array(await this.adapter.readBinary(path));
+    checkAbort(signal);
+    return bytes.byteLength < EMBEDDING_ARTIFACT_MAX_FILE_BYTES ? bytes : undefined;
+  }
+}
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const input = bytes.slice().buffer as ArrayBuffer;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function randomSuffix(): string {
+  return crypto.randomUUID();
+}
+
+function checkAbort(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+}

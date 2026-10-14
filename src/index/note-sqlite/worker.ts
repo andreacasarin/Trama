@@ -1,4 +1,4 @@
-import { NoteSqliteDatabase } from "./database";
+import { NoteSqliteDatabase, type SqliteEmbeddingShardPool } from "./database";
 import type { NoteStoreInit, NoteStoreMethod, NoteStoreRpc, SqliteConnection } from "./protocol";
 
 type Sqlite = {
@@ -8,6 +8,11 @@ type Sqlite = {
     initialCapacity: number;
   }): Promise<{
     OpfsSAHPoolDb: new (name: string, mode: string) => SqliteConnection;
+    readonly vfsName: string;
+    reserveMinimumCapacity(capacity: number): Promise<void>;
+    exportFile(path: string): Uint8Array;
+    importDb(path: string, bytes: Uint8Array): void;
+    unlink(path: string): void;
     pauseVfs(): unknown;
   }>;
 };
@@ -59,11 +64,20 @@ async function open(namespace: string): Promise<OpenDatabase> {
   const pool = await sqlite.installOpfsSAHPoolVfs({
     name: directory,
     directory,
-    initialCapacity: 4,
+    initialCapacity: 8,
   });
+  await pool.reserveMinimumCapacity(8);
   const connection = new pool.OpfsSAHPoolDb("/notes.sqlite3", "c");
+  const shardPool: SqliteEmbeddingShardPool = {
+    vfsName: pool.vfsName,
+    mainPath: "/notes.sqlite3",
+    openDatabase: (path, mode) => new pool.OpfsSAHPoolDb(path, mode),
+    exportFile: (path) => pool.exportFile(path),
+    importDb: (path, bytes) => pool.importDb(path, bytes),
+    unlink: (path) => pool.unlink(path),
+  };
   return {
-    database: new NoteSqliteDatabase(connection),
+    database: new NoteSqliteDatabase(connection, shardPool),
     close() {
       try {
         connection.close();

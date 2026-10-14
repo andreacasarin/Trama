@@ -157,3 +157,109 @@ The 300-note profile used five fresh-index samples and the 3,000-note profile us
 The vector payload is identical at 9,236,872 bytes. Vector allocation decreased from 28,090,368 to 12,312,576 bytes; vector pages fell from 3,429 to 1,503, and overflow pages fell from 3,000 to zero. The candidate added a 49,152-byte unique index. Total pages decreased from 5,043 to 3,123 at 8,192 bytes per page, with no freelist pages. The centroid-bearing `note_index` table was unchanged at 12,312,576 bytes. At 300 notes, exported database size fell from 4,235,264 to 2,662,400 bytes (37.1%); cold indexing was 465.68 versus 480.52 ms, and hybrid lookup was 1.690 versus 1.201 ms.
 
 This fresh-database experiment shows a storage reduction and a lower observed hybrid-query median, while no-op updates and writes were slightly slower and delete timing varied. It does not guarantee improvement across operations. The candidate's `CREATE TABLE IF NOT EXISTS` behavior does not convert existing databases; no vault database was changed and no migration or automatic reset was tested. The synthetic provider and in-memory SQLite run do not measure live LM Studio, Obsidian, OPFS, or semantic quality. This experiment records evidence, not a migration policy.
+
+## SQLite embedding-cache comparison — 2026-10-13
+
+The cache snapshots in the two 2026-10-13 sections below predate the later endpoint-independent cache identity based on trimmed model ID and dimensions. Those measurements do not evaluate that identity change; all other historical figures and provenance remain as recorded.
+
+This paired run compares uncached commit `50fa` with a working-tree snapshot of that commit plus document-cache and publication-receipt fixes. The snapshot is identified by archive SHA-256 `57d208666c43637b3f40098b28bfe009194715a548941e8dd01def578ce0aeaf`; it is not a committed revision. Both builds used the same corpus, 768-dimensional zero-delay provider, in-memory SQLite WASM, and each revision's own lockfile. The ignored raw report is `.ai/bench/sqlite-embedding-cache/run-20261013/uncached-comparison-final/report.json`.
+
+The 300-note profile used five fresh-index samples and the 3,000-note profile used three, each after one warmup. Queries used five warmups and 30 per run; the 24-note profile was a smoke run.
+
+| Profile and operation     |    Uncached |       Cache snapshot |
+| ------------------------- | ----------: | -------------------: |
+| 3,000-note cold index     | 4,962.74 ms | 5,779.67 ms (+16.5%) |
+| 3,000-note no-op update   |   188.18 ms |            198.87 ms |
+| 3,000-note edit           |   192.16 ms |            203.51 ms |
+| 3,000-note delete         |   184.03 ms |            197.55 ms |
+| 3,000-note lexical query  |     1.02 ms |              1.04 ms |
+| 3,000-note hybrid query   |     5.24 ms |              5.73 ms |
+| 3,000-note related lookup |     2.73 ms |              2.75 ms |
+| 300-note cold index       |   503.35 ms |   590.27 ms (+17.3%) |
+
+For 90 measured hybrid queries, provider calls fell from 90 to 6. Cold indexing still made 30 provider calls and embedded 3,000 texts on both sides. At 3,000 notes, exported database size grew from 25,583,616 to 39,174,144 bytes (+53.1%); the cache stored 2,999 unique document vectors alongside the index's 3,000 vectors and centroids. At 300 notes, database size grew from 2,662,400 to 4,063,232 bytes while measured query calls fell from 150 to 10.
+
+A separate second-database bootstrap indexed 3,000 notes and vectors with zero provider requests; its median time was 5,725.15 ms. Its 24 cache artifacts occupied 12,502,544 bytes; after one edit, 25 artifacts occupied 12,506,825 bytes. This used an in-memory vault adapter and does not validate real vault synchronization. `main.js` changed from 1,990,378 to 2,000,264 bytes (502,459 to 505,357 bytes gzip); the worker changed from 13,979 to 21,755 bytes (4,747 to 6,328 bytes gzip).
+
+This is a synthetic comparison of an uncached commit and an uncommitted cache snapshot. It does not test a live provider or real sync transport, establish semantic quality, or show that cached and uncached outputs are interchangeable. Cold indexing was slower in both measured profiles, while query timings were broadly similar; the observed request reduction comes with additional local database and package storage.
+
+## Legacy-to-cache comparison — 2026-10-13
+
+This is a separate fresh pair comparing baseline `e03133025f3acb68b75514dfbf18448e903cbbf0` with the declared `50fa` revision plus the cache working-tree snapshot, archive SHA-256 `57d208666c43637b3f40098b28bfe009194715a548941e8dd01def578ce0aeaf`. It uses the same corpus, SQLite assets, and deterministic 768-dimensional zero-delay provider. The 300-note profile used five fresh-index samples and the 3,000-note profile three, each after one warmup; queries used five warmups and 30 per run. The ignored raw report is `.ai/bench/sqlite-embedding-cache/run-20261013/legacy-comparison-final/report.json`.
+
+| 3,000-note operation |         Legacy median (p95) |        Cache median (p95) |
+| -------------------- | --------------------------: | ------------------------: |
+| Cold index           | 20,344.00 ms (20,544.45 ms) | 5,757.37 ms (5,980.18 ms) |
+| No-op update         |       113.93 ms (117.42 ms) |     190.48 ms (192.04 ms) |
+| Edit                 |   1,652.14 ms (1,681.93 ms) |     196.98 ms (202.18 ms) |
+| Delete               |   1,196.34 ms (1,235.34 ms) |     187.76 ms (206.28 ms) |
+| Lexical query        |         32.51 ms (40.99 ms) |         0.98 ms (5.26 ms) |
+| Hybrid query         |         48.75 ms (74.25 ms) |         5.38 ms (9.30 ms) |
+| Related lookup       |       118.02 ms (125.33 ms) |         2.71 ms (3.06 ms) |
+
+Provider calls for 90 measured hybrid queries were six on both sides. Cold indexing used 24 provider calls and 3,005 texts at baseline versus 30 calls and 3,000 texts in the cache snapshot. At 3,000 notes, exported database size increased from 23,371,776 to 39,174,144 bytes (67.6%). The baseline produced 6,000 structural chunks and 3,005 deduplicated vectors; the cache snapshot used 3,000 default Markdown chunks and 3,000 vectors. At 300 notes, cold indexing was 266.30 versus 603.32 ms and no-op update was 13.87 versus 20.81 ms; edit and delete were 83.67 versus 25.68 ms and 67.98 versus 22.29 ms.
+
+The cache snapshot's second-database bootstrap took a median 5,949 ms in the in-memory vault adapter with zero provider calls; this pair's bootstrap artifacts had 24 files. The legacy-pair build changed `main.js` from 217,257 to 2,000,264 bytes (58,261 to 505,358 bytes gzip) and the worker from 125,726 to 21,755 bytes (31,005 to 6,329 bytes gzip); SQLite assets were unchanged.
+
+The pairs have different chunking, ranking, and related-result cache behavior, so their timings do not establish equivalent result quality or isolate the cache's causal effect. This zero-delay-provider comparison does not measure live endpoint latency or real vault synchronization.
+
+## Publication phase and cache format experiment — 2026-10-13
+
+These measurements use the current cache implementation and a separate SQLite-file-format prototype. They use the same deterministic 768-dimensional vector fixture, in-memory SQLite WASM, in-memory vault adapter, and 24-note smoke, 300-note, and 3,000-note profiles. The 300-note profile used five samples and the 3,000-note profile three. The current-run report is `.ai/bench/sqlite-embedding-cache/publication-20261013/current-final/report.json`; the format comparison report is `.ai/bench/sqlite-embedding-cache/publication-20261013/format-comparison-final/format-report.json`.
+
+The production publisher's measured phase is included in each total and is not additive to it. “Temporary writes” counts local temporary cache-file writes, not remote vault synchronization.
+
+| Current cache operation | Total median | Publication phase median (p95) | Temporary writes | Bytes written |
+| ----------------------- | -----------: | -----------------------------: | ---------------: | ------------: |
+| 300-note cold index     |    578.91 ms |               79.77 ms (81.09) |                3 |     1,246,571 |
+| 3,000-note cold index   |  5,772.86 ms |             793.34 ms (801.47) |               24 |    12,502,544 |
+| 3,000-note no-op update |    192.32 ms |                        2.49 ms |                0 |             0 |
+| 3,000-note edit         |    204.45 ms |                        5.39 ms |                1 |         4,281 |
+| 3,000-note delete       |    188.99 ms |                        2.54 ms |                0 |             0 |
+
+A separate 3,000-note bootstrap of a second local index completed in a median 5,895.93 ms with zero provider calls and 3,000 notes/vectors. Its initial cache contained 24 files and 12,502,544 bytes; a later edit produced a 25th file, so that final file count is not the bootstrap count.
+
+The format comparison seeded the same deterministic vector fixture outside the timed publication phase, then alternated JSON and SQLite-shard publication in one process. The SQLite prototype publishes document vectors only; its timed work includes ATTACH, schema setup, copying, VACUUM, export, file write and verification, and DETACH. Receipt-count checks run after the timed phase in both arms. A separate exact comparison after SQLite deserialization covered 2,999 document vectors for 3,000 notes and 299 for 300 notes; it took 9.275 ms and 1.228 ms, respectively.
+
+| Profile     |    JSON median (p95) | SQLite-shard median (p95) | JSON files | SQLite files | JSON bytes |        SQLite bytes |
+| ----------- | -------------------: | ------------------------: | ---------: | -----------: | ---------: | ------------------: |
+| 300 notes   |   78.918 ms (85.773) |          4.676 ms (5.119) |          3 |            3 |  1,246,571 |  1,359,872 (+9.09%) |
+| 3,000 notes | 782.971 ms (806.053) |        44.289 ms (48.535) |         24 |           24 | 12,502,544 | 13,451,264 (+7.59%) |
+
+This prototype was a measurement, not an adopted format change. It did not test `VACUUM INTO`, OPFS durability, real vault synchronization, live-provider latency, incremental publication alternatives, or semantic quality. At the time of that experiment, the production format remained unchanged; its in-memory results alone did not establish end-to-end performance in Obsidian.
+
+## Production OPFS shard comparison — 2026-10-14
+
+This paired comparison measures the frozen JSON cache snapshot (`cf8e2902ef6582cafc09d28b445d41593222af4376ad2919b020c61ea502d0d3`) against the production SQLite-shard snapshot (`1bfef414f52958c38186d80caf2968ebd67a2c62a2407bcae16c1a6b8f0729bc`). Both used the same corpus, 768-dimensional deterministic provider fixture, SQLite WASM assets, and lockfile. Publication ran through the production worker on Brave 154 with a real SAH OPFS pool and an in-memory vault adapter; this does not measure actual vault synchronization. The raw report is `.ai/bench/sqlite-embedding-cache/opfs-performance-20261014-final/report.json` (SHA-256 `33e5ae23e9a9400429f0817ca59db9d8a51cd22138166a6a4c281ab1f3954fb8`). Production-worker OPFS validation is recorded in `.ai/bench/sqlite-embedding-cache/opfs-20261014/production-worker-opfs.json`.
+
+The 300-note profile used five samples and the 3,000-note profile used three. The 24-note profile was a smoke run. The publication phase is included in cold-index totals and must not be added to them. The measured production path uses native SQL to select and copy vectors into file-backed scratch databases, `VACUUM INTO` to create each shard, and VFS export; the import path validates and copies into the local cache using SQLite. No per-step OPFS timings were collected.
+
+| Operation               |   300-note JSON |           300-note SQLite |   3,000-note JSON |           3,000-note SQLite |
+| ----------------------- | --------------: | ------------------------: | ----------------: | --------------------------: |
+| Cold index              |     1,198.07 ms |               2,485.47 ms |       9,478.29 ms |                24,337.27 ms |
+| Publication phase       |       107.47 ms |               1,567.02 ms |       1,045.95 ms |                15,255.30 ms |
+| Fresh-device bootstrap  |       973.72 ms |               1,235.99 ms |       9,221.01 ms |                 8,825.08 ms |
+| Published files / bytes | 3 / 1,246,571 B | 3 / 1,409,024 B (+13.03%) | 24 / 12,502,544 B | 24 / 13,844,480 B (+10.73%) |
+
+At 3,000 notes, no-op update was 407.38 ms for JSON and 440.62 ms for SQLite; edit was 433.70 versus 481.61 ms, and delete was 410.98 versus 461.36 ms. Lexical, hybrid, and related-query medians were similar (1.31/13.30/3.02 ms for JSON and 1.36/13.94/3.06 ms for SQLite). Both made six provider calls across 90 measured hybrid queries. Fresh-device bootstrap made zero provider calls in both cases. The local SQLite database was 39,174,144 bytes in both snapshots, with 3,000 notes/vectors and 2,999 cached document vectors.
+
+In this pre-optimization snapshot, SQLite shard publication was substantially slower than JSON publication, while producing artifacts 10–13% larger. Fresh-device bootstrap timings were similar and varied by profile. The benchmark did not measure live provider latency or real sync; these results do not establish semantic equivalence or broad end-to-end performance in Obsidian.
+
+## OPFS receipt batching comparison — 2026-10-14
+
+This paired comparison isolates the bounded receipt-insert optimization in the production SQLite-shard path. It compares the earlier SQLite implementation (`1bfef414f52958c38186d80caf2968ebd67a2c62a2407bcae16c1a6b8f0729bc`) with the receipt-batched implementation (`94945f991f82d6912c7c8916af50c53420be7ec7f7ea6b3f3a02f464fe546b7d`). Both use the production `VACUUM INTO` and OPFS export path; shard format, VFS workflow, corpus, SQLite assets, and provider fixture are unchanged. The receipt write now uses one bounded native `INSERT ... SELECT` for up to 128 document hashes per shard, with cancellation checks between SQL steps and before commit. The raw paired report is `.ai/bench/sqlite-embedding-cache/opfs-receipts-20261014/report.json` (SHA-256 `05904dc80ec6548c9697914e4085e41def20090f9d18bc5d49000d59cdfd2dcd`); the focused OPFS profile is `.ai/bench/sqlite-embedding-cache/opfs-profile-20261014/profile.json` (SHA-256 `71418ff7b6ca23fa2bd173206362469f091446e417d636eb94a136d8173b6517`).
+
+Runs used Brave 154, a real SAH OPFS worker, SQLite WASM, an in-memory vault adapter, and a deterministic 768-dimensional provider fixture. The 300-note profile used five samples; the 3,000-note profile used three; the 24-note profile was a smoke run. Publication timing is included in cold-index totals. These snapshots are a causal pair for the receipt optimization; their absolute timings should not be compared directly with the earlier JSON-to-SQLite pair.
+
+| Operation              | 300-note old SQL | 300-note batched SQL | 3,000-note old SQL | 3,000-note batched SQL |
+| ---------------------- | ---------------: | -------------------: | -----------------: | ---------------------: |
+| Cold index             |      3,159.70 ms |          1,444.66 ms |       31,905.10 ms |           14,675.80 ms |
+| Publication phase      |      1,857.84 ms |            103.91 ms |       18,169.12 ms |              802.04 ms |
+| No-op update           |                — |                    — |          537.46 ms |              520.72 ms |
+| Edit                   |                — |                    — |          561.37 ms |              548.25 ms |
+| Delete                 |                — |                    — |          517.63 ms |              512.91 ms |
+| Fresh-device bootstrap |                — |                    — |       13,809.98 ms |           13,690.98 ms |
+
+At 3,000 notes, publication time fell by about 22.7× and cold indexing by about 2.2× in this pair. The focused profile identified the earlier cost: per-hash receipt writes yielded 3,023 times and took 14,056.95 ms (86.54% of publication), while the measured `VACUUM INTO` step took 143.52 ms across 24 artifacts. The cache held 24 artifacts totaling 13,844,480 bytes in both paired runs; the local database was 39,174,144 bytes in both. Both versions made 30 embedding calls for 3,000 texts during cold indexing and six calls across 90 measured hybrid queries. Lexical/hybrid/related-query medians were similar (1.04/11.77/2.48 ms before and 0.99/11.50/2.45 ms after). Fresh-device bootstrap made zero provider calls in both versions.
+
+This comparison measures the receipt-write change, not JSON versus SQLite. It did not measure live provider latency or real vault synchronization; it establishes neither semantic quality nor broad end-to-end Obsidian performance.

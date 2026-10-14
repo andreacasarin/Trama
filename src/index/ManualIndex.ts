@@ -16,12 +16,18 @@ export interface ManualIndexVault {
   readMarkdown(path: string, signal: AbortSignal): Promise<ManualIndexNote>;
 }
 
+export interface ManualIndexArtifacts {
+  importAvailable(signal: AbortSignal): Promise<void>;
+  publishAvailable(signal: AbortSignal): Promise<void>;
+}
+
 export interface ManualIndexResult {
   readonly visited: number;
   readonly deleted: number;
   readonly numAdded: number;
   readonly numUpdated: number;
   readonly numSkipped: number;
+  readonly sharing: "complete" | "incomplete" | "cancelled";
 }
 
 export class ManualIndex {
@@ -33,7 +39,8 @@ export class ManualIndex {
   constructor(
     private readonly vault: ManualIndexVault,
     private readonly store: SqliteNoteVectorStore,
-    private readonly records: SqliteNoteRecordManager
+    private readonly records: SqliteNoteRecordManager,
+    private readonly artifacts?: ManualIndexArtifacts
   ) {}
 
   update(): Promise<ManualIndexResult> {
@@ -58,6 +65,7 @@ export class ManualIndex {
 
   private async run(rebuild: boolean, signal: AbortSignal): Promise<ManualIndexResult> {
     const store = this.store.withSignal(signal);
+    await this.artifacts?.importAvailable(signal);
     if (rebuild) await store.reset(signal);
     const paths = await this.vault.listMarkdownPaths(signal);
     const records = this.records.forRun(await this.records.getTime(signal), signal);
@@ -97,12 +105,19 @@ export class ManualIndex {
       vectorStore: store,
       options: { cleanup: "full", cleanupBatchSize: 1000, sourceIdKey: "path" },
     });
+    let sharing: ManualIndexResult["sharing"] = "complete";
+    try {
+      await this.artifacts?.publishAvailable(signal);
+    } catch {
+      sharing = signal.aborted ? "cancelled" : "incomplete";
+    }
     return {
       visited: paths.length,
       deleted: cleanup.numDeleted,
       numAdded,
       numUpdated,
       numSkipped,
+      sharing,
     };
   }
 }
