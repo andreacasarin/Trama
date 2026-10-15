@@ -10,6 +10,11 @@ import { build } from "esbuild";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const browser = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const outputDir = join(root, ".ai/bench/sqlite-embedding-cache/opfs-20261014");
+const outputArgument = process.argv.indexOf("--output");
+const outputPath =
+  outputArgument >= 0
+    ? resolve(process.argv[outputArgument + 1])
+    : join(outputDir, "production-worker-opfs.json");
 const scratch = mkdtempSync(`/private/tmp/trama-d11-opfs-${randomUUID()}-`);
 const profileDir = join(scratch, "profile-" + randomUUID());
 const site = join(scratch, "site");
@@ -269,10 +274,10 @@ try {
     buildInputs: Object.keys(built.metafile.inputs),
     capturedAt: new Date().toISOString(),
   };
-  const path = join(outputDir, "production-worker-opfs.json");
-  writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`);
+  mkdirSync(dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(
-    `${JSON.stringify({ ok: true, report: path, browser: report.browser, rows: result.artifactRows, bytes: result.artifactBytes, importedRows: result.importedRows, browserExit: exit })}\n`
+    `${JSON.stringify({ ok: true, report: outputPath, browser: report.browser, rows: result.artifactRows, bytes: result.artifactBytes, importedRows: result.importedRows, browserExit: exit })}\n`
   );
 } catch (error) {
   process.stderr.write(`${error.stack ?? error}\n`);

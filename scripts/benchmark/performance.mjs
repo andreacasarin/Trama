@@ -384,7 +384,7 @@ async function runBrowserAdapter(workspace, planPath, corpusPath, outputPath, op
   return report;
 }
 
-async function instrumentBuild(workspace) {
+export async function instrumentBuild(workspace) {
   const normal = {
     main: await fileDigest(path.join(workspace, "main.js")),
     worker: await fileDigest(path.join(workspace, "sqlite-worker.mjs")),
@@ -437,7 +437,7 @@ async function instrumentBuild(workspace) {
   return metafile.result;
 }
 
-async function bundleFiles(workspace) {
+export async function bundleFiles(workspace) {
   const paths = [
     "main.js",
     "sqlite-worker.mjs",

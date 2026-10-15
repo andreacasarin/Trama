@@ -276,11 +276,23 @@ export async function runWorkload(
     profile
   );
   const vault: ManualIndexVault = {
-    listMarkdownPaths: async () => [...contents.keys()].sort(),
+    listMarkdownPaths: async () => {
+      const started = performance.now();
+      try {
+        return [...contents.keys()].sort();
+      } finally {
+        recordProfile("vault.listMarkdownPaths", performance.now() - started, contents.size);
+      }
+    },
     readMarkdown: async (path) => {
-      const content = contents.get(path);
-      if (content === undefined) throw new Error(`Missing benchmark note ${path}`);
-      return { path, content };
+      const started = performance.now();
+      try {
+        const content = contents.get(path);
+        if (content === undefined) throw new Error(`Missing benchmark note ${path}`);
+        return { path, content };
+      } finally {
+        recordProfile("vault.readMarkdown", performance.now() - started, 1);
+      }
     },
   };
   const manager = new ManualIndex(vault, store, new SqliteNoteRecordManager(client.call), measured);
@@ -376,15 +388,21 @@ export async function runWorkload(
   await bootstrapClient.close();
 
   const before = embeddings.snapshot();
+  const unchangedProfileBefore = await inspectSqlite(client);
+  const unchangedVaultBefore = profileSnapshot();
   const operationStart = performance.now();
   const unchanged = await manager.update();
   if (unchanged.sharing !== "complete")
     throw new Error(`Unchanged update sharing ${unchanged.sharing}`);
+  const unchangedElapsedMs = performance.now() - operationStart;
+  const unchangedProfileAfter = await inspectSqlite(client);
   const unchangedResult = operationResult(
-    performance.now() - operationStart,
+    unchangedElapsedMs,
     before,
     embeddings.snapshot(),
-    measured.lastPublication
+    measured.lastPublication,
+    profileDelta(unchangedProfileBefore.profile ?? {}, unchangedProfileAfter.profile ?? {}),
+    profileDelta(unchangedVaultBefore, profileSnapshot())
   );
 
   const firstPath = notes[0].path;
@@ -402,14 +420,20 @@ export async function runWorkload(
 
   contents.delete(notes.at(-1)!.path);
   const deleteBefore = embeddings.snapshot();
+  const deleteProfileBefore = await inspectSqlite(client);
+  const deleteVaultBefore = profileSnapshot();
   const deleteStart = performance.now();
   const deleted = await manager.update();
   if (deleted.sharing !== "complete") throw new Error(`Delete sharing ${deleted.sharing}`);
+  const deleteElapsedMs = performance.now() - deleteStart;
+  const deleteProfileAfter = await inspectSqlite(client);
   const deleteResult = operationResult(
-    performance.now() - deleteStart,
+    deleteElapsedMs,
     deleteBefore,
     embeddings.snapshot(),
-    measured.lastPublication
+    measured.lastPublication,
+    profileDelta(deleteProfileBefore.profile ?? {}, deleteProfileAfter.profile ?? {}),
+    profileDelta(deleteVaultBefore, profileSnapshot())
   );
 
   const finalSqlite = await inspectSqlite(client);
@@ -511,11 +535,15 @@ function operationResult(
   elapsedMs: number,
   before: Stats,
   after: Stats,
-  publication: MeasuredArtifacts["lastPublication"]
+  publication: MeasuredArtifacts["lastPublication"],
+  recordManagerProfile: ProfileValues = {},
+  vaultProfile: ProfileValues = {}
 ) {
   return {
     elapsedMs,
     publication: { ...publication },
+    recordManagerProfile,
+    vaultProfile,
     provider: {
       calls: after.calls - before.calls,
       texts: after.texts - before.texts,

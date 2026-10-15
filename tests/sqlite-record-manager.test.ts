@@ -63,4 +63,54 @@ describe("SQLite LangChain record manager", () => {
       db.close();
     }
   });
+
+  it("batches the 1000-key boundary while preserving duplicate and group update semantics", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const database = new NoteSqliteDatabase(db);
+    const records = new SqliteNoteRecordManager(database.call.bind(database));
+    const statements: string[] = [];
+    const exec = db.exec.bind(db);
+    db.exec = ((options: string | { sql: string; bind?: unknown[] }) => {
+      const sql = typeof options === "string" ? options : options.sql;
+      if (/^INSERT INTO note_records\(/i.test(sql)) statements.push(sql);
+      return exec(options as never);
+    }) as typeof db.exec;
+    try {
+      await records.update(["kept", "cleared"], { groupIds: ["original", "original"] });
+      await records.update(["kept"], {});
+      await records.update(["cleared"], { groupIds: [null] });
+
+      const keys = Array.from({ length: 998 }, (_, index) => `uid-${index}`);
+      keys.push("duplicate", "duplicate");
+      const groupIds = [...keys.slice(0, 998).map(() => "batch"), "first", "last"];
+      await records.update(keys, { groupIds });
+
+      expect(statements).toHaveLength(13);
+      expect(await records.listKeys({ groupIds: ["original"], limit: 10 })).toEqual(["kept"]);
+      expect(await records.listKeys({ groupIds: [null], limit: 10 })).toEqual(["cleared"]);
+      expect(await records.listKeys({ groupIds: ["first"], limit: 10 })).toEqual([]);
+      expect(await records.listKeys({ groupIds: ["last"], limit: 10 })).toEqual(["duplicate"]);
+      expect(await records.listKeys({ groupIds: ["batch"], limit: 1000 })).toHaveLength(998);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rolls back a rejected timeAtLeast update without advancing the clock", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    const database = new NoteSqliteDatabase(db);
+    const records = new SqliteNoteRecordManager(database.call.bind(database));
+    try {
+      const before = Number(db.selectValue("SELECT value FROM note_record_clock WHERE id=1"));
+      await expect(
+        records.update(["rolled-back"], { groupIds: ["temporary"], timeAtLeast: before + 1 })
+      ).rejects.toThrow(/earlier than timeAtLeast/);
+      expect(Number(db.selectValue("SELECT value FROM note_record_clock WHERE id=1"))).toBe(before);
+      expect(await records.listKeys({ groupIds: ["temporary"], limit: 10 })).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
 });

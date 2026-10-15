@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import { build } from "esbuild";
+import { instrumentBuild, bundleFiles } from "./performance.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const browser = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
@@ -39,6 +40,7 @@ mkdirSync(join(profile, "crashes"), { recursive: true });
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 let child;
 let server;
+const httpRequests = [];
 
 async function stopChild() {
   if (!child || child.exitCode !== null) return;
@@ -69,7 +71,7 @@ function instrumentWorkerSource(source, label) {
     throw new Error(`${label} worker RPC instrumentation anchor changed`);
   source = source.replace(
     dispatchMarker,
-    `${profileMode ? `const rpcStarted = performance.now();\n          ` : ""}${dispatchMarker}${profileMode ? `\n          if (method === "embeddingCacheSqliteMarkPublished") {\n            const profile = (globalThis as any).__tramaBenchProfile;\n            const value = profile.phases["receipt.rpc"] ??= { calls: 0, elapsedMs: 0, rows: 0, bytes: 0 };\n            value.calls++; value.elapsedMs += performance.now() - rpcStarted; value.rows += Number((payload as any)?.hashes?.length ?? 0);\n          }` : ""}`
+    `${profileMode ? `const rpcStarted = performance.now();\n          ` : ""}${dispatchMarker}${profileMode ? `\n          if (method === "embeddingCacheSqliteMarkPublished" || String(method).startsWith("recordManager")) {\n            const profile = (globalThis as any).__tramaBenchProfile;\n            const name = method === "embeddingCacheSqliteMarkPublished" ? "receipt.rpc" : "recordManager.rpc." + method;\n            const value = profile.phases[name] ??= { calls: 0, elapsedMs: 0, rows: 0, bytes: 0 };\n            value.calls++; value.elapsedMs += performance.now() - rpcStarted; value.rows += Number((payload as any)?.hashes?.length ?? (payload as any)?.keys?.length ?? 0);\n          }` : ""}`
   );
   const inspection = `if (method === "__benchSnapshot") {
             const state = globalThis as any;
@@ -153,7 +155,37 @@ function instrumentDatabaseExport(source, label) {
     "await yieldSqlite(signal);",
     'await (async () => { const started = performance.now(); try { await yieldSqlite(signal); } finally { __tramaBenchRecord("receipt.yield", performance.now() - started); } })();'
   );
-  return source.slice(0, receiptStart) + receipt + source.slice(receiptEnd);
+  source = source.slice(0, receiptStart) + receipt + source.slice(receiptEnd);
+  const profileHelper = `\nfunction __tramaBenchRecordManagerExec(name: string, db: any, ...args: any[]): any {\n  const options = args[0];\n  const sql = typeof options === "string" ? options : String(options?.sql ?? "");\n  const started = performance.now();\n  try { return db.exec(...args); } finally {\n    const elapsed = performance.now() - started;\n    __tramaBenchRecord(name + ".nativeExec", elapsed);\n    const transaction = /^\\s*(BEGIN|COMMIT|ROLLBACK)/i.exec(sql)?.[1]?.toLowerCase();\n    if (transaction) __tramaBenchRecord(name + ".transaction." + transaction, elapsed);\n  }\n}\nfunction __tramaBenchRecordManagerRows(name: string, db: any, ...args: any[]): any[] {\n  const started = performance.now();\n  let result: any[] = [];\n  try { result = rows(db, ...args); return result; } finally { __tramaBenchRecord(name + ".nativeExec", performance.now() - started, result.length); }\n}\n`;
+  source = source.replace(
+    "const SQLITE_SHARD_APPLICATION_ID",
+    `${profileHelper}\nconst SQLITE_SHARD_APPLICATION_ID`
+  );
+  const instrumentMethod = (name, next, label) => {
+    const start = source.indexOf(`  private ${name}(`);
+    const end =
+      next === "__CLASS_END__"
+        ? source.lastIndexOf("\n}")
+        : source.indexOf(`  private ${next}(`, start);
+    if (start < 0 || end < 0) throw new Error(`${label} RecordManager profiling anchors changed`);
+    let method = source.slice(start, end);
+    method = method.replaceAll(
+      "this.db.exec(",
+      `__tramaBenchRecordManagerExec("${label}", this.db, `
+    );
+    method = method.replaceAll(
+      "rows(this.db,",
+      `__tramaBenchRecordManagerRows("${label}", this.db,`
+    );
+    source = source.slice(0, start) + method + source.slice(end);
+  };
+  instrumentMethod("async updateRecords", "reserveRecordTime", "recordManager.update");
+  instrumentMethod("reserveRecordTime", "tickRecordClock", "recordManager.getTime");
+  instrumentMethod("tickRecordClock", "recordExists", "recordManager.clock");
+  instrumentMethod("recordExists", "listRecordKeys", "recordManager.exists");
+  instrumentMethod("listRecordKeys", "deleteRecords", "recordManager.list");
+  instrumentMethod("deleteRecords", "__CLASS_END__", "recordManager.delete");
+  return source;
 }
 
 function validateReports(reports, plan) {
@@ -170,11 +202,26 @@ function validateReports(reports, plan) {
       )
         throw new Error(`${side} report has incomplete ${expected.count}-note samples`);
       for (const sample of [...run.warmups, ...run.samples]) {
+        if (side === "baseline" && args.has("baseline-workload")) {
+          const cold = sample.initial.publication;
+          const last = sample.operations.oneDelete.publication;
+          if (
+            cold.captureStage !== "cold-scheduler-update-complete" ||
+            cold.temporaryFileWrites !== sample.initial.artifactCount ||
+            cold.temporaryBytesWritten !== sample.initial.artifactBytes ||
+            (cold.elapsedMs === last.elapsedMs &&
+              cold.temporaryFileWrites === last.temporaryFileWrites &&
+              cold.temporaryBytesWritten === last.temporaryBytesWritten)
+          )
+            throw new Error(`${side} ${expected.count}-note cold publication snapshot is invalid`);
+        }
         if (
           sample.initial.noteCount !== expected.count ||
           sample.finalSqlite?.counts?.note_index !== expected.count - 1
         )
-          throw new Error(`${side} ${expected.count}-note index counts are incorrect`);
+          throw new Error(
+            `${side} ${expected.count}-note index counts are incorrect: ${JSON.stringify({ initial: sample.initial.noteCount, final: sample.finalSqlite?.counts, finalNoteCount: sample.finalNoteCount })}`
+          );
         if (sample.initial.sqlite?.mainDatabaseBytes <= 0)
           throw new Error(`${side} ${expected.count}-note SQL database page stats are missing`);
         if (
@@ -184,7 +231,11 @@ function validateReports(reports, plan) {
         )
           throw new Error(`${side} ${expected.count}-note shared bootstrap failed`);
         const names = sample.finalSqlite?.poolNames;
-        if (!Array.isArray(names) || names.length !== 1 || names[0] !== "/notes.sqlite3")
+        if (
+          !Array.isArray(names) ||
+          names.length !== 1 ||
+          !["/notes.sqlite3", "/index.sqlite3"].includes(names[0])
+        )
           throw new Error(`${side} left logical SAH pool scratch files allocated`);
         for (const [kind, expectedPath] of [
           ["lexical", "notes/0000.md"],
@@ -227,12 +278,22 @@ try {
           workspace: resolve(args.get("baseline-workspace")),
           worker: "/baseline-worker.mjs",
           bundle: "/baseline-workload.mjs",
+          workload: resolve(
+            args.get("baseline-workload") ??
+              join(root, "scripts/benchmark/sqlite-opfs-performance/workload.ts")
+          ),
+          legacy: args.has("baseline-workload"),
         },
         {
           label: "current",
           workspace: resolve(args.get("current-workspace")),
           worker: "/current-worker.mjs",
           bundle: "/current-workload.mjs",
+          workload: resolve(
+            args.get("current-workload") ??
+              join(root, "scripts/benchmark/sqlite-opfs-performance/workload.ts")
+          ),
+          legacy: false,
         },
       ]
     : [
@@ -241,8 +302,21 @@ try {
           workspace: resolve(args.get("workspace") ?? root),
           worker: "/note-worker.mjs",
           bundle: "/workload.mjs",
+          workload: resolve(
+            args.get("workload") ??
+              join(root, "scripts/benchmark/sqlite-opfs-performance/workload.ts")
+          ),
+          legacy: false,
         },
       ];
+  const bundleMetrics = Object.fromEntries(
+    await Promise.all(
+      workspaces.map(async ({ label, workspace }) => [
+        label,
+        { metafile: await instrumentBuild(workspace), files: await bundleFiles(workspace) },
+      ])
+    )
+  );
   for (const version of workspaces) {
     const aliasPlugin = {
       name: `benchmark-${version.label}-src`,
@@ -255,8 +329,23 @@ try {
     const benchWorkerPlugin = {
       name: "benchmark-readonly-sqlite-inspector",
       setup(api) {
-        api.onLoad({ filter: /src\/index\/note-sqlite\/worker\.ts$/ }, ({ path }) => {
+        api.onLoad({ filter: /src\/index\/(?:note-sqlite|sqlite)\/worker\.ts$/ }, ({ path }) => {
           let contents = readFileSync(path, "utf8");
+          if (version.legacy) {
+            const connectionMarker =
+              'storage.connection = new storage.opfsPool!.OpfsSAHPoolDb("/index.sqlite3", "c");';
+            const handlerMarker =
+              "  let request: SqliteRequest;\n  try {\n    validateRequest(data);";
+            if (!contents.includes(connectionMarker) || !contents.includes(handlerMarker))
+              throw new Error("Original worker benchmark instrumentation anchors changed");
+            contents = contents.replace(
+              connectionMarker,
+              `${connectionMarker}\n  (globalThis as any).__tramaBenchLegacyConnection = storage.connection;\n  (globalThis as any).__tramaBenchLegacyPool = storage.opfsPool;`
+            );
+            const inspect = `  if (data?.method === "__benchSnapshot") {\n    const state = globalThis as any;\n    const db = state.__tramaBenchLegacyConnection;\n    const pool = state.__tramaBenchLegacyPool;\n    const scalar = (sql: string): number => { let value = 0; db.exec({ sql, callback: (row: Record<string, unknown>) => { value = Number(Object.values(row)[0] ?? 0); } }); return value; };\n    const counts: Record<string, number> = {};\n    for (const table of ["notes", "chunk_occurrences", "embedding_cache", "cache_artifact_receipts", "cache_shard_membership", "lexical_notes"]) counts[table] = scalar("SELECT count(*) FROM " + table);\n    counts.note_index = counts.notes; counts.note_vectors = counts.chunk_occurrences;\n    counts.embedding_cache_document = scalar("SELECT count(*) FROM embedding_cache WHERE task_kind='document'");\n    counts.embedding_cache_query = scalar("SELECT count(*) FROM embedding_cache WHERE task_kind='query'");\n    const pageCount = scalar("PRAGMA page_count"); const pageSize = scalar("PRAGMA page_size");\n    const result = { pageCount, pageSize, mainDatabaseBytes: pageCount * pageSize, counts, poolNames: pool.getFileNames?.() ?? ["/index.sqlite3"], poolFileCount: pool.getFileCount?.(), poolCapacity: pool.getCapacity?.() };\n    post({ v: SQLITE_PROTOCOL_VERSION, id: Number(data.id), ok: true, result } as any); return;\n  }\n`;
+            contents = contents.replace(handlerMarker, `${inspect}${handlerMarker}`);
+            return { contents, loader: "ts" };
+          }
           contents = instrumentWorkerSource(contents, version.label);
           return { contents, loader: "ts" };
         });
@@ -290,17 +379,35 @@ try {
       sourcemap: false,
       logLevel: "silent",
       nodePaths: [join(root, "node_modules")],
+      define: {
+        __TRAMA_RUNTIME_BUILD_ID__: JSON.stringify(
+          JSON.parse(readFileSync(join(version.workspace, ".cache/runtime-build.json"), "utf8"))
+            .buildId
+        ),
+      },
       plugins: [aliasPlugin, benchWorkerPlugin],
     };
     await build({
       ...common,
-      entryPoints: [join(root, "scripts/benchmark/sqlite-opfs-performance/workload.ts")],
+      entryPoints: [version.workload],
       outfile: join(site, version.bundle.slice(1)),
     });
     await build({
       ...common,
-      entryPoints: [join(version.workspace, "src/index/note-sqlite/worker.ts")],
+      entryPoints: [
+        join(
+          version.workspace,
+          version.legacy ? "src/index/sqlite/worker.ts" : "src/index/note-sqlite/worker.ts"
+        ),
+      ],
       outfile: join(site, version.worker.slice(1)),
+      ...(version.legacy
+        ? {
+            banner: {
+              js: 'globalThis.__TRAMA_SQLITE_ASSETS__={moduleUrl:new URL("/sqlite3.mjs",self.location.href).href,wasmUrl:new URL("/sqlite3.wasm",self.location.href).href};',
+            },
+          }
+        : {}),
     });
   }
   writeFileSync(
@@ -330,6 +437,12 @@ try {
     response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
     response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
+    httpRequests.push({
+      method: request.method,
+      path: pathname,
+      stage: new URL(request.url, "http://127.0.0.1").searchParams.get("stage"),
+    });
+    if (pathname === "/__bench-stage") return response.writeHead(204).end();
     const name = pathname === "/" ? "page.html" : pathname.slice(1);
     const type = types.get(name);
     if (!type) return response.writeHead(404).end("not found");
@@ -383,8 +496,24 @@ try {
   });
   let sequence = 0;
   const pending = new Map();
+  const browserDiagnostics = { console: [], exceptions: [], workerTargets: [] };
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
+    if (message.method === "Runtime.consoleAPICalled") {
+      browserDiagnostics.console.push({
+        type: message.params.type,
+        args: message.params.args?.map((arg) => arg.value ?? arg.description).slice(0, 4),
+      });
+      if (browserDiagnostics.console.length > 20) browserDiagnostics.console.shift();
+    }
+    if (message.method === "Runtime.exceptionThrown") {
+      browserDiagnostics.exceptions.push({
+        text: message.params.exceptionDetails?.text,
+        url: message.params.exceptionDetails?.url,
+        line: message.params.exceptionDetails?.lineNumber,
+      });
+      if (browserDiagnostics.exceptions.length > 20) browserDiagnostics.exceptions.shift();
+    }
     if (!message.id) return;
     const callback = pending.get(message.id);
     if (!callback) return;
@@ -398,7 +527,7 @@ try {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error(`CDP timed out: ${method}`));
-      }, 5000);
+      }, 15000);
       pending.set(id, {
         resolve: (value) => {
           clearTimeout(timer);
@@ -417,12 +546,19 @@ try {
     url: `http://127.0.0.1:${server.address().port}/${profileMode ? "?profile" : ""}`,
   });
   let result;
+  let pollFailure;
   const runDeadline = Date.now() + 30 * 60_000;
   while (Date.now() < runDeadline) {
-    const evaluation = await command("Runtime.evaluate", {
-      expression: "document.querySelector('#result')?.textContent ?? ''",
-      returnByValue: true,
-    });
+    let evaluation;
+    try {
+      evaluation = await command("Runtime.evaluate", {
+        expression: "document.querySelector('#result')?.textContent ?? ''",
+        returnByValue: true,
+      });
+    } catch (error) {
+      pollFailure = String(error);
+      break;
+    }
     const value = evaluation.result?.value;
     if (value && value !== "running") {
       try {
@@ -434,11 +570,28 @@ try {
     }
     await new Promise((done) => setTimeout(done, 100));
   }
-  if (!result) throw new Error("Browser workload timed out");
+  if (!result) {
+    browserDiagnostics.workerTargets = await fetch(`http://127.0.0.1:${devtoolsPort}/json/list`)
+      .then((response) => response.json())
+      .then((targets) => targets.map(({ type, url, title }) => ({ type, url, title })))
+      .catch((error) => [{ error: String(error) }]);
+    throw new Error(
+      `Browser workload timed out: ${JSON.stringify({ pollFailure, browserDiagnostics, httpRequests })}`
+    );
+  }
+  if (!result.ok) {
+    browserDiagnostics.workerTargets = await fetch(`http://127.0.0.1:${devtoolsPort}/json/list`)
+      .then((response) => response.json())
+      .then((targets) => targets.map(({ type, url, title }) => ({ type, url, title })))
+      .catch((error) => [{ error: String(error) }]);
+  }
   await command("Browser.close").catch(() => undefined);
   ws.close();
   await stopChild();
-  if (!result.ok) throw new Error(`Browser workload failed: ${result.error}\n${result.stack}`);
+  if (!result.ok)
+    throw new Error(
+      `Browser workload failed: ${result.error}\n${result.stack}\n${JSON.stringify({ browserDiagnostics, requests: httpRequests.filter(({ path }) => !path.includes("corpus.json")).slice(-24) })}`
+    );
   validateReports(result.reports, effectivePlan);
   const archivePaths = args.has("pair")
     ? {
@@ -503,6 +656,8 @@ try {
       readFileSync(join(root, "scripts/benchmark/sqlite-opfs-performance/workload.ts"))
     ),
     profileMode,
+    invocation: process.argv,
+    bundleMetrics,
     report: result.reports,
   };
   mkdirSync(dirname(output), { recursive: true });

@@ -957,20 +957,20 @@ export class NoteSqliteDatabase {
         sql: "UPDATE note_record_clock SET value=? WHERE id=1",
         bind: [updatedAt],
       });
-      for (let index = 0; index < keys.length; index++) {
-        if (groupIds === undefined) {
-          this.db.exec({
-            sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES(?,NULL,?)
-              ON CONFLICT(uid) DO UPDATE SET updated_at=excluded.updated_at`,
-            bind: [keys[index], updatedAt],
-          });
-        } else {
-          this.db.exec({
-            sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES(?,?,?)
-              ON CONFLICT(uid) DO UPDATE SET group_path=excluded.group_path,updated_at=excluded.updated_at`,
-            bind: [keys[index], groupIds[index], updatedAt],
-          });
+      for (let offset = 0; offset < keys.length; offset += 100) {
+        const batch = keys.slice(offset, offset + 100);
+        const values = batch.map(() => (groupIds === undefined ? "(?,NULL,?)" : "(?,?,?)"));
+        const bind: unknown[] = [];
+        for (let index = offset; index < offset + batch.length; index++) {
+          bind.push(keys[index]);
+          if (groupIds !== undefined) bind.push(groupIds[index]);
+          bind.push(updatedAt);
         }
+        this.db.exec({
+          sql: `INSERT INTO note_records(uid,group_path,updated_at) VALUES ${values.join(",")}
+            ON CONFLICT(uid) DO UPDATE SET ${groupIds === undefined ? "" : "group_path=excluded.group_path,"}updated_at=excluded.updated_at`,
+          bind,
+        });
       }
       this.db.exec("COMMIT");
     } catch (error) {
