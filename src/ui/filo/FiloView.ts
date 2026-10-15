@@ -2,6 +2,7 @@ import { ItemView, Keymap, setTooltip, WorkspaceLeaf } from "obsidian";
 import type { Document } from "@langchain/core/documents";
 import type { IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
+import { appendNoteResultRow } from "@/ui/noteResultRow";
 import type { IconName } from "obsidian";
 
 export const FILO_VIEW_TYPE = "trama-filo";
@@ -132,24 +133,30 @@ export class FiloView extends ItemView {
       root.createDiv({ text: "No related notes found." });
       return;
     }
-    for (const document of this.documents) {
+    const documents = this.documents.filter((document) => {
       const path = String(document.metadata.path ?? document.id ?? "");
-      if (!path || path === this.activePath) continue;
-      const link = root.createEl("a", {
-        cls: "internal-link trama-filo__link",
-        text: path.split("/").pop()?.replace(/\.md$/i, "") ?? path,
-        attr: { href: path },
-      });
-      setTooltip(link, path);
-      link.addEventListener("click", (event) => {
-        event.preventDefault();
+      return Boolean(path && path !== this.activePath);
+    });
+    if (!documents.length) {
+      root.createDiv({ text: "No related notes found." });
+      return;
+    }
+    const resultGroup = root.createDiv({ cls: "trama-note-results" });
+    resultGroup.createDiv({
+      cls: "setting-item-description trama-note-results__count",
+      text: `${documents.length} related ${documents.length === 1 ? "note" : "notes"}`,
+    });
+    const rows = resultGroup.createDiv({ cls: "trama-filo__rows" });
+    for (const document of documents) {
+      const path = String(document.metadata.path ?? document.id ?? "");
+      const link = appendNoteResultRow(rows, this.app, path, this.leaf, (event) => {
         void (this.app as any).workspace.openLinkText(
           path,
           this.activePath ?? "",
           Keymap.isModEvent(event)
         );
       });
-      root.createDiv({ cls: "setting-item-description trama-filo__path", text: path });
+      setTooltip(link, path);
     }
   }
 }

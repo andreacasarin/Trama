@@ -37,6 +37,15 @@ export type LiveMarkdownReader = (
 
 export class VaultRetrieval {
   readonly runnable: RunnableLambda<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>;
+  private relatedGeneration = 0;
+  private relatedRequest?: {
+    readonly sourcePath: string;
+    readonly profile: string;
+    readonly limit: number;
+    readonly generation: number;
+    readonly controller: AbortController;
+    readonly promise: Promise<NoteStoreRelatedResult>;
+  };
 
   constructor(
     private readonly call: NoteStoreCall,
@@ -59,14 +68,64 @@ export class VaultRetrieval {
     limit = 20
   ): Promise<{ readonly documents: readonly Document[]; readonly available: boolean }> {
     checkAbort(signal);
-    if (!this.profile) return { documents: [], available: false };
-    const result = (await this.call(
-      "noteStoreRelated",
-      { sourcePath, profile: this.profile, k: Math.max(0, Math.min(20, Math.floor(limit))) },
-      signal
-    )) as NoteStoreRelatedResult;
+    const result = await this.relatedHits(sourcePath, signal, limit);
     const documents = await this.hydrate(result.hits, signal);
     return { documents, available: result.available };
+  }
+
+  async relatedPaths(
+    sourcePath: string,
+    signal: AbortSignal,
+    limit = 7
+  ): Promise<{ readonly paths: readonly string[]; readonly available: boolean }> {
+    checkAbort(signal);
+    const result = await this.relatedHits(sourcePath, signal, limit);
+    return { paths: result.hits.map((hit) => hit.path), available: result.available };
+  }
+
+  invalidateRelated(): void {
+    this.relatedGeneration++;
+    this.relatedRequest?.controller.abort();
+    this.relatedRequest = undefined;
+  }
+
+  private async relatedHits(
+    sourcePath: string,
+    signal: AbortSignal,
+    limit: number
+  ): Promise<NoteStoreRelatedResult> {
+    checkAbort(signal);
+    if (!this.profile) return { hits: [], available: false };
+    const k = Math.max(0, Math.min(20, Math.floor(limit)));
+    let request = this.relatedRequest;
+    if (
+      !request ||
+      request.sourcePath !== sourcePath ||
+      request.profile !== this.profile ||
+      request.limit !== k ||
+      request.generation !== this.relatedGeneration
+    ) {
+      const controller = new AbortController();
+      const generation = this.relatedGeneration;
+      const promise = this.call(
+        "noteStoreRelated",
+        { sourcePath, profile: this.profile, k },
+        controller.signal
+      ) as Promise<NoteStoreRelatedResult>;
+      request = {
+        sourcePath,
+        profile: this.profile,
+        limit: k,
+        generation,
+        controller,
+        promise,
+      };
+      this.relatedRequest = request;
+      void promise.catch(() => {
+        if (this.relatedRequest === request) this.relatedRequest = undefined;
+      });
+    }
+    return waitForConsumer(request.promise, signal);
   }
 
   private async search(
@@ -145,6 +204,25 @@ export class VaultRetrieval {
     }
     return documents;
   }
+}
+
+function waitForConsumer<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  checkAbort(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (signal.aborted) reject(new DOMException("Aborted", "AbortError"));
+        else resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 function checkAbort(signal?: AbortSignal): void {

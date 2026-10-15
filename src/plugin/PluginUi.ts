@@ -5,6 +5,7 @@ import type { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
+import { NOTE_RESULT_HOVER_SOURCE_ID } from "@/ui/noteResultRow";
 
 export async function loadPluginUi() {
   const [voce, filo, lente, settings] = await Promise.all([
@@ -30,6 +31,10 @@ export function registerPluginUi(
   ui: Awaited<ReturnType<typeof loadPluginUi>>,
   dependencies: PluginUiDependencies
 ): void {
+  plugin.registerHoverLinkSource(NOTE_RESULT_HOVER_SOURCE_ID, {
+    display: "Trama results",
+    defaultMod: false,
+  });
   plugin.addSettingTab(new ui.TramaSettingsTab(app, plugin));
   plugin.registerView(
     ui.VOCE_VIEW_TYPE,
@@ -38,7 +43,9 @@ export function registerPluginUi(
         leaf,
         dependencies.session,
         dependencies.noteCatalog,
-        dependencies.currentNote
+        dependencies.currentNote,
+        undefined,
+        (signal) => plugin.relatedNoteSuggestions(signal)
       )
   );
   plugin.registerView(
@@ -78,7 +85,12 @@ export function registerPluginUi(
   });
   plugin.addCommand({
     id: "trama-stop-indexing",
-    name: "Stop note indexing",
+    name: "Stop index operation",
     callback: () => plugin.stopIndex(),
+  });
+  plugin.addCommand({
+    id: "trama-clear-index",
+    name: "Clear local index",
+    callback: () => void plugin.clearIndex(),
   });
 }

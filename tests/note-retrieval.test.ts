@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
@@ -67,6 +67,48 @@ async function fixture() {
 }
 
 describe("SQLite note retrieval", () => {
+  it("coalesces Filo and Voce related hits while isolating consumer cancellation", async () => {
+    let resolveHits!: (value: unknown) => void;
+    let workerSignal!: AbortSignal | undefined;
+    const call = vi.fn((_method: string, _payload: unknown, signal?: AbortSignal) => {
+      workerSignal = signal;
+      return new Promise((resolve) => (resolveHits = resolve));
+    });
+    const readNote = vi.fn(async (path: string) => ({ path, content: `# ${path}` }));
+    const retrieval = new VaultRetrieval(call as any, undefined, "profile", readNote);
+    const cancelOne = new AbortController();
+    const paths = retrieval.relatedPaths("source.md", cancelOne.signal, 7);
+    const hydrated = retrieval.related("source.md", new AbortController().signal, 7);
+    cancelOne.abort();
+    await expect(paths).rejects.toMatchObject({ name: "AbortError" });
+    expect(workerSignal?.aborted).toBe(false);
+    resolveHits({ hits: [{ path: "related.md", score: 0.8 }], available: true });
+    await expect(hydrated).resolves.toMatchObject({
+      available: true,
+      documents: [{ id: "related.md", pageContent: "# related.md" }],
+    });
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(readNote).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns path-only related suggestions without reading note bodies and refreshes after invalidation", async () => {
+    const call = vi.fn(async () => ({
+      hits: [{ path: "related.md", score: 0.8 }],
+      available: true,
+    }));
+    const readNote = vi.fn(async (path: string) => ({ path, content: "private text" }));
+    const retrieval = new VaultRetrieval(call as any, undefined, "profile", readNote);
+    const signal = new AbortController().signal;
+    await expect(retrieval.relatedPaths("source.md", signal, 7)).resolves.toEqual({
+      paths: ["related.md"],
+      available: true,
+    });
+    expect(readNote).not.toHaveBeenCalled();
+    retrieval.invalidateRelated();
+    await retrieval.relatedPaths("source.md", signal, 7);
+    expect(call).toHaveBeenCalledTimes(2);
+  });
+
   it("uses native hybrid ranks, safely tokenizes punctuation, hydrates live notes, and reports degradation", async () => {
     const f = await fixture();
     try {

@@ -17,7 +17,12 @@ import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
-import { DEFAULT_SETTINGS, SettingsStore, type TramaSettings } from "@/settings/Settings";
+import {
+  DEFAULT_SETTINGS,
+  normalizeExcludedFolders,
+  SettingsStore,
+  type TramaSettings,
+} from "@/settings/Settings";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
@@ -34,7 +39,18 @@ export class TramaPlugin extends Plugin {
   private retrieval?: VaultRetrieval;
   private session?: ChatSession;
   private status?: IndexStatusController;
-  private indexRun?: { readonly manualIndex: ManualIndex; promise: Promise<void> };
+  private indexRun?: {
+    readonly manualIndex: ManualIndex;
+    readonly excludedFolders: readonly string[];
+    readonly label: string;
+    promise: Promise<void>;
+  };
+  private clearRun?: {
+    client: NoteStoreClient;
+    controller: AbortController;
+    promise: Promise<void>;
+  };
+  private operationNotice?: Notice;
   private activeNote?: string;
   private ui?: Awaited<ReturnType<typeof loadPluginUi>>;
   private readonly catalog = () =>
@@ -53,7 +69,12 @@ export class TramaPlugin extends Plugin {
       this.activeNote = app.workspace.getActiveFile()?.path;
       this.registerEvent(
         app.workspace.on("file-open", (file: { path?: string } | null) => {
-          this.activeNote = file?.path && this.isVisibleMarkdown(file.path) ? file.path : undefined;
+          const next = file?.path && this.isVisibleMarkdown(file.path) ? file.path : undefined;
+          if (next !== this.activeNote) {
+            this.activeNote = next;
+            this.retrieval?.invalidateRelated();
+            this.refreshVoceSuggestions();
+          }
         })
       );
       try {
@@ -82,12 +103,19 @@ export class TramaPlugin extends Plugin {
     const settings = this.getSettings();
     const wasConfigured = Boolean(this.client);
     const previousRun = this.indexRun;
+    const previousClear = this.clearRun;
     const previousClient = this.client;
     this.manualIndex?.cancel();
+    previousClear?.controller.abort();
+    this.retrieval?.invalidateRelated();
     this.session?.reset();
     this.manualIndex = undefined;
     this.client = undefined;
-    if (previousRun) await previousRun.promise;
+    if (previousRun) {
+      await previousRun.promise;
+      this.finishOperationNotice("Index operation stopped because settings changed.");
+    }
+    if (previousClear) await previousClear.promise;
     await previousClient?.close();
     if (this.disposed) return;
     const namespace = await this.sqliteRuntime.resolveNamespace(app);
@@ -130,7 +158,7 @@ export class TramaPlugin extends Plugin {
         )
       : undefined;
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.metadataCache);
-    const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isVisibleMarkdown(path));
+    const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isIndexableMarkdown(path));
     const store = new SqliteNoteVectorStore(
       embeddings,
       candidate.call,
@@ -177,13 +205,20 @@ export class TramaPlugin extends Plugin {
       for (const leaf of app.workspace.getLeavesOfType("trama-lente"))
         leaf.view?.setSearch?.(this.retrieval.runnable);
     }
+    this.refreshVoceSuggestions();
   }
 
   onunload(): void {
     this.disposed = true;
     this.manualIndex?.cancel();
+    const activeClear = this.clearRun;
+    activeClear?.controller.abort();
+    this.operationNotice?.hide();
+    this.operationNotice = undefined;
     this.session?.reset();
-    void this.client?.close().catch(() => undefined);
+    const client = this.client;
+    if (activeClear) void activeClear.promise.finally(() => client?.close().catch(() => undefined));
+    else void client?.close().catch(() => undefined);
     this.manualIndex = undefined;
     this.retrieval = undefined;
     this.session = undefined;
@@ -198,18 +233,24 @@ export class TramaPlugin extends Plugin {
   ): Promise<void> {
     return this.enqueue(async () => {
       if (this.disposed) return;
-      const next = typeof update === "function" ? update(this.getSettings()) : update;
+      const current = this.getSettings();
+      const next = typeof update === "function" ? update(current) : update;
       const policy = new EndpointPolicy({ approvals: next.approvedOrigins });
       const validated = {
         ...next,
         chat: { ...next.chat, endpoint: policy.normalize(next.chat.endpoint) },
         embedding: { ...next.embedding, endpoint: policy.normalize(next.embedding.endpoint) },
+        excludedFolders: normalizeExcludedFolders(next.excludedFolders),
       };
+      const runtimeChanged =
+        JSON.stringify(current.chat) !== JSON.stringify(validated.chat) ||
+        JSON.stringify(current.embedding) !== JSON.stringify(validated.embedding) ||
+        JSON.stringify(current.approvedOrigins) !== JSON.stringify(validated.approvedOrigins);
       const staged = this.settingsStore.stage(validated);
       await this.saveData(staged);
       if (this.disposed) return;
       this.settingsStore.commit(staged);
-      await this.configureServices(this.app as any);
+      if (runtimeChanged) await this.configureServices(this.app as any);
     });
   }
 
@@ -220,7 +261,84 @@ export class TramaPlugin extends Plugin {
     return this.runIndex(true);
   }
   stopIndex(): void {
-    this.manualIndex?.cancel();
+    if (this.indexRun) {
+      this.operationNotice?.setMessage(`Stopping ${this.indexRun.label.toLowerCase()}…`);
+      this.indexRun.manualIndex.cancel();
+      return;
+    }
+    if (this.clearRun) {
+      this.operationNotice?.setMessage("Stopping index clear…");
+      this.clearRun.controller.abort();
+      return;
+    }
+    new Notice("No index operation is running.");
+  }
+
+  clearIndex(): Promise<void> {
+    if (this.indexRun || this.clearRun) {
+      new Notice("An index operation is already running.");
+      return Promise.resolve();
+    }
+    const client = this.client;
+    if (!client) {
+      new Notice("The local index is unavailable.");
+      return Promise.resolve();
+    }
+    const controller = new AbortController();
+    const previousStatus = this.status?.getStatus();
+    this.status?.setStatus({
+      kind: "building",
+      message: "Clearing local index…",
+      canIndex: false,
+      canReindex: false,
+      canCancel: true,
+    });
+    this.showOperationNotice("Clearing local index…");
+    const run = { client, controller, promise: Promise.resolve() };
+    this.clearRun = run;
+    const operation = client
+      .call("noteStoreReset", {}, controller.signal)
+      .then(() => {
+        if (this.clearRun !== run || this.disposed) return;
+        this.retrieval?.invalidateRelated();
+        this.status?.setStatus({
+          kind: "index-required",
+          message: "Local index cleared.",
+          canIndex: true,
+          canReindex: true,
+          canCancel: false,
+        });
+        this.refreshLenteResults();
+        this.refreshVoceSuggestions();
+        this.finishOperationNotice("Local index cleared.");
+      })
+      .catch((error: unknown) => {
+        if (this.clearRun !== run || this.disposed) return;
+        if (previousStatus) this.status?.setStatus(previousStatus);
+        const cancelled = error instanceof DOMException && error.name === "AbortError";
+        const message = cancelled
+          ? "Index clear stopped."
+          : error instanceof Error
+            ? error.message
+            : "Could not clear the local index.";
+        this.finishOperationNotice(message);
+      })
+      .finally(() => {
+        if (this.clearRun === run) this.clearRun = undefined;
+      });
+    run.promise = operation;
+    return operation;
+  }
+
+  async relatedNoteSuggestions(signal: AbortSignal): Promise<readonly string[]> {
+    const sourcePath = this.activeNote;
+    const retrieval = this.retrieval;
+    if (!sourcePath || !retrieval) return [];
+    const result = await retrieval.relatedPaths(sourcePath, signal, 7);
+    if (signal.aborted || this.activeNote !== sourcePath || this.retrieval !== retrieval) return [];
+    return [...new Set(result.paths)]
+      .filter((path) => path !== sourcePath && this.catalog().includes(path))
+      .slice(0, 5);
   }
 
   discoverModels(
@@ -236,13 +354,24 @@ export class TramaPlugin extends Plugin {
   }
 
   private runIndex(rebuild: boolean): Promise<void> {
+    if (this.clearRun) {
+      new Notice("The local index is being cleared.");
+      return Promise.resolve();
+    }
     const manualIndex = this.manualIndex;
     if (!manualIndex) return Promise.reject(new Error("Index is unavailable."));
-    if (this.indexRun?.manualIndex === manualIndex) return this.indexRun.promise;
-    const run: { readonly manualIndex: ManualIndex; promise: Promise<void> } = {
+    if (this.indexRun?.manualIndex === manualIndex) {
+      new Notice("An index operation is already running.");
+      return this.indexRun.promise;
+    }
+    const run = {
       manualIndex,
+      excludedFolders: [...this.getSettings().excludedFolders],
+      label: rebuild ? "Rebuilding note index" : "Updating note index",
       promise: Promise.resolve(),
     };
+    this.indexRun = run;
+    this.showOperationNotice(rebuild ? "Rebuilding note index…" : "Updating note index…");
     this.status?.setStatus({
       kind: "building",
       message: rebuild ? "Rebuilding note index…" : "Updating note index…",
@@ -250,9 +379,18 @@ export class TramaPlugin extends Plugin {
       canReindex: false,
       canCancel: true,
     });
-    run.promise = (rebuild ? manualIndex.rebuild() : manualIndex.update())
+    let operation: ReturnType<ManualIndex["update"]>;
+    try {
+      operation = rebuild ? manualIndex.rebuild() : manualIndex.update();
+    } catch (error) {
+      operation = Promise.reject(error);
+    }
+    const completion = operation
       .then((result) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
+        this.retrieval?.invalidateRelated();
+        this.refreshLenteResults();
+        this.refreshVoceSuggestions();
         const message =
           result.sharing === "incomplete"
             ? "Index updated; sharing incomplete."
@@ -266,10 +404,13 @@ export class TramaPlugin extends Plugin {
           canReindex: true,
           canCancel: false,
         });
+        this.finishOperationNotice(message);
       })
       .catch((error) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
-        const cancelled = error instanceof DOMException && error.name === "AbortError";
+        const cancelled = isCancelled(error);
+        this.retrieval?.invalidateRelated();
+        this.refreshVoceSuggestions();
         this.status?.setStatus({
           kind: cancelled ? "ready" : "error",
           message: cancelled
@@ -281,13 +422,43 @@ export class TramaPlugin extends Plugin {
           canReindex: true,
           canCancel: false,
         });
-        if (!cancelled) new Notice(error instanceof Error ? error.message : "Indexing failed.");
+        this.finishOperationNotice(
+          cancelled
+            ? "Indexing stopped."
+            : error instanceof Error
+              ? error.message
+              : "Indexing failed."
+        );
       })
       .finally(() => {
         if (this.indexRun === run) this.indexRun = undefined;
       });
-    this.indexRun = run;
-    return run.promise;
+    run.promise = completion;
+    return completion;
+  }
+
+  private refreshVoceSuggestions(): void {
+    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-voce") ?? [])
+      void leaf.view?.refreshSuggestions?.();
+  }
+
+  private refreshLenteResults(): void {
+    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
+      leaf.view?.refreshSubmitted?.();
+  }
+
+  private showOperationNotice(message: string): void {
+    this.operationNotice?.hide();
+    this.operationNotice = new Notice(message, 0);
+  }
+
+  private finishOperationNotice(message: string): void {
+    if (this.disposed) return;
+    const notice = this.operationNotice;
+    this.operationNotice = undefined;
+    if (!notice) return;
+    notice.hide();
+    new Notice(message);
   }
 
   private isVisibleMarkdown(path: string): boolean {
@@ -295,6 +466,15 @@ export class TramaPlugin extends Plugin {
       typeof path === "string" &&
       path.toLowerCase().endsWith(".md") &&
       !path.split("/").some((part) => part.startsWith("."))
+    );
+  }
+
+  private isIndexableMarkdown(path: string): boolean {
+    return (
+      this.isVisibleMarkdown(path) &&
+      !(this.indexRun?.excludedFolders ?? this.getSettings().excludedFolders).some((folder) =>
+        path.startsWith(`${folder}/`)
+      )
     );
   }
 
@@ -315,4 +495,11 @@ function unavailableEmbeddings(): EmbeddingsInterface<number[]> & {} {
     );
   };
   return { embedDocuments: fail, embedQuery: fail };
+}
+
+function isCancelled(error: unknown): boolean {
+  return Boolean(
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error && typeof error === "object" && "code" in error && error.code === "cancelled")
+  );
 }

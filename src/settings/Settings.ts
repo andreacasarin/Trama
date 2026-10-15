@@ -16,12 +16,14 @@ export interface TramaSettings {
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
+  readonly excludedFolders: readonly string[];
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   chat: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", temperature: 0.2 }),
   embedding: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", dimensions: 768 }),
   approvedOrigins: Object.freeze([]),
+  excludedFolders: Object.freeze([]),
 });
 
 export class SettingsStore {
@@ -71,6 +73,7 @@ export class SettingsStore {
           host: host.toLowerCase(),
           port,
         })),
+      excludedFolders: normalizeExcludedFolders(data.excludedFolders),
     };
     return (this.value = Object.freeze(settings));
   }
@@ -83,6 +86,22 @@ export class SettingsStore {
   commit(value: TramaSettings): void {
     this.value = value;
   }
+}
+
+export function normalizeExcludedFolders(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.flatMap((raw) => {
+        if (typeof raw !== "string") return [];
+        const path = raw.trim();
+        if (!path || path.startsWith("/") || path.includes("\\")) return [];
+        const parts = path.split("/").filter((part) => part && part !== ".");
+        if (!parts.length || parts.includes("..")) return [];
+        return [parts.join("/")];
+      })
+    ),
+  ].sort((left, right) => left.localeCompare(right));
 }
 
 function isApproval(value: unknown): value is EndpointApproval {

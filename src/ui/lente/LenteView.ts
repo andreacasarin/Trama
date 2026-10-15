@@ -1,7 +1,8 @@
-import { ItemView, Keymap, WorkspaceLeaf } from "obsidian";
+import { ButtonComponent, ItemView, Keymap, SearchComponent, WorkspaceLeaf } from "obsidian";
 import type { Runnable } from "@langchain/core/runnables";
 import type { VaultRetrievalInput, VaultRetrievalOutput } from "@/index/VaultRetrieval";
 import { TRAMA_ICONS } from "@/ui/icons";
+import { appendNoteResultRow } from "@/ui/noteResultRow";
 import type { IconName } from "obsidian";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
@@ -11,6 +12,7 @@ export class LenteView extends ItemView {
   private input!: HTMLInputElement;
   private status!: HTMLDivElement;
   private rows!: HTMLDivElement;
+  private resultsCount!: HTMLDivElement;
   private controller?: AbortController;
   private revision = 0;
   private submitted = "";
@@ -46,9 +48,11 @@ export class LenteView extends ItemView {
     const root = this.contentEl.createDiv({ cls: "trama-lente" });
     root.createEl("h1", { text: "Lente", cls: "trama-lente__title" });
     const form = root.createDiv({ cls: "trama-lente__form" });
-    this.input = form.createEl("input", {
-      attr: { type: "search", placeholder: "Search your vault", "aria-label": "Search your vault" },
-    });
+    const search = new SearchComponent(form).setPlaceholder("Search your vault");
+    this.input = search.inputEl;
+    this.input.parentElement?.classList.add("trama-lente__input-component");
+    this.input.classList.add("trama-lente__input");
+    this.input.setAttribute("aria-label", "Search your vault");
     this.input.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.isComposing) {
         event.preventDefault();
@@ -62,16 +66,23 @@ export class LenteView extends ItemView {
         this.render();
       }
     });
-    const button = form.createEl("button", { text: "Search", attr: { type: "button" } });
-    button.addEventListener("click", () => {
-      this.submitted = this.input.value.trim();
-      void this.run(this.submitted);
-    });
+    new ButtonComponent(form)
+      .setButtonText("Search")
+      .onClick(() => {
+        this.submitted = this.input.value.trim();
+        void this.run(this.submitted);
+      })
+      .buttonEl.classList.add("trama-lente__submit");
     this.status = root.createDiv({
       cls: "setting-item-description trama-lente__status",
       attr: { "aria-live": "polite" },
     });
-    this.rows = root.createDiv({ cls: "trama-lente__rows" });
+    const resultGroup = root.createDiv({ cls: "trama-note-results" });
+    this.resultsCount = resultGroup.createDiv({
+      cls: "setting-item-description trama-note-results__count",
+      attr: { "aria-live": "polite" },
+    });
+    this.rows = resultGroup.createDiv({ cls: "trama-lente__rows" });
     this.render();
     return Promise.resolve();
   }
@@ -116,6 +127,7 @@ export class LenteView extends ItemView {
   private render(): void {
     if (!this.status || !this.rows) return;
     this.rows.empty();
+    this.resultsCount.textContent = "";
     if (this.controller) {
       this.status.textContent = "Searching…";
       return;
@@ -126,26 +138,24 @@ export class LenteView extends ItemView {
         this.status.textContent = "Submit a query to search your vault.";
       return;
     }
+    const documents = output.documents.filter((document) =>
+      Boolean(String(document.metadata.path ?? document.id ?? ""))
+    );
+    this.resultsCount.textContent = documents.length
+      ? `${documents.length} ${documents.length === 1 ? "result" : "results"}`
+      : "";
     this.status.textContent = output.status.degraded
       ? output.status.degradationReason === "query-embedding-failed"
         ? "Lexical results (query embedding failed)."
         : "Lexical results (semantic search unavailable)."
-      : output.documents.length
-        ? `${output.documents.length} notes`
+      : documents.length
+        ? ""
         : "No matching notes found.";
-    for (const document of output.documents) {
+    for (const document of documents) {
       const path = String(document.metadata.path ?? document.id ?? "");
-      if (!path) continue;
-      const link = this.rows.createEl("a", {
-        cls: "internal-link trama-lente__link",
-        text: path.split("/").pop()?.replace(/\.md$/i, "") ?? path,
-        attr: { href: path },
-      });
-      link.addEventListener("click", (event) => {
-        event.preventDefault();
+      appendNoteResultRow(this.rows, this.app, path, this.leaf, (event) => {
         void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
       });
-      this.rows.createDiv({ cls: "setting-item-description trama-lente__path", text: path });
     }
   }
 }

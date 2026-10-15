@@ -270,6 +270,17 @@ describe("SQLite note worker transport", () => {
       hits: expect.arrayContaining(paths.map((path) => expect.objectContaining({ path }))),
     });
 
+    const cachedHash = "a".repeat(64);
+    const cacheProfile = "b".repeat(64);
+    const cachedVector = new Uint8Array(new Float32Array([1, 0]).buffer);
+    await client.call("embeddingCacheSet", {
+      profile: cacheProfile,
+      task: "document",
+      dimensions: 2,
+      entries: [{ hash: cachedHash, vector: cachedVector }],
+      now: 1,
+    });
+
     const resetController = new AbortController();
     cancelNextYield = () => resetController.abort();
     await expect(client.call("noteStoreReset", {}, resetController.signal)).rejects.toMatchObject({
@@ -278,6 +289,26 @@ describe("SQLite note worker transport", () => {
     expect(await client.call("noteStoreHybrid", { query: "shared", k: 100 })).toMatchObject({
       hits: expect.arrayContaining(paths.map((path) => expect.objectContaining({ path }))),
     });
+    expect(
+      await client.call("embeddingCacheGet", {
+        profile: cacheProfile,
+        task: "document",
+        hashes: [cachedHash],
+        now: 2,
+      })
+    ).toEqual([expect.any(Uint8Array)]);
+    await client.call("noteStoreReset", {});
+    expect(await client.call("noteStoreHybrid", { query: "shared", k: 100 })).toMatchObject({
+      hits: [],
+    });
+    expect(
+      await client.call("embeddingCacheGet", {
+        profile: cacheProfile,
+        task: "document",
+        hashes: [cachedHash],
+        now: 3,
+      })
+    ).toEqual([expect.any(Uint8Array)]);
     await client.close();
   });
 });

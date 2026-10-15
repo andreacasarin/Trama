@@ -172,6 +172,36 @@ describe("native LangChain note indexing", () => {
     }
   });
 
+  it("cleans excluded notes on Update and restores them when re-included", async () => {
+    const notes = new Map([
+      ["Projects/keep.md", "# keep\n\nvisible"],
+      ["Projects/private/hidden.md", "# private\n\nhidden"],
+    ]);
+    const setupResult = await setup(notes);
+    const { db, client } = setupResult;
+    let excluded = new Set<string>();
+    const filteredVault: ManualIndexVault = {
+      listMarkdownPaths: async () =>
+        [...notes.keys()].filter(
+          (path) => ![...excluded].some((folder) => path.startsWith(`${folder}/`))
+        ),
+      readMarkdown: (path) => setupResult.vault.readMarkdown(path),
+    };
+    const filteredManual = new ManualIndex(filteredVault, setupResult.store, setupResult.records);
+    try {
+      expect((await filteredManual.update()).numAdded).toBe(2);
+      excluded = new Set(["Projects/private"]);
+      expect((await filteredManual.update()).deleted).toBe(1);
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
+      excluded.clear();
+      expect((await filteredManual.update()).numAdded).toBe(1);
+      expect(await db.selectValue("SELECT count(*) FROM note_index")).toBe(2);
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
   it("embeds chunks across notes together and writes each vector to its source UID", async () => {
     const notes = new Map([
       ["alpha.md", "# alpha\n\nalpha uniquealpha searchable body"],

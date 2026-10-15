@@ -1,5 +1,6 @@
 import {
   App,
+  ButtonComponent,
   Component,
   FuzzySuggestModal,
   ItemView,
@@ -7,6 +8,7 @@ import {
   MarkdownRenderer,
   setIcon,
   setTooltip,
+  TextAreaComponent,
   WorkspaceLeaf,
 } from "obsidian";
 import { AssistantConversationTurn, CHAT_LIMITS, ChatSession, ChatState } from "@/chat/ChatSession";
@@ -86,6 +88,10 @@ export class VoceView extends ItemView {
   private localError?: string;
   private attachmentPickerGeneration = 0;
   private isViewOpen = false;
+  private suggestionGeneration = 0;
+  private suggestionController?: AbortController;
+  private relatedSuggestions: readonly string[] = [];
+  private relatedSourcePath?: string;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -93,7 +99,10 @@ export class VoceView extends ItemView {
     private readonly noteCatalog: () => readonly string[] = () => [],
     private readonly noteSuggestions: () => readonly string[] = () => [],
     private readonly copyText: (content: string) => Promise<void> = (content) =>
-      navigator.clipboard.writeText(content)
+      navigator.clipboard.writeText(content),
+    private readonly relatedNoteSuggestions: (
+      signal: AbortSignal
+    ) => Promise<readonly string[]> = async () => []
   ) {
     super(leaf);
   }
@@ -129,10 +138,11 @@ export class VoceView extends ItemView {
     const composer = this.root.createDiv({ cls: "trama-voce__composer" });
     this.attachments = composer.createDiv({ cls: "trama-voce__context" });
     const composeRow = composer.createDiv({ cls: "trama-voce__compose-row" });
-    this.input = composeRow.createEl("textarea", {
-      cls: "trama-voce__input",
-      attr: { rows: "3", "aria-label": "Message" },
-    });
+    const input = new TextAreaComponent(composeRow).inputEl;
+    this.input = input;
+    this.input.classList.add("trama-voce__input");
+    this.input.rows = 3;
+    this.input.setAttribute("aria-label", "Message");
     this.input.addEventListener("input", () => {
       this.localError = undefined;
       this.syncAttachmentsFromInput();
@@ -150,10 +160,9 @@ export class VoceView extends ItemView {
         this.openAttachmentPicker();
       }
     });
-    this.actionButton = composeRow.createEl("button", {
-      cls: "clickable-icon trama-voce__action",
-      attr: { type: "button" },
-    });
+    this.actionButton = new ButtonComponent(composeRow).buttonEl;
+    this.actionButton.classList.add("clickable-icon", "trama-voce__action");
+    this.actionButton.type = "button";
     this.actionButton.addEventListener("click", () => {
       if (this.session.getState().running) {
         this.session.cancel();
@@ -163,15 +172,22 @@ export class VoceView extends ItemView {
     });
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
+        void this.refreshSuggestions();
         this.renderAttachments();
       })
     );
+    void this.refreshSuggestions();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
     return Promise.resolve();
   }
 
   override onClose(): Promise<void> {
     this.isViewOpen = false;
+    this.suggestionGeneration++;
+    this.suggestionController?.abort();
+    this.suggestionController = undefined;
+    this.relatedSuggestions = [];
+    this.relatedSourcePath = undefined;
     this.attachmentPickerGeneration++;
     this.activeAttachmentPicker?.close();
     this.activeAttachmentPicker = undefined;
@@ -377,10 +393,15 @@ export class VoceView extends ItemView {
   private renderAttachments(): void {
     this.attachments.empty();
     const selected = new Set(this.selectedAttachmentPaths);
-    const activeSuggestions = this.noteSuggestions().filter((path) =>
-      this.noteCatalog().includes(path)
+    const activePath = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
+    const activeSuggestions = this.noteSuggestions().filter(
+      (path) => path === activePath && this.noteCatalog().includes(path)
     );
-    const suggestions = [...new Set(activeSuggestions)];
+    const relatedSuggestions =
+      this.relatedSourcePath === activePath
+        ? this.relatedSuggestions.filter((path) => this.noteCatalog().includes(path))
+        : [];
+    const suggestions = [...new Set([...activeSuggestions, ...relatedSuggestions])];
     const paths = [
       ...suggestions,
       ...this.selectedAttachmentPaths.filter((path) => !suggestions.includes(path)),
@@ -420,6 +441,39 @@ export class VoceView extends ItemView {
     setIcon(addButton, "plus");
     setTooltip(addButton, "Choose note");
     addButton.addEventListener("click", () => this.openAttachmentPicker());
+  }
+
+  async refreshSuggestions(): Promise<void> {
+    const generation = ++this.suggestionGeneration;
+    this.suggestionController?.abort();
+    this.suggestionController = undefined;
+    this.relatedSuggestions = [];
+    this.relatedSourcePath = undefined;
+    if (!this.isViewOpen) return;
+    this.renderAttachments();
+    const sourcePath = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
+    const controller = new AbortController();
+    this.suggestionController = controller;
+    try {
+      const paths = await this.relatedNoteSuggestions(controller.signal);
+      if (
+        generation !== this.suggestionGeneration ||
+        controller.signal.aborted ||
+        !this.isViewOpen ||
+        (this.app as any)?.workspace?.getActiveFile?.()?.path !== sourcePath
+      )
+        return;
+      this.relatedSuggestions = [...paths];
+      this.relatedSourcePath = sourcePath;
+      this.renderAttachments();
+    } catch {
+      if (generation === this.suggestionGeneration && !controller.signal.aborted) {
+        this.relatedSuggestions = [];
+        this.renderAttachments();
+      }
+    } finally {
+      if (this.suggestionController === controller) this.suggestionController = undefined;
+    }
   }
 
   private noteLabel(path: string): string {

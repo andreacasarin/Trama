@@ -55,6 +55,7 @@ describe("V1 plugin composition", () => {
         getActiveFile: () => null,
         getLeavesOfType: () => [],
         on: () => ({ unsubscribe: vi.fn() }),
+        trigger: vi.fn(),
       },
       metadataCache: { getFirstLinkpathDest: () => null, getFileCache: () => null },
     };
@@ -64,9 +65,15 @@ describe("V1 plugin composition", () => {
     plugin.loadData = vi.fn(async () => undefined);
     plugin.saveData = vi.fn(async () => undefined);
     const commands = vi.spyOn(plugin, "addCommand");
+    const hoverSource = vi.spyOn(plugin, "registerHoverLinkSource");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     try {
       await plugin.onload();
+      expect(hoverSource).toHaveBeenCalledOnce();
+      expect(hoverSource).toHaveBeenCalledWith("trama-results", {
+        display: "Trama results",
+        defaultMod: false,
+      });
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(WorkerStub).toHaveBeenCalledWith(
         expect.stringMatching(
@@ -75,24 +82,213 @@ describe("V1 plugin composition", () => {
         { type: "module" }
       );
       expect(commands.mock.calls.map(([command]) => (command as any).id)).toEqual(
-        expect.arrayContaining(["trama-update-index", "trama-rebuild-index", "trama-stop-indexing"])
+        expect.arrayContaining([
+          "trama-update-index",
+          "trama-rebuild-index",
+          "trama-stop-indexing",
+          "trama-clear-index",
+        ])
       );
       await plugin.saveSettings(plugin.getSettings());
-      expect(lifecycle.slice(0, 4)).toEqual(["create-1", "close-1", "terminate-1", "create-2"]);
-      expect(workers[0].terminate).toHaveBeenCalledOnce();
+      expect(lifecycle).toEqual(["create-1"]);
+      expect(workers).toHaveLength(1);
       plugin.onunload();
       await vi.waitFor(() =>
-        expect(workers[1].postMessage).toHaveBeenCalledWith(
+        expect(workers[0].postMessage).toHaveBeenCalledWith(
           expect.objectContaining({ method: "close" })
         )
       );
-      await vi.waitFor(() => expect(workers[1].terminate).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(workers[0].terminate).toHaveBeenCalledOnce());
     } finally {
       fetchSpy.mockRestore();
       globalThis.Worker = originalWorker;
       plugin.onunload();
     }
   });
+
+  it("persists folder exclusions without reconfiguring runtime and applies subtree boundaries", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const saved: any[] = [];
+    plugin.saveData = vi.fn(async (value: unknown) => saved.push(value));
+    plugin.configureServices = vi.fn(async () => undefined);
+    const first = plugin.saveSettings((current: any) => ({
+      ...current,
+      excludedFolders: ["Projects", "Projects/Archive"],
+    }));
+    await first;
+    expect(saved[0].excludedFolders).toEqual(["Projects", "Projects/Archive"]);
+    expect(plugin.configureServices).not.toHaveBeenCalled();
+    expect(plugin.isIndexableMarkdown("Projects/one.md")).toBe(false);
+    expect(plugin.isIndexableMarkdown("Projects/Archive/old.md")).toBe(false);
+    expect(plugin.isIndexableMarkdown("Projects Archive/one.md")).toBe(true);
+    expect(plugin.isVisibleMarkdown("Projects/one.md")).toBe(true);
+  });
+
+  it("clears only the local note index and reports the committed status", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = new IndexStatusController();
+    const invalidateRelated = vi.fn();
+    const refreshSubmitted = vi.fn();
+    plugin.retrieval = { invalidateRelated };
+    plugin.app = { workspace: { getLeavesOfType: () => [{ view: { refreshSubmitted } }] } };
+    plugin.client = { call: vi.fn(async () => undefined) };
+    await plugin.clearIndex();
+    expect(plugin.client.call).toHaveBeenCalledWith("noteStoreReset", {}, expect.any(AbortSignal));
+    expect(invalidateRelated).toHaveBeenCalledOnce();
+    expect(refreshSubmitted).toHaveBeenCalledOnce();
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "index-required",
+      message: "Local index cleared.",
+    });
+    expect(plugin.updateIndex).toBeDefined();
+  });
+
+  it("stops a running clear without claiming success and excludes other index actions", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = new IndexStatusController();
+    let rejectReset!: (error: unknown) => void;
+    let resetSignal!: AbortSignal;
+    const reset = new Promise((_, reject) => (rejectReset = reject));
+    plugin.client = {
+      call: vi.fn((_method: string, _payload: unknown, signal: AbortSignal) => {
+        resetSignal = signal;
+        return reset;
+      }),
+    };
+    const clear = plugin.clearIndex();
+    await plugin.updateIndex();
+    expect(plugin.manualIndex).toBeUndefined();
+    plugin.stopIndex();
+    expect(resetSignal.aborted).toBe(true);
+    rejectReset(new DOMException("Aborted", "AbortError"));
+    await clear;
+    expect(plugin.status.getStatus().kind).toBe("index-required");
+  });
+
+  it("returns the active note and first five distinct related catalog paths for Voce", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.activeNote = "notes/current.md";
+    plugin.catalog = () => [
+      "notes/current.md",
+      "notes/a.md",
+      "notes/b.md",
+      "notes/c.md",
+      "notes/d.md",
+      "notes/e.md",
+      "notes/f.md",
+    ];
+    plugin.retrieval = {
+      relatedPaths: vi.fn(async () => ({
+        available: true,
+        paths: [
+          "notes/current.md",
+          "notes/a.md",
+          "notes/a.md",
+          "hidden.md",
+          "notes/b.md",
+          "notes/c.md",
+          "notes/d.md",
+          "notes/e.md",
+          "notes/f.md",
+        ],
+      })),
+    };
+    await expect(plugin.relatedNoteSuggestions(new AbortController().signal)).resolves.toEqual([
+      "notes/a.md",
+      "notes/b.md",
+      "notes/c.md",
+      "notes/d.md",
+      "notes/e.md",
+    ]);
+    expect(plugin.retrieval.relatedPaths).toHaveBeenCalledWith(
+      "notes/current.md",
+      expect.any(AbortSignal),
+      7
+    );
+  });
+
+  it.each([
+    { initial: [], next: ["Projects"], active: true, following: false },
+    { initial: ["Projects"], next: [], active: false, following: true },
+  ])(
+    "keeps eligibility stable when exclusions change during an active Update ($initial to $next)",
+    async ({ initial, next, active, following }) => {
+      const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+      plugin.settingsStore.load({ ...plugin.getSettings(), excludedFolders: initial });
+      plugin.saveData = vi.fn(async () => undefined);
+      plugin.configureServices = vi.fn(async () => undefined);
+      let releaseRead!: () => void;
+      let notifyRead!: () => void;
+      const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+      const readStarted = new Promise<void>((resolve) => (notifyRead = resolve));
+      const eligibility: boolean[] = [];
+      let isPaused = true;
+      plugin.manualIndex = {
+        update: async () => {
+          eligibility.push(plugin.isIndexableMarkdown("Projects/note.md"));
+          if (isPaused) {
+            isPaused = false;
+            notifyRead();
+            await readGate;
+          }
+          eligibility.push(plugin.isIndexableMarkdown("Projects/note.md"));
+          return { visited: 1, deleted: 0, numAdded: 0, numUpdated: 0, numSkipped: 1 };
+        },
+        rebuild: async () => ({
+          visited: 0,
+          deleted: 0,
+          numAdded: 0,
+          numUpdated: 0,
+          numSkipped: 0,
+        }),
+        cancel: vi.fn(),
+      };
+
+      const activeUpdate = plugin.updateIndex();
+      await readStarted;
+      await plugin.saveSettings((current: any) => ({ ...current, excludedFolders: next }));
+      expect(plugin.configureServices).not.toHaveBeenCalled();
+      releaseRead();
+      await activeUpdate;
+      expect(eligibility).toEqual([active, active]);
+
+      await plugin.updateIndex();
+      expect(eligibility.slice(2)).toEqual([following, following]);
+    }
+  );
+
+  it.each(["stop", "unload"] as const)(
+    "starts ManualIndex synchronously so immediate %s reaches the active run",
+    async (action) => {
+      const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+      let cancelled = false;
+      let startedAfterCancel = false;
+      const manualIndex = {
+        update: vi.fn(async () => {
+          startedAfterCancel ||= cancelled;
+          return { visited: 0, deleted: 0, numAdded: 0, numUpdated: 0, numSkipped: 0 };
+        }),
+        rebuild: vi.fn(async () => ({
+          visited: 0,
+          deleted: 0,
+          numAdded: 0,
+          numUpdated: 0,
+          numSkipped: 0,
+        })),
+        cancel: vi.fn(() => {
+          cancelled = true;
+        }),
+      };
+      plugin.manualIndex = manualIndex;
+      const update = plugin.updateIndex();
+      if (action === "stop") plugin.stopIndex();
+      else plugin.onunload();
+      await update;
+      expect(manualIndex.update).toHaveBeenCalledOnce();
+      expect(manualIndex.cancel).toHaveBeenCalledOnce();
+      expect(startedAfterCancel).toBe(false);
+    }
+  );
 
   it("assigns each vault a stable independent namespace and rejects a malformed identity", async () => {
     const runtime = new NoteSqliteRuntime(() => undefined);
