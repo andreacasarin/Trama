@@ -3,6 +3,7 @@ import { Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { FiloView } from "@/ui/filo/FiloView";
 
 describe("V1 plugin composition", () => {
   beforeEach(() => {
@@ -122,6 +123,84 @@ describe("V1 plugin composition", () => {
     expect(plugin.isIndexableMarkdown("Projects/Archive/old.md")).toBe(false);
     expect(plugin.isIndexableMarkdown("Projects Archive/one.md")).toBe(true);
     expect(plugin.isVisibleMarkdown("Projects/one.md")).toBe(true);
+  });
+
+  it("restarts Filo when file-open invalidates a pending active-leaf search", async () => {
+    const handlers = new Map<string, (value: any) => void>();
+    let activeFile: { path: string } | null = { path: "notes/previous.md" };
+    const relatedCalls: { path: string; signal: AbortSignal; reject: (error: unknown) => void }[] =
+      [];
+    const related = vi.fn(
+      (path: string, signal: AbortSignal) =>
+        new Promise<any>((resolve, reject) => {
+          relatedCalls.push({ path, signal, reject });
+          if (relatedCalls.length === 3)
+            resolve({
+              documents: [
+                {
+                  id: "notes/current-result.md",
+                  pageContent: "",
+                  metadata: { path: "notes/current-result.md" },
+                },
+              ],
+              available: true,
+            });
+        })
+    );
+    let consumerWasLiveAtInvalidation = false;
+    const invalidateRelated = vi.fn(() => {
+      consumerWasLiveAtInvalidation = !relatedCalls[1].signal.aborted;
+      relatedCalls[1]?.reject(Object.assign(new Error("invalidated"), { name: "AbortError" }));
+    });
+    const retrieval = { invalidateRelated, related, runnable: { invoke: vi.fn() } };
+    const status = new IndexStatusController();
+    let filoView: FiloView | undefined;
+    const app = {
+      vault: { getMarkdownFiles: () => [] },
+      workspace: {
+        getActiveFile: () => activeFile,
+        getLeavesOfType: (type: string) =>
+          type === "trama-filo" && filoView ? [{ view: filoView }] : [],
+        on: (event: string, handler: (value: any) => void) => {
+          handlers.set(event, handler);
+          return { unsubscribe: vi.fn() };
+        },
+      },
+      metadataCache: {},
+    };
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.app = app;
+    plugin.loadData = vi.fn(async () => undefined);
+    plugin.registerEvent = vi.fn();
+    plugin.configureServices = vi.fn(async () => {
+      plugin.status = status;
+      plugin.session = { reset: vi.fn() };
+      plugin.retrieval = retrieval;
+    });
+    try {
+      await plugin.onload();
+      filoView = new FiloView({ app } as any, status, retrieval as any);
+      (filoView as any).contentEl = undefined;
+      await filoView.onOpen();
+      activeFile = { path: "notes/current.md" };
+      handlers.get("active-leaf-change")?.({});
+      expect(related).toHaveBeenCalledTimes(2);
+      expect(relatedCalls[0].signal.aborted).toBe(true);
+      expect(relatedCalls[1].path).toBe("notes/current.md");
+      handlers.get("file-open")?.({ path: "notes/current.md" });
+      expect(invalidateRelated).toHaveBeenCalledOnce();
+      expect(consumerWasLiveAtInvalidation).toBe(true);
+      await vi.waitFor(() => expect(related).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() =>
+        expect((filoView as any).documents[0].metadata.path).toBe("notes/current-result.md")
+      );
+      expect(relatedCalls[1].signal.aborted).toBe(true);
+      expect(relatedCalls[2].path).toBe("notes/current.md");
+      expect((filoView as any).error).toBe(false);
+    } finally {
+      filoView?.onClose();
+      plugin.onunload();
+    }
   });
 
   it("clears only the local note index and reports the committed status", async () => {

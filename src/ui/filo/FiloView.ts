@@ -47,6 +47,9 @@ export class FiloView extends ItemView {
     this.documents = [];
     this.refresh();
   }
+  refreshActiveNote(path: string | undefined): void {
+    this.refresh(path ?? null);
+  }
   override onOpen(): Promise<void> {
     this.unsubscribe = this.statusSource.subscribe((status) => {
       const wasBuilding = this.status.kind === "building";
@@ -71,8 +74,11 @@ export class FiloView extends ItemView {
     this.controller?.abort();
     this.controller = undefined;
   }
-  private refresh(): void {
-    const path = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
+  private refresh(pathOverride?: string | null): void {
+    const path =
+      pathOverride === undefined
+        ? ((this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined)
+        : (pathOverride ?? undefined);
     this.activePath = path && path.toLowerCase().endsWith(".md") ? path : undefined;
     this.cancel();
     this.documents = [];

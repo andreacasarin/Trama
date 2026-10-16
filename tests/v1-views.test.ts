@@ -458,6 +458,53 @@ describe("V1 note views", () => {
     reloaded.onClose();
   });
 
+  it("restarts Filo for the same active path after related work is invalidated", async () => {
+    const app = {
+      workspace: {
+        getActiveFile: () => ({ path: "notes/current.md" }),
+        on: () => ({ unsubscribe: vi.fn() }),
+        openLinkText: vi.fn(),
+      },
+      vault: { getFileByPath: () => null },
+    };
+    let rejectInvalidated!: (error: unknown) => void;
+    let resolveFresh!: (result: any) => void;
+    const related = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectInvalidated = reject)))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveFresh = resolve)));
+    const view = Object.assign(
+      new FiloView({ app } as any, new IndexStatusController(), { related } as any),
+      { contentEl: new ElementStub() }
+    );
+    await view.onOpen();
+    expect(related).toHaveBeenCalledWith("notes/current.md", expect.any(AbortSignal), 20);
+    view.refreshActiveNote("notes/current.md");
+    expect(related).toHaveBeenCalledTimes(2);
+    expect(related).toHaveBeenLastCalledWith("notes/current.md", expect.any(AbortSignal), 20);
+    expect(related.mock.calls[0][1].aborted).toBe(true);
+    resolveFresh({
+      documents: [
+        new Document({
+          id: "notes/fresh.md",
+          pageContent: "fresh result",
+          metadata: { path: "notes/fresh.md", score: 0.9 },
+        }),
+      ],
+      available: true,
+    });
+    await vi.waitFor(() =>
+      expect((view.contentEl as unknown as ElementStub).findAll("a")).toHaveLength(1)
+    );
+    rejectInvalidated(Object.assign(new Error("invalidated"), { name: "AbortError" }));
+    await Promise.resolve();
+    expect((view.contentEl as unknown as ElementStub).allText()).toContain("1 related note");
+    expect((view.contentEl as unknown as ElementStub).allText()).not.toContain(
+      "Related notes could not be loaded."
+    );
+    view.onClose();
+  });
+
   it("renders live edit dates for modal suggestions and skips missing files", () => {
     const app = {
       vault: {

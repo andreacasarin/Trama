@@ -73,6 +73,7 @@ export class TramaPlugin extends Plugin {
           if (next !== this.activeNote) {
             this.activeNote = next;
             this.retrieval?.invalidateRelated();
+            this.refreshFiloResults(next);
             this.refreshVoceSuggestions();
           }
         })
@@ -440,6 +441,11 @@ export class TramaPlugin extends Plugin {
   private refreshVoceSuggestions(): void {
     for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-voce") ?? [])
       void leaf.view?.refreshSuggestions?.();
+  }
+
+  private refreshFiloResults(path: string | undefined): void {
+    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-filo") ?? [])
+      leaf.view?.refreshActiveNote?.(path);
   }
 
   private refreshLenteResults(): void {
