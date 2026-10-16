@@ -78,11 +78,14 @@ export class LenteView extends ItemView {
       attr: { "aria-live": "polite" },
     });
     const resultGroup = root.createDiv({ cls: "trama-note-results" });
-    this.resultsCount = resultGroup.createDiv({
-      cls: "setting-item-description trama-note-results__count",
+    const resultsInfo = resultGroup.createDiv({ cls: "search-results-info" });
+    this.resultsCount = resultsInfo.createDiv({
+      cls: "search-results-result-count",
       attr: { "aria-live": "polite" },
     });
-    this.rows = resultGroup.createDiv({ cls: "trama-lente__rows" });
+    this.rows = resultGroup.createDiv({
+      cls: "search-result-container mod-global-search trama-lente__rows",
+    });
     this.render();
     return Promise.resolve();
   }

@@ -78,6 +78,14 @@ describe("Trama settings tab autosave", () => {
     await vi.waitFor(() => expect(getSettings().chat.reasoningEffort).toBe("high"));
   });
 
+  it("omits the redundant Trama title and starts maintenance at Update index", () => {
+    const { tab } = setup();
+    const container = tab.containerEl as unknown as { children: Array<{ textContent: string }> };
+    expect(container.children.some((child) => child.textContent === "Trama")).toBe(false);
+    const settingNames = mockSettings.instances.map((item) => item.name);
+    expect(settingNames.indexOf("Maintenance")).toBeLessThan(settingNames.indexOf("Update index"));
+  });
+
   it("keeps a failed endpoint commit visible and leaves the saved value intact", async () => {
     const { tab, plugin, getSettings } = setup();
     vi.mocked(plugin.saveSettings).mockRejectedValueOnce(new Error("disk full"));

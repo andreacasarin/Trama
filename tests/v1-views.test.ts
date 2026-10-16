@@ -5,6 +5,7 @@ import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
 import { FiloView } from "@/ui/filo/FiloView";
 import { VoceView } from "@/ui/voce/VoceView";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
+import { appendNoteResultRow } from "@/ui/noteResultRow";
 
 class ElementStub {
   children: ElementStub[] = [];
@@ -20,6 +21,14 @@ class ElementStub {
       this.className = [
         ...new Set([...this.className.split(" ").filter(Boolean), ...classes]),
       ].join(" ");
+    },
+    toggle: (className: string, force?: boolean) => {
+      const classes = new Set(this.className.split(" ").filter(Boolean));
+      const shouldAdd = force ?? !classes.has(className);
+      if (shouldAdd) classes.add(className);
+      else classes.delete(className);
+      this.className = [...classes].join(" ");
+      return shouldAdd;
     },
   };
   constructor(readonly tag = "div") {}
@@ -77,16 +86,18 @@ describe("V1 note views", () => {
   it("runs Lente through the native retrieval runnable and renders note links/status", async () => {
     const invoke = vi.fn(async () => ({
       documents: [
+        new Document({ id: "", pageContent: "not a result", metadata: {} }),
+        new Document({ id: "", pageContent: "not a result", metadata: {} }),
+        new Document({ id: "", pageContent: "not a result", metadata: {} }),
         new Document({
           id: "notes/result.md",
           pageContent: "private excerpt",
-          metadata: { path: "notes/result.md" },
+          metadata: { path: "notes/result.md", score: 0.99, semanticScore: 0.7345 },
         }),
       ],
       status: {
-        mode: "lexical" as const,
-        degraded: true,
-        degradationReason: "semantic-unavailable" as const,
+        mode: "hybrid" as const,
+        degraded: false,
       },
     }));
     const app = {
@@ -103,36 +114,52 @@ describe("V1 note views", () => {
     input.value = "search query";
     input.dispatch("keydown", { key: "Enter", isComposing: false, preventDefault: vi.fn() });
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(root.allText()).toContain("Lexical results"));
+    await vi.waitFor(() => expect(root.allText()).toContain("1 result"));
     expect(root.allText()).toContain("1 result");
     const links = root.findAll("a");
     expect(links).toHaveLength(1);
     expect(links[0].textContent).toBe("result");
-    expect(links[0].className).toContain("search-result-file-title");
+    expect(links[0].className).toContain("tree-item-inner");
     expect(links[0].className).toContain("trama-note-result__title");
     const result = root
       .findAll("div")
-      .find((element) => element.className === "trama-note-result")!;
+      .find((element) => element.className === "tree-item search-result is-collapsed")!;
     const resultGroup = result.parentElement?.parentElement;
     expect(resultGroup?.className).toBe("trama-note-results");
     expect(resultGroup?.children.map((child) => child.className)).toEqual([
-      "setting-item-description trama-note-results__count",
-      "trama-lente__rows",
+      "search-results-info",
+      "search-result-container mod-global-search trama-lente__rows",
     ]);
-    expect(result.children[0].className).toBe("trama-note-result__heading");
+    expect(resultGroup?.children[0].children[0].className).toBe("search-results-result-count");
+    expect(result.children[0].className).toBe(
+      "tree-item-self search-result-file-title is-clickable"
+    );
     const toggle = result.children[0].children[0];
     expect(toggle.tag).toBe("button");
+    expect(toggle.className).toContain("clickable-icon");
+    expect(toggle.className).toContain("tree-item-icon");
     expect(toggle.attributes.type).toBe("button");
     expect(toggle.attributes["aria-expanded"]).toBe("false");
+    expect(toggle.attributes["data-icon"]).toBe("right-triangle");
+    expect(toggle.className).toContain("is-collapsed");
+    expect(toggle.attributes["data-tooltip"]).toBe("Expand note details");
     expect(result.children[0].children[1]).toBe(links[0]);
     const metadata = result.children[1];
-    expect(metadata.className).toBe("trama-note-result__meta");
+    expect(metadata.className).toBe("search-result-file-matches");
     expect(metadata.hidden).toBe(true);
-    expect(metadata.children.map((child) => child.className)).toEqual([
-      "trama-note-result__path",
-      "setting-item-description trama-result-date",
+    expect(metadata.children[0].className).toBe("search-result-file-match");
+    expect(metadata.children[0].children[0].textContent).toBe("notes/result.md");
+    expect(metadata.children[0].children[1].className).toBe(
+      "setting-item-description trama-result-date"
+    );
+    expect(metadata.children[0].children.map((child) => child.textContent)).toEqual([
+      "notes/result.md",
+      expect.stringContaining("Edited"),
     ]);
-    expect(result.className).not.toContain("search-result");
+    expect(root.allText()).not.toContain("Relevance:");
+    expect(root.allText()).not.toContain("Similarity:");
+    expect(result.className).toContain("search-result");
+    expect(result.className).toContain("is-collapsed");
     const hoverEvent = { type: "mouseover" } as MouseEvent;
     links[0].dispatch("mouseover", hoverEvent);
     expect(app.workspace.trigger).toHaveBeenCalledWith("hover-link", {
@@ -142,13 +169,21 @@ describe("V1 note views", () => {
       targetEl: links[0],
       linktext: "notes/result.md",
     });
+    toggle.dispatch("mouseover", hoverEvent);
     toggle.dispatch("click", {});
     expect(app.workspace.trigger).toHaveBeenCalledOnce();
     expect(metadata.hidden).toBe(false);
+    expect(result.className).not.toContain("is-collapsed");
     expect(toggle.attributes["aria-expanded"]).toBe("true");
     expect(toggle.attributes["aria-label"]).toBe("Collapse note details");
+    expect(toggle.attributes["data-icon"]).toBe("right-triangle");
+    expect(toggle.className).not.toContain("is-collapsed");
+    expect(toggle.attributes["data-tooltip"]).toBe("Collapse note details");
     toggle.dispatch("click", {});
     expect(metadata.hidden).toBe(true);
+    expect(result.className).toContain("is-collapsed");
+    expect(toggle.attributes["data-icon"]).toBe("right-triangle");
+    expect(toggle.className).toContain("is-collapsed");
     expect(root.allText()).toContain("Edited");
     expect(
       root
@@ -158,6 +193,86 @@ describe("V1 note views", () => {
     expect(root.findAll("pre")).toHaveLength(0);
     links[0].dispatch("click", { preventDefault: vi.fn(), metaKey: false, ctrlKey: false });
     expect(app.workspace.openLinkText).toHaveBeenCalledWith("notes/result.md", "", false);
+  });
+
+  it("omits missing and non-finite result scores", () => {
+    const app = { workspace: { trigger: vi.fn() }, vault: { getFileByPath: () => null } };
+    for (const value of [undefined, Number.NaN, Number.POSITIVE_INFINITY, "0.5"]) {
+      const parent = new ElementStub();
+      const row = appendNoteResultRow(
+        parent as unknown as HTMLElement,
+        app as any,
+        "notes/result.md",
+        {} as any,
+        vi.fn(),
+        value
+      );
+      const details = (row as unknown as ElementStub).children[1];
+      expect(details.children[0].children.map((child) => child.textContent)).toEqual([
+        "notes/result.md",
+      ]);
+    }
+  });
+
+  it("labels similarity at the qualitative score boundaries", () => {
+    const app = { workspace: { trigger: vi.fn() }, vault: { getFileByPath: () => null } };
+    const cases = [
+      [0.85, "Very high"],
+      [0.7, "High"],
+      [0.5, "Medium"],
+      [0.3, "Low"],
+      [0.2999, "Very low"],
+    ] as const;
+    for (const [value, label] of cases) {
+      const row = appendNoteResultRow(
+        new ElementStub() as unknown as HTMLElement,
+        app as any,
+        "notes/result.md",
+        {} as any,
+        vi.fn(),
+        value
+      ) as unknown as ElementStub;
+      expect(row.children[1].children[0].children[1].textContent).toBe(`Similarity: ${label}`);
+    }
+  });
+
+  it("omits ratings for lexical-only Lente results", async () => {
+    const invoke = vi.fn(async () => ({
+      documents: [
+        new Document({
+          id: "notes/lexical.md",
+          pageContent: "lexical result",
+          metadata: { path: "notes/lexical.md", score: 0.99 },
+        }),
+      ],
+      status: {
+        mode: "lexical" as const,
+        degraded: true,
+        degradationReason: "semantic-unavailable" as const,
+      },
+    }));
+    const app = {
+      workspace: { openLinkText: vi.fn(), trigger: vi.fn() },
+      vault: { getFileByPath: () => ({ stat: { mtime: 1_750_000_000_000 } }) },
+    };
+    const view = Object.assign(new LenteView({ app } as any, { invoke } as any), {
+      contentEl: new ElementStub(),
+    });
+    await view.onOpen();
+    const root = view.contentEl as unknown as ElementStub;
+    const input = root.find("input")!;
+    input.value = "needle";
+    input.dispatch("keydown", { key: "Enter", isComposing: false, preventDefault: vi.fn() });
+    await vi.waitFor(() => expect(root.findAll("a")).toHaveLength(1));
+    root
+      .findAll("div")
+      .find((element) => element.className === "tree-item search-result is-collapsed")!
+      .children[0].children[0].dispatch("click", {});
+    expect(root.allText()).toContain("notes/lexical.md");
+    expect(root.allText()).toContain("Edited");
+    expect(root.allText()).not.toContain("Relevance:");
+    expect(root.allText()).not.toContain("Similarity:");
+    view.onClose();
   });
 
   it("clears stale Lente hits while a refresh races an older pending search", async () => {
@@ -292,7 +407,7 @@ describe("V1 note views", () => {
         new Document({
           id: "notes/related.md",
           pageContent: "private related passage",
-          metadata: { path: "notes/related.md" },
+          metadata: { path: "notes/related.md", score: -0.12356 },
         }),
       ],
       available: true,
@@ -311,20 +426,25 @@ describe("V1 note views", () => {
     await view.onOpen();
     await vi.waitFor(() => expect(related).toHaveBeenCalledOnce());
     await vi.waitFor(() => expect(root.findAll("a")).toHaveLength(1));
-    expect(related).toHaveBeenCalledWith("notes/source.md", expect.any(AbortSignal), 7);
+    expect(related).toHaveBeenCalledWith("notes/source.md", expect.any(AbortSignal), 20);
     expect(root.findAll("a")[0].textContent).toBe("related");
     expect(root.allText()).toContain("1 related note");
-    expect(root.findAll("a")[0].className).toContain("search-result-file-title");
     expect(root.findAll("a")[0].className).toContain("trama-note-result__title");
     const group = root
       .findAll("div")
       .find((element) => element.className === "trama-note-results")!;
     expect(group.children.map((child) => child.className)).toEqual([
-      "setting-item-description trama-note-results__count",
-      "trama-filo__rows",
+      "search-results-info",
+      "search-result-container mod-global-search trama-filo__rows",
     ]);
+    expect(group.children[0].children[0].className).toBe("search-results-result-count");
     expect(root.allText()).toContain("Edited");
     expect(root.allText()).not.toContain("private related passage");
+    const result = root
+      .findAll("div")
+      .find((element) => element.className === "tree-item search-result is-collapsed")!;
+    result.children[0].children[0].dispatch("click", {});
+    expect(root.allText()).toContain("Similarity: Very low");
     status.setStatus({ kind: "building", canIndex: false, canReindex: false, canCancel: true });
     status.setStatus({ kind: "ready", canIndex: true, canReindex: true, canCancel: false });
     await vi.waitFor(() => expect(related).toHaveBeenCalledTimes(2));

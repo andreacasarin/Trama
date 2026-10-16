@@ -270,6 +270,14 @@ export class ButtonComponent {
     this.buttonEl.textContent = value;
     return this;
   }
+  setIcon(icon: string): this {
+    this.buttonEl.setAttribute("data-icon", icon);
+    return this;
+  }
+  setTooltip(tooltip: string): this {
+    this.buttonEl.setAttribute("data-tooltip", tooltip);
+    return this;
+  }
   onClick(callback: (event: unknown) => unknown): this {
     this.buttonEl.addEventListener("click", callback);
     return this;

@@ -86,7 +86,7 @@ export class FiloView extends ItemView {
     const controller = new AbortController();
     this.controller = controller;
     void this.related
-      .related(this.activePath, controller.signal, 7)
+      .related(this.activePath, controller.signal, 20)
       .then((result) => {
         if (generation !== this.generation || controller.signal.aborted) return;
         this.documents = result.documents;
@@ -142,20 +142,30 @@ export class FiloView extends ItemView {
       return;
     }
     const resultGroup = root.createDiv({ cls: "trama-note-results" });
-    resultGroup.createDiv({
-      cls: "setting-item-description trama-note-results__count",
+    const resultsInfo = resultGroup.createDiv({ cls: "search-results-info" });
+    resultsInfo.createDiv({
+      cls: "search-results-result-count",
       text: `${documents.length} related ${documents.length === 1 ? "note" : "notes"}`,
     });
-    const rows = resultGroup.createDiv({ cls: "trama-filo__rows" });
+    const rows = resultGroup.createDiv({
+      cls: "search-result-container mod-global-search trama-filo__rows",
+    });
     for (const document of documents) {
       const path = String(document.metadata.path ?? document.id ?? "");
-      const link = appendNoteResultRow(rows, this.app, path, this.leaf, (event) => {
-        void (this.app as any).workspace.openLinkText(
-          path,
-          this.activePath ?? "",
-          Keymap.isModEvent(event)
-        );
-      });
+      const link = appendNoteResultRow(
+        rows,
+        this.app,
+        path,
+        this.leaf,
+        (event) => {
+          void (this.app as any).workspace.openLinkText(
+            path,
+            this.activePath ?? "",
+            Keymap.isModEvent(event)
+          );
+        },
+        document.metadata.score
+      );
       setTooltip(link, path);
     }
   }

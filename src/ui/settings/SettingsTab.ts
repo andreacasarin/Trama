@@ -59,8 +59,6 @@ export class TramaSettingsTab extends PluginSettingTab {
     containerEl.empty();
     this.flushText.length = 0;
     const settings = (this.draft ??= cloneSettings(this.plugin.getSettings()));
-    containerEl.createEl("h2", { text: "Trama" });
-
     this.heading("Voce");
     this.text(
       "Chat endpoint",
@@ -210,6 +208,7 @@ export class TramaSettingsTab extends PluginSettingTab {
         button.setButtonText("Add").onClick(() => void this.addFolder(settings))
       );
 
+    this.heading("Maintenance");
     new Setting(containerEl)
       .setName("Update index")
       .setDesc("Index current Markdown notes and remove deleted or excluded notes.")
