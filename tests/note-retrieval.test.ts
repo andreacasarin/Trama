@@ -3,6 +3,8 @@ import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
+import { EmbeddingProviderError } from "@/model/LocalModels";
+import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import type { NoteStoreMethod, NoteStoreRpc } from "@/index/note-sqlite/protocol";
@@ -67,6 +69,138 @@ async function fixture() {
 }
 
 describe("SQLite note retrieval", () => {
+  it("logs a bounded warning when query embeddings fall back to lexical search", async () => {
+    const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const embeddings: EmbeddingsInterface<number[]> = {
+      embedDocuments: async () => [],
+      embedQuery: async () => {
+        throw new EmbeddingProviderError("local embedding unavailable");
+      },
+    };
+    const call = vi.fn(async () => ({ mode: "lexical" as const, degraded: true, hits: [] }));
+    const retrieval = new VaultRetrieval(
+      call as any,
+      embeddings,
+      "profile",
+      async () => null,
+      new ConsoleDebug(() => true)
+    );
+    const result = await retrieval.runnable.invoke({
+      query: "private search text",
+      mode: "hybrid",
+    });
+    expect(result.status.degradationReason).toBe("query-embedding-failed");
+    expect(debugWarn).toHaveBeenCalledOnce();
+    expect(debugWarn.mock.calls[0][0]).toContain("using lexical search");
+    expect(debugWarn.mock.calls[0][1]).toMatchObject({ message: "local embedding unavailable" });
+    expect(JSON.stringify(debugWarn.mock.calls)).not.toContain("private search text");
+    debugWarn.mockRestore();
+  });
+
+  it("terminalizes failed and cancelled searches while preserving failures for the view", async () => {
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const original = new Error("search transport failed");
+    const failed = new VaultRetrieval(
+      vi.fn(async () => {
+        throw original;
+      }) as any,
+      undefined,
+      "profile",
+      async () => null,
+      new ConsoleDebug(() => true)
+    );
+    await expect(failed.runnable.invoke({ query: "private text", mode: "lexical" })).rejects.toBe(
+      original
+    );
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain("[Trama] Vault search failed");
+    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugError).not.toHaveBeenCalled();
+
+    debugInfo.mockClear();
+    const call = vi.fn(
+      (_method: string, _payload: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) =>
+          signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")))
+        )
+    );
+    const cancelled = new VaultRetrieval(
+      call as any,
+      undefined,
+      "profile",
+      async () => null,
+      new ConsoleDebug(() => true)
+    );
+    const controller = new AbortController();
+    const pending = cancelled.runnable.invoke(
+      { query: "private text", mode: "lexical" },
+      { signal: controller.signal }
+    );
+    await vi.waitFor(() => expect(call).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
+      "[Trama] Vault search cancelled"
+    );
+    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugError).not.toHaveBeenCalled();
+    debugInfo.mockRestore();
+    debugError.mockRestore();
+  });
+
+  it("terminalizes related lookup failures and consumer cancellation without duplicate errors", async () => {
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const original = new Error("related query failed");
+    const failed = new VaultRetrieval(
+      vi.fn(async () => {
+        throw original;
+      }) as any,
+      undefined,
+      "profile",
+      async () => null,
+      new ConsoleDebug(() => true)
+    );
+    await expect(failed.related("source.md", new AbortController().signal)).rejects.toBe(original);
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
+      "[Trama] Filo related-note lookup failed"
+    );
+    const relatedTerminal = debugInfo.mock.calls.find(([label]) =>
+      String(label).includes("related-note lookup failed")
+    );
+    expect(relatedTerminal?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugError).toHaveBeenCalledOnce();
+    expect(debugError.mock.calls[0][1]).toBe(original);
+
+    debugInfo.mockClear();
+    debugError.mockClear();
+    let resolveHits!: (value: unknown) => void;
+    const pendingCall = vi.fn(() => new Promise((resolve) => (resolveHits = resolve)));
+    const pendingRetrieval = new VaultRetrieval(
+      pendingCall as any,
+      undefined,
+      "profile",
+      async () => null,
+      new ConsoleDebug(() => true)
+    );
+    const controller = new AbortController();
+    const lookup = pendingRetrieval.related("source.md", controller.signal);
+    controller.abort();
+    await expect(lookup).rejects.toMatchObject({ name: "AbortError" });
+    resolveHits({ hits: [], available: true });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
+      "[Trama] Filo related-note lookup cancelled"
+    );
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
+      "[Trama] Filo related-note lookup completed"
+    );
+    expect(debugError).not.toHaveBeenCalled();
+    debugInfo.mockRestore();
+    debugError.mockRestore();
+  });
+
   it("coalesces Filo and Voce related hits while isolating consumer cancellation", async () => {
     let resolveHits!: (value: unknown) => void;
     let workerSignal!: AbortSignal | undefined;

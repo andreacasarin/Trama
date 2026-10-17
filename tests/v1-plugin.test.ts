@@ -164,8 +164,10 @@ describe("V1 plugin composition", () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     const current = {
       ...plugin.getSettings(),
+      consoleDebug: true,
       embedding: { ...plugin.getSettings().embedding, modelId: "working-model" },
     };
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     plugin.settingsStore.load(current);
     plugin.loadData = vi.fn(async () => {
       throw new Error("settings read failed");
@@ -176,6 +178,61 @@ describe("V1 plugin composition", () => {
     expect(plugin.getSettings()).toEqual(current);
     expect(plugin.configureServices).not.toHaveBeenCalled();
     expect(plugin.settingsTab.refreshExternalSettings).not.toHaveBeenCalled();
+    expect(debugError).toHaveBeenCalledOnce();
+    expect(debugError.mock.calls[0][1]).toMatchObject({ message: "settings read failed" });
+    debugError.mockRestore();
+  });
+
+  it("applies an externally synchronized debug toggle without rebuilding services", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    plugin.loadData = vi.fn(async () => ({ ...plugin.getSettings(), consoleDebug: true }));
+    plugin.configureServices = vi.fn();
+    await plugin.onExternalSettingsChange();
+    plugin.consoleDebug.info("sync enabled");
+    expect(debugInfo).toHaveBeenCalledOnce();
+    expect(debugInfo.mock.calls[0][0]).toContain("sync enabled");
+    expect(plugin.configureServices).not.toHaveBeenCalled();
+    debugInfo.mockRestore();
+  });
+
+  it("logs one bounded indexing completion with the existing result counts", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.settingsStore.commit({ ...plugin.getSettings(), consoleDebug: true });
+    plugin.client = {
+      call: vi.fn(async () => true),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.status = new IndexStatusController();
+    plugin.manualIndex = {
+      update: vi.fn(async () => ({
+        visited: 4,
+        deleted: 1,
+        numAdded: 2,
+        numUpdated: 1,
+        numSkipped: 1,
+        sharing: "complete",
+      })),
+      cancel: vi.fn(),
+    };
+    plugin.retrieval = { invalidateRelated: vi.fn() };
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    await plugin.updateIndex();
+    expect(debugInfo).toHaveBeenCalledTimes(2);
+    expect(debugInfo.mock.calls[0][0]).toContain("Updating note index started");
+    expect(debugInfo.mock.calls[1][0]).toContain("Updating note index completed");
+    expect(debugInfo.mock.calls[1][1]).toMatchObject({
+      automatic: false,
+      rebuild: false,
+      visited: 4,
+      deleted: 1,
+      numAdded: 2,
+      numUpdated: 1,
+      numSkipped: 1,
+      elapsedMs: expect.any(Number),
+    });
+    debugInfo.mockRestore();
+    plugin.onunload();
   });
 
   it("starts automatic indexing after layout and coalesces vault events behind the debounce", async () => {

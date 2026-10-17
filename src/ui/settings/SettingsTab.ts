@@ -1,6 +1,7 @@
 import { Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { EndpointPolicy, type EndpointApproval } from "@/security/EndpointPolicy";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import {
   normalizeReasoningEffort,
   normalizeExcludedFolders,
@@ -12,6 +13,7 @@ import {
 
 type Mutable<T> = { -readonly [Key in keyof T]: T[Key] };
 interface SettingsDraft {
+  consoleDebug: boolean;
   chat: Mutable<ChatSettings>;
   embedding: Mutable<EmbeddingSettings>;
   approvedOrigins: EndpointApproval[];
@@ -50,7 +52,8 @@ export class TramaSettingsTab extends PluginSettingTab {
         endpoint?: string,
         approvals?: readonly EndpointApproval[]
       ): Promise<readonly string[]>;
-    }
+    },
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     super(app, plugin as unknown as Plugin);
   }
@@ -230,6 +233,20 @@ export class TramaSettingsTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("Clear").onClick(() => void this.plugin.clearIndex())
       );
+    new Setting(containerEl)
+      .setName("Console debugging")
+      .setDesc("Log operation timings and errors to the developer console.")
+      .addToggle((toggle) => {
+        toggle.setValue(settings.consoleDebug);
+        toggle.onChange((value) => {
+          void this.persistDiscrete((current) => ({ ...current, consoleDebug: value })).then(
+            (saved) => {
+              if (saved) settings.consoleDebug = saved.consoleDebug;
+              else toggle.setValue(this.plugin.getSettings().consoleDebug);
+            }
+          );
+        });
+      });
 
     this.heading("Approved private origins");
     this.renderOrigins(settings);
@@ -432,6 +449,7 @@ export class TramaSettingsTab extends PluginSettingTab {
         JSON.stringify(settings.approvedOrigins) !== approvals
       )
         return;
+      this.consoleDebug?.error("Local model discovery failed", error);
       this.clearDiscoveredModels(target);
       new Notice(error instanceof Error ? error.message : "Model discovery failed.");
     } finally {
@@ -528,6 +546,7 @@ export class TramaSettingsTab extends PluginSettingTab {
 
 function cloneSettings(settings: TramaSettings): SettingsDraft {
   return {
+    consoleDebug: settings.consoleDebug,
     chat: { ...settings.chat },
     embedding: { ...settings.embedding },
     approvedOrigins: settings.approvedOrigins.map((origin) => ({ ...origin })),

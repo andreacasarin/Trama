@@ -13,6 +13,7 @@ export interface EmbeddingSettings {
   readonly dimensions: number;
 }
 export interface TramaSettings {
+  readonly consoleDebug: boolean;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly approvedOrigins: readonly EndpointApproval[];
@@ -20,6 +21,7 @@ export interface TramaSettings {
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
+  consoleDebug: false,
   chat: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", temperature: 0.2 }),
   embedding: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", dimensions: 768 }),
   approvedOrigins: Object.freeze([]),
@@ -62,6 +64,7 @@ export class SettingsStore {
     const modelId = typeof chat.modelId === "string" ? chat.modelId : "";
     const effort = normalizeReasoningEffort(chat.reasoningEffort);
     const settings: TramaSettings = {
+      consoleDebug: data.consoleDebug === true,
       chat: {
         endpoint: endpoint(chat.endpoint, DEFAULT_SETTINGS.chat.endpoint),
         modelId,

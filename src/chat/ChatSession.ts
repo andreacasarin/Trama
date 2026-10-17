@@ -11,6 +11,7 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import { ProvenanceRecord, ReadonlyNote, ReadonlyVault } from "@/domain/vault";
 import { StructuredError } from "@/domain/errors";
 import type { VaultToolFactory } from "@/tools/VaultTools";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 export const CHAT_LIMITS = Object.freeze({
   maxToolCalls: 8,
@@ -116,12 +117,14 @@ export class ChatSession {
   private generation = 0;
   private nextTurnId = 0;
   private readonly listeners = new Set<(state: ChatState) => void>();
+  private finishDebug?: ReturnType<ConsoleDebug["start"]>;
 
   constructor(
     private model: BaseChatModel,
     private readonly createTools: VaultToolFactory,
     private readonly vault: Pick<ReadonlyVault, "readNote">,
-    private readonly preflight: () => void = () => undefined
+    private readonly preflight: () => void = () => undefined,
+    private readonly consoleDebug?: ConsoleDebug
   ) {}
 
   replaceModel(model: BaseChatModel): void {
@@ -162,6 +165,7 @@ export class ChatSession {
 
     const controller = new AbortController();
     const identity = ++this.generation;
+    this.finishDebug = this.consoleDebug?.start("Chat turn");
     this.active = controller;
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
@@ -261,6 +265,13 @@ export class ChatSession {
       return this.finish(identity, turnId, content, provenance);
     } catch (error) {
       if (!this.isCurrent(identity)) return this.state;
+      const cancelled = controller.signal.aborted;
+      this.finishDebug?.(
+        cancelled ? "cancelled" : "failed",
+        undefined,
+        cancelled ? undefined : error,
+        cancelled ? "info" : "error"
+      );
       const message = error instanceof Error ? error.message : "Chat turn failed.";
       const code = controller.signal.aborted
         ? "cancelled"
@@ -282,6 +293,7 @@ export class ChatSession {
       if (this.active === controller) {
         this.active = undefined;
         this.activeTurnId = undefined;
+        this.finishDebug = undefined;
       }
     }
   }
@@ -290,6 +302,8 @@ export class ChatSession {
     if (!this.active) return;
     ++this.generation;
     this.active.abort();
+    this.finishDebug?.("cancelled");
+    this.finishDebug = undefined;
     this.active = undefined;
     const turnId = this.activeTurnId;
     const turns = turnId
@@ -381,6 +395,7 @@ export class ChatSession {
     content: string,
     provenance: ProvenanceRecord[]
   ): ChatState {
+    this.finishDebug?.("completed");
     this.updateAssistant(identity, id, content, provenance, "complete");
     this.publish(identity, { ...this.state, running: false, error: undefined });
     return this.state;

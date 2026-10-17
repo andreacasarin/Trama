@@ -4,6 +4,7 @@ import type { VaultRetrievalInput, VaultRetrievalOutput } from "@/index/VaultRet
 import { TRAMA_ICONS } from "@/ui/icons";
 import { appendNoteResultRow } from "@/ui/noteResultRow";
 import type { IconName } from "obsidian";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
 export type SearchRunnable = Pick<Runnable<VaultRetrievalInput, VaultRetrievalOutput>, "invoke">;
@@ -20,7 +21,8 @@ export class LenteView extends ItemView {
   private opened = false;
   constructor(
     leaf: WorkspaceLeaf,
-    private search: SearchRunnable
+    private search: SearchRunnable,
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     super(leaf);
   }
@@ -119,8 +121,9 @@ export class LenteView extends ItemView {
       if (revision !== this.revision || controller.signal.aborted) return;
       this.output = output;
       this.controller = undefined;
-    } catch {
+    } catch (error) {
       if (revision !== this.revision || controller.signal.aborted) return;
+      this.consoleDebug?.error("Lente search failed", error);
       this.output = undefined;
       this.controller = undefined;
       this.status.textContent = "Search failed. Try again.";

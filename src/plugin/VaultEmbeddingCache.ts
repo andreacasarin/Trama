@@ -5,6 +5,7 @@ import {
   EMBEDDING_ARTIFACT_MAX_VECTOR_BYTES,
 } from "@/index/note-sqlite/protocol";
 import type { SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 type SharedShardCache = Pick<
   SqliteEmbeddingCache,
@@ -26,33 +27,64 @@ export class VaultEmbeddingCache {
       "exists" | "list" | "mkdir" | "stat" | "readBinary" | "writeBinary" | "rename" | "remove"
     >,
     private readonly cache: SharedShardCache,
-    private readonly dimensions: number
+    private readonly dimensions: number,
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     this.folder = `${ROOT}/${cache.profileFingerprint}`;
   }
 
   async importAvailable(signal: AbortSignal): Promise<void> {
     checkAbort(signal);
-    await this.ensureFolder();
-    const { files } = await this.adapter.list(this.folder);
-    const checksums = files
-      .map((path) => path.slice(path.lastIndexOf("/") + 1))
-      .filter((name) => /^[0-9a-f]{64}\.sqlite3$/.test(name))
-      .map((name) => name.slice(0, 64));
-    for (let offset = 0; offset < checksums.length; offset += EMBEDDING_ARTIFACT_MAX_ENTRIES) {
-      const page = checksums.slice(offset, offset + EMBEDDING_ARTIFACT_MAX_ENTRIES);
-      const pending = new Set(await this.cache.unimportedSqliteShards(page, signal));
-      for (const checksum of page) {
-        checkAbort(signal);
-        if (!pending.has(checksum)) continue;
-        const bytes = await this.readBoundedArtifact(`${this.folder}/${checksum}.sqlite3`, signal);
-        if (!bytes || (await sha256Bytes(bytes)) !== checksum) continue;
-        try {
-          await this.cache.importDocumentShard(checksum, bytes, signal);
-        } catch {
+    const finish = this.consoleDebug?.start("Embedding cache import");
+    const counts = { imported: 0, invalid: 0, checksumFailures: 0, failures: 0 };
+    let firstError: unknown;
+    try {
+      await this.ensureFolder();
+      const { files } = await this.adapter.list(this.folder);
+      const names = files.map((path) => path.slice(path.lastIndexOf("/") + 1));
+      const checksums = names
+        .filter((name) => /^[0-9a-f]{64}\.sqlite3$/.test(name))
+        .map((name) => name.slice(0, 64));
+      counts.invalid = names.length - checksums.length;
+      for (let offset = 0; offset < checksums.length; offset += EMBEDDING_ARTIFACT_MAX_ENTRIES) {
+        const page = checksums.slice(offset, offset + EMBEDDING_ARTIFACT_MAX_ENTRIES);
+        const pending = new Set(await this.cache.unimportedSqliteShards(page, signal));
+        for (const checksum of page) {
           checkAbort(signal);
+          if (!pending.has(checksum)) continue;
+          const bytes = await this.readBoundedArtifact(
+            `${this.folder}/${checksum}.sqlite3`,
+            signal
+          );
+          if (!bytes) {
+            counts.invalid++;
+            continue;
+          }
+          if ((await sha256Bytes(bytes)) !== checksum) {
+            counts.checksumFailures++;
+            continue;
+          }
+          try {
+            await this.cache.importDocumentShard(checksum, bytes, signal);
+            counts.imported++;
+          } catch (error) {
+            checkAbort(signal);
+            counts.failures++;
+            firstError ??= error;
+          }
         }
       }
+      finish?.(
+        counts.failures || counts.checksumFailures || counts.invalid
+          ? "completed-with-skips"
+          : "completed",
+        counts,
+        firstError,
+        counts.failures || counts.checksumFailures || counts.invalid ? "warn" : "info"
+      );
+    } catch (error) {
+      finish?.(signal.aborted ? "cancelled" : "failed", counts);
+      throw error;
     }
   }
 

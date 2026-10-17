@@ -3,6 +3,7 @@ import { Document } from "@langchain/core/documents";
 import { StructuredError } from "@/domain/errors";
 import { SqliteNoteRecordManager } from "./SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "./SqliteNoteVectorStore";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 const INDEX_BATCH_SIZE = 100;
 
@@ -40,7 +41,8 @@ export class ManualIndex {
     private readonly vault: ManualIndexVault,
     private readonly store: SqliteNoteVectorStore,
     private readonly records: SqliteNoteRecordManager,
-    private readonly artifacts?: ManualIndexArtifacts
+    private readonly artifacts?: ManualIndexArtifacts,
+    private readonly consoleDebug?: ConsoleDebug
   ) {}
 
   update(): Promise<ManualIndexResult> {
@@ -106,10 +108,20 @@ export class ManualIndex {
       options: { cleanup: "full", cleanupBatchSize: 1000, sourceIdKey: "path" },
     });
     let sharing: ManualIndexResult["sharing"] = "complete";
+    const finishPublish = this.artifacts
+      ? this.consoleDebug?.start("Embedding cache publication")
+      : undefined;
     try {
       await this.artifacts?.publishAvailable(signal);
-    } catch {
+      finishPublish?.("completed");
+    } catch (error) {
       sharing = signal.aborted ? "cancelled" : "incomplete";
+      finishPublish?.(
+        sharing,
+        undefined,
+        sharing === "cancelled" ? undefined : error,
+        sharing === "cancelled" ? "info" : "warn"
+      );
     }
     return {
       visited: paths.length,

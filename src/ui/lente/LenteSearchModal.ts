@@ -2,6 +2,7 @@ import { Keymap, SuggestModal, type App } from "obsidian";
 import type { VaultRetrievalOutput } from "@/index/VaultRetrieval";
 import { appendNoteEditDate } from "@/ui/noteEditDate";
 import type { SearchRunnable } from "./LenteView";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 interface NoteResult {
   readonly path: string;
@@ -13,7 +14,8 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
   private opened = false;
   constructor(
     app: App,
-    private readonly search: SearchRunnable
+    private readonly search: SearchRunnable,
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     super(app);
     this.setPlaceholder("Search your vault");
@@ -44,8 +46,9 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
       this.emptyStateText = this.describe(result);
       this.controller = undefined;
       return suggestions;
-    } catch {
+    } catch (error) {
       if (!this.isCurrent(revision, controller, trimmed)) return [];
+      this.consoleDebug?.error("Lente modal search failed", error);
       this.emptyStateText = "Search failed.";
       this.controller = undefined;
       return [];

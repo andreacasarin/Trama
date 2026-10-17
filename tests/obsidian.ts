@@ -139,6 +139,12 @@ export class Setting {
     callback(control);
     return this;
   }
+  addToggle(callback: (control: any) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
   addButton(callback: (control: TestControl) => unknown): this {
     const control = new TestControl();
     this.controls.push(control);
@@ -154,11 +160,11 @@ export class Setting {
 }
 
 class TestControl {
-  value = "";
+  value: any = "";
   disabled = false;
   options = new Map<string, string>();
   readonly selectEl = { replaceChildren: () => this.options.clear() };
-  changeCallback?: (value: string) => unknown;
+  changeCallback?: (value: any) => unknown;
   clickCallback?: () => unknown;
   inputEl = {
     listeners: new Map<string, Array<(event: any) => unknown>>(),
@@ -170,18 +176,18 @@ class TestControl {
     fire: (type: string, event: any = {}) =>
       this.inputEl.listeners.get(type)?.forEach((fn) => fn(event)),
   };
-  setValue(value: string): this {
+  setValue(value: any): this {
     this.value = value;
     return this;
   }
   getValue(): string {
     return this.value;
   }
-  onChange(callback: (value: string) => unknown): this {
+  onChange(callback: (value: any) => unknown): this {
     this.changeCallback = callback;
     return this;
   }
-  change(value: string): void {
+  change(value: any): void {
     this.value = value;
     this.changeCallback?.(value);
   }

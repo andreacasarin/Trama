@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { sha256 } from "@langchain/core/utils/hash";
 import { ManualIndex, type ManualIndexNote, type ManualIndexVault } from "@/index/ManualIndex";
@@ -10,6 +10,7 @@ import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/c
 import type { NoteStoreMethod, NoteStoreRpc, SqliteConnection } from "@/index/note-sqlite/protocol";
 import { EMBEDDING_ARTIFACT_MAX_FILE_BYTES } from "@/index/note-sqlite/protocol";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
+import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 
 const profile = {
@@ -256,7 +257,8 @@ async function setup(
   adapter: MemoryAdapter,
   notes: Map<string, string>,
   provider: TestEmbeddings,
-  embeddingProfile = profile
+  embeddingProfile = profile,
+  consoleDebug?: ConsoleDebug
 ) {
   const sqlite = await loadTestSqlite();
   const db = new sqlite.oo1.DB(":memory:", "c");
@@ -277,13 +279,15 @@ async function setup(
   const shared = new VaultEmbeddingCache(
     adapter,
     testShardCache(cachedEmbeddings, database, db, embeddingProfile.dimensions),
-    embeddingProfile.dimensions
+    embeddingProfile.dimensions,
+    consoleDebug
   );
   const manual = new ManualIndex(
     new MemoryVault(notes),
     store,
     new SqliteNoteRecordManager(client.call),
-    shared
+    shared,
+    consoleDebug
   );
   return { db, client, manual, shared, cachedEmbeddings };
 }
@@ -448,6 +452,78 @@ describe("vault-shared document embedding artifacts", () => {
     }
   });
 
+  it("summarizes shard import failures in one bounded warning", async () => {
+    const adapter = new MemoryAdapter();
+    const folder = `Trama/embedding-cache-v2/${profileHash}`;
+    adapter.folders.add(folder);
+    const bytes = new TextEncoder().encode("invalid sqlite artifact");
+    const digest = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", bytes.slice().buffer as ArrayBuffer)
+    );
+    const checksum = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const filename = `${folder}/${checksum}.sqlite3`;
+    adapter.files.set(filename, bytes);
+    const cache = {
+      profileFingerprint: profileHash,
+      unimportedSqliteShards: vi.fn(async (values: string[]) => values),
+      importDocumentShard: vi.fn(async () => {
+        throw new Error("SQLite shard import failed");
+      }),
+      exportNextDocumentShard: vi.fn(),
+      markDocumentShardPublished: vi.fn(),
+    };
+    const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const shared = new VaultEmbeddingCache(
+      adapter as any,
+      cache as any,
+      2,
+      new ConsoleDebug(() => true)
+    );
+    await shared.importAvailable(new AbortController().signal);
+    expect(debugWarn).toHaveBeenCalledOnce();
+    expect(debugWarn.mock.calls[0][0]).toContain("Embedding cache import completed-with-skips");
+    expect(debugWarn.mock.calls[0][1]).toMatchObject({ message: "SQLite shard import failed" });
+    expect(debugWarn.mock.calls[0][2]).toMatchObject({ failures: 1, imported: 0 });
+    expect(JSON.stringify(debugWarn.mock.calls)).not.toContain(checksum);
+    debugWarn.mockRestore();
+  });
+
+  it("reports an aborted cache import as a normal timed cancellation", async () => {
+    const adapter = new MemoryAdapter();
+    const controller = new AbortController();
+    const aborted = new DOMException("Import cancelled", "AbortError");
+    adapter.list = vi.fn(async () => {
+      controller.abort();
+      throw aborted;
+    });
+    const cache = {
+      profileFingerprint: profileHash,
+      unimportedSqliteShards: vi.fn(),
+      importDocumentShard: vi.fn(),
+      exportNextDocumentShard: vi.fn(),
+      markDocumentShardPublished: vi.fn(),
+    };
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const shared = new VaultEmbeddingCache(
+      adapter as any,
+      cache as any,
+      2,
+      new ConsoleDebug(() => true)
+    );
+    await expect(shared.importAvailable(controller.signal)).rejects.toBe(aborted);
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
+      "[Trama] Embedding cache import cancelled"
+    );
+    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugWarn).not.toHaveBeenCalled();
+    expect(debugError).not.toHaveBeenCalled();
+    debugInfo.mockRestore();
+    debugWarn.mockRestore();
+    debugError.mockRestore();
+  });
+
   it("checks file metadata before reading a published artifact for verification", async () => {
     const adapter = new MemoryAdapter();
     const provider = new TestEmbeddings();
@@ -468,7 +544,14 @@ describe("vault-shared document embedding artifacts", () => {
   it("keeps a published artifact when a later artifact fails and retries on the next update", async () => {
     const adapter = new MemoryAdapter();
     const provider = new TestEmbeddings();
-    const result = await setup(adapter, new Map([["note.md", markdown]]), provider);
+    const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await setup(
+      adapter,
+      new Map([["note.md", markdown]]),
+      provider,
+      profile,
+      new ConsoleDebug(() => true)
+    );
     try {
       await result.cachedEmbeddings.embedDocuments(
         Array.from({ length: 129 }, (_, index) => `shared cache entry ${index}`)
@@ -478,6 +561,9 @@ describe("vault-shared document embedding artifacts", () => {
       const first = await result.manual.update();
       expect(first.numAdded).toBe(1);
       expect(first.sharing).toBe("incomplete");
+      expect(debugWarn).toHaveBeenCalledOnce();
+      expect(debugWarn.mock.calls[0][0]).toContain("Embedding cache publication incomplete");
+      expect(debugWarn.mock.calls[0][1]).toMatchObject({ message: "sharing write failed" });
       expect(adapter.files.size).toBe(1);
       expect(Number(result.db.selectValue("SELECT count(*) FROM note_index"))).toBe(1);
       expect(
@@ -493,6 +579,7 @@ describe("vault-shared document embedding artifacts", () => {
     } finally {
       await result.client.close();
       result.db.close();
+      debugWarn.mockRestore();
     }
   });
 

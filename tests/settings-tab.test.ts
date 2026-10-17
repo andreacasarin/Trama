@@ -7,12 +7,13 @@ import {
   type TramaSettings,
 } from "@/settings/Settings";
 import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
+import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 interface MockControl {
-  value: string;
+  value: string | boolean;
   options: Map<string, string>;
   inputEl: { fire(type: string, event?: any): void };
-  change(value: string): void;
+  change(value: string | boolean): void;
   click(): void;
 }
 interface MockSetting {
@@ -26,7 +27,7 @@ describe("Trama settings tab autosave", () => {
     mockSettings.instances = [];
   });
 
-  function setup(initial: TramaSettings = DEFAULT_SETTINGS) {
+  function setup(initial: TramaSettings = DEFAULT_SETTINGS, consoleDebug?: ConsoleDebug) {
     let settings = structuredClone(initial) as TramaSettings;
     const configureServices = vi.fn();
     const plugin = {
@@ -44,7 +45,7 @@ describe("Trama settings tab autosave", () => {
     const app = {
       vault: { getAllFolders: () => [{ path: "Projects" }, { path: "Projects Archive" }] },
     };
-    const tab = new TramaSettingsTab(app as never, plugin as never);
+    const tab = new TramaSettingsTab(app as never, plugin as never, consoleDebug);
     tab.display();
     return { tab, plugin, getSettings: () => settings };
   }
@@ -77,6 +78,39 @@ describe("Trama settings tab autosave", () => {
     const reasoning = setting("Reasoning effort").controls[0];
     reasoning.change("high");
     await vi.waitFor(() => expect(getSettings().chat.reasoningEffort).toBe("high"));
+  });
+
+  it("persists the default-off console toggle without rebuilding services", async () => {
+    const { plugin, getSettings } = setup();
+    expect(DEFAULT_SETTINGS.consoleDebug).toBe(false);
+    const toggle = setting("Console debugging").controls[0];
+    expect(toggle.value).toBe(false);
+    toggle.change(true);
+    await vi.waitFor(() => expect(getSettings().consoleDebug).toBe(true));
+    expect(plugin.configureServices).not.toHaveBeenCalled();
+  });
+
+  it("normalizes console debugging strictly and suppresses every console level when disabled", () => {
+    const store = new SettingsStore();
+    expect(store.load({ consoleDebug: "true" }).consoleDebug).toBe(false);
+    expect(store.load({ consoleDebug: true }).consoleDebug).toBe(true);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    let enabled = false;
+    const debug = new ConsoleDebug(() => enabled);
+    debug.info("hidden");
+    debug.warn("hidden", new Error("hidden"));
+    debug.error("hidden", new Error("hidden"));
+    expect(info).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    enabled = true;
+    debug.error("visible", new Error("detail"));
+    expect(error).toHaveBeenCalledOnce();
+    info.mockRestore();
+    warn.mockRestore();
+    error.mockRestore();
   });
 
   it("loads supported efforts and treats the removed on/off values as Auto", () => {
@@ -224,11 +258,42 @@ describe("Trama settings tab autosave", () => {
     tab.hide();
   });
 
-  it("scopes discovered choices to the current endpoint and clears them on failure", async () => {
-    const { plugin } = setup({
+  it("invalidates pending draft and discovery callbacks when settings sync refreshes the tab", async () => {
+    const { tab, plugin, getSettings } = setup({
       ...DEFAULT_SETTINGS,
       chat: { ...DEFAULT_SETTINGS.chat, modelId: "saved-model" },
     });
+    let resolveModels!: (models: readonly string[]) => void;
+    vi.mocked(plugin.discoverModels).mockReturnValue(
+      new Promise((resolve) => (resolveModels = resolve))
+    );
+    const oldTemperature = setting("Temperature").controls[0];
+    oldTemperature.change("0.9");
+    setting("Chat model").controls[1].click();
+    await plugin.saveSettings((current) => ({
+      ...current,
+      chat: { ...current.chat, modelId: "synced-model", temperature: 0.4 },
+    }));
+    tab.refreshExternalSettings();
+    oldTemperature.inputEl.fire("blur");
+    resolveModels(["stale-model"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getSettings().chat).toMatchObject({ modelId: "synced-model", temperature: 0.4 });
+    const modelRow = mockSettings.instances.filter((item) => item.name === "Chat model").at(-1)!;
+    expect(modelRow.controls[0].value).toBe("synced-model");
+    expect(modelRow.controls[0].options.has("stale-model")).toBe(false);
+  });
+
+  it("scopes discovered choices to the current endpoint and clears them on failure", async () => {
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { plugin } = setup(
+      {
+        ...DEFAULT_SETTINGS,
+        chat: { ...DEFAULT_SETTINGS.chat, modelId: "saved-model" },
+      },
+      new ConsoleDebug(() => true)
+    );
     vi.mocked(plugin.discoverModels)
       .mockResolvedValueOnce(["endpoint-a-model"])
       .mockRejectedValueOnce(new Error("endpoint B is unavailable"));
@@ -247,6 +312,9 @@ describe("Trama settings tab autosave", () => {
     modelRow = mockSettings.instances.filter((item) => item.name === "Chat model").at(-1)!;
     expect(modelRow.controls[0].options.has("endpoint-a-model")).toBe(false);
     expect(modelRow.controls[0].options.has("saved-model")).toBe(true);
+    expect(debugError).toHaveBeenCalledOnce();
+    expect(debugError.mock.calls[0][1]).toMatchObject({ message: "endpoint B is unavailable" });
+    debugError.mockRestore();
   });
 
   it("adds folders from the native list and keeps missing exclusions removable", async () => {

@@ -16,6 +16,7 @@ import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReference
 import type { ProvenanceRecord } from "@/domain/vault";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 export const VOCE_VIEW_TYPE = "trama-voce";
 const COLLAPSIBLE_MESSAGE_LENGTH = 600;
@@ -102,7 +103,8 @@ export class VoceView extends ItemView {
       navigator.clipboard.writeText(content),
     private readonly relatedNoteSuggestions: (
       signal: AbortSignal
-    ) => Promise<readonly string[]> = async () => []
+    ) => Promise<readonly string[]> = async () => [],
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     super(leaf);
   }
@@ -288,6 +290,7 @@ export class VoceView extends ItemView {
       this.renderAttachments();
       await pendingSend;
     } catch (error) {
+      this.consoleDebug?.error("Chat turn setup failed", error);
       if (this.session === session)
         this.localError = error instanceof Error ? error.message : "Message could not be sent.";
     }
@@ -362,6 +365,7 @@ export class VoceView extends ItemView {
     void this.app.workspace
       .openLinkText(linkText, sourcePath, Keymap.isModEvent(event))
       .catch((error) => {
+        this.consoleDebug?.error("Voce note link failed", error);
         this.localError = error instanceof Error ? error.message : "Note could not be opened.";
         this.renderFeedback(this.session.getState());
       });
@@ -502,6 +506,7 @@ export class VoceView extends ItemView {
       setTooltip(button, action.label);
       button.addEventListener("click", () => {
         void action.run().catch((error) => {
+          this.consoleDebug?.error("Voce response action failed", error);
           this.localError =
             error instanceof Error ? error.message : "Response could not be copied.";
           this.renderFeedback(this.session.getState());

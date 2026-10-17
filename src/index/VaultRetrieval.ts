@@ -3,6 +3,7 @@ import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { RunnableLambda, type RunnableConfig } from "@langchain/core/runnables";
 import { StructuredError } from "@/domain/errors";
 import { EmbeddingProviderError } from "@/model/LocalModels";
+import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import type {
   NoteStoreCall,
   NoteStoreHybridResult,
@@ -55,7 +56,8 @@ export class VaultRetrieval {
         })
       | undefined,
     private readonly profile: string | undefined,
-    private readonly readNote: LiveMarkdownReader
+    private readonly readNote: LiveMarkdownReader,
+    private readonly consoleDebug?: ConsoleDebug
   ) {
     this.runnable = RunnableLambda.from<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>(
       (input, config) => this.search(input, config.signal)
@@ -68,9 +70,16 @@ export class VaultRetrieval {
     limit = 20
   ): Promise<{ readonly documents: readonly Document[]; readonly available: boolean }> {
     checkAbort(signal);
-    const result = await this.relatedHits(sourcePath, signal, limit);
-    const documents = await this.hydrate(result.hits, signal);
-    return { documents, available: result.available };
+    const finish = this.consoleDebug?.start("Filo related-note lookup");
+    try {
+      const result = await this.relatedHits(sourcePath, signal, limit);
+      const documents = await this.hydrate(result.hits, signal);
+      finish?.("completed", { resultCount: documents.length, available: result.available });
+      return { documents, available: result.available };
+    } catch (error) {
+      finish?.(signal.aborted || isCancelled(error) ? "cancelled" : "failed");
+      throw error;
+    }
   }
 
   async relatedPaths(
@@ -107,11 +116,28 @@ export class VaultRetrieval {
     ) {
       const controller = new AbortController();
       const generation = this.relatedGeneration;
-      const promise = this.call(
+      const finish = this.consoleDebug?.start("Filo related-note lookup");
+      const pending = this.call(
         "noteStoreRelated",
         { sourcePath, profile: this.profile, k },
         controller.signal
       ) as Promise<NoteStoreRelatedResult>;
+      const promise = pending.then(
+        (result) => {
+          finish?.("completed", { resultCount: result.hits.length, available: result.available });
+          return result;
+        },
+        (error) => {
+          const cancelled = controller.signal.aborted || isCancelled(error);
+          finish?.(
+            cancelled ? "cancelled" : "failed",
+            undefined,
+            cancelled ? undefined : error,
+            cancelled ? "info" : "error"
+          );
+          throw error;
+        }
+      );
       request = {
         sourcePath,
         profile: this.profile,
@@ -138,41 +164,51 @@ export class VaultRetrieval {
       throw new StructuredError("invalid_request", "Search query must not be empty.", false);
     if (input.mode !== "hybrid" && input.mode !== "lexical")
       throw new StructuredError("invalid_request", "Search mode is invalid.", false);
+    const finish = this.consoleDebug?.start("Vault search", { mode: input.mode });
 
-    let vector: number[] | undefined;
-    let degradationReason: VaultRetrievalStatus["degradationReason"];
-    if (input.mode === "hybrid" && this.embeddings && this.profile) {
-      try {
-        vector = await (this.embeddings.withSignal?.(signal) ?? this.embeddings).embedQuery(query);
-      } catch (error) {
-        if (signal?.aborted || isCancelled(error)) throw error;
-        if (!(error instanceof EmbeddingProviderError)) throw error;
-        degradationReason = "query-embedding-failed";
+    try {
+      let vector: number[] | undefined;
+      let degradationReason: VaultRetrievalStatus["degradationReason"];
+      if (input.mode === "hybrid" && this.embeddings && this.profile) {
+        try {
+          vector = await (this.embeddings.withSignal?.(signal) ?? this.embeddings).embedQuery(
+            query
+          );
+        } catch (error) {
+          if (signal?.aborted || isCancelled(error)) throw error;
+          if (!(error instanceof EmbeddingProviderError)) throw error;
+          degradationReason = "query-embedding-failed";
+          this.consoleDebug?.warn("Query embedding failed; using lexical search", error);
+        }
+      } else if (input.mode === "hybrid") {
+        degradationReason = "semantic-unavailable";
       }
-    } else if (input.mode === "hybrid") {
-      degradationReason = "semantic-unavailable";
+      checkAbort(signal);
+      const result = (await this.call(
+        "noteStoreHybrid",
+        {
+          query,
+          ...(vector && this.profile ? { vector, profile: this.profile } : {}),
+          k: 20,
+        },
+        signal
+      )) as NoteStoreHybridResult;
+      if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
+      const documents = await this.hydrate(result.hits, signal);
+      const degraded = Boolean(degradationReason) || result.degraded;
+      finish?.("completed", { resultCount: documents.length, degraded });
+      return {
+        documents,
+        status: {
+          mode: result.mode,
+          degraded,
+          ...(degradationReason ? { degradationReason } : {}),
+        },
+      };
+    } catch (error) {
+      finish?.(signal?.aborted || isCancelled(error) ? "cancelled" : "failed");
+      throw error;
     }
-    checkAbort(signal);
-    const result = (await this.call(
-      "noteStoreHybrid",
-      {
-        query,
-        ...(vector && this.profile ? { vector, profile: this.profile } : {}),
-        k: 20,
-      },
-      signal
-    )) as NoteStoreHybridResult;
-    if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
-    const documents = await this.hydrate(result.hits, signal);
-    const degraded = Boolean(degradationReason) || result.degraded;
-    return {
-      documents,
-      status: {
-        mode: result.mode,
-        degraded,
-        ...(degradationReason ? { degradationReason } : {}),
-      },
-    };
   }
 
   private async hydrate(
@@ -231,6 +267,7 @@ function checkAbort(signal?: AbortSignal): void {
 
 function isCancelled(error: unknown): boolean {
   return Boolean(
-    error && typeof error === "object" && "code" in error && error.code === "cancelled"
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error && typeof error === "object" && "code" in error && error.code === "cancelled")
   );
 }

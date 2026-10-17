@@ -6,6 +6,7 @@ import type { VaultToolFactory } from "@/tools/VaultTools";
 import { createVaultTools } from "@/tools/VaultTools";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { createLocalChatModel } from "@/model/LocalModels";
+import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
 const tools: VaultToolFactory = () => [];
 
@@ -75,9 +76,14 @@ describe("Voce native agent session", () => {
       }
     }
     const model = new FailThenAnswerModel({ toolCalls: [[], []] });
-    const session = new ChatSession(model, tools, {
-      readNote: async (path) => ({ path, content: "failed turn private body" }),
-    });
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const session = new ChatSession(
+      model,
+      tools,
+      { readNote: async (path) => ({ path, content: "failed turn private body" }) },
+      undefined,
+      new ConsoleDebug(() => true)
+    );
 
     const failed = await session.send({ content: "fail", attachmentPaths: ["private.md"] });
     expect(failed.turns.at(-1)).toMatchObject({ status: "failed" });
@@ -87,6 +93,10 @@ describe("Voce native agent session", () => {
     expect(model.inputs[0].join("\n")).toContain("failed turn private body");
     expect(model.inputs[1].join("\n")).toContain("fail");
     expect(model.inputs[1].join("\n")).not.toContain("failed turn private body");
+    expect(debugError).toHaveBeenCalledOnce();
+    expect(debugError.mock.calls[0][1]).toBeInstanceOf(Error);
+    expect(debugError.mock.calls[0][0]).toContain("Chat turn failed");
+    debugError.mockRestore();
   });
 
   it("still attaches notes when the user's prompt contains the attachment marker", async () => {
@@ -142,9 +152,16 @@ describe("Voce native agent session", () => {
       }
     }
     const model = new PendingModel({ toolCalls: [[], []] });
-    const session = new ChatSession(model, tools, {
-      readNote: async (path) => ({ path, content: "cancelled private body" }),
-    });
+    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const session = new ChatSession(
+      model,
+      tools,
+      { readNote: async (path) => ({ path, content: "cancelled private body" }) },
+      undefined,
+      new ConsoleDebug(() => true)
+    );
     const pending = session.send({ content: "cancel me", attachmentPaths: ["cancel.md"] });
     await vi.waitFor(() => expect(release).toBeTypeOf("function"));
     await expect(session.send({ content: "busy", attachmentPaths: [] })).rejects.toThrow(
@@ -161,6 +178,12 @@ describe("Voce native agent session", () => {
     expect(model.inputs[0].join("\n")).toContain("cancelled private body");
     expect(model.inputs[1].join("\n")).toContain("cancel me");
     expect(model.inputs[1].join("\n")).not.toContain("cancelled private body");
+    expect(debugInfo.mock.calls.map(([label]) => label)).toContain("[Trama] Chat turn cancelled");
+    expect(debugWarn).not.toHaveBeenCalled();
+    expect(debugError).not.toHaveBeenCalled();
+    debugInfo.mockRestore();
+    debugWarn.mockRestore();
+    debugError.mockRestore();
   });
 
   it("executes a real native tool call and projects its source into the answer", async () => {

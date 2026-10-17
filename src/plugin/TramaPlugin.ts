@@ -15,6 +15,7 @@ import {
 import { createVaultTools } from "@/tools/VaultTools";
 import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
+import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
 import {
@@ -31,6 +32,7 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 
 export class TramaPlugin extends Plugin {
   private readonly settingsStore = new SettingsStore();
+  private readonly consoleDebug = new ConsoleDebug(() => this.getSettings().consoleDebug);
   private readonly sqliteRuntime = new NoteSqliteRuntime(() => this.manifest);
   private lifecycle = Promise.resolve();
   private disposed = false;
@@ -95,9 +97,11 @@ export class TramaPlugin extends Plugin {
           retrieval: this.retrieval!,
           noteCatalog: this.catalog,
           currentNote: () => (this.activeNote ? [this.activeNote] : []),
+          consoleDebug: this.consoleDebug,
         });
         app.workspace.onLayoutReady?.(() => this.startAutomaticIndexing(app));
       } catch (error) {
+        this.consoleDebug.error("Plugin initialization failed", error);
         if (!this.disposed)
           new Notice(error instanceof Error ? error.message : "Trama could not start.");
         throw error;
@@ -163,7 +167,8 @@ export class TramaPlugin extends Plugin {
       ? new VaultEmbeddingCache(
           app.vault.adapter,
           embeddings as SqliteEmbeddingCache,
-          profile.dimensions
+          profile.dimensions,
+          this.consoleDebug
         )
       : undefined;
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.metadataCache);
@@ -181,7 +186,8 @@ export class TramaPlugin extends Plugin {
       noteVault,
       store,
       new SqliteNoteRecordManager(candidate.call),
-      sharedEmbeddingCache
+      sharedEmbeddingCache,
+      this.consoleDebug
     );
     this.retrieval = new VaultRetrieval(
       candidate.call,
@@ -194,7 +200,8 @@ export class TramaPlugin extends Plugin {
         } catch {
           return null;
         }
-      }
+      },
+      this.consoleDebug
     );
     const chatModel: BaseChatModel = createLocalChatModel(settings.chat, policy);
     this.session = new ChatSession(
@@ -204,7 +211,8 @@ export class TramaPlugin extends Plugin {
       () => {
         if (!settings.chat.modelId.trim())
           throw new Error("Set a local chat model in Trama settings before sending a message.");
-      }
+      },
+      this.consoleDebug
     );
     if (wasConfigured && this.ui) {
       for (const leaf of app.workspace.getLeavesOfType("trama-voce"))
@@ -262,6 +270,9 @@ export class TramaPlugin extends Plugin {
       if (this.disposed) return;
       this.settingsStore.commit(staged);
       if (runtimeChanged) await this.configureServices(this.app as any);
+    }).catch((error) => {
+      this.consoleDebug.error("Settings update failed", error);
+      throw error;
     });
   }
 
@@ -277,6 +288,9 @@ export class TramaPlugin extends Plugin {
         JSON.stringify(previous.approvedOrigins) !== JSON.stringify(current.approvedOrigins);
       if (runtimeChanged && this.app) await this.configureServices(this.app as any);
       this.settingsTab?.refreshExternalSettings();
+    }).catch((error) => {
+      this.consoleDebug.error("External settings reload failed", error);
+      throw error;
     });
   }
 
@@ -324,12 +338,14 @@ export class TramaPlugin extends Plugin {
       canCancel: true,
     });
     this.showOperationNotice("Clearing local index…");
+    const finishLog = this.consoleDebug.start("Index clear");
     const run = { client, controller, promise: Promise.resolve() };
     this.clearRun = run;
     const operation = client
       .call("noteStoreReset", {}, controller.signal)
       .then(() => {
         if (this.clearRun !== run || this.disposed) return;
+        finishLog("completed");
         this.retrieval?.invalidateRelated();
         this.hasIndexedNotes = false;
         this.status?.setStatus({
@@ -347,6 +363,12 @@ export class TramaPlugin extends Plugin {
         if (this.clearRun !== run || this.disposed) return;
         if (previousStatus) this.status?.setStatus(previousStatus);
         const cancelled = error instanceof DOMException && error.name === "AbortError";
+        finishLog(
+          cancelled ? "cancelled" : "failed",
+          undefined,
+          cancelled ? undefined : error,
+          cancelled ? "info" : "error"
+        );
         const message = cancelled
           ? "Index clear stopped."
           : error instanceof Error
@@ -405,6 +427,7 @@ export class TramaPlugin extends Plugin {
       promise: Promise.resolve(),
     };
     this.indexRun = run;
+    const finishLog = this.consoleDebug.start(run.label, { automatic, rebuild });
     if (!automatic)
       this.showOperationNotice(rebuild ? "Rebuilding note index…" : "Updating note index…");
     this.status?.setStatus({
@@ -426,6 +449,13 @@ export class TramaPlugin extends Plugin {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
         this.hasIndexedNotes = Boolean(await this.client?.call("noteStoreHasNotes", {}));
         completed = result.sharing === "complete";
+        finishLog(result.sharing === "complete" ? "completed" : result.sharing, {
+          visited: result.visited,
+          deleted: result.deleted,
+          numAdded: result.numAdded,
+          numUpdated: result.numUpdated,
+          numSkipped: result.numSkipped,
+        });
         this.retrieval?.invalidateRelated();
         this.refreshLenteResults();
         this.refreshVoceSuggestions();
@@ -447,6 +477,12 @@ export class TramaPlugin extends Plugin {
       .catch((error) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
         const cancelled = isCancelled(error);
+        finishLog(
+          cancelled ? "cancelled" : "failed",
+          undefined,
+          cancelled ? undefined : error,
+          cancelled ? "info" : "error"
+        );
         this.retrieval?.invalidateRelated();
         this.refreshVoceSuggestions();
         this.status?.setStatus({
