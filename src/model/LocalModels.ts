@@ -5,7 +5,7 @@ import OpenAI from "openai";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { StructuredError } from "@/domain/errors";
 import { EndpointPolicy } from "@/security/EndpointPolicy";
-import type { ChatSettings } from "@/settings/Settings";
+import { normalizeReasoningEffort, type ChatSettings } from "@/settings/Settings";
 
 export function createLocalChatModel(
   settings: ChatSettings,
@@ -13,6 +13,7 @@ export function createLocalChatModel(
   fetcher: typeof fetch = globalThis.fetch
 ): BaseChatModel {
   const baseURL = policy.normalize(settings.endpoint);
+  const reasoningEffort = normalizeReasoningEffort(settings.reasoningEffort);
   return new ChatOpenAI({
     model: settings.modelId || "local-model-not-configured",
     apiKey: "local-endpoint",
@@ -22,10 +23,9 @@ export function createLocalChatModel(
     maxRetries: 0,
     temperature: settings.temperature,
     ...(settings.maxOutputTokens ? { maxTokens: settings.maxOutputTokens } : {}),
-    ...(settings.reasoningEffort ? { reasoning: { effort: settings.reasoningEffort } } : {}),
     modelKwargs: {
       text: { format: { type: "text" } },
-      ...(settings.reasoningEffort ? { reasoning: { effort: settings.reasoningEffort } } : {}),
+      ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
     },
     configuration: {
       baseURL,

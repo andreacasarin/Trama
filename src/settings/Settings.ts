@@ -5,7 +5,7 @@ export interface ChatSettings {
   readonly modelId: string;
   readonly temperature: number;
   readonly maxOutputTokens?: number;
-  readonly reasoningEffort?: "none" | "low" | "medium" | "high";
+  readonly reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 }
 export interface EmbeddingSettings {
   readonly endpoint: string;
@@ -26,6 +26,23 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   excludedFolders: Object.freeze([]),
 });
 
+export type ReasoningEffort = NonNullable<ChatSettings["reasoningEffort"]>;
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
+export function normalizeReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === "string" && REASONING_EFFORTS.includes(value as ReasoningEffort)
+    ? (value as ReasoningEffort)
+    : undefined;
+}
+
 export class SettingsStore {
   private value = DEFAULT_SETTINGS;
   load(value: unknown): TramaSettings {
@@ -42,13 +59,12 @@ export class SettingsStore {
         return fallback;
       }
     };
-    const effort = ["none", "low", "medium", "high"].includes(chat.reasoningEffort)
-      ? chat.reasoningEffort
-      : undefined;
+    const modelId = typeof chat.modelId === "string" ? chat.modelId : "";
+    const effort = normalizeReasoningEffort(chat.reasoningEffort);
     const settings: TramaSettings = {
       chat: {
         endpoint: endpoint(chat.endpoint, DEFAULT_SETTINGS.chat.endpoint),
-        modelId: typeof chat.modelId === "string" ? chat.modelId : "",
+        modelId,
         temperature:
           Number.isFinite(chat.temperature) && chat.temperature >= 0 && chat.temperature <= 1
             ? chat.temperature

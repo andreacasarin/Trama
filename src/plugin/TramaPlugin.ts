@@ -34,6 +34,10 @@ export class TramaPlugin extends Plugin {
   private readonly sqliteRuntime = new NoteSqliteRuntime(() => this.manifest);
   private lifecycle = Promise.resolve();
   private disposed = false;
+  private hasIndexedNotes = false;
+  private automaticReady = false;
+  private automaticPending = false;
+  private automaticTimer?: ReturnType<typeof setTimeout>;
   private client?: NoteStoreClient;
   private manualIndex?: ManualIndex;
   private retrieval?: VaultRetrieval;
@@ -53,6 +57,7 @@ export class TramaPlugin extends Plugin {
   private operationNotice?: Notice;
   private activeNote?: string;
   private ui?: Awaited<ReturnType<typeof loadPluginUi>>;
+  private settingsTab?: { refreshExternalSettings(): void };
   private readonly catalog = () =>
     (this.app as any).vault
       .getMarkdownFiles()
@@ -84,13 +89,14 @@ export class TramaPlugin extends Plugin {
         const ui = await loadPluginUi();
         if (this.disposed) return;
         this.ui = ui;
-        registerPluginUi(this, app, ui, {
+        this.settingsTab = registerPluginUi(this, app, ui, {
           session: this.session!,
           status: this.status!,
           retrieval: this.retrieval!,
           noteCatalog: this.catalog,
           currentNote: () => (this.activeNote ? [this.activeNote] : []),
         });
+        app.workspace.onLayoutReady?.(() => this.startAutomaticIndexing(app));
       } catch (error) {
         if (!this.disposed)
           new Notice(error instanceof Error ? error.message : "Trama could not start.");
@@ -106,6 +112,7 @@ export class TramaPlugin extends Plugin {
     const previousRun = this.indexRun;
     const previousClear = this.clearRun;
     const previousClient = this.client;
+    this.automaticPending = false;
     this.manualIndex?.cancel();
     previousClear?.controller.abort();
     this.retrieval?.invalidateRelated();
@@ -134,6 +141,7 @@ export class TramaPlugin extends Plugin {
       return;
     }
     this.client = candidate;
+    this.hasIndexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
     const policy = new EndpointPolicy({ approvals: settings.approvedOrigins });
     const profile = {
       endpoint: settings.embedding.endpoint,
@@ -211,6 +219,8 @@ export class TramaPlugin extends Plugin {
 
   onunload(): void {
     this.disposed = true;
+    this.cancelAutomaticDebounce();
+    this.automaticPending = false;
     this.manualIndex?.cancel();
     const activeClear = this.clearRun;
     activeClear?.controller.abort();
@@ -255,6 +265,21 @@ export class TramaPlugin extends Plugin {
     });
   }
 
+  async onExternalSettingsChange(): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.disposed) return;
+      const previous = this.getSettings();
+      this.settingsStore.load(await this.loadData());
+      const current = this.getSettings();
+      const runtimeChanged =
+        JSON.stringify(previous.chat) !== JSON.stringify(current.chat) ||
+        JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding) ||
+        JSON.stringify(previous.approvedOrigins) !== JSON.stringify(current.approvedOrigins);
+      if (runtimeChanged && this.app) await this.configureServices(this.app as any);
+      this.settingsTab?.refreshExternalSettings();
+    });
+  }
+
   updateIndex(): Promise<void> {
     return this.runIndex(false);
   }
@@ -262,6 +287,8 @@ export class TramaPlugin extends Plugin {
     return this.runIndex(true);
   }
   stopIndex(): void {
+    this.automaticPending = false;
+    this.cancelAutomaticDebounce();
     if (this.indexRun) {
       this.operationNotice?.setMessage(`Stopping ${this.indexRun.label.toLowerCase()}…`);
       this.indexRun.manualIndex.cancel();
@@ -276,6 +303,8 @@ export class TramaPlugin extends Plugin {
   }
 
   clearIndex(): Promise<void> {
+    this.automaticPending = false;
+    this.cancelAutomaticDebounce();
     if (this.indexRun || this.clearRun) {
       new Notice("An index operation is already running.");
       return Promise.resolve();
@@ -302,6 +331,7 @@ export class TramaPlugin extends Plugin {
       .then(() => {
         if (this.clearRun !== run || this.disposed) return;
         this.retrieval?.invalidateRelated();
+        this.hasIndexedNotes = false;
         this.status?.setStatus({
           kind: "index-required",
           message: "Local index cleared.",
@@ -326,6 +356,7 @@ export class TramaPlugin extends Plugin {
       })
       .finally(() => {
         if (this.clearRun === run) this.clearRun = undefined;
+        this.automaticPending = false;
       });
     run.promise = operation;
     return operation;
@@ -354,7 +385,7 @@ export class TramaPlugin extends Plugin {
     );
   }
 
-  private runIndex(rebuild: boolean): Promise<void> {
+  private runIndex(rebuild: boolean, automatic = false): Promise<void> {
     if (this.clearRun) {
       new Notice("The local index is being cleared.");
       return Promise.resolve();
@@ -362,9 +393,11 @@ export class TramaPlugin extends Plugin {
     const manualIndex = this.manualIndex;
     if (!manualIndex) return Promise.reject(new Error("Index is unavailable."));
     if (this.indexRun?.manualIndex === manualIndex) {
-      new Notice("An index operation is already running.");
+      if (automatic) this.automaticPending = true;
+      else new Notice("An index operation is already running.");
       return this.indexRun.promise;
     }
+    this.automaticPending = false;
     const run = {
       manualIndex,
       excludedFolders: [...this.getSettings().excludedFolders],
@@ -372,7 +405,8 @@ export class TramaPlugin extends Plugin {
       promise: Promise.resolve(),
     };
     this.indexRun = run;
-    this.showOperationNotice(rebuild ? "Rebuilding note index…" : "Updating note index…");
+    if (!automatic)
+      this.showOperationNotice(rebuild ? "Rebuilding note index…" : "Updating note index…");
     this.status?.setStatus({
       kind: "building",
       message: rebuild ? "Rebuilding note index…" : "Updating note index…",
@@ -381,14 +415,17 @@ export class TramaPlugin extends Plugin {
       canCancel: true,
     });
     let operation: ReturnType<ManualIndex["update"]>;
+    let completed = false;
     try {
       operation = rebuild ? manualIndex.rebuild() : manualIndex.update();
     } catch (error) {
       operation = Promise.reject(error);
     }
     const completion = operation
-      .then((result) => {
+      .then(async (result) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
+        this.hasIndexedNotes = Boolean(await this.client?.call("noteStoreHasNotes", {}));
+        completed = result.sharing === "complete";
         this.retrieval?.invalidateRelated();
         this.refreshLenteResults();
         this.refreshVoceSuggestions();
@@ -405,7 +442,7 @@ export class TramaPlugin extends Plugin {
           canReindex: true,
           canCancel: false,
         });
-        this.finishOperationNotice(message);
+        if (!automatic) this.finishOperationNotice(message);
       })
       .catch((error) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
@@ -423,19 +460,72 @@ export class TramaPlugin extends Plugin {
           canReindex: true,
           canCancel: false,
         });
-        this.finishOperationNotice(
-          cancelled
-            ? "Indexing stopped."
-            : error instanceof Error
-              ? error.message
-              : "Indexing failed."
-        );
+        if (!automatic)
+          this.finishOperationNotice(
+            cancelled
+              ? "Indexing stopped."
+              : error instanceof Error
+                ? error.message
+                : "Indexing failed."
+          );
       })
       .finally(() => {
         if (this.indexRun === run) this.indexRun = undefined;
+        if (completed && this.automaticPending) {
+          this.automaticPending = false;
+          if (this.hasIndexedNotes && !this.disposed) void this.runIndex(false, true);
+        } else this.automaticPending = false;
       });
     run.promise = completion;
     return completion;
+  }
+
+  private startAutomaticIndexing(app: any): void {
+    if (this.disposed || this.automaticReady) return;
+    this.automaticReady = true;
+    const schedule = (vaultEvent = false) => {
+      if (
+        this.disposed ||
+        !this.automaticReady ||
+        !this.client ||
+        !this.manualIndex ||
+        !this.getSettings().embedding.modelId.trim()
+      )
+        return;
+      if (this.indexRun || this.clearRun) {
+        if (vaultEvent) this.automaticPending = true;
+        return;
+      }
+      if (!this.hasIndexedNotes) return;
+      void this.runIndex(false, true);
+    };
+    const changed = (file: any) => {
+      if (this.isVisibleMarkdown(file?.path)) this.debounceAutomaticIndex(() => schedule(true));
+    };
+    for (const event of ["create", "modify", "delete"])
+      this.registerEvent(app.vault.on(event, changed));
+    this.registerEvent(
+      app.vault.on("rename", (file: any, oldPath: string) => {
+        if (this.isVisibleMarkdown(file?.path) || this.isVisibleMarkdown(oldPath))
+          this.debounceAutomaticIndex(() => schedule(true));
+      })
+    );
+    this.registerInterval(window.setInterval(schedule, 300_000));
+    schedule();
+  }
+
+  private debounceAutomaticIndex(schedule: () => void): void {
+    if (this.disposed) return;
+    if (this.automaticTimer) clearTimeout(this.automaticTimer);
+    this.automaticTimer = setTimeout(() => {
+      this.automaticTimer = undefined;
+      schedule();
+    }, 20_000);
+  }
+
+  private cancelAutomaticDebounce(): void {
+    if (this.automaticTimer) clearTimeout(this.automaticTimer);
+    this.automaticTimer = undefined;
   }
 
   private refreshVoceSuggestions(): void {

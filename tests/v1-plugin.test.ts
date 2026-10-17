@@ -20,9 +20,19 @@ describe("V1 plugin composition", () => {
       const worker = {
         postMessage: vi.fn((request: any) => {
           if (request.method === "close") lifecycle.push(`close-${workers.length}`);
-          if (request.method === "init" || request.method === "close")
+          if (
+            request.method === "init" ||
+            request.method === "close" ||
+            request.method === "noteStoreHasNotes"
+          )
             for (const listener of listeners)
-              listener({ data: { id: request.id, ok: true, result: undefined } });
+              listener({
+                data: {
+                  id: request.id,
+                  ok: true,
+                  result: request.method === "noteStoreHasNotes" ? false : undefined,
+                },
+              });
         }),
         addEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
           listeners.add(listener)
@@ -124,6 +134,514 @@ describe("V1 plugin composition", () => {
     expect(plugin.isIndexableMarkdown("Projects Archive/one.md")).toBe(true);
     expect(plugin.isVisibleMarkdown("Projects/one.md")).toBe(true);
   });
+
+  it("reloads all externally synchronized settings and reapplies runtime model dimensions", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const external = {
+      chat: {
+        ...plugin.getSettings().chat,
+        modelId: "synced-chat",
+        reasoningEffort: "minimal",
+      },
+      embedding: { ...plugin.getSettings().embedding, modelId: "synced-embed", dimensions: 1024 },
+      approvedOrigins: [],
+      excludedFolders: ["Projects"],
+    };
+    const refresh = vi.fn();
+    plugin.loadData = vi.fn(async () => external);
+    plugin.saveData = vi.fn();
+    plugin.app = {};
+    plugin.configureServices = vi.fn(async () => undefined);
+    plugin.settingsTab = { refreshExternalSettings: refresh };
+    await plugin.onExternalSettingsChange();
+    expect(plugin.getSettings()).toMatchObject(external);
+    expect(plugin.configureServices).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("preserves current settings and runtime when external settings cannot be read", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const current = {
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "working-model" },
+    };
+    plugin.settingsStore.load(current);
+    plugin.loadData = vi.fn(async () => {
+      throw new Error("settings read failed");
+    });
+    plugin.configureServices = vi.fn();
+    plugin.settingsTab = { refreshExternalSettings: vi.fn() };
+    await expect(plugin.onExternalSettingsChange()).rejects.toThrow("settings read failed");
+    expect(plugin.getSettings()).toEqual(current);
+    expect(plugin.configureServices).not.toHaveBeenCalled();
+    expect(plugin.settingsTab.refreshExternalSettings).not.toHaveBeenCalled();
+  });
+
+  it("starts automatic indexing after layout and coalesces vault events behind the debounce", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void, delay: number) => {
+        expect(delay).toBe(300_000);
+        intervalCallback = callback;
+        return 1;
+      },
+    });
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.hasIndexedNotes = true;
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.client = { close: vi.fn(async () => undefined) };
+    plugin.manualIndex = { cancel: vi.fn() };
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    plugin.runIndex = vi.fn(async () => undefined);
+    try {
+      plugin.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      expect(plugin.runIndex).toHaveBeenCalledOnce();
+      handlers.get("modify")!({ path: "notes/a.md" });
+      handlers.get("create")!({ path: "notes/b.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(plugin.runIndex).toHaveBeenCalledTimes(2);
+      intervalCallback();
+      expect(plugin.runIndex).toHaveBeenCalledTimes(3);
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("keeps an empty index paused through events and timers until a manual Update indexes notes", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
+    });
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    let databaseHasNotes = false;
+    let nextUpdateHasNotes = false;
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.client = {
+      call: vi.fn(async (method: string) => {
+        if (method === "noteStoreHasNotes") return databaseHasNotes;
+      }),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.hasIndexedNotes = await plugin.client.call("noteStoreHasNotes", {});
+    plugin.manualIndex = {
+      update: vi.fn(async () => {
+        databaseHasNotes = nextUpdateHasNotes;
+        return { visited: 1, deleted: 0, numAdded: 0, numUpdated: 0, numSkipped: 1 };
+      }),
+      rebuild: vi.fn(),
+      cancel: vi.fn(),
+    };
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    try {
+      plugin.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      handlers.get("modify")!({ path: "notes/a.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      intervalCallback();
+      expect(plugin.manualIndex.update).not.toHaveBeenCalled();
+      expect(plugin.client.call).toHaveBeenCalledTimes(1);
+
+      await plugin.updateIndex();
+      intervalCallback();
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+      expect(plugin.client.call).toHaveBeenCalledTimes(2);
+
+      nextUpdateHasNotes = true;
+      await plugin.updateIndex();
+      intervalCallback();
+      await vi.waitFor(() => expect(plugin.manualIndex.update).toHaveBeenCalledTimes(3));
+      expect(plugin.client.call).toHaveBeenCalledTimes(4);
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("queues a vault event during the first manual indexing run and follows after notes publish", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
+    });
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    let databaseHasNotes = false;
+    let finishManual!: (result: any) => void;
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.client = {
+      call: vi.fn(async () => databaseHasNotes),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.hasIndexedNotes = false;
+    plugin.manualIndex = {
+      update: vi.fn(() =>
+        plugin.manualIndex.update.mock.calls.length === 1
+          ? new Promise((resolve) => (finishManual = resolve))
+          : Promise.resolve({
+              visited: 1,
+              deleted: 0,
+              numAdded: 0,
+              numUpdated: 0,
+              numSkipped: 0,
+              sharing: "complete",
+            })
+      ),
+      cancel: vi.fn(),
+    };
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    try {
+      plugin.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      const manual = plugin.updateIndex();
+      handlers.get("modify")!({ path: "notes/new.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      intervalCallback();
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+
+      databaseHasNotes = true;
+      finishManual({
+        visited: 1,
+        deleted: 0,
+        numAdded: 1,
+        numUpdated: 0,
+        numSkipped: 0,
+        sharing: "complete",
+      });
+      await manual;
+      await vi.waitFor(() => expect(plugin.manualIndex.update).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(plugin.indexRun).toBeUndefined());
+      expect(plugin.client.call).toHaveBeenCalledTimes(2);
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("keeps Clear and last-note deletion paused across a fresh plugin instance", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
+    });
+    let databaseHasNotes = true;
+    const client = {
+      call: vi.fn(async (method: string, _payload?: unknown) => {
+        if (method === "noteStoreReset") databaseHasNotes = false;
+        if (method === "noteStoreHasNotes") return databaseHasNotes;
+      }),
+      close: vi.fn(async () => undefined),
+    };
+    const first = new TramaPlugin(undefined as never, undefined as never) as any;
+    first.client = client;
+    await first.clearIndex();
+    expect(databaseHasNotes).toBe(false);
+    expect(first.hasIndexedNotes).toBe(false);
+
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    const second = new TramaPlugin(undefined as never, undefined as never) as any;
+    second.client = client;
+    second.hasIndexedNotes = await client.call("noteStoreHasNotes", {});
+    second.manualIndex = { update: vi.fn(), cancel: vi.fn() };
+    second.settingsStore.commit({
+      ...second.getSettings(),
+      embedding: { ...second.getSettings().embedding, modelId: "local-embed" },
+    });
+    second.registerEvent = vi.fn();
+    second.registerInterval = vi.fn();
+    try {
+      second.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      handlers.get("create")!({ path: "notes/after-clear.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      intervalCallback();
+      expect(second.manualIndex.update).not.toHaveBeenCalled();
+
+      databaseHasNotes = true;
+      second.hasIndexedNotes = await client.call("noteStoreHasNotes", {});
+      second.manualIndex.update.mockImplementationOnce(async () => {
+        databaseHasNotes = false;
+        return { visited: 1, deleted: 1, numAdded: 0, numUpdated: 0, numSkipped: 0 };
+      });
+      intervalCallback();
+      await vi.waitFor(() => expect(second.manualIndex.update).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(second.hasIndexedNotes).toBe(false));
+      intervalCallback();
+      expect(second.manualIndex.update).toHaveBeenCalledOnce();
+    } finally {
+      first.onunload();
+      second.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("coalesces events during an active automatic run into one successful follow-up", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
+    });
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    let finishFirst!: (result: any) => void;
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.client = {
+      call: vi.fn(async () => true),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.manualIndex = {
+      update: vi.fn(() =>
+        plugin.manualIndex.update.mock.calls.length === 1
+          ? new Promise((resolve) => (finishFirst = resolve))
+          : Promise.resolve({
+              visited: 1,
+              deleted: 0,
+              numAdded: 0,
+              numUpdated: 0,
+              numSkipped: 0,
+            })
+      ),
+      cancel: vi.fn(),
+    };
+    plugin.hasIndexedNotes = true;
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    try {
+      plugin.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      handlers.get("modify")!({ path: "notes/a.md" });
+      handlers.get("create")!({ path: "notes/b.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      handlers.get("modify")!({ path: "notes/c.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      intervalCallback();
+      intervalCallback();
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+
+      finishFirst({
+        visited: 1,
+        deleted: 0,
+        numAdded: 0,
+        numUpdated: 0,
+        numSkipped: 0,
+        sharing: "complete",
+      });
+      await vi.waitFor(() => expect(plugin.manualIndex.update).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(plugin.indexRun).toBeUndefined());
+      expect(plugin.manualIndex.update).toHaveBeenCalledTimes(2);
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("does not turn repeated busy timer ticks into a follow-up run", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    let intervalCallback!: () => void;
+    vi.stubGlobal("window", {
+      setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
+    });
+    let finishFirst!: (result: any) => void;
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.client = {
+      call: vi.fn(async () => true),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.manualIndex = {
+      update: vi.fn(() => new Promise((resolve) => (finishFirst = resolve))),
+      cancel: vi.fn(),
+    };
+    plugin.hasIndexedNotes = true;
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    try {
+      plugin.startAutomaticIndexing({ vault: { on: () => ({}) } });
+      intervalCallback();
+      intervalCallback();
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+      finishFirst({
+        visited: 1,
+        deleted: 0,
+        numAdded: 0,
+        numUpdated: 0,
+        numSkipped: 0,
+        sharing: "complete",
+      });
+      await vi.waitFor(() => expect(plugin.indexRun).toBeUndefined());
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it("does not retry a pending edit after publication is incomplete", async () => {
+    vi.useFakeTimers();
+    const previousWindow = (globalThis as any).window;
+    vi.stubGlobal("window", { setInterval: () => 1 });
+    const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+    let finishFirst!: (result: any) => void;
+    const status = new IndexStatusController();
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = status;
+    plugin.client = {
+      call: vi.fn(async () => true),
+      close: vi.fn(async () => undefined),
+    };
+    plugin.manualIndex = {
+      update: vi.fn(() => new Promise((resolve) => (finishFirst = resolve))),
+      cancel: vi.fn(),
+    };
+    plugin.hasIndexedNotes = true;
+    plugin.settingsStore.commit({
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerInterval = vi.fn();
+    try {
+      plugin.startAutomaticIndexing({
+        vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+      });
+      handlers.get("modify")!({ path: "notes/a.md" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      finishFirst({
+        visited: 1,
+        deleted: 0,
+        numAdded: 0,
+        numUpdated: 0,
+        numSkipped: 0,
+        sharing: "incomplete",
+      });
+      await vi.waitFor(() => expect(plugin.indexRun).toBeUndefined());
+      expect(plugin.hasIndexedNotes).toBe(true);
+      expect(plugin.manualIndex.update).toHaveBeenCalledOnce();
+      expect(status.getStatus()).toMatchObject({
+        kind: "ready",
+        message: "Index updated; sharing incomplete.",
+      });
+    } finally {
+      plugin.onunload();
+      vi.useRealTimers();
+      if (previousWindow === undefined) vi.unstubAllGlobals();
+      else vi.stubGlobal("window", previousWindow);
+    }
+  });
+
+  it.each(["failure", "stop", "unload"] as const)(
+    "drops a pending automatic follow-up after %s",
+    async (ending) => {
+      vi.useFakeTimers();
+      const previousWindow = (globalThis as any).window;
+      vi.stubGlobal("window", {
+        setInterval: () => 1,
+      });
+      const handlers = new Map<string, (file: any, oldPath?: string) => void>();
+      let rejectFirst!: (error: unknown) => void;
+      let firstStarted!: () => void;
+      const started = new Promise<void>((resolve) => (firstStarted = resolve));
+      let calls = 0;
+      const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+      plugin.client = {
+        call: vi.fn(async () => true),
+        close: vi.fn(async () => undefined),
+      };
+      plugin.manualIndex = {
+        update: vi.fn(() => {
+          calls++;
+          if (calls === 1) {
+            firstStarted();
+            return new Promise((_resolve, reject) => (rejectFirst = reject));
+          }
+          return Promise.resolve({
+            visited: 1,
+            deleted: 0,
+            numAdded: 0,
+            numUpdated: 0,
+            numSkipped: 0,
+          });
+        }),
+        cancel: vi.fn(() => rejectFirst(new DOMException("Aborted", "AbortError"))),
+      };
+      plugin.hasIndexedNotes = true;
+      plugin.settingsStore.commit({
+        ...plugin.getSettings(),
+        embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
+      });
+      plugin.registerEvent = vi.fn();
+      plugin.registerInterval = vi.fn();
+      try {
+        plugin.startAutomaticIndexing({
+          vault: { on: (event: string, handler: any) => (handlers.set(event, handler), {}) },
+        });
+        await started;
+        handlers.get("modify")!({ path: "notes/a.md" });
+        handlers.get("create")!({ path: "notes/b.md" });
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(calls).toBe(1);
+
+        if (ending === "failure") rejectFirst(new Error("index failed"));
+        if (ending === "stop") plugin.stopIndex();
+        if (ending === "unload") plugin.onunload();
+        await vi.waitFor(() => expect(plugin.indexRun).toBeUndefined());
+        expect(calls).toBe(1);
+        expect(calls).toBe(1);
+      } finally {
+        plugin.onunload();
+        vi.useRealTimers();
+        if (previousWindow === undefined) vi.unstubAllGlobals();
+        else vi.stubGlobal("window", previousWindow);
+      }
+    }
+  );
 
   it("restarts Filo when file-open invalidates a pending active-leaf search", async () => {
     const handlers = new Map<string, (value: any) => void>();
@@ -566,9 +1084,19 @@ describe("V1 plugin composition", () => {
               for (const listener of listeners)
                 listener({ data: { id: request.id, ok: true, result: undefined } });
             });
-          } else if (request.method === "init" || request.method === "close") {
+          } else if (
+            request.method === "init" ||
+            request.method === "close" ||
+            request.method === "noteStoreHasNotes"
+          ) {
             for (const listener of listeners)
-              listener({ data: { id: request.id, ok: true, result: undefined } });
+              listener({
+                data: {
+                  id: request.id,
+                  ok: true,
+                  result: request.method === "noteStoreHasNotes" ? false : undefined,
+                },
+              });
           }
         }),
         addEventListener: vi.fn((_type: string, listener: (event: any) => void) =>

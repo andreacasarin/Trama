@@ -46,6 +46,70 @@ describe("guarded local OpenAI chat", () => {
     });
   });
 
+  it.each(["none", "minimal", "low", "medium", "high", "xhigh"] as const)(
+    "sends supported reasoning effort %s through model kwargs",
+    async (effort) => {
+      let body: Record<string, unknown> | undefined;
+      const modelId = "local-chat";
+      const model = createLocalChatModel(
+        { ...DEFAULT_SETTINGS.chat, modelId, reasoningEffort: effort },
+        undefined,
+        async (_input, init) => {
+          body = JSON.parse(String(init?.body));
+          return Response.json({
+            id: "resp_effort",
+            object: "response",
+            status: "completed",
+            output: [
+              {
+                id: "msg_effort",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "ready", annotations: [] }],
+              },
+            ],
+            usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+          });
+        }
+      );
+      await model.invoke("hello");
+      expect(body).toMatchObject({
+        model: modelId,
+        reasoning: { effort },
+      });
+      expect(body).not.toHaveProperty("reasoning_effort");
+    }
+  );
+
+  it("omits automatic reasoning", async () => {
+    let body: Record<string, unknown> | undefined;
+    const model = createLocalChatModel(
+      { ...DEFAULT_SETTINGS.chat, modelId: "local-chat" },
+      undefined,
+      async (_input, init) => {
+        body = JSON.parse(String(init?.body));
+        return Response.json({
+          id: "resp_auto",
+          object: "response",
+          status: "completed",
+          output: [
+            {
+              id: "msg_auto",
+              type: "message",
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: "ready", annotations: [] }],
+            },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        });
+      }
+    );
+    await model.invoke("hello");
+    expect(body).not.toHaveProperty("reasoning");
+  });
+
   it("rejects redirects from the local chat endpoint", async () => {
     const fetcher = vi.fn<typeof fetch>(
       async () =>

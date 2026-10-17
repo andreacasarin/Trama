@@ -3,6 +3,7 @@ import { Setting } from "obsidian";
 import {
   DEFAULT_SETTINGS,
   normalizeExcludedFolders,
+  SettingsStore,
   type TramaSettings,
 } from "@/settings/Settings";
 import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
@@ -76,6 +77,63 @@ describe("Trama settings tab autosave", () => {
     const reasoning = setting("Reasoning effort").controls[0];
     reasoning.change("high");
     await vi.waitFor(() => expect(getSettings().chat.reasoningEffort).toBe("high"));
+  });
+
+  it("loads supported efforts and treats the removed on/off values as Auto", () => {
+    const store = new SettingsStore();
+    const loaded = store.load({
+      ...DEFAULT_SETTINGS,
+      chat: { ...DEFAULT_SETTINGS.chat, modelId: "local-chat", reasoningEffort: "minimal" },
+    });
+    expect(loaded.chat.reasoningEffort).toBe("minimal");
+    const staged = store.stage({
+      ...loaded,
+      chat: { ...loaded.chat, modelId: "another-model", reasoningEffort: "xhigh" },
+    });
+    expect(staged.chat.reasoningEffort).toBe("xhigh");
+    for (const effort of ["on", "off"]) {
+      expect(
+        store.load({
+          ...DEFAULT_SETTINGS,
+          chat: { ...DEFAULT_SETTINGS.chat, reasoningEffort: effort },
+        }).chat.reasoningEffort
+      ).toBeUndefined();
+    }
+  });
+
+  it("offers only API efforts globally and preserves the choice across model changes", async () => {
+    const { plugin, getSettings } = setup({
+      ...DEFAULT_SETTINGS,
+      chat: { ...DEFAULT_SETTINGS.chat, modelId: "first-model" },
+    });
+    const reasoning = setting("Reasoning effort").controls[0];
+    expect([...reasoning.options.keys()]).toEqual([
+      "auto",
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    reasoning.change("xhigh");
+    await vi.waitFor(() => expect(getSettings().chat.reasoningEffort).toBe("xhigh"));
+
+    vi.mocked(plugin.discoverModels).mockResolvedValueOnce(["second-model"]);
+    setting("Chat model").controls[1].click();
+    await vi.waitFor(() =>
+      expect(mockSettings.instances.filter((item) => item.name === "Chat model")).toHaveLength(2)
+    );
+    const refreshedReasoning = mockSettings.instances
+      .filter((item) => item.name === "Reasoning effort")
+      .at(-1)!.controls[0];
+    mockSettings.instances
+      .filter((item) => item.name === "Chat model")
+      .at(-1)!
+      .controls[0].change("second-model");
+    await vi.waitFor(() => expect(getSettings().chat.modelId).toBe("second-model"));
+    expect(getSettings().chat.reasoningEffort).toBe("xhigh");
+    expect([...refreshedReasoning.options.keys()]).toEqual([...reasoning.options.keys()]);
   });
 
   it("omits the redundant Trama title and starts maintenance at Update index", () => {
@@ -230,5 +288,17 @@ describe("Trama settings tab autosave", () => {
         "Bad\\Path",
       ])
     ).toEqual(["Projects", "Projects/Archive"]);
+  });
+
+  it("discards pending text callbacks when synchronized settings replace the form", async () => {
+    const { tab, plugin, getSettings } = setup();
+    const temperature = setting("Temperature").controls[0];
+    temperature.change("0.8");
+    (getSettings() as any).chat.temperature = 0.4;
+    tab.refreshExternalSettings();
+    temperature.inputEl.fire("blur");
+    await Promise.resolve();
+    expect(plugin.saveSettings).not.toHaveBeenCalled();
+    expect(getSettings().chat.temperature).toBe(0.4);
   });
 });

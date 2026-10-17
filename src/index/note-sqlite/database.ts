@@ -264,6 +264,10 @@ export class NoteSqliteDatabase {
           throw error;
         }
       }
+      case "noteStoreHasNotes":
+        return Boolean(
+          rows(this.db, "SELECT EXISTS(SELECT 1 FROM note_index LIMIT 1) AS present")[0]?.present
+        );
       case "recordManagerGetTime":
         return this.reserveRecordTime();
       case "recordManagerUpdate":

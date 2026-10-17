@@ -2,7 +2,9 @@ import { Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { EndpointPolicy, type EndpointApproval } from "@/security/EndpointPolicy";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import {
+  normalizeReasoningEffort,
   normalizeExcludedFolders,
+  REASONING_EFFORTS,
   type ChatSettings,
   type EmbeddingSettings,
   type TramaSettings,
@@ -124,23 +126,21 @@ export class TramaSettingsTab extends PluginSettingTab {
     );
     new Setting(containerEl).setName("Reasoning effort").addDropdown((dropdown) => {
       dropdown.addOption("auto", "Auto");
-      for (const value of ["none", "low", "medium", "high"] as const)
+      for (const value of REASONING_EFFORTS)
         dropdown.addOption(value, value[0].toUpperCase() + value.slice(1));
       dropdown.setValue(settings.chat.reasoningEffort ?? "auto");
       dropdown.onChange((value) => {
-        if (value !== "auto" && !["none", "low", "medium", "high"].includes(value)) return;
+        const effort = value === "auto" ? undefined : normalizeReasoningEffort(value);
+        if (value !== "auto" && effort === undefined) return;
         void this.persistDiscrete((current) => {
           const chat = { ...current.chat };
-          if (value === "auto") delete chat.reasoningEffort;
-          else chat.reasoningEffort = value as NonNullable<typeof chat.reasoningEffort>;
+          if (effort === undefined) delete chat.reasoningEffort;
+          else chat.reasoningEffort = effort;
           return { ...current, chat };
         }).then((saved) => {
           if (saved) {
-            if (value === "auto") delete settings.chat.reasoningEffort;
-            else
-              settings.chat.reasoningEffort = value as NonNullable<
-                typeof settings.chat.reasoningEffort
-              >;
+            if (saved.chat.reasoningEffort === undefined) delete settings.chat.reasoningEffort;
+            else settings.chat.reasoningEffort = saved.chat.reasoningEffort;
           }
         });
       });
@@ -242,6 +242,16 @@ export class TramaSettingsTab extends PluginSettingTab {
     })();
   }
 
+  refreshExternalSettings(): void {
+    this.displayGeneration++;
+    this.discoveryGeneration.chat++;
+    this.discoveryGeneration.embedding++;
+    this.draft = undefined;
+    this.pendingText.clear();
+    this.flushText.length = 0;
+    this.display();
+  }
+
   private heading(title: string): void {
     new Setting(this.containerEl).setName(title).setHeading();
   }
@@ -259,6 +269,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     const setting = new Setting(this.containerEl).setName(name);
     if (description) setting.setDesc(description);
     setting.addText((input) => {
+      const generation = this.displayGeneration;
       input.setValue(this.pendingText.get(key) ?? draftValue).onChange((raw) => {
         this.pendingText.set(key, raw);
         updateDraft(raw);
@@ -284,6 +295,7 @@ export class TramaSettingsTab extends PluginSettingTab {
             this.pendingText.delete(key);
             return;
           }
+          if (this.displayGeneration !== generation) return;
           try {
             await save(parsed.value);
             this.pendingText.delete(key);

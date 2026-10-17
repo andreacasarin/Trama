@@ -30,12 +30,13 @@ export function registerPluginUi(
   app: any,
   ui: Awaited<ReturnType<typeof loadPluginUi>>,
   dependencies: PluginUiDependencies
-): void {
+): InstanceType<typeof ui.TramaSettingsTab> {
   plugin.registerHoverLinkSource(NOTE_RESULT_HOVER_SOURCE_ID, {
     display: "Trama results",
     defaultMod: false,
   });
-  plugin.addSettingTab(new ui.TramaSettingsTab(app, plugin));
+  const settingsTab = new ui.TramaSettingsTab(app, plugin);
+  plugin.addSettingTab(settingsTab);
   plugin.registerView(
     ui.VOCE_VIEW_TYPE,
     (leaf) =>
@@ -93,4 +94,5 @@ export function registerPluginUi(
     name: "Clear local index",
     callback: () => void plugin.clearIndex(),
   });
+  return settingsTab;
 }

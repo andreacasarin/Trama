@@ -135,10 +135,12 @@ describe("SQLite note worker transport", () => {
     const secondWorker = createWorker();
     const first = new NoteStoreClient(firstWorker, namespaceA);
     const second = new NoteStoreClient(secondWorker, namespaceB);
+    expect(await first.call("noteStoreHasNotes", {})).toBe(false);
     await Promise.all([
       first.call("noteStoreReplace", entry("alpha.md", "# alpha\n\nalpha note")),
       second.call("noteStoreReplace", entry("beta.md", "# beta\n\nbeta note")),
     ]);
+    expect(await first.call("noteStoreHasNotes", {})).toBe(true);
     expect(opened).toEqual([namespaceA, namespaceB]);
     expect(await first.call("noteStoreHybrid", { query: "alpha", k: 10 })).toMatchObject({
       hits: [{ path: "alpha.md" }],
@@ -153,6 +155,7 @@ describe("SQLite note worker transport", () => {
     firstWorker.postMessage({ id: 71, method: "init", payload: { namespace: namespaceB } });
     expect((await firstWorker.response(71)).error.message).toMatch(/cannot change vault namespace/);
     await first.call("noteStoreReset", {});
+    expect(await first.call("noteStoreHasNotes", {})).toBe(false);
     expect(await first.call("noteStoreHybrid", { query: "alpha", k: 10 })).toMatchObject({
       hits: [],
     });
