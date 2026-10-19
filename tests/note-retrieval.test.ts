@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
+import { SqliteEmbeddingCache, embeddingCacheIdentity } from "@/index/SqliteEmbeddingCache";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { EmbeddingProviderError } from "@/model/LocalModels";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -69,6 +70,38 @@ async function fixture() {
 }
 
 describe("SQLite note retrieval", () => {
+  it("cancels non-view searches before cache clearing and permits subsequent searches", async () => {
+    const f = await fixture();
+    let release!: (vector: number[]) => void;
+    const embedQuery = vi.fn(
+      () =>
+        new Promise<number[]>((resolve) => {
+          release = resolve;
+        })
+    );
+    const cache = new SqliteEmbeddingCache(
+      { embedDocuments: async () => [], embedQuery },
+      f.client.call,
+      embeddingCacheIdentity("test", 2),
+      2
+    );
+    const retrieval = new VaultRetrieval(f.client.call, cache, "profile", async () => null);
+    try {
+      const pending = retrieval.runnable.invoke({ query: "needle", mode: "hybrid" });
+      await vi.waitFor(() => expect(embedQuery).toHaveBeenCalledOnce());
+      retrieval.cancelSearches();
+      await f.client.call("noteStoreClear", {});
+      release([1, 0]);
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(f.db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(0);
+      embedQuery.mockResolvedValue([1, 0]);
+      await retrieval.runnable.invoke({ query: "needle", mode: "hybrid" });
+      expect(f.db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
+    } finally {
+      f.db.close();
+    }
+  });
+
   it("logs a bounded warning when query embeddings fall back to lexical search", async () => {
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const embeddings: EmbeddingsInterface<number[]> = {

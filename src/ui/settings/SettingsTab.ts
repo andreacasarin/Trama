@@ -553,12 +553,12 @@ export class TramaSettingsTab extends PluginSettingTab {
       nextProfile !== undefined &&
       currentProfile !== nextProfile;
     const settingsGeneration = this.settingsGeneration;
-    const formGeneration = this.displayGeneration;
+    const formGeneration = this.textGeneration;
     if (requiresConfirmation && !(await this.confirmEmbeddingChange())) return undefined;
     if (
       requiresConfirmation &&
       (this.settingsGeneration !== settingsGeneration ||
-        this.displayGeneration !== formGeneration ||
+        this.textGeneration !== formGeneration ||
         effectiveEmbeddingProfile(this.plugin.getSettings()) !== currentProfile)
     )
       return undefined;

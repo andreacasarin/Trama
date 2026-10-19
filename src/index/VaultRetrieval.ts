@@ -38,6 +38,7 @@ export type LiveMarkdownReader = (
 
 export class VaultRetrieval {
   readonly runnable: RunnableLambda<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>;
+  private searchController = new AbortController();
   private relatedGeneration = 0;
   private relatedRequest?: {
     readonly sourcePath: string;
@@ -90,6 +91,11 @@ export class VaultRetrieval {
     checkAbort(signal);
     const result = await this.relatedHits(sourcePath, signal, limit);
     return { paths: result.hits.map((hit) => hit.path), available: result.available };
+  }
+
+  cancelSearches(): void {
+    this.searchController.abort();
+    this.searchController = new AbortController();
   }
 
   invalidateRelated(): void {
@@ -158,6 +164,9 @@ export class VaultRetrieval {
     input: VaultRetrievalInput,
     signal?: AbortSignal
   ): Promise<VaultRetrievalOutput> {
+    signal = signal
+      ? AbortSignal.any([signal, this.searchController.signal])
+      : this.searchController.signal;
     checkAbort(signal);
     const query = input.query.trim();
     if (!query)

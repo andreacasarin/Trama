@@ -361,6 +361,9 @@ export class TramaPlugin extends Plugin {
     let committed = false;
     const operation = (async () => {
       try {
+        this.retrieval?.cancelSearches();
+        for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
+          leaf.view?.clearResults?.();
         await client.call("noteStoreClear", {}, controller.signal);
         if (this.clearRun !== run || this.disposed) return;
         committed = true;
@@ -373,7 +376,6 @@ export class TramaPlugin extends Plugin {
           canReindex: false,
           canCancel: true,
         });
-        this.refreshLenteResults();
         this.refreshVoceSuggestions();
         this.operationNotice?.setMessage("Clearing shared embedding cache files…");
         const adapter = (this.app as any)?.vault?.adapter;

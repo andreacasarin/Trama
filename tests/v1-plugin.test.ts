@@ -7,6 +7,11 @@ import { FiloView } from "@/ui/filo/FiloView";
 import { registerPluginUi, loadPluginUi } from "@/plugin/PluginUi";
 import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
+import { LenteView } from "@/ui/lente/LenteView";
+import { VaultRetrieval } from "@/index/VaultRetrieval";
+import { SqliteEmbeddingCache, embeddingCacheIdentity } from "@/index/SqliteEmbeddingCache";
+import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
+import { loadTestSqlite } from "./note-sqlite-test-client";
 
 describe("V1 plugin composition", () => {
   beforeEach(() => {
@@ -919,9 +924,11 @@ describe("V1 plugin composition", () => {
     plugin.status = new IndexStatusController();
     const invalidateRelated = vi.fn();
     const refreshSubmitted = vi.fn();
-    plugin.retrieval = { invalidateRelated };
+    const cancelSearches = vi.fn();
+    const clearResults = vi.fn();
+    plugin.retrieval = { invalidateRelated, cancelSearches };
     plugin.app = {
-      workspace: { getLeavesOfType: () => [{ view: { refreshSubmitted } }] },
+      workspace: { getLeavesOfType: () => [{ view: { refreshSubmitted, clearResults } }] },
       vault: {
         adapter: {
           exists: vi.fn(async () => false),
@@ -933,13 +940,70 @@ describe("V1 plugin composition", () => {
     await plugin.clearIndex();
     expect(plugin.client.call).toHaveBeenCalledWith("noteStoreClear", {}, expect.any(AbortSignal));
     expect(invalidateRelated).toHaveBeenCalledOnce();
-    expect(refreshSubmitted).toHaveBeenCalledOnce();
+    expect(refreshSubmitted).not.toHaveBeenCalled();
+    expect(clearResults).toHaveBeenCalledOnce();
+    expect(cancelSearches).toHaveBeenCalledOnce();
     expect(plugin.status.getStatus()).toMatchObject({
       kind: "index-required",
       message: "Local index and embedding cache cleared.",
     });
     expect(plugin.updateIndex).toBeDefined();
   });
+
+  it.each([false, true])(
+    "keeps caches empty after Clear with a submitted Lente query (pending: %s)",
+    async (pending) => {
+      const sqlite = await loadTestSqlite();
+      const db = new sqlite.oo1.DB(":memory:", "c");
+      const database = new NoteSqliteDatabase(db);
+      const call = database.call.bind(database);
+      let release!: (vector: number[]) => void;
+      const embedQuery = vi.fn(() =>
+        pending
+          ? new Promise<number[]>((resolve) => {
+              release = resolve;
+            })
+          : Promise.resolve([1, 0])
+      );
+      const cache = new SqliteEmbeddingCache(
+        { embedDocuments: async () => [], embedQuery },
+        call,
+        embeddingCacheIdentity("test", 2),
+        2
+      );
+      const retrieval = new VaultRetrieval(call, cache, "profile", async () => null);
+      const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+      const view = new LenteView({} as any, retrieval.runnable) as any;
+      view.opened = true;
+      view.submitted = "needle";
+      plugin.retrieval = retrieval;
+      plugin.client = { call };
+      plugin.app = {
+        workspace: {
+          getLeavesOfType: (type: string) => (type === "trama-lente" ? [{ view }] : []),
+        },
+        vault: { adapter: { exists: async () => false } },
+      };
+      try {
+        const search = view.run("needle");
+        await vi.waitFor(() => expect(embedQuery).toHaveBeenCalledOnce());
+        if (!pending) {
+          await search;
+          expect(db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
+        }
+        await plugin.clearIndex();
+        if (pending) release([1, 0]);
+        await search;
+        view.refreshSubmitted();
+        expect(embedQuery).toHaveBeenCalledOnce();
+        expect(db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(0);
+        expect(view.output).toBeUndefined();
+        expect(view.submitted).toBe("");
+      } finally {
+        db.close();
+      }
+    }
+  );
 
   it("keeps committed clear status after shared-file cancellation and allows a retry", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;

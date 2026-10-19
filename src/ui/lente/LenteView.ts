@@ -41,6 +41,14 @@ export class LenteView extends ItemView {
     this.output = undefined;
     this.render();
   }
+  clearResults(): void {
+    this.cancel();
+    this.submitted = "";
+    this.output = undefined;
+    if (this.input) this.input.value = "";
+    if (this.status) this.status.textContent = "";
+    this.render();
+  }
   refreshSubmitted(): void {
     if (this.submitted && this.opened) void this.run(this.submitted);
   }

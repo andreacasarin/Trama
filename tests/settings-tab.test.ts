@@ -302,6 +302,28 @@ describe("Trama settings tab autosave", () => {
     expect(getSettings()).toEqual(initial);
   });
 
+  it.each(["blur", "Enter"])(
+    "saves an accepted %s confirmation after settings hides",
+    async (trigger) => {
+      const initial = {
+        ...DEFAULT_SETTINGS,
+        embedding: { ...DEFAULT_SETTINGS.embedding, modelId: "embed-old" },
+      };
+      const { tab, plugin, getSettings } = setup(initial, undefined, true);
+      const dimensions = setting("Embedding dimensions").controls[0];
+      dimensions.change("1024");
+      dimensions.inputEl.fire(trigger === "blur" ? "blur" : "keydown", {
+        key: "Enter",
+        preventDefault: vi.fn(),
+      });
+      await vi.waitFor(() => expect((Modal as any).instances).toHaveLength(1));
+      tab.hide();
+      resolveEmbeddingConfirmation("Save changes");
+      await vi.waitFor(() => expect(getSettings().embedding.dimensions).toBe(1024));
+      expect(plugin.saveSettings).toHaveBeenCalledOnce();
+    }
+  );
+
   it("treats native modal close as cancel and lets hide flush finish afterward", async () => {
     const initial = {
       ...DEFAULT_SETTINGS,
