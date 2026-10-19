@@ -1,9 +1,12 @@
 # Lifecycle benchmark run and comparison guide
 
+> **Historical workflow:** The collection and comparison guidance below belongs to
+> the former lifecycle benchmark. It is not a current V1 workflow or performance
+> baseline. See the [current V1 implementation and evidence](langchain-sqlite-implementation.md).
+
 This guide describes how to collect and compare lifecycle benchmark observations.
-It does not publish a machine-specific performance baseline. See the
-[lifecycle benchmark contract](lifecycle-benchmark-contract.md) for the stable
-workload, output oracle, report identities, and change policy.
+It does not publish a machine-specific performance baseline. The workflow is
+historical and is not active for V1. See the [current implementation and evidence](langchain-sqlite-implementation.md).
 
 ## Run ordinary observations
 

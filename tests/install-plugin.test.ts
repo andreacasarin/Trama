@@ -34,7 +34,7 @@ async function digest(file: string): Promise<string> {
 }
 
 describe("plugin installer", () => {
-  it("creates both vaults from a clean checkout and preserves them on subsequent CLI installs", async () => {
+  it("creates the demo vault from a clean checkout and preserves it on subsequent CLI installs", async () => {
     const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama-install-"));
     try {
       for (const name of ["scripts", "src", "test-vaults", "tsconfig.json", ...runtimeFiles])
@@ -59,44 +59,23 @@ describe("plugin installer", () => {
         );
       const { stdout } = await run();
       const demo = path.join(project, ".artifacts/test-vaults/demo/Trama Test Vault");
-      const benchmark = path.join(
-        project,
-        ".artifacts/test-vaults/benchmark/Trama Benchmark Vault"
-      );
       expect(stdout).toContain(`Demo: ${demo}`);
-      expect(stdout).toContain(`Benchmark: ${benchmark}`);
-      expect(stdout).toContain("Enable Community plugins and Trama in both vaults.");
-      expect(stdout).toContain(
-        "In the benchmark vault, open Settings > General, enable Command line interface, and follow its registration prompt for benchmarks."
-      );
-      for (const vault of [demo, benchmark]) {
-        expect(stdout).toContain(path.join(vault, ".obsidian/plugins/trama"));
-        await expect(
-          readFile(path.join(vault, ".obsidian/community-plugins.json"), "utf8")
-        ).resolves.toBe('["trama"]\n');
-        await writeFile(
-          path.join(vault, ".obsidian/plugins/trama/data.json"),
-          '{"preserved":true}'
-        );
-      }
+      expect(stdout).toContain("Enable Community plugins and Trama in the demo vault.");
+      expect(stdout).not.toContain("Benchmark:");
+      expect(stdout).toContain(path.join(demo, ".obsidian/plugins/trama"));
+      await expect(
+        readFile(path.join(demo, ".obsidian/community-plugins.json"), "utf8")
+      ).resolves.toBe('["trama"]\n');
+      await writeFile(path.join(demo, ".obsidian/plugins/trama/data.json"), '{"preserved":true}');
       expect(await readdir(path.join(demo, "journal"))).toHaveLength(10);
       expect(await readdir(path.join(demo, "zettelkasten"))).toHaveLength(30);
-      const marker = await readFile(path.join(benchmark, ".trama-benchmark-vault"), "utf8");
-      expect(JSON.parse(marker).noteCount).toBe(3000);
       const demoNote = path.join(demo, "journal", (await readdir(path.join(demo, "journal")))[0]);
       await writeFile(demoNote, "edited demo note");
-      const report = path.join(benchmark, ".trama-benchmark-report.json");
-      await writeFile(report, '{"sentinel":true}');
       await run();
       await expect(readFile(demoNote, "utf8")).resolves.toBe("edited demo note");
-      await expect(readFile(report, "utf8")).resolves.toBe('{"sentinel":true}');
-      await expect(readFile(path.join(benchmark, ".trama-benchmark-vault"), "utf8")).resolves.toBe(
-        marker
-      );
-      for (const vault of [demo, benchmark])
-        await expect(
-          readFile(path.join(vault, ".obsidian/plugins/trama/data.json"), "utf8")
-        ).resolves.toBe('{"preserved":true}');
+      await expect(
+        readFile(path.join(demo, ".obsidian/plugins/trama/data.json"), "utf8")
+      ).resolves.toBe('{"preserved":true}');
     } finally {
       await rm(project, { recursive: true, force: true });
     }

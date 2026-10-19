@@ -12,6 +12,7 @@ export default tseslint.config(
       "coverage/**",
       ".artifacts/**",
       ".cache/sqlite-wasm/**",
+      ".ai/bench/**",
     ],
   },
   js.configs.recommended,

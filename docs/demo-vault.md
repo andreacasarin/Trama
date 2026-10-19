@@ -7,19 +7,16 @@ The source notes live in `test-vaults/demo/`; the runnable copy is ignored by Gi
 
 From a fresh clone, use Node.js 24 and install dependencies once with `npm ci`.
 
-Run this one-time setup to create both generated test vaults and install or update
-Trama in them:
+Run this one-time setup to create the generated demo vault and install or update
+Trama in it:
 
 ```sh
 npm run install:plugin -- --test-vaults
 ```
 
-It builds once, prepares only missing generated copies, and installs or updates Trama
-in both the demo and benchmark vaults. Existing generated vaults are reused rather
-than regenerated; their benchmark corpus/run and reports are preserved. The
-command validates the exact generated paths before writing, prints both paths, and
-instructs you to add both vaults to Obsidian and enable Trama in each. Enable the
-Obsidian CLI in Settings > General > Command line interface for benchmark runs.
+It builds once, prepares the generated demo vault if needed, and installs or updates
+Trama there. The command validates the generated path before writing, prints the
+path, and instructs you to add the demo vault to Obsidian and enable Trama.
 Setup sends no Obsidian CLI commands or model requests; no manual vault ID is
 needed for the standard flow.
 
@@ -35,7 +32,8 @@ notes and writes only to the marked demo path. Setup never accesses personal vau
 Any CLI interaction must first prove the exact demo path with
 `verifyDemoCliTarget`; there is no active-vault fallback. A new vault requires manual registration once.
 
-For a first demo, use keyword search in Lente, then run Update to index the notes.
+For a first demo, run Update to index the notes, then use keyword search in the
+available search interface.
 For semantic/hybrid retrieval and Filo suggestions, configure an embedding model
 in this vault's Trama settings and Update again. Voce responses require a chat
 model. Provider settings are not copied from another vault; no model calls are
@@ -55,5 +53,4 @@ Suggested walkthrough:
 4. Follow a reference from the answer back to its source.
 
 The journal entry `2026-09-30` rehearses this sequence. Treat the notes as editable
-demo material, not measured performance evidence. Use `npm run benchmark` for the
-separate versioned workload.
+demo material, not measured performance evidence.

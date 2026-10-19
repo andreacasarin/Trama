@@ -18,6 +18,7 @@ export class Plugin {
   addCommand(_command: unknown): void {}
   addSettingTab(_tab: unknown): void {}
   registerView(_type: string, _factory: unknown): void {}
+  registerHoverLinkSource(_id: string, _info: unknown): void {}
   registerEvent(_event: unknown): void {}
 }
 
@@ -35,11 +36,33 @@ export class Component {
 }
 
 export class PluginSettingTab {
-  readonly containerEl = {} as HTMLElement;
+  readonly containerEl = new SettingsElement() as unknown as HTMLElement;
   constructor(
     public app: unknown,
     public plugin: unknown
   ) {}
+}
+
+export class Modal {
+  static instances: Modal[] = [];
+  readonly contentEl = new SettingsElement() as unknown as HTMLElement;
+  title = "";
+  opened = false;
+  constructor(public app: unknown) {
+    Modal.instances.push(this);
+  }
+  setTitle(value: string): this {
+    this.title = value;
+    return this;
+  }
+  open(): void {
+    this.opened = true;
+  }
+  onClose(): void {}
+  close(): void {
+    this.opened = false;
+    this.onClose();
+  }
 }
 
 export class WorkspaceLeaf {
@@ -57,7 +80,9 @@ export class ItemView extends Component {
 
 export class SuggestModal<T> {
   readonly contentEl = {} as HTMLElement;
-  readonly inputEl = {} as HTMLInputElement;
+  readonly inputEl = { value: "", focus: () => {} } as unknown as HTMLInputElement;
+  emptyStateText = "";
+  instructions?: unknown;
   constructor(public app: unknown) {}
   open(): void {
     this.onOpen();
@@ -68,7 +93,9 @@ export class SuggestModal<T> {
   onOpen(): void {}
   onClose(): void {}
   setPlaceholder(_value: string): void {}
-  setInstructions(_value: unknown): void {}
+  setInstructions(value: unknown): void {
+    this.instructions = value;
+  }
   getSuggestions(_query: string): T[] {
     return [];
   }
@@ -106,9 +133,193 @@ export function setIcon(_element: HTMLElement, _icon: string): void {}
 export function setTooltip(_element: HTMLElement, _tooltip: string): void {}
 
 export class Setting {
-  constructor(_container: unknown) {}
+  static instances: Setting[] = [];
+  name = "";
+  controls: TestControl[] = [];
+  constructor(_container: unknown) {
+    Setting.instances.push(this);
+  }
+  setName(value: string): this {
+    this.name = value;
+    return this;
+  }
+  setDesc(_value: string): this {
+    return this;
+  }
+  setHeading(): this {
+    return this;
+  }
+  addText(callback: (control: TestControl) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
+  addDropdown(callback: (control: TestControl) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
+  addToggle(callback: (control: any) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
+  addButton(callback: (control: TestControl) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
+  addExtraButton(callback: (control: TestControl) => unknown): this {
+    const control = new TestControl();
+    this.controls.push(control);
+    callback(control);
+    return this;
+  }
+}
+
+class TestControl {
+  value: any = "";
+  disabled = false;
+  options = new Map<string, string>();
+  readonly selectEl = { replaceChildren: () => this.options.clear() };
+  changeCallback?: (value: any) => unknown;
+  clickCallback?: () => unknown;
+  inputEl = {
+    listeners: new Map<string, Array<(event: any) => unknown>>(),
+    addEventListener: (type: string, callback: (event: any) => unknown) => {
+      const listeners = this.inputEl.listeners.get(type) ?? [];
+      listeners.push(callback);
+      this.inputEl.listeners.set(type, listeners);
+    },
+    fire: (type: string, event: any = {}) =>
+      this.inputEl.listeners.get(type)?.forEach((fn) => fn(event)),
+  };
+  setValue(value: any): this {
+    this.value = value;
+    return this;
+  }
+  getValue(): string {
+    return this.value;
+  }
+  onChange(callback: (value: any) => unknown): this {
+    this.changeCallback = callback;
+    return this;
+  }
+  change(value: any): void {
+    this.value = value;
+    this.changeCallback?.(value);
+  }
+  addOption(value: string, label: string): this {
+    this.options.set(value, label);
+    return this;
+  }
+  setButtonText(value: string): this {
+    this.value = value;
+    return this;
+  }
+  onClick(callback: () => unknown): this {
+    this.clickCallback = callback;
+    return this;
+  }
+  click(): void {
+    this.clickCallback?.();
+  }
+  setCta(): this {
+    return this;
+  }
+  setIcon(value: string): this {
+    this.value = value;
+    return this;
+  }
+  setTooltip(_value: string): this {
+    return this;
+  }
+  setDisabled(value: boolean): this {
+    this.disabled = value;
+    return this;
+  }
+}
+
+class SettingsElement {
+  children: SettingsElement[] = [];
+  textContent = "";
+  attrs = new Map<string, string>();
+  empty(): void {
+    this.children = [];
+  }
+  createEl(_tag: string, options?: { text?: string }): SettingsElement {
+    const child = new SettingsElement();
+    child.textContent = options?.text ?? "";
+    this.children.push(child);
+    return child;
+  }
+  createDiv(_options?: unknown): SettingsElement {
+    const child = new SettingsElement();
+    this.children.push(child);
+    return child;
+  }
+  querySelector(_selector: string): null {
+    return null;
+  }
+  remove(): void {}
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, value);
+  }
+}
+
+export class SearchComponent {
+  readonly inputEl: any;
+  constructor(container: any) {
+    this.inputEl = container.createEl("input");
+  }
+  setPlaceholder(value: string): this {
+    this.inputEl.placeholder = value;
+    return this;
+  }
+}
+
+export class TextAreaComponent {
+  readonly inputEl: any;
+  constructor(container: any) {
+    this.inputEl = container.createEl("textarea");
+  }
+}
+
+export class ButtonComponent {
+  readonly buttonEl: any;
+  constructor(container: any) {
+    this.buttonEl = container.createEl("button");
+  }
+  setButtonText(value: string): this {
+    this.buttonEl.textContent = value;
+    return this;
+  }
+  setIcon(icon: string): this {
+    this.buttonEl.setAttribute("data-icon", icon);
+    return this;
+  }
+  setTooltip(tooltip: string): this {
+    this.buttonEl.setAttribute("data-tooltip", tooltip);
+    return this;
+  }
+  onClick(callback: (event: unknown) => unknown): this {
+    this.buttonEl.addEventListener("click", callback);
+    return this;
+  }
 }
 
 export class Notice {
-  constructor(public message: string) {}
+  static instances: Notice[] = [];
+  constructor(public message: string) {
+    Notice.instances.push(this);
+  }
+  setMessage(message: string): this {
+    this.message = message;
+    return this;
+  }
+  hide(): void {}
 }

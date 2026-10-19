@@ -1,5 +1,8 @@
 node_modules/
-.ai/
+!.ai/
+.ai/*
+!.ai/adrs/
+!.ai/adrs/**
 main.js
 sqlite-worker.mjs
 sqlite3.mjs

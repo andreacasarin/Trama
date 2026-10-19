@@ -43,7 +43,7 @@ describe("ObsidianIndexVault", () => {
     await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual(["ok.md"]);
   });
 
-  it("keeps base visibility separate from live index eligibility", async () => {
+  it("applies the current index-path filter during listing and reads", async () => {
     let excluded = new Set(["private", "exact.md"]);
     const files = [{ path: "ok.md" }, { path: "private/note.md" }, { path: "exact.md" }] as any[];
     const vault = new ObsidianIndexVault(
@@ -52,11 +52,9 @@ describe("ObsidianIndexVault", () => {
         getFileByPath: (path) => files.find((f) => f.path === path) ?? null,
         read: async () => "ok",
       },
-      {
-        isBaseVisible: (path) => path.endsWith(".md"),
-        isIndexEligible: (path) =>
-          ![...excluded].some((entry) => path === entry || path.startsWith(`${entry}/`)),
-      }
+      (path) =>
+        path.endsWith(".md") &&
+        ![...excluded].some((entry) => path === entry || path.startsWith(`${entry}/`))
     );
 
     await expect(vault.listMarkdownPaths(new AbortController().signal)).resolves.toEqual(["ok.md"]);
@@ -71,7 +69,7 @@ describe("ObsidianIndexVault", () => {
     ]);
   });
 
-  it("reports whether a Markdown path is still available after a move", async () => {
+  it("rejects a listed path that has moved before its note is read", async () => {
     const file = { path: "new.md" } as any;
     const vault = new ObsidianIndexVault(
       {
@@ -82,11 +80,11 @@ describe("ObsidianIndexVault", () => {
       () => true
     );
 
-    await expect(vault.isMarkdownAvailable("old.md", new AbortController().signal)).resolves.toBe(
-      false
+    await expect(vault.readMarkdown("old.md", new AbortController().signal)).rejects.toThrow(
+      /unavailable/
     );
-    await expect(vault.isMarkdownAvailable("new.md", new AbortController().signal)).resolves.toBe(
-      true
+    await expect(vault.readMarkdown("new.md", new AbortController().signal)).resolves.toMatchObject(
+      { path: "new.md", content: "content" }
     );
   });
 });

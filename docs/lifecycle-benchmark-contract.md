@@ -2,8 +2,9 @@
 
 This document records the former deterministic Node lifecycle benchmark. It is kept
 only to interpret historical Node reports and tests. It does not define current
-benchmark commands, profiles, correctness gates, or performance claims. Follow the
-[Obsidian benchmark guide](obsidian-benchmark.md) for the active workflow.
+benchmark commands, profiles, correctness gates, or performance claims. See the
+[current V1 implementation and evidence](langchain-sqlite-implementation.md); no
+active benchmark workflow is documented.
 
 The old report-v2/workload-v1 contracts, expected-outputs-v2 oracle, source manifests,
 12-scenario/17-gate suite, and profile matrix are superseded for current benchmark

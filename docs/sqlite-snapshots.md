@@ -1,5 +1,7 @@
 # Shared embedding cache shards
 
+> **Historical design:** This document records the retired pre-rewrite shared-cache design. The current document-only SQLite cache and publication path is defined in the [cache ADR](../.ai/adrs/embedding-cache-sharing-and-clear.md); see the [implementation reference](langchain-sqlite-implementation.md) for component locations. The lifecycle and retrieval rules below are historical.
+
 Each vault maintains its own local lexical index and semantic note heads. Shared
 files carry reusable computed vectors only; they do not carry FTS data, note heads,
 paths, or local IDs. Markdown in the current vault remains authoritative for which
@@ -10,9 +12,15 @@ notes can appear in search.
 The local SQLite/WASM index keeps one full-note FTS entry for each visible note,
 with body, path, filename, title, and heading weights of 1, 2, 3, 3, and 0.5;
 headings are not counted twice. Lexical search works without an embedding provider.
-Semantic input uses structural Markdown blocks capped at 384 characters of canonical
-serialized input including heading context, with zero overlap. While changed inputs
-are prepared, the last complete compatible semantic head remains searchable.
+Semantic input uses LangChain's default Markdown splitter. Each split's raw
+Markdown text, including headings and frontmatter, is used for embeddings. While
+changed inputs are prepared, the last complete compatible semantic head remains
+searchable. Voce and Lente invoke indexed SQLite search through a shared
+LangChain `RunnableLambda`, which returns Documents with status and degradation
+context. SQLite/WASM continues to perform vector scoring, candidate ranking,
+and reciprocal-rank fusion.
+
+Frontmatter is retained in semantic embedding text and full-note lexical search.
 
 A vault uses one active embedding model/version, dimensions, and preprocessing
 identity. Model identifiers must identify the same version on all devices; endpoint
@@ -46,22 +54,27 @@ Stop during reset also cancels its follow-up cache import. Edits arriving during
 failed embedding request retain normal lexical scheduling instead of waiting for
 the provider retry.
 
-Vector dot products, source centroids, probe selection, candidate ranking, exact
-related reranking, and reciprocal-rank fusion run inside SQLite/WASM. JavaScript
-prepares bounded query inputs and maps final rows; it does not scan corpus vectors.
+Vector dot products, candidate ranking, related-note reranking, and reciprocal-rank
+fusion run inside SQLite/WASM. JavaScript prepares bounded query inputs and maps
+final rows; it does not scan corpus vectors.
 Dot products delegate to SQLite-Vector's maintained Float32 distance routine through
 an SQL adapter, including bounded passage pairs. This avoids full cache scans and
 connection-scoped dimension registration; model changes can rebuild on the same
-connection. Centroids retain double accumulation, and UTF-16 path ordering resolves
-deterministic ties. A maintained passage FTS index selects lexical excerpts using each note's own
+connection. UTF-16 path ordering resolves deterministic ties. A maintained passage FTS index selects lexical excerpts using each note's own
 BM25 statistics. Token counts are stored during lexical writes, and phrase document
 frequencies are shared across the excerpt query instead of rebuilding FTS per note.
 
-Related retrieval reads the source vectors once and each candidate note's vectors
-once into SQLite scratch tables. Its exact symmetric score uses batches of 16 source
-passages by 128 target passages, storing only per-passage maxima between batches.
-Candidate generation retains scalar metadata, not a corpus of vectors. Performance
-diagnostics distinguish `centroid`, `relatedCandidates`, and `relatedRerank`.
+Related retrieval materializes source vectors once. Candidate discovery scans the
+corpus for each distinct source passage, retaining up to 32 distinct candidate notes
+per source passage and trimming the bounded pool to 128 after each source passage.
+It groups each note's passage vectors in a streaming per-note query and removes
+duplicate embedding inputs by digest without building a corpus-wide sorter. Candidate
+note vectors are loaded into SQLite scratch tables for reranking. The
+rerank compares every distinct indexed source passage against compatible target
+passages in batches of 16 by 128. Its experimental score and endpoint rules are
+described below. Scratch storage retains bounded per-passage
+evidence summaries between batches rather than a corpus of vectors. Performance
+diagnostics distinguish `sourcePassages`, `relatedCandidates`, and `relatedRerank`.
 When the last consumer cancels a related request, its Worker request yields and checks
 cancellation between SQL batches using an eight-millisecond yield budget; an
 individual SQL step finishes before yielding. Remaining consumers share the work.
@@ -126,16 +139,21 @@ and settings. The benchmark uses its generated-vault reset for a fresh fixture r
 ## Retrieval behavior
 
 Lente ranks at most 80 lexical notes and 80 semantic notes, then combines ranks with
-reciprocal-rank fusion using k=60. A semantic note's score is its maximum compatible
-passage cosine, and the winning passage is retained as evidence. Related-note
-candidate generation uses the source-note centroid and three deterministic diverse
-passage probes selected by nearest-centroid then farthest-point selection, up to 32
-distinct notes per probe and 128 candidates total. It then reranks candidates using
-all compatible distinct passages in both notes and the exact symmetric mean of each
-direction's top two passage matches, using a single available match when needed. The
-winning target passage is retained as evidence. Candidate generation can miss relevant notes; the all-passage
-rerank has quadratic comparison cost and no bounded interactive-latency guarantee.
-These settings are not evidence of relevance quality or mobile performance.
+reciprocal-rank fusion using k=60. The semantic query is one source passage. Related
+scoring uses every distinct indexed source passage against each retained candidate's
+compatible target passages. In both cases the shared experimental score is 0.75
+times the strongest compatible passage-pair cosine plus 0.25 times the maximum of
+zero and the strongest distinct compatible corroborating pair. When a side has at
+least two distinct embedding inputs, its corroborating pair must use a different
+endpoint from the anchor; a singleton side may reuse its only endpoint. If both
+sides are singletons, there is no corroborator. Embedding-input duplicates within a
+note count once. The winning target passage is retained as evidence. Related
+candidate discovery compares every distinct indexed source passage against the
+corpus, retaining up to 32 distinct notes per source passage and trimming the pool
+to 128 after each source passage. Candidate discovery can miss notes whose
+aggregate evidence would rank highly; reranking has quadratic comparison cost and
+no bounded interactive-latency guarantee. This unaccepted experiment does not
+establish relevance quality or mobile performance.
 
 ## Validation still required
 

@@ -1,5 +1,51 @@
 # Work brief: local indexes and a shared embedding cache
 
+> **Historical work brief:** The shared-cache direction below was superseded by the V1 rewrite. It does not describe current product behavior; see [the current implementation](langchain-sqlite-implementation.md).
+
+## Current semantic chunking
+
+The active SQLite Markdown semantic path uses LangChain's default Markdown
+splitter. Each split's raw Markdown text, including headings and frontmatter, is
+used for embeddings. There is no custom 384-character cap or YAML frontmatter
+exclusion. SQLite remains the computation backend for vector scoring and
+retrieval.
+
+## Historical: 2026-10-08 section-aware chunking trial (superseded)
+
+At the time of this trial, the SQLite Markdown semantic path used `chunkMarkdownSections` from `src/index/chunking.ts`, with a cap of 384 serialized JavaScript characters and zero overlap. The cap included heading context but did not enforce Nomic's 512-token limit; actual token fit and retrieval quality were unmeasured. The fingerprint changed, so the prior corpus needed a normal indexing refresh. Exact-input digests kept unchanged input vectors eligible for cache reuse. The legacy 64-character overlap field remained stored but the chunker did not use it. See [the section-aware chunking trial](section-aware-chunking-experiment.md) for historical behavior and evaluation context.
+
+The trial's YAML policy excluded closed frontmatter from semantic chunks while retaining its original text in the full-note lexical entry. Properties-only notes remained lexical-only; an unclosed frontmatter opener remained ordinary body text. An index refresh under that policy made old YAML-derived embeddings ineligible; cached vectors could remain stored but unused.
+
+## 2026-10-08 successor note: passage scoring experiment
+
+An unaccepted experiment uses one semantic score for search and related notes:
+0.75 times the best compatible passage-pair cosine plus 0.25 times the maximum of
+zero and the best distinct compatible corroborating pair. Related scoring compares
+every distinct indexed source passage against retained candidates. See
+[SQLite snapshot and retrieval details](sqlite-snapshots.md) for endpoint rules and
+bounded candidate discovery. On a synthetic 250-note workload with two warmups and
+six measured calls,
+five source passages took 42.04 ms versus a 42.68 ms baseline; 35 source passages
+took 135.24 ms versus 53.87 ms (about 2.51x slower) after the review fixes and before
+the SQLite memory fix. No real-vault, mobile, or
+relevance improvement has been established. A near-perfect lone match at 0.99 scores
+0.7425 and remains high; differently worded but correlated evidence can corroborate.
+
+A follow-up query change reduces temporary memory during candidate discovery. It
+scans one source passage at a time and groups note passages in a streaming per-note
+query, with digest-indexed duplicate checks. On identical synthetic data with 200
+notes, 30 passages per note, and 768-dimensional vectors, peak SQLite memory fell
+from 329,316,584 bytes to 71,277,544 bytes (about 78% lower) in the uncapped
+comparison; runtime rose from 756 ms to 1,439 ms (about 1.9x slower), with the same
+128-candidate pool checksum. With a 128 MiB SQLite heap limit in disposable
+processes, the old query reproduced `SQLITE_NOMEM` and the new query completed with
+a candidate checksum matching the uncapped comparison. The production `findRelated` API against the same
+synthetic fixture also completed under that limit, returning 37 results with the
+expected top results. This does not confirm the reported user error is resolved or
+predict real-vault latency.
+
+The historical status and approved decisions below predate this experiment.
+
 Status: the current implementation uses schema 16/protocol 13, including SQLite-native retrieval scoring and the maintained SQLite-Vector dot-product kernel. Latest completed verification after the merge-review fixes: 596 tests passed, none skipped; build, lint, and formatting passed. The latest installed generated 3,000-note Obsidian CLI benchmark, run before these review fixes, passed all 12 gates in 52.222s (`1efacecd-9fa2-4215-b52e-43e2ea766ce4`). Production timings were 37.8 ms for retrieval RPC and 125.5 ms for related retrieval. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
 
 Historical verification before SQLite-native retrieval: 581 tests passed, none skipped; build, lint, and formatting passed. The generated 3,000-note Obsidian CLI benchmark passed all 12 gates in 52.696s with a complete 2,655-record capture (`8103c46b-5ef8-4c76-a52c-a6f2cbe70533`). The prior current-design run took 53.594s: cold-run performance is comparable. The final repeated unchanged cache check took 0.8 ms. The final build reloaded with cache preserved and the fixture provider stopped, reaching idle in 2.273s including CLI verification; evidence is in `.artifacts/benchmarks/cleanup-cache-reload.json`. These generated-vault measurements do not establish personal-vault or mobile latency, or judged relevance quality.
@@ -109,8 +155,9 @@ Remaining pre-adoption work is capability confirmation, implementation validatio
 B1/B2/B3 are implemented; the current database uses schema 16/protocol 13. The local
 SQLite/WASM database maintains full-note lexical FTS separately from structural
 semantic blocks and current/last-complete semantic heads. Markdown remains the
-visibility authority. The current semantic input cap is 384 canonical serialized
-characters including heading context, with zero overlap.
+visibility authority. The former semantic input cap was 384 canonical serialized
+characters including heading context, with zero overlap; LangChain defaults now
+replace that superseded policy.
 
 - Full-note FTS weights are body 1, path 2, filename 3, title 3, and headings 0.5,
   without duplicate heading contributions. Lexical retrieval works without embeddings.
@@ -157,7 +204,7 @@ The user accepted this concrete V1 contract for implementation. It records appro
 - Maintain semantic block mappings for the last complete state while changed inputs are prepared. Build requests from current visible Markdown, check digest/profile/recipe and cancellation generation before promotion, then atomically promote complete current coverage and remove superseded mappings. Failed or cancelled work leaves last-complete state available; committed compatible vectors remain reusable.
 - Provider requests stay outside SQL transactions. Persist successful compatible cache results in bounded transactions. Keep active work and old last-complete inputs protected from pruning. Derive pending work from current inputs versus cache/coverage; do not add a durable request queue or arbitrary revision history in V1.
 - Use the existing single local DB worker/VFS, including candidate databases where needed; two separately maintained local databases are not a V1 requirement.
-- The accepted initial semantic cap is 384 characters of canonical serialized input including its heading, with zero overlap. This is the currently exercised bound, not a claim that characters equal tokens or an ideal chunk size. Current adapters lack an exact tokenizer. Any later cap change requires verified provider limits and relevance-quality evaluation.
+- Historical section-aware chunking policy: the accepted initial semantic cap was 384 characters of canonical serialized input including its heading, with zero overlap. This was the exercised bound, not a claim that characters equal tokens or an ideal chunk size. Adapters at the time lacked an exact tokenizer. Future chunking policy changes should consider verified provider limits and relevance-quality evaluation.
 - Separate embedding model/output-space identity (verified model identity, dimensions, and provenance) from input-recipe metadata (chunking and semantic-head reconciliation). The exact cache key is the final provider-input bytes digest plus true model/output space, task, and any vector-affecting input/output transform not captured by those bytes. Pure segmentation or recipe-version changes do not force a miss when provider bytes are identical; changed headings/serialization miss when they change those bytes. Preserve the last-complete old-recipe head while refreshing chunks if the verified model space is unchanged; never mix changed model spaces. Current fingerprinting includes normalized-float32 preprocessing/input options rather than a direct chunk-algorithm version. Use the configured versioned model identifier, dimensions, and preprocessing. Do not infer equivalence between opaque aliases or migrate old fingerprints.
 
 ### Shared publication and cache lifecycle
@@ -181,9 +228,10 @@ The user accepted this concrete V1 contract for implementation. It records appro
 
 ### D5 fixed Obsidian benchmark (approved; supersedes former benchmark workflow)
 
-- Use one pinned generated corpus: 3,000 notes of 400 characters each, 6,000 semantic
-  passages with the existing 384-character chunker, and 768-dimensional embedding
-  vectors. Apply the same chunking to every note; do not add type-specific chunks.
+- Historical benchmark baseline: one pinned generated corpus of 3,000 notes of 400
+  characters each, 6,000 semantic passages with the 384-character chunker, and
+  768-dimensional embedding vectors. The benchmark applied the same chunking to
+  every note and did not add type-specific chunks.
 - For each run, replace only generated Markdown from the prepared corpus, select and
   reload the exact marked benchmark vault, then call the same visible Clear All
   handler in plugin settings or the command palette. It clears local indexes,
