@@ -1,6 +1,6 @@
 # LangChain rewrite: performance and package assessment
 
-**Status: measured comparison.** The database figures below use the same exported-byte metric for both revisions. Results describe this deterministic local workload and do not establish general performance or live-provider behavior.
+**Historical assessment.** All measurements below preserve results from retired benchmark runners and describe their original workloads only. They do not establish current-app timings or general performance claims. For current comparisons in the normal Obsidian application, follow the [current benchmark guide](obsidian-benchmark.md).
 
 ## Compared revisions and method
 
@@ -67,9 +67,9 @@ The rewrite retains Voce, Filo, Lente, Obsidian integration, approved local endp
 
 The comparison does not demonstrate semantic-quality equivalence, a universal speedup, or live-provider performance. It does not validate Obsidian startup, desktop/mobile storage behavior, or live LM Studio agent tool execution. The unchanged Filo same-leaf refresh limitation predates this rewrite and is not a new regression. No new behavior or architecture decision follows from this measurement; the rewrite is an approved simplification, not a behavior-equivalence claim.
 
-## Reproduction
+## Historical reproduction: retired paired runner
 
-Create the exact source archives for the two revisions, then run the paired comparison with explicit archive and output paths. Default local archive paths are not portable, so supply all three paths:
+The source-archive runner below has been removed and cannot reproduce a current-app comparison. Keep this command as historical context for the measurements immediately above; use the [current benchmark guide](obsidian-benchmark.md) for new before/after observations.
 
 ```sh
 git archive --format=tar e03133025f3acb68b75514dfbf18448e903cbbf0 -o /private/tmp/trama-e031330.tar
@@ -77,7 +77,7 @@ git archive --format=tar 86423c69ef8563dabebd4db252e88a53676853db -o /private/tm
 npm run benchmark:compare -- --baseline-tar /private/tmp/trama-e031330.tar --current-tar /private/tmp/trama-86423c6.tar --output-dir .ai/bench/langchain-assessment/local-run
 ```
 
-For a quick 24-note validation, add `--smoke`. The full assessment uses the default 300- and 3,000-note profiles. Preserve the output report and archive hashes when publishing a final rerun. The measured raw report is `.ai/bench/langchain-assessment/run-20261011-b4/report.json`.
+This historical runner used a 24-note smoke mode and 300- and 3,000-note profiles. Its measured raw report was `.ai/bench/langchain-assessment/run-20261011-b4/report.json`; these instructions no longer describe a supported command.
 
 The rewrite substantially reduces owned source code and improves local query times on the large profile, while increasing packaged asset size and slowing no-op updates and small-profile cold indexing. Provider-call differences and the zero-delay fake provider leave real cold-index latency uncertain; this comparison does not measure semantic quality or live endpoint behavior.
 
@@ -315,3 +315,82 @@ The earlier RecordManager profile saw roughly 6,000 per-key UPSERTs across 60 RP
 Earlier legacy-to-cache results that showed 5.76 seconds for a 3,000-note cold index used a Node in-memory SQLite test workflow and an intermediate cache candidate, not the production OPFS workflow. The original adapter called `IndexManager.build`/`synchronize` directly and omitted production maintenance scheduling/publication and record-path mutation events. The later original-to-final comparison used the full production controller on real OPFS and correct mutation events, with different indexing and cache behavior. Those runs have different harnesses and operations and cannot attribute their absolute timing difference to one code change; they are not evidence that this SQL change caused the full difference.
 
 This comparison is a synthetic OPFS workload, not live-provider or real-sync timing. It does not establish retrieval-quality equivalence or predict end-to-end Obsidian performance.
+
+## Latest HEAD paired benchmark — 2026-10-17
+
+This paired run compares the committed production baseline `b32f6be97af9a4502b2f00e72d38cd770c0e86ab` with current HEAD `5a0cf5378588761eb8067413a121d4d5d414b770`. The paired raw report is [paired.json](../.ai/bench/history-20261017-5a0cf53/paired.json); the current-only summary and raw browser report are [latest/report.json](../.ai/bench/history-20261017-5a0cf53/latest/report.json) and [latest/current-raw.json.browser.json](../.ai/bench/history-20261017-5a0cf53/latest/current-raw.json.browser.json). Run metadata, archive hashes, and exact plan are in [run-metadata.json](../.ai/bench/history-20261017-5a0cf53/run-metadata.json). The baseline and current archive SHA-256 values are `4dfa29190c831a96e2b58bdb0e79f6dded1e1b546bd8f83eb0b6573798f46b83` and `5f7536cec8e1b5c84f75575539d88ddb128d35bcbc7c70ea0588b63abfeaab17`.
+
+The matched workload uses the same 3,000-note corpus (400 characters per note), 768-dimensional deterministic provider fixture, benchmark driver, SQLite WASM, package lock, Node 24.13, Apple M1 Max, and Brave 154.1.96.61. It also runs a 24-note smoke profile and 300-note profile. The 300-note run has five measured samples and 3,000-note run three, each after one warmup; queries use five warmups and 30 samples per profile run. Production workers use a real SAH OPFS pool and an in-memory vault adapter. Note/sentinel counts and complete-bootstrap checks passed. This measures neither a live provider nor real vault synchronization or the Obsidian UI. Times below are medians in milliseconds unless the publication p95 is shown in parentheses. Publication is included in cold-update time and must not be added to it.
+
+| Operation                           | 300-note baseline | 300-note HEAD |   3,000-note baseline |       3,000-note HEAD |
+| ----------------------------------- | ----------------: | ------------: | --------------------: | --------------------: |
+| Cold update                         |          1,344.31 |      1,340.10 |             13,853.09 |             13,914.36 |
+| Publication phase                   |             89.90 |         91.38 | 913.72 (p95 1,110.99) | 641.31 (p95 1,202.85) |
+| No-op update                        |             58.56 |         54.95 |                519.16 |                472.73 |
+| One-note edit                       |             79.39 |         81.70 |                548.19 |                491.15 |
+| One-note delete                     |             46.63 |         54.80 |                502.77 |                447.95 |
+| Fresh-device bootstrap, 3,000 notes |                 — |             — |             13,030.04 |             13,355.74 |
+
+At 3,000 notes, cold update is effectively flat (+0.4%); the median publication phase is 29.8% lower, but its p95 is higher, so the three-sample tail is noisy. No-op, edit, and delete medians are 8.9%, 10.4%, and 10.9% lower, respectively; bootstrap is 2.5% higher. The 300-note results are mixed and do not show a uniform improvement. A separate current-only run measured 11,640.01 ms for 3,000-note cold update versus 13,914.36 ms in the paired run; use the matched pair for revision comparisons and treat this spread as observed run-to-run variation rather than selecting the faster single run.
+
+| 3,000-note query    | Baseline median (p95) | HEAD median (p95) |
+| ------------------- | --------------------: | ----------------: |
+| Lexical             |         0.925 (4.605) |     1.015 (4.940) |
+| Hybrid              |       11.355 (17.475) |   12.000 (16.745) |
+| Related-note lookup |         2.415 (3.125) |     0.010 (2.955) |
+
+Both revisions made 30 provider calls for 3,000 texts during cold indexing, and fresh-device bootstrap completed with zero provider calls. With repeated source paths and the new related-hit cache, 51 of 90 HEAD related-note calls completed in under 0.1 ms (baseline: none); this is consistent with cache reuse, not evidence of faster SQL. Database and shared-artifact sizes were unchanged between paired revisions: 39,174,144 bytes locally and 13,844,480 bytes across 24 immutable artifacts.
+
+The main bundle increased from 1,998,502 to 2,019,950 bytes; the worker from 25,791 to 25,884 bytes. Combined main, worker, and SQLite JavaScript/WASM assets increased from 4,435,698 to 4,457,239 raw bytes; SQLite assets were unchanged. The esbuild metafile attributes 1,926,367 bytes of the HEAD main bundle to vendor modules and 91,313 bytes to local code; the worker adds 25,791 local bytes. Thus local main-plus-worker output is 117,104 bytes, compared with 95,604 bytes at the b32 baseline and 342,363 bytes in the original implementation. Vendor modules account for about 95.4% of the HEAD main bundle. These emitted-byte counts are not source lines, and gzip attribution by module is not measured. The measured revision spans accumulated changes since b32; this comparison does not isolate the Console debugging toggle or assign timing differences to any single change.
+
+The historical sections above describe successive milestones, but their harnesses are not one continuous timing series. The 2026-10-11 in-memory baseline-to-rewrite run reported 3,000-note cold indexing at 19.52 s versus 8.62 s; its batching follow-up measured 5.70 s and reduced embedding calls from 3,000 to 30. The 2026-10-12 rowid experiment reduced exported database size from 41,312,256 to 25,583,616 bytes. On 2026-10-13, the query-cache comparison reduced measured hybrid-query provider calls from 90 to 6 while increasing local DB size; the 44.289 ms SQLite publication result was an in-memory format prototype, not the production OPFS path. Production OPFS measurements on 2026-10-14 first exposed high SQLite receipt-write cost, then a separate receipt-batching pair reduced its 3,000-note publication median from 18,169.12 to 802.04 ms. The 2026-10-15 RecordManager pair then reduced 3,000-note no-op/delete medians from 565.36/560.23 to 445.76/440.95 ms, while 300-note no-op was 5.7% slower. The specific reports and their differing conditions are documented in the dated sections above. In particular, the attractive 20.344 s to 5.757 s legacy-to-cache result used a Node in-memory direct-index harness without production publication and is not comparable to the OPFS workflow. Do not splice these results into one trend or treat cross-harness differences as effects of a single code change.
+
+## RecordManager clock-statement experiment — 2026-10-17
+
+A scratch-only candidate replaced the database-clock SELECT plus guarded UPDATE with one guarded UPDATE ... RETURNING. It kept the existing transaction boundaries, 100-key batches, LangChain indexing, watermark handling, and rollback behavior; no production SQL change was adopted. The repaired browser runner completed smoke runs and this unprofiled matched OPFS pair. The pair used the same plan, 3,000-note corpus, driver, package lock, and SQLite inputs; it measured five 300-note samples and three 3,000-note samples after one warmup. Values are medians in milliseconds with min–max ranges.
+
+| Operation       |    300-note control |   300-note candidate |            3,000-note control |       3,000-note candidate |
+| --------------- | ------------------: | -------------------: | ----------------------------: | -------------------------: |
+| No-op update    | 57.96 (48.74–63.88) | 60.98 (39.73–995.50) | 4,627.91 (3,099.41–23,001.11) | 1,097.99 (564.51–9,807.26) |
+| One-note delete | 55.38 (51.85–66.58) | 43.76 (41.04–248.87) | 6,562.10 (3,614.31–23,234.44) |   674.83 (668.37–2,009.82) |
+
+The ranges are too wide to establish a stable benefit or attribute the median differences to the statement change. Cold-index timing also varied substantially (15.64–146.04 s for the control and 16.51–149.63 s for the candidate). The pair preserved the expected result: after deletion, both sides had 2,999 indexed notes and vectors; cold indexing made 30 provider calls for 3,000 texts, while no-op and delete made none. The 3,000-note database and 24 shared artifacts remained 39,174,144 and 13,844,480 bytes, respectively. The candidate remains a benchmark-only experiment; no SQL optimization was adopted because this run did not prove a reliable improvement.
+
+Raw results and validation summary: [clock-pair.json](../.ai/bench/index-maintenance-20261017-5a0cf53/browser-fix-rerun/clock-pair.json) and [clock-pair-summary.json](../.ai/bench/index-maintenance-20261017-5a0cf53/browser-fix-rerun/clock-pair-summary.json). The full pair passed 183 validation checks.
+
+## Focused maintenance rerun — 2026-10-17
+
+A focused, unprofiled OPFS pair compared 12 balanced AB/BA rounds of no-op update and deletion on the same 3,000-note plan and corpus. Each side prepared its index once and ran two warmup no-ops before timing. Each measured round ran one no-op, then deleted notes/2999.md and restored/reindexed it outside the timer. Both workers stayed open; retrieval queries and bootstrap were omitted. The existing LangChain index, 100-key batches, cache handling, and publication path were unchanged. The lower-middle observation is used for even-sized medians; paired improvements are medians of the 12 per-round percentage changes, not a significance test.
+
+- **No-op:** control median 3,018 ms (p90 5,354); candidate median 3,047 ms (p90 4,184). The candidate won 5/12 pairs; paired median improvement was −5.45%.
+- **Delete:** control median 3,634 ms (p90 7,367); candidate median 2,857 ms (p90 6,528). The candidate won 8/12 pairs; paired median improvement was +10.90%.
+
+The predeclared retention gate required at least 10/12 wins and at least 5% paired-median improvement for both operations, with no worse p90 or extreme tails. It failed: no-op did not improve, despite its lower candidate p90; delete improved by the median but won only 8/12 pairs. No sample exceeded three times its side median, and no additional tail diagnostic was triggered. The candidate SQL change is therefore not adopted in production.
+
+All timed no-op and delete operations made zero provider calls, cache-publication writes, or vault-adapter writes. The no-op skipped all 3,000 notes; deletion removed exactly one note, and every round restored the index to 3,000 notes and vectors. The OPFS database remained about 39.2 MB, with an eight-KiB allocation increase observed between rounds 4 and 5, outside timed samples. Browser timer lag before and after each operation was at most 3.685 ms; this bounds observed event-loop lag around the timer but does not prove the host was otherwise idle. Host load was high during the run, but the captured data cannot attribute the latency variation to CPU, disk, or another cause.
+
+A separate two-round baseline profile found 60 RecordManager update RPCs per operation accounting for 49–60% of elapsed time; nested native-exec timings overlap those RPC spans. Transaction commits accounted for 22–31% (433–1,143 ms). Between the profile two no-op samples, elapsed time rose from 1,976 to 5,106 ms: 1,317 ms more in update RPCs and 1,813 ms elsewhere, which the profile did not localize. This is evidence of variable cost, not a proven root cause. A later phase-instrumented attempt timed out during DevTools setup before workload measurement, so it produced no additional timing data.
+
+The primary artifact recorded a b32f6be baseline archive argument, but the provenance correction confirms the measured baseline workspace matches the 5a0cf53 source tree; the candidate is that same tree plus the isolated clock SQL patch and focused-test correction. This is a 5a-to-5a-plus-scratch comparison, not a b32 comparison. Raw results, summary, run metadata, and provenance correction are local ignored benchmark artifacts and may be absent from a clean checkout: [raw.json](../.ai/bench/index-maintenance-20261017-5a0cf53/maintenance-focus/raw.json), [summary.json](../.ai/bench/index-maintenance-20261017-5a0cf53/maintenance-focus/summary.json), [run-metadata.json](../.ai/bench/index-maintenance-20261017-5a0cf53/maintenance-focus/run-metadata.json), and [provenance-correction.json](../.ai/bench/index-maintenance-20261017-5a0cf53/maintenance-focus/primary-driver/provenance-correction.json).
+
+## Benchmark reliability A/A control — 2026-10-18
+
+An unprofiled A/A control ran four balanced ABBA rounds on the same verified 5a0cf53 source, identical worker and workload bundles, 3,000-note input, and persistent prepared indexes, with two warmups per side. Conventional even-sample medians are used for this and later focused summaries; older saved summaries retain their original lower-middle convention. The no-op medians were 442.06 ms (baseline, 413.71–512.12) and 440.82 ms (current, 417.94–521.29); delete medians were 448.93 ms (baseline, 426.49–451.76) and 437.80 ms (current, 413.17–462.91). These are same-code timing differences, not a speedup. The two second-round no-ops were both slower (512 and 521 ms); the other no-op samples were 414–446 ms. Four rounds indicate modest repeatability for this run and workload, not a general stability bound.
+
+The timed interval is `performance.now()` around `await ManualIndex.update()`. It includes cache import and vault preparation, LangChain hashing/index work, RecordManager refresh writes, cleanup, publication, and waits. A no-op made no provider calls or publication writes but was not read-only: it still performed 60 RecordManager transactions covering 6,000 keys. Deletes removed one note and each restore returned both indexes to 3,000 rows and vectors; each side's initial population used 30 provider calls for 3,000 texts, with no new embeddings during measured no-op/delete work. Runtime PRAGMAs were identical on both sides: journal mode `DELETE`, synchronous `FULL` (`2`), cache size `16 MiB` (`-16384`), and page size `8 KiB`. Warmups, snapshots, OPFS enumeration, timer-lag probes, and status posts were outside the clock and can affect subsequent samples. RPC, native-exec, and commit durations overlap; native-exec is worker wall time, not isolated CPU or physical I/O time.
+
+The older focused run's no-op range was 1.766–5.596 s and its delete range was 1.710–8.970 s. These observations occurred alongside high host load, but the measurements do not establish that load as their cause. A slow no-op pair also appeared before the later rounds, so round age alone does not explain the variation. The full historical harness repeats cold indexing, queries, and bootstrap, whereas this control uses persistent workers and indexes; their timings are not directly comparable. The root cause of the older swings remains unresolved. The successful control and corrected raw-first report capture establish the measurement result, not a performance effect; synthetic success, failure-preservation, and output-collision checks passed for report generation.
+
+If the slow behavior recurs, first repeat a source-verified A/A with identical inputs, then use an unprofiled matched ABBA comparison with raw ranges, paired statistics, and state guards. Capture phase or resource evidence during the measured operations before drawing a causal conclusion. The current four-round control does not justify a production change or generic profiling without recurrence.
+
+Raw report, summary, and run metadata: [raw.json](../.ai/bench/benchmark-reliability-20261018/aa-unprofiled-verified/raw.json), [summary.json](../.ai/bench/benchmark-reliability-20261018/aa-unprofiled-verified/summary.json), and [metadata.json](../.ai/bench/benchmark-reliability-20261018/aa-unprofiled-verified/metadata.json). These local ignored artifacts may be absent from a clean checkout.
+
+## Controlled `UPDATE RETURNING` comparison — 2026-10-19
+
+A profile-off comparison used 3,000 notes, two warmups per side, and 12 balanced rounds across three sessions: the same 5a source as baseline and identical-code control, plus the scratch `UPDATE RETURNING` candidate. Conventional medians were 470.65/462.34/456.37 ms for no-op and 466.52/461.08/469.89 ms for delete (baseline/control/candidate). Median paired savings against the mean of the two controls were 1.31 ms (0.29%) for no-op and 11.80 ms (2.45%) for delete; the candidate was faster than both controls in only 4/12 rounds for each operation. Median absolute A/A gaps were 31.22 ms (6.82%) and 38.89 ms (8.24%). The predeclared gate required at least 10/12 wins and paired median gains exceeding both the 5%/A-A-gap and 25-ms/A-A-gap thresholds; the candidate failed all three conditions for both operations. One identical-code delete control sample reached 1,506.74 ms; its cause is unknown.
+
+Decision: retain the existing 5a clock SQL and do not adopt `UPDATE RETURNING`. This comparison demonstrates no gain that meets the predeclared gate and does not establish behavioral equivalence.
+
+The result is **offline-validated from preserved browser output**, not a clean successful runner result. The original post-capture identity guard failed because it compared emitted workload bytes that differed in esbuild comments containing workspace paths. Offline checks found the 725-input closures equal and rebuilt workload bytes equal after only that exact comment normalization; executable-byte differences were rejected. The original emitted bundle hashes were not retained, so this does not prove the exact bundle bytes used by the browser run. The failed sidecars remain unchanged, and no rerun was made. Validation covered 180 snapshots, matching SQLite PRAGMAs, restored index/vector counts, zero provider/publication writes, one OPFS pool, and bounded OPFS allocation; four focused clock tests and synthetic guard checks passed.
+
+Artifacts: [offline-validated report](../.ai/bench/update-returning-controlled-comparison-20261019/offline-validated-from-preserved-browser-result.json), [bundle-identity diagnosis](../.ai/bench/update-returning-controlled-comparison-20261019/bundle-identity-diagnosis.json), and [preserved browser result](../.ai/bench/update-returning-controlled-comparison-20261019/raw-browser-unvalidated.json). These local ignored files may be absent from a clean checkout.

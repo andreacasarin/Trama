@@ -32,29 +32,5 @@ export default tseslint.config(
   {
     files: ["scripts/sqlite-wasm/**/*.{js,mjs}"],
     languageOptions: { globals: { console: "readonly", URL: "readonly", WebAssembly: "readonly" } },
-  },
-  {
-    files: ["scripts/benchmark/sqlite-opfs-performance.mjs"],
-    languageOptions: {
-      globals: {
-        Buffer: "readonly",
-        URL: "readonly",
-        fetch: "readonly",
-        WebSocket: "readonly",
-        setTimeout: "readonly",
-        clearTimeout: "readonly",
-      },
-    },
-  },
-  {
-    files: ["scripts/benchmark/sqlite-opfs-performance/page.js"],
-    languageOptions: {
-      globals: {
-        document: "readonly",
-        fetch: "readonly",
-        location: "readonly",
-        URLSearchParams: "readonly",
-      },
-    },
   }
 );

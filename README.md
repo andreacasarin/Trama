@@ -23,6 +23,6 @@ The agent uses session-only conversation history and turn attachments. Tools are
 
 The packaged runtime consists of `main.js`, `sqlite-worker.mjs`, `sqlite3.mjs`, `sqlite3.wasm`, `manifest.json`, and `styles.css`. The repository includes a version hook and commands to build and install the plugin into the demo vault. The demo installer targets that vault only.
 
-Run `npm run benchmark:compare -- --baseline-tar path/to/baseline.tar --current-tar path/to/current.tar --output-dir path/to/report` for a paired before/after measurement. See [the LangChain performance assessment](docs/langchain-performance-assessment.md) for the method, findings, and limitations.
+Use the current-app benchmark to compare repeated timing samples from the normal Obsidian plugin. Build and prepare the generated benchmark vault with `npm run build` and `npm run benchmark:prepare`, then follow [the Obsidian benchmark guide](docs/obsidian-benchmark.md). The comparison command is `npm run benchmark:compare -- before.json after.json`; it prints raw samples, medians, and after-minus-before milliseconds without writing files. Historical measurements and retired runner instructions remain in the [LangChain performance assessment](docs/langchain-performance-assessment.md).
 
 The current implementation reference is [docs/langchain-sqlite-implementation.md](docs/langchain-sqlite-implementation.md). Historical design briefs, benchmark reports, and test inventories are labeled in their respective documents; they do not define current V1 behavior or performance claims.
