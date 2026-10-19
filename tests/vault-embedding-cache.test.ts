@@ -88,7 +88,7 @@ class MemoryAdapter {
     const prefix = `${path}/`;
     return {
       files: [...this.files.keys()].filter((file) => file.startsWith(prefix)),
-      folders: [],
+      folders: [...this.folders].filter((folder) => folder.startsWith(prefix)),
     };
   }
   async mkdir(path: string): Promise<void> {
@@ -289,10 +289,154 @@ async function setup(
     shared,
     consoleDebug
   );
-  return { db, client, manual, shared, cachedEmbeddings };
+  return { db, client, database, manual, shared, cachedEmbeddings };
 }
 
 describe("vault-shared document embedding artifacts", () => {
+  it("clears SQLite index and cache atomically while ordinary reset retains reusable cache", async () => {
+    const adapter = new MemoryAdapter();
+    const notes = new Map([["clear.md", markdown]]);
+    const provider = new TestEmbeddings();
+    const { db, client, database, manual, cachedEmbeddings } = await setup(
+      adapter,
+      notes,
+      provider
+    );
+    const cacheHash = "a".repeat(64);
+    const checksum = "b".repeat(64);
+    const profileFingerprint = cachedEmbeddings.profileFingerprint;
+    const vector = new Uint8Array(new Float32Array([0.6, 0.8]).buffer);
+    try {
+      await manual.update();
+      await client.call("embeddingCacheSet", {
+        profile: profileFingerprint,
+        task: "query",
+        dimensions: 2,
+        entries: [{ hash: cacheHash, vector }],
+        now: Date.now(),
+      });
+      db.exec({
+        sql: "INSERT INTO embedding_cache_sqlite_imports(profile,checksum,imported_at) VALUES(?,?,?)",
+        bind: [profileFingerprint, checksum, Date.now()],
+      });
+      db.exec({
+        sql: "INSERT INTO embedding_cache_sqlite_publications(profile,hash,checksum,published_at) VALUES(?,?,?,?)",
+        bind: [profileFingerprint, cacheHash, checksum, Date.now()],
+      });
+      const callsBeforeReset = provider.calls.length;
+      const importsBeforeReset = Number(
+        db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports")
+      );
+      const publicationsBeforeReset = Number(
+        db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_publications")
+      );
+
+      await client.call("noteStoreReset", {});
+      expect(Number(db.selectValue("SELECT count(*) FROM note_index"))).toBe(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache"))).toBeGreaterThan(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports"))).toBe(
+        importsBeforeReset
+      );
+      expect(
+        Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_publications"))
+      ).toBe(publicationsBeforeReset);
+      await manual.update();
+      expect(provider.calls.length).toBe(callsBeforeReset);
+      const importsBeforeClear = Number(
+        db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports")
+      );
+      const publicationsBeforeClear = Number(
+        db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_publications")
+      );
+
+      const abort = new AbortController();
+      const clearing = database.call("noteStoreClear", {}, abort.signal);
+      abort.abort();
+      await expect(clearing).rejects.toMatchObject({ name: "AbortError" });
+      expect(Number(db.selectValue("SELECT count(*) FROM note_index"))).toBeGreaterThan(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache"))).toBeGreaterThan(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports"))).toBe(
+        importsBeforeClear
+      );
+      expect(
+        Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_publications"))
+      ).toBe(publicationsBeforeClear);
+
+      await client.call("noteStoreClear", {});
+      expect(Number(db.selectValue("SELECT count(*) FROM note_index"))).toBe(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM note_vectors"))).toBe(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM note_records"))).toBe(0);
+      expect(Number(db.selectValue("SELECT value FROM note_record_clock WHERE id=1"))).toBe(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache"))).toBe(0);
+      expect(Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports"))).toBe(0);
+      expect(
+        Number(db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_publications"))
+      ).toBe(0);
+    } finally {
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("clears only managed shared cache files across direct profile folders", async () => {
+    const adapter = new MemoryAdapter();
+    const otherProfile = "c".repeat(64);
+    const checksum = "d".repeat(64);
+    const temp = ".tmp-" + checksum + "-123e4567-e89b-42d3-a456-426614174000";
+    const root = "Trama/embedding-cache-v2";
+    const paths = [
+      root + "/" + profileHash + "/" + checksum + ".sqlite3",
+      root + "/" + profileHash + "/" + temp,
+      root + "/" + otherProfile + "/" + "e".repeat(64) + ".sqlite3",
+      root + "/unrelated.bin",
+      root + "/" + "f".repeat(63) + "/" + "a".repeat(64) + ".sqlite3",
+      root + "/" + profileHash + "/unknown.txt",
+      root + "/" + profileHash + "/nested/" + "b".repeat(64) + ".sqlite3",
+    ];
+    for (const path of paths) {
+      const parent = path.slice(0, path.lastIndexOf("/"));
+      adapter.folders.add(parent);
+      adapter.files.set(path, new Uint8Array([1]));
+    }
+    adapter.folders.add(root);
+
+    const removed = await VaultEmbeddingCache.clearManagedFiles(
+      adapter as any,
+      new AbortController().signal
+    );
+    expect(removed).toBe(3);
+    expect([...adapter.files.keys()]).toEqual(expect.arrayContaining(paths.slice(3)));
+    expect([...adapter.files.keys()]).not.toEqual(expect.arrayContaining(paths.slice(0, 3)));
+  });
+
+  it("cancels shared-file cleanup after a deletion and safely retries remaining files", async () => {
+    const adapter = new MemoryAdapter();
+    const root = "Trama/embedding-cache-v2";
+    const folder = root + "/" + profileHash;
+    const files = ["a", "b"].map((letter) => folder + "/" + letter.repeat(64) + ".sqlite3");
+    adapter.folders.add(root);
+    adapter.folders.add(folder);
+    for (const path of files) adapter.files.set(path, new Uint8Array([1]));
+    const controller = new AbortController();
+    const remove = adapter.remove.bind(adapter);
+    adapter.remove = async (path) => {
+      await remove(path);
+      controller.abort();
+    };
+
+    await expect(
+      VaultEmbeddingCache.clearManagedFiles(adapter as any, controller.signal)
+    ).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(adapter.files.size).toBe(1);
+    adapter.remove = remove;
+    expect(
+      await VaultEmbeddingCache.clearManagedFiles(adapter as any, new AbortController().signal)
+    ).toBe(1);
+    expect(adapter.files.size).toBe(0);
+  });
+
   it("imports compatible vectors across endpoint changes into an independent index", async () => {
     const adapter = new MemoryAdapter();
     const notes = new Map([["folder/shared.md", markdown]]);

@@ -1,13 +1,85 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Platform } from "obsidian";
+import { Notice, Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { FiloView } from "@/ui/filo/FiloView";
+import { registerPluginUi, loadPluginUi } from "@/plugin/PluginUi";
+import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
+import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 
 describe("V1 plugin composition", () => {
   beforeEach(() => {
     Platform.isDesktopApp = false;
+    (Notice as any).instances = [];
+  });
+
+  it("exposes an active index run without changing the indexed-note state", () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    expect(plugin.hasIndexedNotes).toBe(false);
+    expect(plugin.hasIndexedOrActiveIndex).toBe(false);
+    plugin.indexRun = {};
+    expect(plugin.hasIndexedNotes).toBe(false);
+    expect(plugin.hasIndexedOrActiveIndex).toBe(true);
+  });
+
+  it("resolves current services when creating views and the Lente search modal", async () => {
+    const ui = await loadPluginUi();
+    const factories = new Map<string, (leaf: any) => any>();
+    const commands = new Map<string, { callback(): void }>();
+    const plugin = {
+      registerHoverLinkSource: vi.fn(),
+      addSettingTab: vi.fn(),
+      addCommand: vi.fn((command: any) => commands.set(command.id, command)),
+      registerView: vi.fn((type: string, factory: (leaf: any) => any) =>
+        factories.set(type, factory)
+      ),
+      relatedNoteSuggestions: vi.fn(),
+      updateIndex: vi.fn(),
+      rebuildIndex: vi.fn(),
+      stopIndex: vi.fn(),
+      clearIndex: vi.fn(),
+    };
+    const app = { workspace: { getLeaf: () => ({ setViewState: vi.fn() }) } };
+    const oldSession = {} as any;
+    const newSession = {} as any;
+    const oldRunnable = { invoke: vi.fn() };
+    const newRunnable = { invoke: vi.fn() };
+    let session = oldSession;
+    let retrieval = { runnable: oldRunnable, related: vi.fn() } as any;
+    const status = { getStatus: () => ({ kind: "idle" }) } as any;
+    registerPluginUi(plugin as any, app, ui, {
+      session: () => session,
+      status,
+      retrieval: () => retrieval,
+      noteCatalog: () => [],
+      currentNote: () => [],
+      consoleDebug: {} as any,
+    });
+
+    const existingVoce = factories.get(ui.VOCE_VIEW_TYPE)!({ app });
+    const existingFilo = factories.get(ui.FILO_VIEW_TYPE)!({ app });
+    const existingLente = factories.get(ui.LENTE_VIEW_TYPE)!({ app });
+    expect((existingVoce as any).session).toBe(oldSession);
+    expect((existingFilo as any).related).toBe(retrieval);
+    expect((existingLente as any).search).toBe(oldRunnable);
+
+    session = newSession;
+    retrieval = { runnable: newRunnable, related: vi.fn() };
+    const newVoce = factories.get(ui.VOCE_VIEW_TYPE)!({ app });
+    const newFilo = factories.get(ui.FILO_VIEW_TYPE)!({ app });
+    const newLente = factories.get(ui.LENTE_VIEW_TYPE)!({ app });
+    expect((newVoce as any).session).toBe(newSession);
+    expect((newFilo as any).related).toBe(retrieval);
+    expect((newLente as any).search).toBe(newRunnable);
+
+    const open = vi.spyOn(LenteSearchModal.prototype, "open").mockImplementation(function (
+      this: LenteSearchModal
+    ) {
+      expect((this as any).search).toBe(newRunnable);
+    });
+    commands.get("search-with-lente")!.callback();
+    open.mockRestore();
   });
 
   it("starts without provider requests, registers manual index controls, and closes the worker", async () => {
@@ -15,6 +87,9 @@ describe("V1 plugin composition", () => {
     const directories = new Set<string>();
     const workers: any[] = [];
     const lifecycle: string[] = [];
+    const openVoce = { setSession: vi.fn() };
+    const openFilo = { setRelated: vi.fn() };
+    const openLente = { setSearch: vi.fn() };
     const WorkerStub = vi.fn(() => {
       const listeners = new Set<(event: any) => void>();
       const worker = {
@@ -64,7 +139,12 @@ describe("V1 plugin composition", () => {
       },
       workspace: {
         getActiveFile: () => null,
-        getLeavesOfType: () => [],
+        getLeavesOfType: (type: string) =>
+          ({
+            "trama-voce": [{ view: openVoce }],
+            "trama-filo": [{ view: openFilo }],
+            "trama-lente": [{ view: openLente }],
+          })[type] ?? [],
         on: () => ({ unsubscribe: vi.fn() }),
         trigger: vi.fn(),
       },
@@ -103,6 +183,10 @@ describe("V1 plugin composition", () => {
       await plugin.saveSettings(plugin.getSettings());
       expect(lifecycle).toEqual(["create-1"]);
       expect(workers).toHaveLength(1);
+      await plugin.configureServices(app);
+      expect(openVoce.setSession).toHaveBeenCalledWith(plugin.session);
+      expect(openFilo.setRelated).toHaveBeenCalledWith(plugin.retrieval);
+      expect(openLente.setSearch).toHaveBeenCalledWith(plugin.retrieval.runnable);
       plugin.onunload();
       await vi.waitFor(() =>
         expect(workers[0].postMessage).toHaveBeenCalledWith(
@@ -196,6 +280,57 @@ describe("V1 plugin composition", () => {
     debugInfo.mockRestore();
   });
 
+  it("advises after an external embedding profile change without clearing or rebuilding", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const current = {
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "embed-old" },
+    };
+    const external = {
+      ...current,
+      embedding: { ...current.embedding, modelId: "embed-new" },
+    };
+    plugin.settingsStore.commit(current);
+    plugin.indexedNotes = true;
+    plugin.loadData = vi.fn(async () => external);
+    plugin.app = {};
+    plugin.configureServices = vi.fn(async () => undefined);
+    plugin.settingsTab = { refreshExternalSettings: vi.fn() };
+    plugin.clearIndex = vi.fn();
+    plugin.rebuildIndex = vi.fn();
+
+    await plugin.onExternalSettingsChange();
+
+    expect(plugin.getSettings()).toEqual(external);
+    expect(plugin.settingsTab.refreshExternalSettings).toHaveBeenCalledOnce();
+    expect((Notice as any).instances.at(-1).message).toContain(
+      "Clear the index and embedding cache"
+    );
+    expect(plugin.clearIndex).not.toHaveBeenCalled();
+    expect(plugin.rebuildIndex).not.toHaveBeenCalled();
+  });
+
+  it("does not advise for chat-only external changes", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const current = {
+      ...plugin.getSettings(),
+      embedding: { ...plugin.getSettings().embedding, modelId: "embed-current" },
+    };
+    plugin.settingsStore.commit(current);
+    plugin.indexedNotes = true;
+    plugin.loadData = vi.fn(async () => ({
+      ...current,
+      chat: { ...current.chat, modelId: "chat-new" },
+    }));
+    plugin.app = {};
+    plugin.configureServices = vi.fn(async () => undefined);
+    plugin.settingsTab = { refreshExternalSettings: vi.fn() };
+
+    await plugin.onExternalSettingsChange();
+
+    expect((Notice as any).instances).toHaveLength(0);
+  });
+
   it("logs one bounded indexing completion with the existing result counts", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.settingsStore.commit({ ...plugin.getSettings(), consoleDebug: true });
@@ -248,7 +383,7 @@ describe("V1 plugin composition", () => {
     });
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.hasIndexedNotes = true;
+    plugin.indexedNotes = true;
     plugin.settingsStore.commit({
       ...plugin.getSettings(),
       embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
@@ -294,7 +429,7 @@ describe("V1 plugin composition", () => {
       }),
       close: vi.fn(async () => undefined),
     };
-    plugin.hasIndexedNotes = await plugin.client.call("noteStoreHasNotes", {});
+    plugin.indexedNotes = await plugin.client.call("noteStoreHasNotes", {});
     plugin.manualIndex = {
       update: vi.fn(async () => {
         databaseHasNotes = nextUpdateHasNotes;
@@ -352,7 +487,7 @@ describe("V1 plugin composition", () => {
       call: vi.fn(async () => databaseHasNotes),
       close: vi.fn(async () => undefined),
     };
-    plugin.hasIndexedNotes = false;
+    plugin.indexedNotes = false;
     plugin.manualIndex = {
       update: vi.fn(() =>
         plugin.manualIndex.update.mock.calls.length === 1
@@ -415,13 +550,14 @@ describe("V1 plugin composition", () => {
     let databaseHasNotes = true;
     const client = {
       call: vi.fn(async (method: string, _payload?: unknown) => {
-        if (method === "noteStoreReset") databaseHasNotes = false;
+        if (method === "noteStoreClear") databaseHasNotes = false;
         if (method === "noteStoreHasNotes") return databaseHasNotes;
       }),
       close: vi.fn(async () => undefined),
     };
     const first = new TramaPlugin(undefined as never, undefined as never) as any;
     first.client = client;
+    first.app = { vault: { adapter: { exists: vi.fn(async () => false) } } };
     await first.clearIndex();
     expect(databaseHasNotes).toBe(false);
     expect(first.hasIndexedNotes).toBe(false);
@@ -429,7 +565,7 @@ describe("V1 plugin composition", () => {
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
     const second = new TramaPlugin(undefined as never, undefined as never) as any;
     second.client = client;
-    second.hasIndexedNotes = await client.call("noteStoreHasNotes", {});
+    second.indexedNotes = await client.call("noteStoreHasNotes", {});
     second.manualIndex = { update: vi.fn(), cancel: vi.fn() };
     second.settingsStore.commit({
       ...second.getSettings(),
@@ -447,7 +583,7 @@ describe("V1 plugin composition", () => {
       expect(second.manualIndex.update).not.toHaveBeenCalled();
 
       databaseHasNotes = true;
-      second.hasIndexedNotes = await client.call("noteStoreHasNotes", {});
+      second.indexedNotes = await client.call("noteStoreHasNotes", {});
       second.manualIndex.update.mockImplementationOnce(async () => {
         databaseHasNotes = false;
         return { visited: 1, deleted: 1, numAdded: 0, numUpdated: 0, numSkipped: 0 };
@@ -494,7 +630,7 @@ describe("V1 plugin composition", () => {
       ),
       cancel: vi.fn(),
     };
-    plugin.hasIndexedNotes = true;
+    plugin.indexedNotes = true;
     plugin.settingsStore.commit({
       ...plugin.getSettings(),
       embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
@@ -550,7 +686,7 @@ describe("V1 plugin composition", () => {
       update: vi.fn(() => new Promise((resolve) => (finishFirst = resolve))),
       cancel: vi.fn(),
     };
-    plugin.hasIndexedNotes = true;
+    plugin.indexedNotes = true;
     plugin.settingsStore.commit({
       ...plugin.getSettings(),
       embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
@@ -597,7 +733,7 @@ describe("V1 plugin composition", () => {
       update: vi.fn(() => new Promise((resolve) => (finishFirst = resolve))),
       cancel: vi.fn(),
     };
-    plugin.hasIndexedNotes = true;
+    plugin.indexedNotes = true;
     plugin.settingsStore.commit({
       ...plugin.getSettings(),
       embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
@@ -668,7 +804,7 @@ describe("V1 plugin composition", () => {
         }),
         cancel: vi.fn(() => rejectFirst(new DOMException("Aborted", "AbortError"))),
       };
-      plugin.hasIndexedNotes = true;
+      plugin.indexedNotes = true;
       plugin.settingsStore.commit({
         ...plugin.getSettings(),
         embedding: { ...plugin.getSettings().embedding, modelId: "local-embed" },
@@ -778,23 +914,98 @@ describe("V1 plugin composition", () => {
     }
   });
 
-  it("clears only the local note index and reports the committed status", async () => {
+  it("clears the index and SQLite/shared caches and reports the committed status", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     plugin.status = new IndexStatusController();
     const invalidateRelated = vi.fn();
     const refreshSubmitted = vi.fn();
     plugin.retrieval = { invalidateRelated };
-    plugin.app = { workspace: { getLeavesOfType: () => [{ view: { refreshSubmitted } }] } };
+    plugin.app = {
+      workspace: { getLeavesOfType: () => [{ view: { refreshSubmitted } }] },
+      vault: {
+        adapter: {
+          exists: vi.fn(async () => false),
+          list: vi.fn(async () => ({ folders: [], files: [] })),
+        },
+      },
+    };
     plugin.client = { call: vi.fn(async () => undefined) };
     await plugin.clearIndex();
-    expect(plugin.client.call).toHaveBeenCalledWith("noteStoreReset", {}, expect.any(AbortSignal));
+    expect(plugin.client.call).toHaveBeenCalledWith("noteStoreClear", {}, expect.any(AbortSignal));
     expect(invalidateRelated).toHaveBeenCalledOnce();
     expect(refreshSubmitted).toHaveBeenCalledOnce();
     expect(plugin.status.getStatus()).toMatchObject({
       kind: "index-required",
-      message: "Local index cleared.",
+      message: "Local index and embedding cache cleared.",
     });
     expect(plugin.updateIndex).toBeDefined();
+  });
+
+  it("keeps committed clear status after shared-file cancellation and allows a retry", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = new IndexStatusController();
+    plugin.indexedNotes = true;
+    plugin.app = { vault: { adapter: {} } };
+    plugin.client = { call: vi.fn(async () => undefined) };
+    let cleanupSignal!: AbortSignal;
+    let rejectCleanup!: (error: unknown) => void;
+    const cleanup = vi
+      .spyOn(VaultEmbeddingCache, "clearManagedFiles")
+      .mockImplementationOnce((_adapter, signal) => {
+        cleanupSignal = signal;
+        return new Promise((_resolve, reject) => (rejectCleanup = reject));
+      })
+      .mockResolvedValueOnce(0);
+
+    const first = plugin.clearIndex();
+    await vi.waitFor(() => expect(cleanupSignal).toBeInstanceOf(AbortSignal));
+    plugin.stopIndex();
+    expect(cleanupSignal.aborted).toBe(true);
+    rejectCleanup(new DOMException("Aborted", "AbortError"));
+    await first;
+    expect(plugin.hasIndexedNotes).toBe(false);
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "index-required",
+      message: expect.stringContaining("shared cache cleanup is incomplete"),
+      canCancel: false,
+    });
+
+    await plugin.clearIndex();
+    expect(plugin.client.call).toHaveBeenCalledTimes(2);
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "index-required",
+      message: "Local index and embedding cache cleared.",
+    });
+    cleanup.mockRestore();
+  });
+
+  it("reports shared-file cleanup failure after SQL commit and retries safely", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.status = new IndexStatusController();
+    plugin.indexedNotes = true;
+    plugin.app = { vault: { adapter: {} } };
+    plugin.client = { call: vi.fn(async () => undefined) };
+    const cleanup = vi
+      .spyOn(VaultEmbeddingCache, "clearManagedFiles")
+      .mockRejectedValueOnce(new Error("vault is read-only"))
+      .mockResolvedValueOnce(0);
+
+    await plugin.clearIndex();
+    expect(plugin.hasIndexedNotes).toBe(false);
+    expect(plugin.status.getStatus()).toMatchObject({
+      kind: "index-required",
+      message: expect.stringContaining("shared cache cleanup is incomplete"),
+      canIndex: false,
+    });
+    expect((Notice as any).instances.at(-1).message).toContain(
+      "Local index and SQLite cache cleared; shared cache cleanup is incomplete. Retry Clear to finish. vault is read-only"
+    );
+    await plugin.clearIndex();
+    expect(plugin.client.call).toHaveBeenCalledTimes(2);
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(plugin.status.getStatus().message).toBe("Local index and embedding cache cleared.");
+    cleanup.mockRestore();
   });
 
   it("stops a running clear without claiming success and excludes other index actions", async () => {

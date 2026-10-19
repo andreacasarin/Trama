@@ -17,6 +17,9 @@ type SharedShardCache = Pick<
 >;
 
 const ROOT = "Trama/embedding-cache-v2";
+const PROFILE_FOLDER = /^[0-9a-f]{64}$/;
+const MANAGED_ARTIFACT =
+  /^(?:[0-9a-f]{64}\.sqlite3|\.tmp-[0-9a-f]{64}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 
 export class VaultEmbeddingCache {
   private readonly folder: string;
@@ -31,6 +34,35 @@ export class VaultEmbeddingCache {
     private readonly consoleDebug?: ConsoleDebug
   ) {
     this.folder = `${ROOT}/${cache.profileFingerprint}`;
+  }
+
+  static async clearManagedFiles(
+    adapter: Pick<DataAdapter, "exists" | "list" | "remove">,
+    signal: AbortSignal
+  ): Promise<number> {
+    checkAbort(signal);
+    const rootExists = await adapter.exists(ROOT);
+    checkAbort(signal);
+    if (!rootExists) return 0;
+    const { folders } = await adapter.list(ROOT);
+    checkAbort(signal);
+    let removed = 0;
+    for (const folder of folders) {
+      checkAbort(signal);
+      const profile = folder.slice(folder.lastIndexOf("/") + 1);
+      if (!PROFILE_FOLDER.test(profile) || folder !== `${ROOT}/${profile}`) continue;
+      const { files } = await adapter.list(folder);
+      checkAbort(signal);
+      for (const path of files) {
+        checkAbort(signal);
+        const name = path.slice(path.lastIndexOf("/") + 1);
+        if (path !== `${folder}/${name}` || !MANAGED_ARTIFACT.test(name)) continue;
+        await adapter.remove(path);
+        checkAbort(signal);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   async importAvailable(signal: AbortSignal): Promise<void> {

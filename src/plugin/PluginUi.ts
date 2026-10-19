@@ -19,9 +19,9 @@ export async function loadPluginUi() {
 }
 
 export interface PluginUiDependencies {
-  readonly session: ChatSession;
+  readonly session: () => ChatSession;
   readonly status: IndexStatusController;
-  readonly retrieval: VaultRetrieval;
+  readonly retrieval: () => VaultRetrieval;
   readonly noteCatalog: () => readonly string[];
   readonly currentNote: () => readonly string[];
   readonly consoleDebug: ConsoleDebug;
@@ -44,7 +44,7 @@ export function registerPluginUi(
     (leaf) =>
       new ui.VoceView(
         leaf,
-        dependencies.session,
+        dependencies.session(),
         dependencies.noteCatalog,
         dependencies.currentNote,
         undefined,
@@ -54,11 +54,11 @@ export function registerPluginUi(
   );
   plugin.registerView(
     ui.FILO_VIEW_TYPE,
-    (leaf) => new ui.FiloView(leaf, dependencies.status, dependencies.retrieval)
+    (leaf) => new ui.FiloView(leaf, dependencies.status, dependencies.retrieval())
   );
   plugin.registerView(
     ui.LENTE_VIEW_TYPE,
-    (leaf) => new ui.LenteView(leaf, dependencies.retrieval.runnable, dependencies.consoleDebug)
+    (leaf) => new ui.LenteView(leaf, dependencies.retrieval().runnable, dependencies.consoleDebug)
   );
   for (const [id, name, icon, type] of [
     ["open-voce", "Open Voce", TRAMA_ICONS.voce, ui.VOCE_VIEW_TYPE],
@@ -76,7 +76,11 @@ export function registerPluginUi(
     name: "Search with Lente",
     icon: TRAMA_ICONS.lente,
     callback: () =>
-      new LenteSearchModal(app, dependencies.retrieval.runnable, dependencies.consoleDebug).open(),
+      new LenteSearchModal(
+        app,
+        dependencies.retrieval().runnable,
+        dependencies.consoleDebug
+      ).open(),
   });
   plugin.addCommand({
     id: "trama-update-index",
@@ -95,7 +99,7 @@ export function registerPluginUi(
   });
   plugin.addCommand({
     id: "trama-clear-index",
-    name: "Clear local index",
+    name: "Clear index and embedding cache",
     callback: () => void plugin.clearIndex(),
   });
   return settingsTab;

@@ -36,7 +36,7 @@ export class TramaPlugin extends Plugin {
   private readonly sqliteRuntime = new NoteSqliteRuntime(() => this.manifest);
   private lifecycle = Promise.resolve();
   private disposed = false;
-  private hasIndexedNotes = false;
+  private indexedNotes = false;
   private automaticReady = false;
   private automaticPending = false;
   private automaticTimer?: ReturnType<typeof setTimeout>;
@@ -92,9 +92,9 @@ export class TramaPlugin extends Plugin {
         if (this.disposed) return;
         this.ui = ui;
         this.settingsTab = registerPluginUi(this, app, ui, {
-          session: this.session!,
+          session: () => this.session!,
           status: this.status!,
-          retrieval: this.retrieval!,
+          retrieval: () => this.retrieval!,
           noteCatalog: this.catalog,
           currentNote: () => (this.activeNote ? [this.activeNote] : []),
           consoleDebug: this.consoleDebug,
@@ -145,7 +145,7 @@ export class TramaPlugin extends Plugin {
       return;
     }
     this.client = candidate;
-    this.hasIndexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
+    this.indexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
     const policy = new EndpointPolicy({ approvals: settings.approvedOrigins });
     const profile = {
       endpoint: settings.embedding.endpoint,
@@ -247,6 +247,13 @@ export class TramaPlugin extends Plugin {
   getSettings(): TramaSettings {
     return this.settingsStore.get() ?? DEFAULT_SETTINGS;
   }
+  get hasIndexedNotes(): boolean {
+    return this.indexedNotes;
+  }
+
+  get hasIndexedOrActiveIndex(): boolean {
+    return this.indexedNotes || Boolean(this.indexRun);
+  }
   async saveSettings(
     update: TramaSettings | ((current: TramaSettings) => TramaSettings)
   ): Promise<void> {
@@ -282,12 +289,22 @@ export class TramaPlugin extends Plugin {
       const previous = this.getSettings();
       this.settingsStore.load(await this.loadData());
       const current = this.getSettings();
+      const previousProfile = effectiveEmbeddingProfile(previous);
+      const currentProfile = effectiveEmbeddingProfile(current);
+      const embeddingProfileChanged =
+        previousProfile !== undefined &&
+        currentProfile !== undefined &&
+        previousProfile !== currentProfile;
       const runtimeChanged =
         JSON.stringify(previous.chat) !== JSON.stringify(current.chat) ||
         JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding) ||
         JSON.stringify(previous.approvedOrigins) !== JSON.stringify(current.approvedOrigins);
       if (runtimeChanged && this.app) await this.configureServices(this.app as any);
       this.settingsTab?.refreshExternalSettings();
+      if (embeddingProfileChanged && this.indexedNotes)
+        new Notice(
+          "Embedding settings changed from sync. Clear the index and embedding cache, then run Update or Rebuild. No data was deleted."
+        );
     }).catch((error) => {
       this.consoleDebug.error("External settings reload failed", error);
       throw error;
@@ -341,45 +358,79 @@ export class TramaPlugin extends Plugin {
     const finishLog = this.consoleDebug.start("Index clear");
     const run = { client, controller, promise: Promise.resolve() };
     this.clearRun = run;
-    const operation = client
-      .call("noteStoreReset", {}, controller.signal)
-      .then(() => {
+    let committed = false;
+    const operation = (async () => {
+      try {
+        await client.call("noteStoreClear", {}, controller.signal);
         if (this.clearRun !== run || this.disposed) return;
-        finishLog("completed");
+        committed = true;
         this.retrieval?.invalidateRelated();
-        this.hasIndexedNotes = false;
+        this.indexedNotes = false;
         this.status?.setStatus({
           kind: "index-required",
-          message: "Local index cleared.",
+          message: "Local index and local embedding cache cleared.",
+          canIndex: false,
+          canReindex: false,
+          canCancel: true,
+        });
+        this.refreshLenteResults();
+        this.refreshVoceSuggestions();
+        this.operationNotice?.setMessage("Clearing shared embedding cache files…");
+        const adapter = (this.app as any)?.vault?.adapter;
+        if (!adapter) throw new Error("Vault storage is unavailable for shared cache cleanup.");
+        await VaultEmbeddingCache.clearManagedFiles(adapter, controller.signal);
+        if (this.clearRun !== run || this.disposed) return;
+        finishLog("completed");
+        this.status?.setStatus({
+          kind: "index-required",
+          message: "Local index and embedding cache cleared.",
           canIndex: true,
           canReindex: true,
           canCancel: false,
         });
-        this.refreshLenteResults();
-        this.refreshVoceSuggestions();
-        this.finishOperationNotice("Local index cleared.");
-      })
-      .catch((error: unknown) => {
+        this.finishOperationNotice("Local index and embedding cache cleared.");
+      } catch (error: unknown) {
         if (this.clearRun !== run || this.disposed) return;
-        if (previousStatus) this.status?.setStatus(previousStatus);
         const cancelled = error instanceof DOMException && error.name === "AbortError";
+        if (committed) {
+          this.status?.setStatus({
+            kind: "index-required",
+            message:
+              "Local index and SQLite cache cleared; shared cache cleanup is incomplete. Retry Clear to finish.",
+            canIndex: false,
+            canReindex: false,
+            canCancel: false,
+          });
+        } else if (previousStatus) {
+          this.status?.setStatus(previousStatus);
+        }
         finishLog(
-          cancelled ? "cancelled" : "failed",
+          committed
+            ? cancelled
+              ? "cancelled-after-local-clear"
+              : "shared-cache-cleanup-failed"
+            : cancelled
+              ? "cancelled"
+              : "failed",
           undefined,
           cancelled ? undefined : error,
           cancelled ? "info" : "error"
         );
         const message = cancelled
-          ? "Index clear stopped."
-          : error instanceof Error
-            ? error.message
-            : "Could not clear the local index.";
+          ? committed
+            ? "Local index and SQLite cache cleared; shared cache cleanup stopped. Retry Clear to finish."
+            : "Index clear stopped."
+          : committed
+            ? `Local index and SQLite cache cleared; shared cache cleanup is incomplete. Retry Clear to finish. ${error instanceof Error ? error.message : "Could not remove shared cache files."}`
+            : error instanceof Error
+              ? error.message
+              : "Could not clear the local index.";
         this.finishOperationNotice(message);
-      })
-      .finally(() => {
-        if (this.clearRun === run) this.clearRun = undefined;
-        this.automaticPending = false;
-      });
+      }
+    })().finally(() => {
+      if (this.clearRun === run) this.clearRun = undefined;
+      this.automaticPending = false;
+    });
     run.promise = operation;
     return operation;
   }
@@ -447,7 +498,7 @@ export class TramaPlugin extends Plugin {
     const completion = operation
       .then(async (result) => {
         if (this.indexRun !== run || this.manualIndex !== manualIndex) return;
-        this.hasIndexedNotes = Boolean(await this.client?.call("noteStoreHasNotes", {}));
+        this.indexedNotes = Boolean(await this.client?.call("noteStoreHasNotes", {}));
         completed = result.sharing === "complete";
         finishLog(result.sharing === "complete" ? "completed" : result.sharing, {
           visited: result.visited,
@@ -509,7 +560,7 @@ export class TramaPlugin extends Plugin {
         if (this.indexRun === run) this.indexRun = undefined;
         if (completed && this.automaticPending) {
           this.automaticPending = false;
-          if (this.hasIndexedNotes && !this.disposed) void this.runIndex(false, true);
+          if (this.indexedNotes && !this.disposed) void this.runIndex(false, true);
         } else this.automaticPending = false;
       });
     run.promise = completion;
@@ -532,7 +583,7 @@ export class TramaPlugin extends Plugin {
         if (vaultEvent) this.automaticPending = true;
         return;
       }
-      if (!this.hasIndexedNotes) return;
+      if (!this.indexedNotes) return;
       void this.runIndex(false, true);
     };
     const changed = (file: any) => {
@@ -617,6 +668,18 @@ export class TramaPlugin extends Plugin {
       () => undefined
     );
     return result;
+  }
+}
+
+function effectiveEmbeddingProfile(settings: TramaSettings): string | undefined {
+  if (!settings.embedding.modelId.trim()) return undefined;
+  try {
+    const endpoint = new EndpointPolicy({ approvals: settings.approvedOrigins }).normalize(
+      settings.embedding.endpoint
+    );
+    return noteEmbeddingProfile({ ...settings.embedding, endpoint });
+  } catch {
+    return undefined;
   }
 }
 

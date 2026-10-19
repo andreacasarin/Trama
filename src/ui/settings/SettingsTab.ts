@@ -1,4 +1,5 @@
-import { Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import { EndpointPolicy, type EndpointApproval } from "@/security/EndpointPolicy";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -34,6 +35,8 @@ export class TramaSettingsTab extends PluginSettingTab {
   };
   private readonly resetModelOptions: Partial<Record<"chat" | "embedding", () => void>> = {};
   private displayGeneration = 0;
+  private textGeneration = 0;
+  private settingsGeneration = 0;
   private readonly discoveryGeneration: Record<"chat" | "embedding", number> = {
     chat: 0,
     embedding: 0,
@@ -47,6 +50,8 @@ export class TramaSettingsTab extends PluginSettingTab {
       updateIndex(): Promise<void>;
       rebuildIndex(): Promise<void>;
       stopIndex(): void;
+      readonly hasIndexedNotes: boolean;
+      readonly hasIndexedOrActiveIndex: boolean;
       discoverModels(
         target: "chat" | "embedding",
         endpoint?: string,
@@ -60,6 +65,7 @@ export class TramaSettingsTab extends PluginSettingTab {
 
   display(): void {
     const displayGeneration = ++this.displayGeneration;
+    this.textGeneration++;
     const { containerEl } = this;
     containerEl.empty();
     this.flushText.length = 0;
@@ -228,10 +234,12 @@ export class TramaSettingsTab extends PluginSettingTab {
       .setDesc("Stop an active Update, Rebuild, or Clear operation.")
       .addButton((button) => button.setButtonText("Stop").onClick(() => this.plugin.stopIndex()));
     new Setting(containerEl)
-      .setName("Clear local index")
-      .setDesc("Remove indexed notes and vectors. Vault notes and embedding caches are kept.")
+      .setName("Clear index and embedding cache")
+      .setDesc(
+        "Remove the local index, SQLite embedding cache, and managed shared embedding cache files."
+      )
       .addButton((button) =>
-        button.setButtonText("Clear").onClick(() => void this.plugin.clearIndex())
+        button.setButtonText("Clear index and cache").onClick(() => void this.plugin.clearIndex())
       );
     new Setting(containerEl)
       .setName("Console debugging")
@@ -254,13 +262,17 @@ export class TramaSettingsTab extends PluginSettingTab {
 
   hide(): void {
     this.displayGeneration++;
+    this.discoveryGeneration.chat++;
+    this.discoveryGeneration.embedding++;
     void (async () => {
-      for (const commit of this.flushText) await commit();
+      for (const commit of [...this.flushText]) await commit();
     })();
   }
 
   refreshExternalSettings(): void {
     this.displayGeneration++;
+    this.textGeneration++;
+    this.settingsGeneration++;
     this.discoveryGeneration.chat++;
     this.discoveryGeneration.embedding++;
     this.draft = undefined;
@@ -286,7 +298,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     const setting = new Setting(this.containerEl).setName(name);
     if (description) setting.setDesc(description);
     setting.addText((input) => {
-      const generation = this.displayGeneration;
+      const generation = this.textGeneration;
       input.setValue(this.pendingText.get(key) ?? draftValue).onChange((raw) => {
         this.pendingText.set(key, raw);
         updateDraft(raw);
@@ -312,9 +324,10 @@ export class TramaSettingsTab extends PluginSettingTab {
             this.pendingText.delete(key);
             return;
           }
-          if (this.displayGeneration !== generation) return;
+          if (this.textGeneration !== generation) return;
           try {
-            await save(parsed.value);
+            const saved = await save(parsed.value);
+            if (saved === undefined) return;
             this.pendingText.delete(key);
           } catch (error) {
             new Notice(error instanceof Error ? error.message : `${name} could not be saved.`);
@@ -527,9 +540,73 @@ export class TramaSettingsTab extends PluginSettingTab {
     this.renderOrigins(settings);
   }
 
-  private async persist(update: (current: TramaSettings) => TramaSettings): Promise<TramaSettings> {
+  private async persist(
+    update: (current: TramaSettings) => TramaSettings
+  ): Promise<TramaSettings | undefined> {
+    const current = this.plugin.getSettings();
+    const next = update(current);
+    const currentProfile = effectiveEmbeddingProfile(current);
+    const nextProfile = effectiveEmbeddingProfile(next);
+    const requiresConfirmation =
+      this.plugin.hasIndexedOrActiveIndex &&
+      currentProfile !== undefined &&
+      nextProfile !== undefined &&
+      currentProfile !== nextProfile;
+    const settingsGeneration = this.settingsGeneration;
+    const formGeneration = this.displayGeneration;
+    if (requiresConfirmation && !(await this.confirmEmbeddingChange())) return undefined;
+    if (
+      requiresConfirmation &&
+      (this.settingsGeneration !== settingsGeneration ||
+        this.displayGeneration !== formGeneration ||
+        effectiveEmbeddingProfile(this.plugin.getSettings()) !== currentProfile)
+    )
+      return undefined;
     await this.plugin.saveSettings(update);
-    return this.plugin.getSettings();
+    const saved = this.plugin.getSettings();
+    if (requiresConfirmation)
+      new Notice(
+        "Embedding settings changed. Clear the index and embedding cache, then run Update or Rebuild. The index and caches remain until you choose Clear."
+      );
+    return saved;
+  }
+
+  private confirmEmbeddingChange(): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (save: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(save);
+      };
+      const modal = new (class extends Modal {
+        override onClose(): void {
+          settle(false);
+        }
+      })(this.app);
+      modal.setTitle("Clear index and embedding cache after saving?");
+      modal.contentEl.createEl("p", {
+        text: "Changing embedding settings can leave indexed results out of date. Save changes, then choose Clear index and embedding cache and run Update or Rebuild. Existing notes and caches remain until you choose Clear.",
+      });
+      new Setting(modal.contentEl)
+        .setName("Embedding settings change")
+        .addButton((button) =>
+          button.setButtonText("Cancel").onClick(() => {
+            modal.close();
+            settle(false);
+          })
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Save changes")
+            .setCta()
+            .onClick(() => {
+              settle(true);
+              modal.close();
+            })
+        );
+      modal.open();
+    });
   }
 
   private async persistDiscrete(
@@ -541,6 +618,18 @@ export class TramaSettingsTab extends PluginSettingTab {
       new Notice(error instanceof Error ? error.message : "Settings could not be saved.");
       return undefined;
     }
+  }
+}
+
+function effectiveEmbeddingProfile(settings: TramaSettings): string | undefined {
+  if (!settings.embedding.modelId.trim()) return undefined;
+  try {
+    const endpoint = new EndpointPolicy({ approvals: settings.approvedOrigins }).normalize(
+      settings.embedding.endpoint
+    );
+    return noteEmbeddingProfile({ ...settings.embedding, endpoint });
+  } catch {
+    return undefined;
   }
 }
 

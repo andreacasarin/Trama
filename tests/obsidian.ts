@@ -43,6 +43,28 @@ export class PluginSettingTab {
   ) {}
 }
 
+export class Modal {
+  static instances: Modal[] = [];
+  readonly contentEl = new SettingsElement() as unknown as HTMLElement;
+  title = "";
+  opened = false;
+  constructor(public app: unknown) {
+    Modal.instances.push(this);
+  }
+  setTitle(value: string): this {
+    this.title = value;
+    return this;
+  }
+  open(): void {
+    this.opened = true;
+  }
+  onClose(): void {}
+  close(): void {
+    this.opened = false;
+    this.onClose();
+  }
+}
+
 export class WorkspaceLeaf {
   constructor(public app?: unknown) {}
 }
@@ -291,7 +313,10 @@ export class ButtonComponent {
 }
 
 export class Notice {
-  constructor(public message: string) {}
+  static instances: Notice[] = [];
+  constructor(public message: string) {
+    Notice.instances.push(this);
+  }
   setMessage(message: string): this {
     this.message = message;
     return this;

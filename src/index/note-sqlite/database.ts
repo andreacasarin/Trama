@@ -264,6 +264,32 @@ export class NoteSqliteDatabase {
           throw error;
         }
       }
+      case "noteStoreClear": {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          checkAbort(signal);
+          this.db.exec("DELETE FROM note_fts");
+          await yieldSqlite(signal);
+          this.db.exec("DELETE FROM note_records");
+          this.db.exec("UPDATE note_record_clock SET value=0 WHERE id=1");
+          await yieldSqlite(signal);
+          this.db.exec("DELETE FROM note_index");
+          await yieldSqlite(signal);
+          this.db.exec("DELETE FROM embedding_cache");
+          this.db.exec("DELETE FROM embedding_cache_sqlite_imports");
+          this.db.exec("DELETE FROM embedding_cache_sqlite_publications");
+          await yieldSqlite(signal);
+          this.db.exec("COMMIT");
+          return undefined;
+        } catch (error) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {
+            /* preserve original error */
+          }
+          throw error;
+        }
+      }
       case "noteStoreHasNotes":
         return Boolean(
           rows(this.db, "SELECT EXISTS(SELECT 1 FROM note_index LIMIT 1) AS present")[0]?.present

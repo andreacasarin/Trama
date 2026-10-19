@@ -98,6 +98,7 @@ export interface NoteStoreRpc {
   };
   noteStoreDelete: { readonly uids: readonly string[] };
   noteStoreReset: Record<string, never>;
+  noteStoreClear: Record<string, never>;
   noteStoreHasNotes: Record<string, never>;
   recordManagerGetTime: Record<string, never>;
   recordManagerUpdate: {
