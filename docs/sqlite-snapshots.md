@@ -1,6 +1,6 @@
 # Shared embedding cache shards
 
-> **Historical design:** This document records a retired shared-cache design. V1 has no shared cache or publication path. See [the current implementation](langchain-sqlite-implementation.md) for approved behavior.
+> **Historical design:** This document records the retired pre-rewrite shared-cache design. The current document-only SQLite cache and publication path is defined in the [cache ADR](../.ai/adrs/embedding-cache-sharing-and-clear.md); see the [implementation reference](langchain-sqlite-implementation.md) for component locations. The lifecycle and retrieval rules below are historical.
 
 Each vault maintains its own local lexical index and semantic note heads. Shared
 files carry reusable computed vectors only; they do not carry FTS data, note heads,
