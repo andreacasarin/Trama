@@ -1,5 +1,3 @@
-import { EndpointPolicy, type EndpointApproval } from "@/security/EndpointPolicy";
-
 export interface ChatSettings {
   readonly endpoint: string;
   readonly modelId: string;
@@ -16,7 +14,6 @@ export interface TramaSettings {
   readonly consoleDebug: boolean;
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
-  readonly approvedOrigins: readonly EndpointApproval[];
   readonly excludedFolders: readonly string[];
 }
 
@@ -24,7 +21,6 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   consoleDebug: false,
   chat: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", temperature: 0.2 }),
   embedding: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", dimensions: 768 }),
-  approvedOrigins: Object.freeze([]),
   excludedFolders: Object.freeze([]),
 });
 
@@ -50,13 +46,13 @@ export class SettingsStore {
   load(value: unknown): TramaSettings {
     if (!value || typeof value !== "object") return (this.value = DEFAULT_SETTINGS);
     const data = value as Record<string, any>;
-    const approvals = Array.isArray(data.approvedOrigins) ? data.approvedOrigins : [];
-    const policy = new EndpointPolicy({ approvals: approvals.filter(isApproval) });
     const chat = data.chat && typeof data.chat === "object" ? data.chat : {};
     const embedding = data.embedding && typeof data.embedding === "object" ? data.embedding : {};
     const endpoint = (raw: unknown, fallback: string) => {
+      if (typeof raw !== "string" || !raw.trim()) return fallback;
       try {
-        return policy.normalize(typeof raw === "string" ? raw : fallback);
+        new URL(raw.trim());
+        return raw.trim();
       } catch {
         return fallback;
       }
@@ -85,13 +81,6 @@ export class SettingsStore {
             ? embedding.dimensions
             : DEFAULT_SETTINGS.embedding.dimensions,
       },
-      approvedOrigins: approvals
-        .filter(isApproval)
-        .map(({ scheme, host, port }: EndpointApproval) => ({
-          scheme,
-          host: host.toLowerCase(),
-          port,
-        })),
       excludedFolders: normalizeExcludedFolders(data.excludedFolders),
     };
     return (this.value = Object.freeze(settings));
@@ -121,15 +110,4 @@ export function normalizeExcludedFolders(value: unknown): string[] {
       })
     ),
   ].sort((left, right) => left.localeCompare(right));
-}
-
-function isApproval(value: unknown): value is EndpointApproval {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<EndpointApproval>;
-  return (
-    (item.scheme === "http" || item.scheme === "https") &&
-    typeof item.host === "string" &&
-    Number.isSafeInteger(item.port) &&
-    Number(item.port) > 0
-  );
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { sha256 } from "@langchain/core/utils/hash";
 import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
+import { embeddingEndpointFingerprint } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import type { SqliteConnection } from "@/index/note-sqlite/protocol";
 import { loadTestSqlite } from "./note-sqlite-test-client";
@@ -278,6 +279,47 @@ describe("SQLite embedding cache", () => {
     }
   });
 
+  it("separates cached vectors for endpoint query variants without storing query text", async () => {
+    const f = await fixture();
+    try {
+      const endpointA = "https://user:secret@embed.example.com/v1?tenant=alpha#one";
+      const endpointB = "https://user:secret@embed.example.com/v1?tenant=beta#one";
+      const firstProvider = new CountingEmbeddings();
+      const secondProvider = new CountingEmbeddings();
+      const identity = (endpoint: string) =>
+        embeddingCacheIdentity("same-model", 2, embeddingEndpointFingerprint(endpoint));
+      const first = new SqliteEmbeddingCache(
+        firstProvider,
+        f.database.call.bind(f.database),
+        identity(endpointA),
+        2
+      );
+      const second = new SqliteEmbeddingCache(
+        secondProvider,
+        f.database.call.bind(f.database),
+        identity(endpointB),
+        2
+      );
+
+      await first.embedDocuments(["same document"]);
+      await second.embedDocuments(["same document"]);
+      await first.embedQuery("same query");
+      await second.embedQuery("same query");
+
+      expect(firstProvider.documentCalls).toEqual([["same document"]]);
+      expect(secondProvider.documentCalls).toEqual([["same document"]]);
+      expect(firstProvider.queryCalls).toEqual(["same query"]);
+      expect(secondProvider.queryCalls).toEqual(["same query"]);
+      const stored = JSON.stringify(queryRows(f.db, "SELECT profile FROM embedding_cache"));
+      expect(stored).not.toContain("secret");
+      expect(stored).not.toContain("tenant=");
+      expect(stored).not.toContain("#one");
+      expect(stored).not.toContain("same document");
+    } finally {
+      f.db.close();
+    }
+  });
+
   it("separates exact inputs and embedding profiles", async () => {
     const f = await fixture();
     try {
@@ -321,19 +363,6 @@ describe("SQLite embedding cache", () => {
   it("canonicalizes the shared cache identity from trimmed model and dimensions only", () => {
     expect(embeddingCacheIdentity("  local-model  ", 768)).toBe(
       JSON.stringify({ modelId: "local-model", dimensions: 768 })
-    );
-    const endpointA = {
-      endpoint: "http://127.0.0.1:1234/v1",
-      modelId: "local-model",
-      dimensions: 768,
-    };
-    const endpointB = {
-      endpoint: "http://127.0.0.1:4321/v1",
-      modelId: "local-model",
-      dimensions: 768,
-    };
-    expect(embeddingCacheIdentity(endpointA.modelId, endpointA.dimensions)).toBe(
-      embeddingCacheIdentity(endpointB.modelId, endpointB.dimensions)
     );
   });
 

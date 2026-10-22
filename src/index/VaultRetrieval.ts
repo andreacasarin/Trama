@@ -13,6 +13,7 @@ import type {
 export interface VaultRetrievalInput {
   readonly query: string;
   readonly mode: "hybrid" | "lexical";
+  readonly limit?: number;
 }
 
 export interface VaultRetrievalStatus {
@@ -198,12 +199,12 @@ export class VaultRetrieval {
         {
           query,
           ...(vector && this.profile ? { vector, profile: this.profile } : {}),
-          k: 20,
+          k: Math.max(20, input.limit ?? 10),
         },
         signal
       )) as NoteStoreHybridResult;
       if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
-      const documents = await this.hydrate(result.hits, signal);
+      const documents = await this.hydrate(result.hits, signal, input.limit);
       const degraded = Boolean(degradationReason) || result.degraded;
       finish?.("completed", { resultCount: documents.length, degraded });
       return {
@@ -227,10 +228,12 @@ export class VaultRetrieval {
       readonly lexicalScore?: number;
       readonly semanticScore?: number;
     }[],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    limit?: number
   ): Promise<Document[]> {
     const documents: Document[] = [];
     for (const hit of hits) {
+      if (limit !== undefined && documents.length >= limit) break;
       checkAbort(signal);
       const note = await this.readNote(hit.path, signal);
       if (!note) continue;

@@ -4,15 +4,13 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import OpenAI from "openai";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { StructuredError } from "@/domain/errors";
-import { EndpointPolicy } from "@/security/EndpointPolicy";
 import { normalizeReasoningEffort, type ChatSettings } from "@/settings/Settings";
 
 export function createLocalChatModel(
   settings: ChatSettings,
-  policy = new EndpointPolicy(),
   fetcher: typeof fetch = globalThis.fetch
 ): BaseChatModel {
-  const baseURL = policy.normalize(settings.endpoint);
+  const baseURL = settings.endpoint.trim();
   const reasoningEffort = normalizeReasoningEffort(settings.reasoningEffort);
   return new ChatOpenAI({
     model: settings.modelId || "local-model-not-configured",
@@ -29,23 +27,22 @@ export function createLocalChatModel(
     },
     configuration: {
       baseURL,
-      fetch: guardedFetch(baseURL, fetcher),
+      fetch: fetcher,
     },
   });
 }
 
 export async function discoverLocalModels(
   endpoint: string,
-  policy = new EndpointPolicy(),
   fetcher: typeof fetch = globalThis.fetch
 ): Promise<readonly string[]> {
-  const baseURL = policy.normalize(endpoint);
+  const baseURL = endpoint.trim();
   const client = new OpenAI({
     apiKey: "local-endpoint",
     baseURL,
     maxRetries: 0,
     dangerouslyAllowBrowser: true,
-    fetch: guardedFetch(baseURL, fetcher),
+    fetch: fetcher,
   });
   const result = await client.models.list();
   return result.data.map(({ id }) => id);
@@ -64,7 +61,6 @@ export interface LocalEmbeddingOptions {
   readonly endpoint: string;
   readonly modelId: string;
   readonly dimensions: number;
-  readonly policy?: EndpointPolicy;
   readonly fetcher?: typeof fetch;
 }
 
@@ -87,7 +83,7 @@ class GuardedOpenAIEmbeddings extends OpenAIEmbeddings {
       apiKey: "local-endpoint",
       configuration: {
         baseURL,
-        fetch: guardedFetch(baseURL, fetcher, signal),
+        fetch: signalFetch(fetcher, signal),
       },
     });
     this.expectedDimensions = options.dimensions;
@@ -101,15 +97,14 @@ class GuardedOpenAIEmbeddings extends OpenAIEmbeddings {
       response = await super.embeddingWithRetry(request);
     } catch (error) {
       const guarded = structuredCause(error);
-      if (guarded && (guarded.code === "cancelled" || guarded.code === "invalid_request"))
-        throw guarded;
+      if (guarded?.code === "cancelled") throw guarded;
       if (error instanceof DOMException && error.name === "AbortError")
         throw new StructuredError("cancelled", "The request was cancelled.", false);
-      throw new EmbeddingProviderError("The local embedding request failed.", error);
+      throw new EmbeddingProviderError("The embedding provider request failed.", error);
     }
     const inputCount = Array.isArray(request.input) ? request.input.length : 1;
     if (!Array.isArray(response.data) || response.data.length !== inputCount)
-      throw new EmbeddingProviderError("The local model returned an incomplete embedding batch.");
+      throw new EmbeddingProviderError("The embedding provider returned an incomplete batch.");
     const ordered = new Array<(typeof response.data)[number]>(inputCount);
     for (const item of response.data) {
       if (
@@ -118,12 +113,12 @@ class GuardedOpenAIEmbeddings extends OpenAIEmbeddings {
         item.index >= inputCount ||
         ordered[item.index]
       )
-        throw new EmbeddingProviderError("The local model returned invalid embedding indexes.");
+        throw new EmbeddingProviderError("The embedding provider returned invalid indexes.");
       if (
         item.embedding.length !== this.expectedDimensions ||
         item.embedding.some((value) => !Number.isFinite(value))
       )
-        throw new EmbeddingProviderError("The local model returned an invalid embedding vector.");
+        throw new EmbeddingProviderError("The embedding provider returned an invalid vector.");
       ordered[item.index] = item;
     }
     return { ...response, data: ordered };
@@ -154,8 +149,7 @@ export function createLocalEmbeddings(options: LocalEmbeddingOptions): Embedding
       "A model ID and positive embedding dimensions are required.",
       false
     );
-  const policy = options.policy ?? new EndpointPolicy();
-  const baseURL = policy.normalize(options.endpoint);
+  const baseURL = options.endpoint.trim();
   const fetcher = (options.fetcher ?? globalThis.fetch).bind(globalThis);
   const make = (signal?: AbortSignal) =>
     new GuardedOpenAIEmbeddings(options, baseURL, signal, fetcher);
@@ -166,45 +160,27 @@ export function createLocalEmbeddings(options: LocalEmbeddingOptions): Embedding
   return embeddings;
 }
 
-function guardedFetch(
-  baseURL: string,
-  fetcher: typeof fetch,
-  scopedSignal?: AbortSignal
-): typeof fetch {
-  const base = new URL(baseURL);
+function signalFetch(fetcher: typeof fetch, scopedSignal?: AbortSignal): typeof fetch {
   return async (input, init = {}) => {
-    const url = new URL(input instanceof Request ? input.url : String(input), base);
-    if (
-      url.origin !== base.origin ||
-      (url.pathname !== "/v1" && !url.pathname.startsWith("/v1/")) ||
-      url.username ||
-      url.password ||
-      url.hash
-    )
-      throw new StructuredError("invalid_request", "Request escaped the approved endpoint.", false);
     const requestSignal = input instanceof Request ? input.signal : undefined;
     const signals = [init.signal, requestSignal, scopedSignal].filter(
       (signal): signal is AbortSignal => signal !== undefined
     );
     const signal = signals.length ? AbortSignal.any(signals) : undefined;
     try {
-      const response = await fetcher(url, {
+      const response = await fetcher(input, {
         ...init,
-        redirect: "error",
         ...(signal ? { signal } : {}),
       });
-      if (response.redirected || (response.status >= 300 && response.status < 400))
-        throw new StructuredError(
-          "invalid_request",
-          "Redirects are not allowed for local model requests.",
-          false
-        );
       return response;
     } catch (error) {
       if (error instanceof StructuredError) throw error;
       if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError"))
         throw new StructuredError("cancelled", "The request was cancelled.", false);
-      throw new EmbeddingProviderError("The local embedding endpoint could not be reached.", error);
+      throw new EmbeddingProviderError(
+        "The configured embedding endpoint could not be reached.",
+        error
+      );
     }
   };
 }

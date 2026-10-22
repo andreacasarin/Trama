@@ -5,8 +5,16 @@ import { sha256 } from "@langchain/core/utils/hash";
 import { BaseStore } from "@langchain/core/stores";
 import type { NoteStoreCall, SqliteEmbeddingShard } from "./note-sqlite/protocol";
 
-export function embeddingCacheIdentity(modelId: string, dimensions: number): string {
-  return JSON.stringify({ modelId: modelId.trim(), dimensions });
+export function embeddingCacheIdentity(
+  modelId: string,
+  dimensions: number,
+  endpointFingerprint?: string
+): string {
+  return JSON.stringify({
+    modelId: modelId.trim(),
+    dimensions,
+    ...(endpointFingerprint ? { endpointFingerprint } : {}),
+  });
 }
 
 type ScopedEmbeddings = EmbeddingsInterface<number[]> & {

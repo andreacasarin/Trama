@@ -24,7 +24,7 @@ export interface ResolvedLink {
 }
 export interface ReadonlyVault {
   readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote>;
-  resolveLink(link: string, sourcePath: string, signal: AbortSignal): Promise<string | null>;
+  resolveLink(link: string, sourcePath: string | null, signal: AbortSignal): Promise<string | null>;
   discoverLinks(
     path: string,
     signal: AbortSignal,
@@ -32,7 +32,7 @@ export interface ReadonlyVault {
   ): Promise<readonly VaultLink[]>;
   resolveLinkDetails?(
     link: string,
-    sourcePath: string,
+    sourcePath: string | null,
     signal: AbortSignal
   ): Promise<ResolvedLink | null>;
 }

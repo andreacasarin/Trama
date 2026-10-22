@@ -1,9 +1,14 @@
 import { Notice, Plugin } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
+import { skillCommandCatalog } from "@/chat/TemplateReferences";
 import { ManualIndex } from "@/index/ManualIndex";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
-import { noteEmbeddingProfile, SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
+import {
+  embeddingEndpointFingerprint,
+  noteEmbeddingProfile,
+  SqliteNoteVectorStore,
+} from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteStoreClient } from "@/index/note-sqlite/client";
 import {
@@ -17,7 +22,6 @@ import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { loadPluginUi, registerPluginUi } from "@/plugin/PluginUi";
-import { EndpointPolicy } from "@/security/EndpointPolicy";
 import {
   DEFAULT_SETTINGS,
   normalizeExcludedFolders,
@@ -44,6 +48,7 @@ export class TramaPlugin extends Plugin {
   private manualIndex?: ManualIndex;
   private retrieval?: VaultRetrieval;
   private session?: ChatSession;
+  private readonlyVault?: ObsidianReadonlyVault;
   private status?: IndexStatusController;
   private indexRun?: {
     readonly manualIndex: ManualIndex;
@@ -97,6 +102,8 @@ export class TramaPlugin extends Plugin {
           retrieval: () => this.retrieval!,
           noteCatalog: this.catalog,
           currentNote: () => (this.activeNote ? [this.activeNote] : []),
+          skillCatalog: () => this.skillCatalog(),
+          readSkill: (path, signal) => this.readonlyVault!.readNote(path, signal),
           consoleDebug: this.consoleDebug,
         });
         app.workspace.onLayoutReady?.(() => this.startAutomaticIndexing(app));
@@ -146,20 +153,23 @@ export class TramaPlugin extends Plugin {
     }
     this.client = candidate;
     this.indexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
-    const policy = new EndpointPolicy({ approvals: settings.approvedOrigins });
     const profile = {
       endpoint: settings.embedding.endpoint,
       modelId: settings.embedding.modelId,
       dimensions: settings.embedding.dimensions,
     };
     const providerEmbeddings = settings.embedding.modelId
-      ? createLocalEmbeddings({ ...profile, policy })
+      ? createLocalEmbeddings(profile)
       : undefined;
     const embeddings = providerEmbeddings
       ? new SqliteEmbeddingCache(
           providerEmbeddings,
           candidate.call,
-          embeddingCacheIdentity(profile.modelId, profile.dimensions),
+          embeddingCacheIdentity(
+            profile.modelId,
+            profile.dimensions,
+            embeddingEndpointFingerprint(profile.endpoint)
+          ),
           profile.dimensions
         )
       : unavailableEmbeddings();
@@ -172,6 +182,7 @@ export class TramaPlugin extends Plugin {
         )
       : undefined;
     const readonlyVault = new ObsidianReadonlyVault(app.vault, app.metadataCache);
+    this.readonlyVault = readonlyVault;
     const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isIndexableMarkdown(path));
     const store = new SqliteNoteVectorStore(
       embeddings,
@@ -203,10 +214,10 @@ export class TramaPlugin extends Plugin {
       },
       this.consoleDebug
     );
-    const chatModel: BaseChatModel = createLocalChatModel(settings.chat, policy);
+    const chatModel: BaseChatModel = createLocalChatModel(settings.chat);
     this.session = new ChatSession(
       chatModel,
-      (observer) => createVaultTools(readonlyVault, this.retrieval!, observer),
+      () => createVaultTools(readonlyVault, this.retrieval!),
       readonlyVault,
       () => {
         if (!settings.chat.modelId.trim())
@@ -261,17 +272,20 @@ export class TramaPlugin extends Plugin {
       if (this.disposed) return;
       const current = this.getSettings();
       const next = typeof update === "function" ? update(current) : update;
-      const policy = new EndpointPolicy({ approvals: next.approvedOrigins });
+      const chatEndpoint = next.chat.endpoint.trim();
+      const embeddingEndpoint = next.embedding.endpoint.trim();
+      if (!chatEndpoint || !embeddingEndpoint) throw new Error("Endpoint cannot be empty.");
+      new URL(chatEndpoint);
+      new URL(embeddingEndpoint);
       const validated = {
         ...next,
-        chat: { ...next.chat, endpoint: policy.normalize(next.chat.endpoint) },
-        embedding: { ...next.embedding, endpoint: policy.normalize(next.embedding.endpoint) },
+        chat: { ...next.chat, endpoint: chatEndpoint },
+        embedding: { ...next.embedding, endpoint: embeddingEndpoint },
         excludedFolders: normalizeExcludedFolders(next.excludedFolders),
       };
       const runtimeChanged =
         JSON.stringify(current.chat) !== JSON.stringify(validated.chat) ||
-        JSON.stringify(current.embedding) !== JSON.stringify(validated.embedding) ||
-        JSON.stringify(current.approvedOrigins) !== JSON.stringify(validated.approvedOrigins);
+        JSON.stringify(current.embedding) !== JSON.stringify(validated.embedding);
       const staged = this.settingsStore.stage(validated);
       await this.saveData(staged);
       if (this.disposed) return;
@@ -297,8 +311,7 @@ export class TramaPlugin extends Plugin {
         previousProfile !== currentProfile;
       const runtimeChanged =
         JSON.stringify(previous.chat) !== JSON.stringify(current.chat) ||
-        JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding) ||
-        JSON.stringify(previous.approvedOrigins) !== JSON.stringify(current.approvedOrigins);
+        JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding);
       if (runtimeChanged && this.app) await this.configureServices(this.app as any);
       this.settingsTab?.refreshExternalSettings();
       if (embeddingProfileChanged && this.indexedNotes)
@@ -448,16 +461,9 @@ export class TramaPlugin extends Plugin {
       .slice(0, 5);
   }
 
-  discoverModels(
-    target: "chat" | "embedding",
-    endpoint?: string,
-    approvals?: readonly import("@/security/EndpointPolicy").EndpointApproval[]
-  ): Promise<readonly string[]> {
+  discoverModels(target: "chat" | "embedding", endpoint?: string): Promise<readonly string[]> {
     const settings = this.getSettings();
-    return discoverLocalModels(
-      endpoint ?? settings[target].endpoint,
-      new EndpointPolicy({ approvals: approvals ?? settings.approvedOrigins })
-    );
+    return discoverLocalModels(endpoint ?? settings[target].endpoint);
   }
 
   private runIndex(rebuild: boolean, automatic = false): Promise<void> {
@@ -654,6 +660,21 @@ export class TramaPlugin extends Plugin {
     );
   }
 
+  private skillCatalog() {
+    const app = this.app as any;
+    return skillCommandCatalog(
+      this.catalog().map((path: string) => {
+        const file = app.vault.getFileByPath(path);
+        const frontmatter = file ? app.metadataCache.getFileCache(file)?.frontmatter : null;
+        return {
+          path,
+          marker: frontmatter?.["trama-voce-skill"],
+          alias: frontmatter?.["trama-voce-command"],
+        };
+      })
+    );
+  }
+
   private isIndexableMarkdown(path: string): boolean {
     return (
       this.isVisibleMarkdown(path) &&
@@ -676,10 +697,10 @@ export class TramaPlugin extends Plugin {
 function effectiveEmbeddingProfile(settings: TramaSettings): string | undefined {
   if (!settings.embedding.modelId.trim()) return undefined;
   try {
-    const endpoint = new EndpointPolicy({ approvals: settings.approvedOrigins }).normalize(
-      settings.embedding.endpoint
-    );
-    return noteEmbeddingProfile({ ...settings.embedding, endpoint });
+    return noteEmbeddingProfile({
+      ...settings.embedding,
+      endpoint: settings.embedding.endpoint.trim(),
+    });
   } catch {
     return undefined;
   }

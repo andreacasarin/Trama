@@ -66,9 +66,12 @@ describe("plugin installer", () => {
       await expect(
         readFile(path.join(demo, ".obsidian/community-plugins.json"), "utf8")
       ).resolves.toBe('["trama"]\n');
+      await expect(
+        readFile(path.join(demo, "zettelkasten/Voce demo skill.md"), "utf8")
+      ).resolves.toBe(await readFile("test-vaults/demo/zettelkasten/Voce demo skill.md", "utf8"));
       await writeFile(path.join(demo, ".obsidian/plugins/trama/data.json"), '{"preserved":true}');
       expect(await readdir(path.join(demo, "journal"))).toHaveLength(10);
-      expect(await readdir(path.join(demo, "zettelkasten"))).toHaveLength(30);
+      expect(await readdir(path.join(demo, "zettelkasten"))).toHaveLength(31);
       const demoNote = path.join(demo, "journal", (await readdir(path.join(demo, "journal")))[0]);
       await writeFile(demoNote, "edited demo note");
       await run();

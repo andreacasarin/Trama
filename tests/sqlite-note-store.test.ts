@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
-import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
+import { noteEmbeddingProfile, SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import type { NoteStoreMethod, NoteStoreRpc } from "@/index/note-sqlite/protocol";
@@ -82,6 +82,43 @@ const note = (path: string, pageContent: string, embeddingProfile?: string) =>
   });
 
 describe("SQLite note vector store", () => {
+  it("distinguishes endpoint variants without storing their raw values", () => {
+    const base = "https://user:private-secret@embed.example.com/v1";
+    const first = noteEmbeddingProfile({
+      endpoint: `${base}?tenant=alpha#fragment-one`,
+      modelId: " test-model ",
+      dimensions: 2,
+    });
+    for (const endpoint of [
+      `${base}?tenant=beta#fragment-one`,
+      `${base}?tenant=alpha#fragment-two`,
+      "https://user:other-secret@embed.example.com/v1?tenant=alpha#fragment-one",
+    ]) {
+      expect(noteEmbeddingProfile({ endpoint, modelId: " test-model ", dimensions: 2 })).not.toBe(
+        first
+      );
+    }
+    expect(first).not.toContain("private-secret");
+    expect(first).not.toContain("tenant=alpha");
+    expect(first).not.toContain("fragment-one");
+
+    expect(
+      noteEmbeddingProfile({
+        endpoint: "http://127.0.0.1:1234/v1",
+        modelId: " test-model ",
+        dimensions: 2,
+      })
+    ).toBe(
+      JSON.stringify({
+        endpoint: "http://127.0.0.1:1234/v1",
+        modelId: "test-model",
+        dimensions: 2,
+        splitter: "langchain-markdown-default-v1",
+        preprocessing: "raw-markdown-v1",
+      })
+    );
+  });
+
   it("uses the default Markdown split once, stores vectors in SQLite, and hydrates live notes", async () => {
     const { db, client, store, embeddings, notes } = await fixture();
     const split = vi.spyOn(MarkdownTextSplitter.prototype, "splitDocuments");

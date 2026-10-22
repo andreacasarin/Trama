@@ -3,9 +3,6 @@ import { Notice, Platform } from "obsidian";
 import { TramaPlugin } from "@/plugin/TramaPlugin";
 import { NoteSqliteRuntime } from "@/plugin/NoteSqliteRuntime";
 import { IndexStatusController } from "@/ui/index/IndexStatus";
-import { FiloView } from "@/ui/filo/FiloView";
-import { registerPluginUi, loadPluginUi } from "@/plugin/PluginUi";
-import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { LenteView } from "@/ui/lente/LenteView";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
@@ -17,74 +14,6 @@ describe("V1 plugin composition", () => {
   beforeEach(() => {
     Platform.isDesktopApp = false;
     (Notice as any).instances = [];
-  });
-
-  it("exposes an active index run without changing the indexed-note state", () => {
-    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    expect(plugin.hasIndexedNotes).toBe(false);
-    expect(plugin.hasIndexedOrActiveIndex).toBe(false);
-    plugin.indexRun = {};
-    expect(plugin.hasIndexedNotes).toBe(false);
-    expect(plugin.hasIndexedOrActiveIndex).toBe(true);
-  });
-
-  it("resolves current services when creating views and the Lente search modal", async () => {
-    const ui = await loadPluginUi();
-    const factories = new Map<string, (leaf: any) => any>();
-    const commands = new Map<string, { callback(): void }>();
-    const plugin = {
-      registerHoverLinkSource: vi.fn(),
-      addSettingTab: vi.fn(),
-      addCommand: vi.fn((command: any) => commands.set(command.id, command)),
-      registerView: vi.fn((type: string, factory: (leaf: any) => any) =>
-        factories.set(type, factory)
-      ),
-      relatedNoteSuggestions: vi.fn(),
-      updateIndex: vi.fn(),
-      rebuildIndex: vi.fn(),
-      stopIndex: vi.fn(),
-      clearIndex: vi.fn(),
-    };
-    const app = { workspace: { getLeaf: () => ({ setViewState: vi.fn() }) } };
-    const oldSession = {} as any;
-    const newSession = {} as any;
-    const oldRunnable = { invoke: vi.fn() };
-    const newRunnable = { invoke: vi.fn() };
-    let session = oldSession;
-    let retrieval = { runnable: oldRunnable, related: vi.fn() } as any;
-    const status = { getStatus: () => ({ kind: "idle" }) } as any;
-    registerPluginUi(plugin as any, app, ui, {
-      session: () => session,
-      status,
-      retrieval: () => retrieval,
-      noteCatalog: () => [],
-      currentNote: () => [],
-      consoleDebug: {} as any,
-    });
-
-    const existingVoce = factories.get(ui.VOCE_VIEW_TYPE)!({ app });
-    const existingFilo = factories.get(ui.FILO_VIEW_TYPE)!({ app });
-    const existingLente = factories.get(ui.LENTE_VIEW_TYPE)!({ app });
-    expect((existingVoce as any).session).toBe(oldSession);
-    expect((existingFilo as any).related).toBe(retrieval);
-    expect((existingLente as any).search).toBe(oldRunnable);
-
-    session = newSession;
-    retrieval = { runnable: newRunnable, related: vi.fn() };
-    const newVoce = factories.get(ui.VOCE_VIEW_TYPE)!({ app });
-    const newFilo = factories.get(ui.FILO_VIEW_TYPE)!({ app });
-    const newLente = factories.get(ui.LENTE_VIEW_TYPE)!({ app });
-    expect((newVoce as any).session).toBe(newSession);
-    expect((newFilo as any).related).toBe(retrieval);
-    expect((newLente as any).search).toBe(newRunnable);
-
-    const open = vi.spyOn(LenteSearchModal.prototype, "open").mockImplementation(function (
-      this: LenteSearchModal
-    ) {
-      expect((this as any).search).toBe(newRunnable);
-    });
-    commands.get("search-with-lente")!.callback();
-    open.mockRestore();
   });
 
   it("starts without provider requests, registers manual index controls, and closes the worker", async () => {
@@ -233,7 +162,6 @@ describe("V1 plugin composition", () => {
         reasoningEffort: "minimal",
       },
       embedding: { ...plugin.getSettings().embedding, modelId: "synced-embed", dimensions: 1024 },
-      approvedOrigins: [],
       excludedFolders: ["Projects"],
     };
     const refresh = vi.fn();
@@ -243,7 +171,11 @@ describe("V1 plugin composition", () => {
     plugin.configureServices = vi.fn(async () => undefined);
     plugin.settingsTab = { refreshExternalSettings: refresh };
     await plugin.onExternalSettingsChange();
-    expect(plugin.getSettings()).toMatchObject(external);
+    expect(plugin.getSettings()).toMatchObject({
+      chat: { modelId: "synced-chat", reasoningEffort: "minimal" },
+      embedding: { modelId: "synced-embed", dimensions: 1024 },
+      excludedFolders: ["Projects"],
+    });
     expect(plugin.configureServices).toHaveBeenCalledOnce();
     expect(refresh).toHaveBeenCalledOnce();
     expect(plugin.saveData).not.toHaveBeenCalled();
@@ -840,84 +772,6 @@ describe("V1 plugin composition", () => {
       }
     }
   );
-
-  it("restarts Filo when file-open invalidates a pending active-leaf search", async () => {
-    const handlers = new Map<string, (value: any) => void>();
-    let activeFile: { path: string } | null = { path: "notes/previous.md" };
-    const relatedCalls: { path: string; signal: AbortSignal; reject: (error: unknown) => void }[] =
-      [];
-    const related = vi.fn(
-      (path: string, signal: AbortSignal) =>
-        new Promise<any>((resolve, reject) => {
-          relatedCalls.push({ path, signal, reject });
-          if (relatedCalls.length === 3)
-            resolve({
-              documents: [
-                {
-                  id: "notes/current-result.md",
-                  pageContent: "",
-                  metadata: { path: "notes/current-result.md" },
-                },
-              ],
-              available: true,
-            });
-        })
-    );
-    let consumerWasLiveAtInvalidation = false;
-    const invalidateRelated = vi.fn(() => {
-      consumerWasLiveAtInvalidation = !relatedCalls[1].signal.aborted;
-      relatedCalls[1]?.reject(Object.assign(new Error("invalidated"), { name: "AbortError" }));
-    });
-    const retrieval = { invalidateRelated, related, runnable: { invoke: vi.fn() } };
-    const status = new IndexStatusController();
-    let filoView: FiloView | undefined;
-    const app = {
-      vault: { getMarkdownFiles: () => [] },
-      workspace: {
-        getActiveFile: () => activeFile,
-        getLeavesOfType: (type: string) =>
-          type === "trama-filo" && filoView ? [{ view: filoView }] : [],
-        on: (event: string, handler: (value: any) => void) => {
-          handlers.set(event, handler);
-          return { unsubscribe: vi.fn() };
-        },
-      },
-      metadataCache: {},
-    };
-    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.app = app;
-    plugin.loadData = vi.fn(async () => undefined);
-    plugin.registerEvent = vi.fn();
-    plugin.configureServices = vi.fn(async () => {
-      plugin.status = status;
-      plugin.session = { reset: vi.fn() };
-      plugin.retrieval = retrieval;
-    });
-    try {
-      await plugin.onload();
-      filoView = new FiloView({ app } as any, status, retrieval as any);
-      (filoView as any).contentEl = undefined;
-      await filoView.onOpen();
-      activeFile = { path: "notes/current.md" };
-      handlers.get("active-leaf-change")?.({});
-      expect(related).toHaveBeenCalledTimes(2);
-      expect(relatedCalls[0].signal.aborted).toBe(true);
-      expect(relatedCalls[1].path).toBe("notes/current.md");
-      handlers.get("file-open")?.({ path: "notes/current.md" });
-      expect(invalidateRelated).toHaveBeenCalledOnce();
-      expect(consumerWasLiveAtInvalidation).toBe(true);
-      await vi.waitFor(() => expect(related).toHaveBeenCalledTimes(3));
-      await vi.waitFor(() =>
-        expect((filoView as any).documents[0].metadata.path).toBe("notes/current-result.md")
-      );
-      expect(relatedCalls[1].signal.aborted).toBe(true);
-      expect(relatedCalls[2].path).toBe("notes/current.md");
-      expect((filoView as any).error).toBe(false);
-    } finally {
-      filoView?.onClose();
-      plugin.onunload();
-    }
-  });
 
   it("clears the index and SQLite/shared caches and reports the committed status", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;

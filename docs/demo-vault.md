@@ -1,8 +1,8 @@
 # Trama Test Vault
 
 The demo vault is separate from the fixed benchmark corpus. It contains fictional
-development notes: 10 daily entries in `journal` and 30 linked topic notes in
-`zettelkasten`, covering retrieval, embeddings, SQLite, and Trama workflows.
+daily journal entries and linked topic notes in `zettelkasten`, covering retrieval,
+embeddings, SQLite, and Trama workflows.
 The source notes live in `test-vaults/demo/`; the runnable copy is ignored by Git.
 
 From a fresh clone, use Node.js 24 and install dependencies once with `npm ci`.
@@ -25,6 +25,28 @@ community plugins and Trama **in that vault only**. The normal commands are
 `Trama: Open Lente`, `Trama: Open Voce`, and `Trama: Open Filo`. This vault has a
 `.trama-demo-vault` marker, not the benchmark marker, so it starts the normal UI
 and does not register the benchmark command.
+
+## Real Obsidian checks
+
+Use this generated vault for checks that depend on Obsidian's actual UI or runtime;
+simulated DOM tests do not verify native behavior. Keep unit and integration tests
+focused on Trama-owned logic and contracts. Do not report a check as passed until
+you have performed it in Obsidian.
+
+- Change a harmless setting, close and reopen Settings, and confirm the value persists.
+- In Lente, search for `embedding cache` and open a result. Keyword search works
+  without a provider; semantic or hybrid search requires a configured embedding model.
+- Open a note and check that Filo shows related notes. After editing a demo note,
+  run Update and confirm the refreshed results reflect the index update. This check
+  requires a configured embedding model.
+- In Voce, type `[[Embeddings` and choose a visible note suggestion;
+  confirm the link is inserted into the draft. For skill suggestions, use the demo
+  fixture `zettelkasten/Voce demo skill.md`: type `/demo`, choose `demo-guide`, and
+  confirm the command is inserted.
+- When a chat provider is configured, send a message, stop a response, and start a
+  new chat. If the provider supports streaming, confirm text appears as it arrives;
+  check that the view follows new text while at the bottom and preserves your reading
+  position after you scroll up.
 
 The setup validates each exact marked path before writing, refuses symlinks, and
 preserves plugin settings. The demo-note preparer refuses to overwrite edited demo

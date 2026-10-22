@@ -289,6 +289,33 @@ export class TextAreaComponent {
   }
 }
 
+export abstract class AbstractInputSuggest<T> {
+  declare isOpen: boolean;
+
+  constructor(
+    public app: unknown,
+    public textInputEl: HTMLInputElement | HTMLDivElement
+  ) {
+    this.isOpen = false;
+  }
+  open(): void {
+    this.isOpen = true;
+  }
+  close(): void {
+    this.isOpen = false;
+  }
+  abstract renderSuggestion(value: T, element: HTMLElement): void;
+  abstract selectSuggestion(value: T, event: MouseEvent | KeyboardEvent): void;
+}
+
+export function prepareFuzzySearch(query: string): (text: string) => { score: number } | null {
+  const normalized = query.toLowerCase();
+  return (text) => {
+    const index = text.toLowerCase().indexOf(normalized);
+    return index < 0 ? null : { score: normalized ? text.length - index : 0 };
+  };
+}
+
 export class ButtonComponent {
   readonly buttonEl: any;
   constructor(container: any) {

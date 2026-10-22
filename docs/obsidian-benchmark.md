@@ -234,7 +234,7 @@ Compare a baseline and changed build with:
 npm run benchmark:compare -- before.json after.json
 ```
 
-The comparator prints each side's raw three samples, medians, and after-minus-before milliseconds. It writes no files. Both reports must use the same corpus and settings, and match in runtime, platform, and machine; `appBuild` may differ. Treat the output as a comparison for that machine and run only. The performance assessment contains historical measurements from retired runners; do not join them to this current-app series.
+The comparator prints each side's raw three samples, medians, and after-minus-before milliseconds. It writes no files. Both reports must use the same corpus and settings, and match in runtime, platform, and machine; `appBuild` may differ. Treat the output as a comparison for that machine and run only. The cache and storage ADRs preserve selected dated measurements with their workloads and limitations; those historical results are not comparable with this current-app series and must not be joined to it.
 
 ## Safety and interpretation
 

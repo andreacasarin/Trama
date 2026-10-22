@@ -1,28 +1,19 @@
-import { MetadataCache, TFile, Vault } from "obsidian";
+import { MetadataCache, TFile, Vault, type CachedMetadata } from "obsidian";
 import type { ReadonlyNote, ReadonlyVault, VaultLink } from "@/domain/vault";
 import { StructuredError } from "@/domain/errors";
 
-export interface ReadLimits {
-  readonly maxLines: number;
-  readonly maxCharacters: number;
-}
-
-const DEFAULT_LIMITS: ReadLimits = { maxLines: 200, maxCharacters: 20_000 };
 const MARKDOWN = /\.md$/i;
 
-/** Provides bounded, read-only access to an Obsidian vault and never exposes its write APIs. */
+/** Provides read-only access to an Obsidian vault and never exposes its write APIs. */
 export class ObsidianReadonlyVault implements ReadonlyVault {
-  private readonly limits: ReadLimits;
   private readonly hidden: readonly string[];
 
   constructor(
     private readonly vault: Pick<Vault, "getFileByPath" | "read" | "configDir"> & {
       getMarkdownFiles?: () => readonly TFile[];
     },
-    private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">,
-    limits: Partial<ReadLimits> = {}
+    private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">
   ) {
-    this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.hidden = [".trama", this.vault.configDir || ".obsidian"];
   }
 
@@ -33,45 +24,52 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     if (!file || !MARKDOWN.test(file.path)) throw new Error("Note not found");
     const content = await this.vault.read(file);
     this.checkCancelled(signal);
-    const lines = content.split("\n");
-    const lineLimited = lines.length > this.limits.maxLines;
-    const selected = lines.slice(0, this.limits.maxLines).join("\n");
-    const truncated = lineLimited || selected.length > this.limits.maxCharacters;
-    const bounded = selected.slice(0, this.limits.maxCharacters);
     return {
       path: normalized,
-      content: bounded,
-      truncated,
+      content,
+      truncated: false,
       startLine: 1,
-      endLine: bounded ? Math.min(this.limits.maxLines, bounded.split("\n").length) : 0,
+      endLine: content ? content.split("\n").length : 0,
     };
   }
 
-  async resolveLink(link: string, sourcePath: string, signal: AbortSignal): Promise<string | null> {
+  async resolveLink(
+    link: string,
+    sourcePath: string | null,
+    signal: AbortSignal
+  ): Promise<string | null> {
     this.checkCancelled(signal);
+    const clean = this.linkText(link).split("#", 1)[0].split("^", 1)[0].trim();
+    if (sourcePath === null) {
+      if (!clean) throw new Error("Invalid vault note name");
+      const exact = MARKDOWN.test(clean) ? clean : `${clean}.md`;
+      this.normalizePath(exact);
+      const markdownFiles = this.vault.getMarkdownFiles?.() ?? [];
+      const exactFile = markdownFiles.find(
+        (file) => !this.isHidden(file.path) && file.path === exact
+      );
+      if (exactFile) return this.normalizePath(exactFile.path);
+      if (clean.includes("/")) return null;
+      const candidates = markdownFiles.filter(
+        (file) => !this.isHidden(file.path) && file.name.toLowerCase() === exact.toLowerCase()
+      );
+      if (candidates.length > 1)
+        throw new StructuredError(
+          "invalid_request",
+          `Ambiguous note name '${clean}'; candidates: ${candidates.map((file) => file.path).join(", ")}`,
+          false
+        );
+      return candidates[0] ? this.normalizePath(candidates[0].path) : null;
+    }
     const source = this.normalizePath(sourcePath);
-    const clean = link.split("#", 1)[0].split("^", 1)[0].trim();
     if (!clean) return source;
     const markdownFiles = this.vault.getMarkdownFiles?.() ?? [];
-    const exact = clean.endsWith(".md") ? clean : `${clean}.md`;
+    const exact = MARKDOWN.test(clean) ? clean : `${clean}.md`;
     if (clean.includes("/")) {
       const exactPath = markdownFiles
         .filter((file) => !this.isHidden(file.path))
         .find((file) => file.path === exact)?.path;
       if (exactPath) return this.normalizePath(exactPath);
-    } else {
-      const candidates = markdownFiles
-        .filter(
-          (file) =>
-            !this.isHidden(file.path) && file.name.toLowerCase() === `${clean.toLowerCase()}.md`
-        )
-        .map((file) => file.path);
-      if (candidates.length > 1)
-        throw new StructuredError(
-          "invalid_request",
-          `Ambiguous link '${clean}'; candidates: ${candidates.join(", ")}`,
-          false
-        );
     }
     const destination = this.metadataCache.getFirstLinkpathDest(clean, source);
     if (!destination || !MARKDOWN.test(destination.path) || this.isHidden(destination.path))
@@ -82,8 +80,11 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
   async resolveLinkDetails(link: string, sourcePath: string, signal: AbortSignal) {
     const source = this.normalizePath(sourcePath);
     const cache = this.metadataCache.getFileCache(this.vault.getFileByPath(source) as TFile);
-    const clean = link.split("#", 1)[0].split("^", 1)[0].trim();
-    const cached = cache?.links?.find((item) => item.link === link || item.link === clean);
+    const text = this.linkText(link);
+    const clean = text.split("#", 1)[0].split("^", 1)[0].trim();
+    const cached = this.cachedLinks(cache).find(
+      (item) => item.link === text || item.link === clean
+    );
     return { path: await this.resolveLink(link, source, signal), ...this.linkRange(cached) };
   }
 
@@ -97,7 +98,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     const file = this.vault.getFileByPath(sourcePath);
     if (!file) throw new Error("Note not found");
     const cache = this.metadataCache.getFileCache(file as TFile);
-    const links = cache?.links ?? [];
+    const links = this.cachedLinks(cache);
     const output: VaultLink[] = [];
     for (const link of links.slice(0, Math.max(0, Math.floor(maxLinks)))) {
       this.checkCancelled(signal);
@@ -135,6 +136,11 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     );
   }
 
+  private linkText(link: string): string {
+    const match = link.match(/^!?\[\[([^\]]+)\]\]$/);
+    return match ? match[1].split("|", 1)[0].trim() : link;
+  }
+
   private linkRange(
     link:
       | {
@@ -147,6 +153,21 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     return startLine === undefined
       ? {}
       : { startLine: startLine + 1, endLine: (endLine ?? startLine) + 1 };
+  }
+
+  private cachedLinks(cache: CachedMetadata | null): readonly {
+    link: string;
+    position?: NonNullable<CachedMetadata["frontmatterPosition"]>;
+  }[] {
+    if (!cache) return [];
+    const frontmatter = (cache.frontmatterLinks ?? []).map((reference) => ({
+      link: reference.link,
+      position: cache.frontmatterPosition,
+    }));
+    const body = [...(cache.links ?? []), ...(cache.embeds ?? [])].sort(
+      (left, right) => left.position.start.offset - right.position.start.offset
+    );
+    return [...frontmatter, ...body];
   }
 
   private checkCancelled(signal: AbortSignal): void {

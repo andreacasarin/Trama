@@ -2,6 +2,7 @@ import { Document, type DocumentInterface } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { VectorStore } from "@langchain/core/vectorstores";
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
+import { sha256 } from "@langchain/core/utils/hash";
 import type { NoteStoreCall } from "./note-sqlite/protocol";
 
 interface ScopedEmbeddings extends EmbeddingsInterface<number[]> {
@@ -14,8 +15,18 @@ export interface NoteEmbeddingProfile {
   readonly dimensions: number;
 }
 
+export function embeddingEndpointFingerprint(rawEndpoint: string): string | undefined {
+  const endpoint = new URL(rawEndpoint);
+  if (!endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash)
+    return undefined;
+  return sha256(endpoint.href);
+}
+
 export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
   const endpoint = new URL(profile.endpoint);
+  const endpointFingerprint = embeddingEndpointFingerprint(profile.endpoint);
+  endpoint.username = "";
+  endpoint.password = "";
   endpoint.search = "";
   endpoint.hash = "";
   return JSON.stringify({
@@ -24,6 +35,7 @@ export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
     dimensions: profile.dimensions,
     splitter: "langchain-markdown-default-v1",
     preprocessing: "raw-markdown-v1",
+    ...(endpointFingerprint ? { endpointFingerprint } : {}),
   });
 }
 

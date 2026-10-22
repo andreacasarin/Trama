@@ -327,4 +327,61 @@ describe("SQLite note retrieval", () => {
       f.db.close();
     }
   });
+
+  it("keeps the SQL candidate pool while hydrating only enough existing documents for the limit", async () => {
+    const call = vi.fn(async (_method: string, _payload: unknown) => ({
+      mode: "lexical" as const,
+      degraded: false,
+      hits: [
+        { path: "missing.md", score: 3 },
+        { path: "first.md", score: 2 },
+        { path: "second.md", score: 1 },
+      ],
+    }));
+    const readNote = vi.fn(async (path: string) =>
+      path === "first.md" || path === "second.md" ? { path, content: path } : null
+    );
+    const retrieval = new VaultRetrieval(call as any, undefined, "profile", readNote);
+
+    const result = await retrieval.runnable.invoke({ query: "needle", mode: "lexical", limit: 1 });
+
+    expect(call).toHaveBeenCalledWith(
+      "noteStoreHybrid",
+      expect.objectContaining({ k: 20 }),
+      expect.any(AbortSignal)
+    );
+    expect(result.documents.map((document) => document.id)).toEqual(["first.md"]);
+    expect(readNote.mock.calls.map(([path]) => path)).toEqual(["missing.md", "first.md"]);
+  });
+
+  it("returns requestable SQLite search counts above the previous ceiling", async () => {
+    const f = await fixture();
+    try {
+      const documents = Array.from({ length: 230 }, (_, index) => {
+        const path = `notes/result-${String(index).padStart(3, "0")}.md`;
+        const content = `# needle result ${index}\n\nSearchable needle content for result ${index}.`;
+        f.notes.set(path, content);
+        return new Document({ id: path, pageContent: content, metadata: { path } });
+      });
+      await f.store.addDocuments(documents);
+      const retrieval = new VaultRetrieval(f.client.call, undefined, undefined, async (path) => {
+        const content = f.notes.get(path);
+        return content === undefined ? null : { path, content };
+      });
+
+      const result = await retrieval.runnable.invoke({
+        query: "needle",
+        mode: "lexical",
+        limit: 210,
+      });
+
+      expect(result.documents).toHaveLength(210);
+      expect(result.documents[0].metadata.path).toBe("notes/result-000.md");
+      expect(result.documents.some(({ metadata }) => metadata.path === "notes/result-209.md")).toBe(
+        true
+      );
+    } finally {
+      f.db.close();
+    }
+  });
 });

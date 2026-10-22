@@ -8,18 +8,28 @@ import {
   MarkdownRenderer,
   setIcon,
   setTooltip,
-  TextAreaComponent,
   WorkspaceLeaf,
 } from "obsidian";
-import { AssistantConversationTurn, CHAT_LIMITS, ChatSession, ChatState } from "@/chat/ChatSession";
+import { AssistantConversationTurn, ChatSession, ChatState } from "@/chat/ChatSession";
 import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReferences";
+import { resolveSkillCommands, skillBody, type SkillCommand } from "@/chat/TemplateReferences";
+import { StructuredError } from "@/domain/errors";
 import type { ProvenanceRecord } from "@/domain/vault";
+import type { ReadonlyNote } from "@/domain/vault";
 import { TRAMA_ICONS } from "@/ui/icons";
 import type { IconName } from "obsidian";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import { VoceComposer, VoceInlineSuggest } from "@/ui/voce/VoceComposer";
 
 export const VOCE_VIEW_TYPE = "trama-voce";
 const COLLAPSIBLE_MESSAGE_LENGTH = 600;
+const TRANSCRIPT_BOTTOM_THRESHOLD = 32;
+
+interface RenderedTurn {
+  readonly id: string;
+  readonly row: HTMLDivElement;
+  markdownComponent?: Component;
+}
 
 interface AssistantTurnAction {
   readonly icon: string;
@@ -33,9 +43,9 @@ function errorMessage(error: ChatState["error"]): string {
     case "cancelled":
       return "Stopped before the answer finished. You can keep editing and send again.";
     case "limit_exceeded":
-      return `${error.message} Attach fewer notes or shorten the request, then try again.`;
+      return `${error.message} Shorten the request and try again.`;
     case "unavailable":
-      return `${error.message} Check LM Studio, then try again.`;
+      return `${error.message} Check your configured chat provider, then try again.`;
     case "busy":
       return "Voce is already working on a message. Stop it or wait for it to finish.";
     case "invalid_request":
@@ -49,18 +59,23 @@ function provenanceLabel(record: ProvenanceRecord): string {
   return record.path;
 }
 
+function errorCode(error: unknown): string {
+  return error instanceof StructuredError ? error.code : "unavailable";
+}
+
 class AttachmentPickerModal extends FuzzySuggestModal<string> {
   constructor(
     app: App,
-    private readonly items: () => readonly string[],
-    private readonly onChoosePath: (path: string) => void
+    private readonly items: readonly string[],
+    private readonly onChoosePath: (path: string) => void,
+    placeholder = "Attach a visible note"
   ) {
     super(app);
-    this.setPlaceholder("Attach a visible note");
+    this.setPlaceholder(placeholder);
   }
 
   getItems(): string[] {
-    return [...this.items()];
+    return [...this.items];
   }
 
   getItemText(item: string): string {
@@ -80,19 +95,28 @@ export class VoceView extends ItemView {
   private transcript!: HTMLDivElement;
   private feedback!: HTMLDivElement;
   private attachments!: HTMLDivElement;
-  private input!: HTMLTextAreaElement;
+  private input!: VoceComposer;
+  private inlineSuggest?: VoceInlineSuggest;
   private actionButton!: HTMLButtonElement;
-  private markdownComponent?: Component;
+  private readonly renderedTurns: RenderedTurn[] = [];
+  private renderedTailSignature?: string;
+  private transcriptActivity?: HTMLDivElement;
   private activeAttachmentPicker?: AttachmentPickerModal;
   private selectedAttachmentPaths: string[] = [];
   private readonly expandedTurnIds = new Set<string>();
   private localError?: string;
+  private skillResolutionGeneration = 0;
+  private skillResolutionAbort?: AbortController;
+  private preparingSkill = false;
   private attachmentPickerGeneration = 0;
   private isViewOpen = false;
   private suggestionGeneration = 0;
   private suggestionController?: AbortController;
   private relatedSuggestions: readonly string[] = [];
   private relatedSourcePath?: string;
+  private followTranscript = true;
+  private desiredTranscriptOffset = 0;
+  private lastAppliedTranscriptTop = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -104,13 +128,23 @@ export class VoceView extends ItemView {
     private readonly relatedNoteSuggestions: (
       signal: AbortSignal
     ) => Promise<readonly string[]> = async () => [],
-    private readonly consoleDebug?: ConsoleDebug
+    private readonly consoleDebug?: ConsoleDebug,
+    private readonly skillCatalog: () => readonly SkillCommand[] = () => [],
+    private readonly readSkill?: (path: string, signal: AbortSignal) => Promise<ReadonlyNote>
   ) {
     super(leaf);
   }
 
   /** Rebinds an open view after settings replace the session graph. */
   setSession(session: ChatSession): void {
+    this.followTranscript = true;
+    this.desiredTranscriptOffset = 0;
+    if (this.transcript) this.lastAppliedTranscriptTop = this.transcript.scrollTop;
+    this.clearTranscriptTurns();
+    this.abortSkillResolution();
+    this.inlineSuggest?.invalidate();
+    this.activeAttachmentPicker?.close();
+    this.activeAttachmentPicker = undefined;
     this.unsubscribe?.();
     this.session = session;
     this.expandedTurnIds.clear();
@@ -131,28 +165,75 @@ export class VoceView extends ItemView {
 
   override onOpen(): Promise<void> {
     this.isViewOpen = true;
+    this.followTranscript = true;
+    this.desiredTranscriptOffset = 0;
     this.contentEl.empty();
     this.root = this.contentEl.createDiv({ cls: "trama-voce" });
-    this.root.createEl("h1", { text: "Voce", cls: "trama-voce__title" });
+    const header = this.root.createDiv({ cls: "trama-voce__header" });
+    header.createEl("h1", { text: "Voce", cls: "trama-voce__title" });
+    header
+      .createEl("button", {
+        cls: "clickable-icon trama-voce__new-chat",
+        text: "New chat",
+        attr: { type: "button", "aria-label": "New chat" },
+      })
+      .addEventListener("click", () => this.startNewChat());
     this.transcript = this.root.createDiv({ cls: "trama-voce__transcript" });
+    this.lastAppliedTranscriptTop = this.transcript.scrollTop;
     this.transcript.addEventListener("click", (event) => this.openInternalLink(event));
+    this.transcript.addEventListener("scroll", () => this.recordTranscriptScrollIntent());
     this.feedback = this.root.createDiv({ cls: "trama-voce__feedback" });
     const composer = this.root.createDiv({ cls: "trama-voce__composer" });
     this.attachments = composer.createDiv({ cls: "trama-voce__context" });
     const composeRow = composer.createDiv({ cls: "trama-voce__compose-row" });
-    const input = new TextAreaComponent(composeRow).inputEl;
-    this.input = input;
-    this.input.classList.add("trama-voce__input");
-    this.input.rows = 3;
-    this.input.setAttribute("aria-label", "Message");
+    const input = composeRow.createDiv({ cls: "trama-voce__input" }) as unknown as HTMLDivElement;
+    input.contentEditable = "plaintext-only";
+    input.setAttribute("role", "textbox");
+    input.setAttribute("aria-multiline", "true");
+    input.setAttribute("aria-label", "Message");
+    input.setAttribute("data-placeholder", "Write a message");
+    this.input = new VoceComposer(input);
+    this.inlineSuggest = new VoceInlineSuggest(
+      this.app,
+      this.input,
+      () => this.noteCatalog(),
+      () => this.skillCatalog(),
+      (suggestion) => {
+        this.abortSkillResolution();
+        this.localError = undefined;
+        const catalog = this.noteCatalog();
+        if (suggestion.kind === "note") {
+          this.syncAttachmentsFromInput(catalog);
+          this.renderAttachments(catalog);
+        } else if (!suggestion.command.alias || suggestion.command.issue) {
+          const command = suggestion.command;
+          this.localError =
+            command.issue === "duplicate_alias"
+              ? `Skill command /${command.alias} is duplicated by ${command.conflictingPaths?.join(", ")}. Give each skill a unique trama-voce-command.`
+              : `Skill ${command.path} needs trama-voce-skill: true and a unique lowercase trama-voce-command.`;
+        }
+        this.renderFeedback(this.session.getState());
+      }
+    );
     this.input.addEventListener("input", () => {
-      this.localError = undefined;
-      this.syncAttachmentsFromInput();
-      this.renderAttachments();
-      this.renderFeedback(this.session.getState());
+      this.onComposerInput();
+    });
+    this.input.addEventListener("paste", (event: ClipboardEvent) => {
+      const text = event.clipboardData?.getData("text/plain");
+      if (text === undefined) return;
+      event.preventDefault();
+      this.input.replaceRange(this.input.selectionStart, this.input.selectionEnd, text);
+      this.onComposerInput();
     });
     this.input.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key === "Enter" && event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        this.input.replaceRange(this.input.selectionStart, this.input.selectionEnd, "\n");
+        this.onComposerInput();
+        return;
+      }
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        if (event.defaultPrevented || this.inlineSuggest?.hasOpenSuggestions) return;
         event.preventDefault();
         if (!this.session.getState().running) void this.submit();
         return;
@@ -160,6 +241,7 @@ export class VoceView extends ItemView {
       if (this.shouldOpenAttachmentPicker(event)) {
         event.preventDefault();
         this.openAttachmentPicker();
+        return;
       }
     });
     this.actionButton = new ButtonComponent(composeRow).buttonEl;
@@ -168,6 +250,12 @@ export class VoceView extends ItemView {
     this.actionButton.addEventListener("click", () => {
       if (this.session.getState().running) {
         this.session.cancel();
+        return;
+      }
+      if (this.preparingSkill) {
+        this.abortSkillResolution();
+        this.localError = "Skill preparation stopped. Your draft is unchanged.";
+        this.renderFeedback(this.session.getState());
         return;
       }
       void this.submit();
@@ -185,6 +273,8 @@ export class VoceView extends ItemView {
 
   override onClose(): Promise<void> {
     this.isViewOpen = false;
+    this.abortSkillResolution();
+    this.inlineSuggest?.invalidate();
     this.suggestionGeneration++;
     this.suggestionController?.abort();
     this.suggestionController = undefined;
@@ -193,8 +283,7 @@ export class VoceView extends ItemView {
     this.attachmentPickerGeneration++;
     this.activeAttachmentPicker?.close();
     this.activeAttachmentPicker = undefined;
-    if (this.markdownComponent) this.removeChild(this.markdownComponent);
-    this.markdownComponent = undefined;
+    this.clearTranscriptTurns();
     this.session.reset();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
@@ -205,31 +294,56 @@ export class VoceView extends ItemView {
     return event.key === "@" && !event.ctrlKey && !event.metaKey && !event.altKey;
   }
 
+  private startNewChat(): void {
+    this.followTranscript = true;
+    this.desiredTranscriptOffset = 0;
+    this.lastAppliedTranscriptTop = this.transcript.scrollTop;
+    this.clearTranscriptTurns();
+    this.abortSkillResolution();
+    this.inlineSuggest?.invalidate();
+    this.attachmentPickerGeneration++;
+    this.activeAttachmentPicker?.close();
+    this.activeAttachmentPicker = undefined;
+    this.suggestionGeneration++;
+    this.suggestionController?.abort();
+    this.suggestionController = undefined;
+    this.relatedSuggestions = [];
+    this.relatedSourcePath = undefined;
+    this.input.value = "";
+    this.selectedAttachmentPaths = [];
+    this.localError = undefined;
+    this.expandedTurnIds.clear();
+    this.session.reset();
+    this.renderAttachments();
+    this.input.focus();
+  }
+
+  private onComposerInput(): void {
+    this.abortSkillResolution();
+    this.localError = undefined;
+    const catalog = this.noteCatalog();
+    this.syncAttachmentsFromInput(catalog);
+    this.renderAttachments(catalog);
+    this.renderFeedback(this.session.getState());
+  }
+
   private openAttachmentPicker(): void {
     this.localError = undefined;
-    if (this.selectedAttachmentPaths.length >= CHAT_LIMITS.maxAttachments) {
-      this.localError = `You can attach up to ${CHAT_LIMITS.maxAttachments} notes.`;
-      this.renderFeedback(this.session.getState());
-      return;
-    }
-    const available = this.availableAttachmentPaths();
+    const catalog = this.noteCatalog();
+    const available = this.availableAttachmentPaths(catalog);
     if (!available.length) {
       this.localError = "No additional visible Markdown notes are available to attach.";
       this.renderFeedback(this.session.getState());
       return;
     }
     const generation = ++this.attachmentPickerGeneration;
-    const picker = new AttachmentPickerModal(
-      this.app,
-      () => this.availableAttachmentPaths(),
-      (path) => {
-        if (!this.isViewOpen || generation !== this.attachmentPickerGeneration) return;
-        this.insertNoteReference(path);
-        this.localError = undefined;
-        this.renderFeedback(this.session.getState());
-        this.input.focus();
-      }
-    );
+    const picker = new AttachmentPickerModal(this.app, available, (path) => {
+      if (!this.isViewOpen || generation !== this.attachmentPickerGeneration) return;
+      this.insertNoteReference(path, catalog);
+      this.localError = undefined;
+      this.renderFeedback(this.session.getState());
+      this.input.focus();
+    });
     const closePicker = picker.close.bind(picker);
     picker.close = () => {
       closePicker();
@@ -239,12 +353,13 @@ export class VoceView extends ItemView {
     picker.open();
   }
 
-  private availableAttachmentPaths(): readonly string[] {
+  private availableAttachmentPaths(catalog: readonly string[]): readonly string[] {
     const selected = new Set(this.selectedAttachmentPaths);
-    return this.noteCatalog().filter((path) => !selected.has(path));
+    return catalog.filter((path) => !selected.has(path));
   }
 
-  private insertNoteReference(path: string): void {
+  private insertNoteReference(path: string, catalog: readonly string[] = this.noteCatalog()): void {
+    this.abortSkillResolution();
     const start = this.input.selectionStart ?? this.input.value.length;
     const end = this.input.selectionEnd ?? start;
     const before = this.input.value.slice(0, start);
@@ -252,22 +367,38 @@ export class VoceView extends ItemView {
     const prefix = before && !/\s$/.test(before) ? " " : "";
     const suffix = after && !/^\s/.test(after) ? " " : "";
     const insertion = `${prefix}[[${path}]]${suffix}`;
-    this.input.value = `${before}${insertion}${after}`;
+    this.input.replaceRange(start, end, insertion);
     const caret = before.length + insertion.length;
     this.input.setSelectionRange(caret, caret);
-    this.syncAttachmentsFromInput();
-    this.renderAttachments();
+    this.syncAttachmentsFromInput(catalog);
+    this.renderAttachments(catalog);
   }
 
-  private syncAttachmentsFromInput(): void {
-    this.selectedAttachmentPaths = [
-      ...resolveNoteReferences(this.input.value, this.noteCatalog()).paths,
-    ];
+  private syncAttachmentsFromInput(catalog: readonly string[] = this.noteCatalog()): void {
+    this.selectedAttachmentPaths = [...resolveNoteReferences(this.input.value, catalog).paths];
   }
 
   private async submit(): Promise<void> {
+    if (this.preparingSkill || this.session.getState().running) return;
     const content = this.input.value;
-    const references = resolveNoteReferences(content, this.noteCatalog());
+    const skillCatalog = this.skillCatalog();
+    const skillRefs = resolveSkillCommands(content, skillCatalog);
+    if (skillRefs.issues.length) {
+      const issue = skillRefs.issues[0];
+      this.localError =
+        issue.reason === "duplicate"
+          ? `Skill command /${issue.alias} is duplicated by ${issue.paths.join(", ")}. Give each skill a unique trama-voce-command.`
+          : `Skill command /${issue.alias} is unavailable. Choose a current skill command.`;
+      this.renderFeedback(this.session.getState());
+      return;
+    }
+    if (skillRefs.commands.length > 1) {
+      this.localError = "Use one Voce skill command per message.";
+      this.renderFeedback(this.session.getState());
+      return;
+    }
+    const noteCatalog = this.noteCatalog();
+    const references = resolveNoteReferences(content, noteCatalog);
     if (references.issues.length) {
       const issue = references.issues[0];
       this.localError =
@@ -279,78 +410,236 @@ export class VoceView extends ItemView {
     }
     const attachmentPaths = [...references.paths];
     const state = this.session.getState();
-    if (state.running) return;
     this.localError = undefined;
     this.renderFeedback(state);
     const session = this.session;
+    let skillRead: AbortController | undefined;
+    const skillGeneration = ++this.skillResolutionGeneration;
     try {
-      const pendingSend = session.send({ content, attachmentPaths });
-      this.input.value = "";
-      this.selectedAttachmentPaths = [];
-      this.renderAttachments();
+      let skill: { path: string; content: string } | undefined;
+      const command = skillRefs.commands[0];
+      if (command) {
+        if (!this.readSkill) throw new Error("Voce skill reading is unavailable.");
+        this.preparingSkill = true;
+        this.render(session.getState());
+        skillRead = new AbortController();
+        this.skillResolutionAbort = skillRead;
+        const note = await this.readSkill(command.path, skillRead.signal);
+        if (
+          skillRead.signal.aborted ||
+          skillGeneration !== this.skillResolutionGeneration ||
+          this.skillResolutionAbort !== skillRead ||
+          !this.isViewOpen ||
+          this.session !== session ||
+          this.input.value !== content
+        )
+          return;
+        if (note.truncated)
+          throw new Error(`Skill ${note.path} is truncated. Shorten it before use.`);
+        if (note.path !== command.path)
+          throw new Error(`Skill read returned ${note.path}, not selected source ${command.path}.`);
+        const skillContent = skillBody(note.content, command);
+        if (!skillContent)
+          throw new Error(`Skill ${note.path} is empty. Add instructions and try again.`);
+        skill = { path: note.path, content: skillContent };
+        this.preparingSkill = false;
+      }
+      this.followTranscript = true;
+      this.lastAppliedTranscriptTop = this.transcript.scrollTop;
+      const pendingSend = session.send({ content, attachmentPaths, skill });
+      if (session.getState().running) {
+        this.input.value = "";
+        this.selectedAttachmentPaths = [];
+        this.renderAttachments();
+      }
       await pendingSend;
     } catch (error) {
-      this.consoleDebug?.error("Chat turn setup failed", error);
-      if (this.session === session)
+      this.consoleDebug?.error("Chat turn setup failed", undefined, {
+        errorCode: errorCode(error),
+      });
+      if (
+        !skillRead?.signal.aborted &&
+        skillGeneration === this.skillResolutionGeneration &&
+        this.session === session &&
+        this.input.value === content &&
+        this.isViewOpen
+      )
         this.localError = error instanceof Error ? error.message : "Message could not be sent.";
+    } finally {
+      if (skillGeneration === this.skillResolutionGeneration) this.preparingSkill = false;
+      if (this.skillResolutionAbort === skillRead) this.skillResolutionAbort = undefined;
     }
     this.render(this.session.getState());
   }
 
+  private abortSkillResolution(): void {
+    const wasPreparing = this.preparingSkill;
+    this.skillResolutionGeneration++;
+    this.skillResolutionAbort?.abort();
+    this.skillResolutionAbort = undefined;
+    this.preparingSkill = false;
+    if (wasPreparing && this.isViewOpen) this.render(this.session.getState());
+  }
+
   private render(state: ChatState): void {
-    if (this.markdownComponent) this.removeChild(this.markdownComponent);
-    this.markdownComponent = this.addChild(new Component());
-    this.transcript.empty();
-    for (const turn of state.turns) {
-      const row = this.transcript.createDiv({
+    this.recordTranscriptScrollIntent();
+    this.renderTranscriptTurns(state.turns);
+    const workingAssistant = state.turns.find(
+      (turn) => turn.role === "assistant" && turn.status === "working"
+    );
+    this.renderTranscriptActivity(this.preparingSkill || (state.running && !workingAssistant));
+    this.renderAttachments();
+    this.renderFeedback(state);
+    this.restoreTranscriptPosition();
+  }
+
+  private renderTranscriptTurns(turns: ChatState["turns"]): void {
+    const previousLength = this.renderedTurns.length;
+    const prefixMatches =
+      previousLength <= turns.length &&
+      this.renderedTurns.every((rendered, index) => rendered.id === turns[index].id);
+    const rebuild = !prefixMatches;
+    if (rebuild) this.clearTranscriptTurns();
+    const firstNewTurn = rebuild ? 0 : previousLength;
+    if (!rebuild && previousLength) {
+      const previousTail = this.renderedTurns[previousLength - 1];
+      const currentTail = turns[previousLength - 1];
+      if (this.renderedTailSignature !== this.turnSignature(currentTail))
+        this.updateRenderedTurn(previousTail, currentTail);
+    }
+    for (let index = firstNewTurn; index < turns.length; index++)
+      this.appendRenderedTurn(turns[index]);
+  }
+
+  private appendRenderedTurn(turn: ChatState["turns"][number]): void {
+    const rendered: RenderedTurn = {
+      id: turn.id,
+      row: this.transcript.createDiv({
         cls: [
           "trama-voce__turn-row",
           turn.role === "user" ? "trama-voce__turn-row--user" : "trama-voce__turn-row--assistant",
         ],
+      }),
+    };
+    this.renderedTurns.push(rendered);
+    this.updateRenderedTurn(rendered, turn);
+  }
+
+  private updateRenderedTurn(rendered: RenderedTurn, turn: ChatState["turns"][number]): void {
+    if (rendered.markdownComponent) this.removeChild(rendered.markdownComponent);
+    const component = this.addChild(new Component());
+    rendered.markdownComponent = component;
+    this.renderedTailSignature = this.turnSignature(turn);
+    rendered.row.empty();
+    const bubble = rendered.row.createDiv({
+      cls: [
+        "trama-voce__bubble",
+        turn.role === "user" ? "trama-voce__bubble--user" : "trama-voce__bubble--assistant",
+      ],
+    });
+    const isCollapsible =
+      !(turn.role === "assistant" && turn.status === "working") &&
+      turn.content.length > COLLAPSIBLE_MESSAGE_LENGTH;
+    const isExpanded = this.expandedTurnIds.has(turn.id);
+    const sourcePath = this.turnSourcePath(turn);
+    const message = bubble.createDiv({
+      cls: [
+        "trama-voce__message",
+        "markdown-rendered",
+        isCollapsible && !isExpanded ? "trama-voce__message--collapsed" : "",
+      ],
+      attr: { "data-source-path": sourcePath },
+    });
+    void MarkdownRenderer.render(this.app, turn.content, message, sourcePath, component).then(
+      () => {
+        if (
+          !this.isViewOpen ||
+          rendered.markdownComponent !== component ||
+          !this.renderedTurns.includes(rendered)
+        )
+          return;
+        this.recordTranscriptScrollIntent();
+        this.restoreTranscriptPosition();
+      }
+    );
+    if (turn.role === "assistant" && turn.status === "working" && !turn.content)
+      this.renderActivity(bubble);
+    if (isCollapsible) this.renderExpandAction(bubble, turn.id, isExpanded, message);
+    if (turn.role === "assistant" && turn.sources.length)
+      this.renderSources(bubble, turn as AssistantConversationTurn);
+    if (turn.role === "user" && turn.skill) {
+      const sources = bubble.createDiv({ cls: "trama-voce__sources" });
+      sources.createDiv({
+        cls: "setting-item-description trama-voce__sources-label",
+        text: "Skill",
       });
-      const bubble = row.createDiv({
-        cls: [
-          "trama-voce__bubble",
-          turn.role === "user" ? "trama-voce__bubble--user" : "trama-voce__bubble--assistant",
-        ],
-      });
-      const isCollapsible =
-        !(turn.role === "assistant" && turn.status === "working") &&
-        turn.content.length > COLLAPSIBLE_MESSAGE_LENGTH;
-      const isExpanded = this.expandedTurnIds.has(turn.id);
-      const sourcePath = this.turnSourcePath(turn);
-      const message = bubble.createDiv({
-        cls: [
-          "trama-voce__message",
-          "markdown-rendered",
-          isCollapsible && !isExpanded ? "trama-voce__message--collapsed" : "",
-        ],
-        attr: { "data-source-path": sourcePath },
-      });
-      if (turn.role === "assistant" && turn.status === "working") message.setText("Working...");
-      else
-        void MarkdownRenderer.render(
-          this.app,
-          turn.content,
-          message,
-          sourcePath,
-          this.markdownComponent
-        );
-      if (isCollapsible) this.renderExpandAction(bubble, turn.id, isExpanded);
-      if (turn.role === "assistant" && turn.provenance.length)
-        this.renderSources(bubble, turn as AssistantConversationTurn);
-      if (turn.role === "assistant" && turn.status === "complete")
-        this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
+      this.renderInternalLink(
+        sources,
+        turn.skill.path,
+        turn.skill.path,
+        "trama-voce__chip",
+        turn.skill.path
+      );
     }
-    this.renderAttachments();
-    this.renderFeedback(state);
-    this.updateActionButton(state.running);
+    if (turn.role === "assistant" && turn.status === "complete")
+      this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
+  }
+
+  private turnSignature(turn: ChatState["turns"][number]): string {
+    return turn.role === "assistant"
+      ? JSON.stringify([turn.id, turn.role, turn.content, turn.status, turn.sources])
+      : JSON.stringify([turn.id, turn.role, turn.content, turn.attachments, turn.skill?.path]);
+  }
+
+  private clearTranscriptTurns(): void {
+    for (const rendered of this.renderedTurns)
+      if (rendered.markdownComponent) this.removeChild(rendered.markdownComponent);
+    this.renderedTurns.length = 0;
+    this.renderedTailSignature = undefined;
+    this.transcriptActivity?.remove();
+    this.transcriptActivity = undefined;
+    if (this.transcript) this.transcript.empty();
+  }
+
+  private renderTranscriptActivity(visible: boolean): void {
+    this.transcriptActivity?.remove();
+    this.transcriptActivity = undefined;
+    if (!visible) return;
+    this.transcriptActivity = this.transcript.createDiv({ cls: "trama-voce__activity" });
+    this.renderActivity(this.transcriptActivity);
+  }
+
+  private restoreTranscriptPosition(): void {
+    this.transcript.scrollTop = this.followTranscript
+      ? this.transcript.scrollHeight
+      : this.desiredTranscriptOffset;
+    this.lastAppliedTranscriptTop = this.transcript.scrollTop;
+  }
+
+  private recordTranscriptScrollIntent(): void {
+    const scrollTop = this.transcript.scrollTop;
+    const previousTop = this.lastAppliedTranscriptTop;
+    if (scrollTop === previousTop) return;
+    const maximum = Math.max(0, this.transcript.scrollHeight - this.transcript.clientHeight);
+    this.lastAppliedTranscriptTop = scrollTop;
+    if (previousTop > maximum && scrollTop === maximum) return;
+    this.followTranscript = maximum - scrollTop <= TRANSCRIPT_BOTTOM_THRESHOLD;
+    this.desiredTranscriptOffset = scrollTop;
+  }
+
+  private renderActivity(parent: HTMLDivElement): void {
+    const activity = parent.createDiv({
+      cls: "trama-voce__activity",
+      attr: { role: "status", "aria-label": "Preparing response", "aria-live": "polite" },
+    });
+    for (let index = 0; index < 3; index++)
+      activity.createEl("span", { cls: "trama-voce__activity-dot" });
   }
 
   private turnSourcePath(turn: ChatState["turns"][number]): string {
     return turn.role === "user"
-      ? (turn.attachments[0]?.path ?? "")
-      : (turn.provenance[0]?.path ?? "");
+      ? (turn.skill?.path ?? turn.attachments[0]?.path ?? "")
+      : (turn.sources[0]?.path ?? "");
   }
 
   private openInternalLink(event: MouseEvent): void {
@@ -361,11 +650,15 @@ export class VoceView extends ItemView {
     event.preventDefault();
     event.stopPropagation();
     const sourcePath =
-      link.closest<HTMLElement>(".trama-voce__message")?.getAttribute("data-source-path") ?? "";
+      link.closest<HTMLElement>(".trama-voce__message")?.getAttribute("data-source-path") ??
+      link.getAttribute("data-source-path") ??
+      "";
     void this.app.workspace
       .openLinkText(linkText, sourcePath, Keymap.isModEvent(event))
       .catch((error) => {
-        this.consoleDebug?.error("Voce note link failed", error);
+        this.consoleDebug?.error("Voce note link failed", undefined, {
+          errorCode: errorCode(error),
+        });
         this.localError = error instanceof Error ? error.message : "Note could not be opened.";
         this.renderFeedback(this.session.getState());
       });
@@ -377,7 +670,7 @@ export class VoceView extends ItemView {
       cls: "setting-item-description trama-voce__sources-label",
       text: "Sources",
     });
-    for (const note of turn.provenance)
+    for (const note of turn.sources)
       this.renderInternalLink(sources, note.path, provenanceLabel(note), "trama-voce__chip");
   }
 
@@ -385,25 +678,30 @@ export class VoceView extends ItemView {
     parent: HTMLDivElement,
     path: string,
     label: string,
-    cls: string
+    cls: string,
+    sourcePath?: string
   ): void {
     parent.createEl("a", {
       cls: `internal-link ${cls}`,
       text: label,
-      attr: { href: path, "data-href": path },
+      attr: {
+        href: path,
+        "data-href": path,
+        ...(sourcePath ? { "data-source-path": sourcePath } : {}),
+      },
     });
   }
 
-  private renderAttachments(): void {
+  private renderAttachments(catalog: readonly string[] = this.noteCatalog()): void {
     this.attachments.empty();
     const selected = new Set(this.selectedAttachmentPaths);
     const activePath = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
     const activeSuggestions = this.noteSuggestions().filter(
-      (path) => path === activePath && this.noteCatalog().includes(path)
+      (path) => path === activePath && catalog.includes(path)
     );
     const relatedSuggestions =
       this.relatedSourcePath === activePath
-        ? this.relatedSuggestions.filter((path) => this.noteCatalog().includes(path))
+        ? this.relatedSuggestions.filter((path) => catalog.includes(path))
         : [];
     const suggestions = [...new Set([...activeSuggestions, ...relatedSuggestions])];
     const paths = [
@@ -424,12 +722,12 @@ export class VoceView extends ItemView {
       setTooltip(button, `${isSelected ? "Remove" : "Include"} [[${path}]]`);
       button.addEventListener("click", () => {
         if (isSelected) {
-          this.input.value = removeNoteReference(this.input.value, path, this.noteCatalog());
-          this.syncAttachmentsFromInput();
-          this.renderAttachments();
+          this.abortSkillResolution();
+          const currentCatalog = this.noteCatalog();
+          this.input.value = removeNoteReference(this.input.value, path, currentCatalog);
+          this.syncAttachmentsFromInput(currentCatalog);
+          this.renderAttachments(currentCatalog);
           this.localError = undefined;
-        } else if (this.selectedAttachmentPaths.length >= CHAT_LIMITS.maxAttachments) {
-          this.localError = `You can attach up to ${CHAT_LIMITS.maxAttachments} notes.`;
         } else {
           this.insertNoteReference(path);
           this.localError = undefined;
@@ -506,7 +804,9 @@ export class VoceView extends ItemView {
       setTooltip(button, action.label);
       button.addEventListener("click", () => {
         void action.run().catch((error) => {
-          this.consoleDebug?.error("Voce response action failed", error);
+          this.consoleDebug?.error("Voce response action failed", undefined, {
+            errorCode: errorCode(error),
+          });
           this.localError =
             error instanceof Error ? error.message : "Response could not be copied.";
           this.renderFeedback(this.session.getState());
@@ -515,7 +815,12 @@ export class VoceView extends ItemView {
     }
   }
 
-  private renderExpandAction(parent: HTMLDivElement, turnId: string, isExpanded: boolean): void {
+  private renderExpandAction(
+    parent: HTMLDivElement,
+    turnId: string,
+    isExpanded: boolean,
+    message: HTMLDivElement
+  ): void {
     const button = parent.createEl("button", {
       cls: "clickable-icon trama-voce__expand",
       text: isExpanded ? "Show less" : "Show more",
@@ -524,18 +829,26 @@ export class VoceView extends ItemView {
         "aria-expanded": String(isExpanded),
       },
     });
+    let expanded = isExpanded;
     button.addEventListener("click", () => {
-      if (isExpanded) this.expandedTurnIds.delete(turnId);
-      else this.expandedTurnIds.add(turnId);
-      this.render(this.session.getState());
+      expanded = !expanded;
+      if (expanded) this.expandedTurnIds.add(turnId);
+      else this.expandedTurnIds.delete(turnId);
+      message.classList.toggle("trama-voce__message--collapsed", !expanded);
+      button.textContent = expanded ? "Show less" : "Show more";
+      button.setAttribute("aria-expanded", String(expanded));
+      this.recordTranscriptScrollIntent();
+      this.restoreTranscriptPosition();
     });
   }
 
   private renderFeedback(state: ChatState): void {
     this.feedback.empty();
     const message = this.localError ?? (state.error ? errorMessage(state.error) : undefined);
-    if (!message) return;
-    this.feedback.createDiv({ cls: "mod-warning trama-voce__error", text: message });
+    if (message) {
+      this.feedback.createDiv({ cls: "mod-warning trama-voce__error", text: message });
+    }
+    this.updateActionButton(state.running || this.preparingSkill);
   }
 
   private updateActionButton(running: boolean): void {

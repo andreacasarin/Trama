@@ -4,6 +4,8 @@ import type { VaultRetrieval } from "@/index/VaultRetrieval";
 import type { IndexStatusController } from "@/ui/index/IndexStatus";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import type { ReadonlyNote } from "@/domain/vault";
+import type { SkillCommand } from "@/chat/TemplateReferences";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { LenteSearchModal } from "@/ui/lente/LenteSearchModal";
 import { NOTE_RESULT_HOVER_SOURCE_ID } from "@/ui/noteResultRow";
@@ -24,6 +26,8 @@ export interface PluginUiDependencies {
   readonly retrieval: () => VaultRetrieval;
   readonly noteCatalog: () => readonly string[];
   readonly currentNote: () => readonly string[];
+  readonly skillCatalog?: () => readonly SkillCommand[];
+  readonly readSkill?: (path: string, signal: AbortSignal) => Promise<ReadonlyNote>;
   readonly consoleDebug: ConsoleDebug;
 }
 
@@ -49,7 +53,9 @@ export function registerPluginUi(
         dependencies.currentNote,
         undefined,
         (signal) => plugin.relatedNoteSuggestions(signal),
-        dependencies.consoleDebug
+        dependencies.consoleDebug,
+        dependencies.skillCatalog,
+        dependencies.readSkill
       )
   );
   plugin.registerView(

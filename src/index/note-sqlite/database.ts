@@ -765,7 +765,6 @@ export class NoteSqliteDatabase {
       (vector === undefined && query === undefined) ||
       !Number.isSafeInteger(k) ||
       k < 0 ||
-      k > 100 ||
       (profile !== undefined && typeof profile !== "string") ||
       (vector !== undefined && (!profile || !Array.isArray(vector)))
     )
@@ -787,7 +786,7 @@ export class NoteSqliteDatabase {
       throw new TypeError("Query vector dimensions do not match the profile");
     const needle = semanticAvailable ? vectorBytes(vector!) : null;
     const expression = query === undefined ? "" : ftsTerms(query);
-    const candidateLimit = Math.min(200, k * 4);
+    const candidateLimit = Math.max(k, Math.min(200, k * 4));
     const lexicalCte = expression
       ? `lexical_base AS (
           SELECT n.note_id,n.path,bm25(note_fts) AS lexicalScore

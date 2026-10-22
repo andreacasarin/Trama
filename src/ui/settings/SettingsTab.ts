@@ -1,6 +1,5 @@
 import { Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
-import { EndpointPolicy, type EndpointApproval } from "@/security/EndpointPolicy";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import {
@@ -17,7 +16,6 @@ interface SettingsDraft {
   consoleDebug: boolean;
   chat: Mutable<ChatSettings>;
   embedding: Mutable<EmbeddingSettings>;
-  approvedOrigins: EndpointApproval[];
   excludedFolders: string[];
 }
 interface ParsedText<T> {
@@ -52,11 +50,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       stopIndex(): void;
       readonly hasIndexedNotes: boolean;
       readonly hasIndexedOrActiveIndex: boolean;
-      discoverModels(
-        target: "chat" | "embedding",
-        endpoint?: string,
-        approvals?: readonly EndpointApproval[]
-      ): Promise<readonly string[]>;
+      discoverModels(target: "chat" | "embedding", endpoint?: string): Promise<readonly string[]>;
     },
     private readonly consoleDebug?: ConsoleDebug
   ) {
@@ -83,9 +77,8 @@ export class TramaSettingsTab extends PluginSettingTab {
       (raw) => ({ value: raw, display: raw }),
       async (value) =>
         this.persist((current) => ({ ...current, chat: { ...current.chat, endpoint: value } })),
-      "Local OpenAI-compatible /v1 endpoint."
+      "OpenAI-compatible base URL."
     );
-    this.approval("chat", settings);
     this.modelSetting("chat", settings, displayGeneration);
     this.text(
       "Temperature",
@@ -155,7 +148,8 @@ export class TramaSettingsTab extends PluginSettingTab {
       });
     });
 
-    this.heading("Index and search");
+    this.heading("Lente");
+    this.heading("Filo");
     this.text(
       "Embedding endpoint",
       "embedding.endpoint",
@@ -171,9 +165,8 @@ export class TramaSettingsTab extends PluginSettingTab {
           ...current,
           embedding: { ...current.embedding, endpoint: value },
         })),
-      "Local OpenAI-compatible /v1 endpoint."
+      "OpenAI-compatible base URL shared by Filo search, related-note suggestions, and Voce."
     );
-    this.approval("embedding", settings);
     this.modelSetting("embedding", settings, displayGeneration);
     this.text(
       "Embedding dimensions",
@@ -255,9 +248,6 @@ export class TramaSettingsTab extends PluginSettingTab {
           );
         });
       });
-
-    this.heading("Approved private origins");
-    this.renderOrigins(settings);
   }
 
   hide(): void {
@@ -348,49 +338,6 @@ export class TramaSettingsTab extends PluginSettingTab {
     });
   }
 
-  private approval(target: "chat" | "embedding", settings: SettingsDraft): void {
-    new Setting(this.containerEl)
-      .setName("Endpoint trust")
-      .setDesc(
-        "Loopback is allowed automatically. Add a private LAN endpoint explicitly before discovering models."
-      )
-      .addButton((button) =>
-        button.setButtonText("Approve private origin").onClick(
-          () =>
-            void (async () => {
-              try {
-                const approval = new EndpointPolicy({
-                  approvals: settings.approvedOrigins,
-                }).approvalFor(settings[target].endpoint);
-                const endpoint = new EndpointPolicy({
-                  approvals: [...settings.approvedOrigins, approval],
-                }).normalize(settings[target].endpoint);
-                const saved = await this.persist((current) => ({
-                  ...current,
-                  [target]: { ...current[target], endpoint },
-                  approvedOrigins: current.approvedOrigins.some((item) =>
-                    sameOrigin(item, approval)
-                  )
-                    ? current.approvedOrigins
-                    : [...current.approvedOrigins, approval],
-                }));
-                if (!saved) return;
-                if (settings[target].endpoint !== endpoint) this.clearDiscoveredModels(target);
-                settings[target].endpoint = endpoint;
-                if (!settings.approvedOrigins.some((item) => sameOrigin(item, approval)))
-                  settings.approvedOrigins.push(approval);
-                this.pendingText.delete(`${target}.endpoint`);
-                this.renderOrigins(settings);
-              } catch (error) {
-                new Notice(
-                  error instanceof Error ? error.message : "This origin cannot be approved."
-                );
-              }
-            })()
-        )
-      );
-  }
-
   private modelSetting(
     target: "chat" | "embedding",
     settings: SettingsDraft,
@@ -439,27 +386,24 @@ export class TramaSettingsTab extends PluginSettingTab {
   ): Promise<void> {
     const generation = ++this.discoveryGeneration[target];
     const endpoint = settings[target].endpoint;
-    const approvals = JSON.stringify(settings.approvedOrigins);
     button.setDisabled(true);
     try {
-      const models = await this.plugin.discoverModels(target, endpoint, settings.approvedOrigins);
+      const models = await this.plugin.discoverModels(target, endpoint);
       if (
         this.displayGeneration !== displayGeneration ||
         this.discoveryGeneration[target] !== generation ||
-        settings[target].endpoint !== endpoint ||
-        JSON.stringify(settings.approvedOrigins) !== approvals
+        settings[target].endpoint !== endpoint
       )
         return;
       this.discovered[target] = [...models];
       if (!this.discovered[target].length)
-        new Notice("No models were returned by the local endpoint.");
+        new Notice("No models were returned by the configured endpoint.");
       this.display();
     } catch (error) {
       if (
         this.displayGeneration !== displayGeneration ||
         this.discoveryGeneration[target] !== generation ||
-        settings[target].endpoint !== endpoint ||
-        JSON.stringify(settings.approvedOrigins) !== approvals
+        settings[target].endpoint !== endpoint
       )
         return;
       this.consoleDebug?.error("Local model discovery failed", error);
@@ -513,31 +457,6 @@ export class TramaSettingsTab extends PluginSettingTab {
     if (!saved) return;
     settings.excludedFolders = [...saved.excludedFolders];
     this.renderFolders(settings);
-  }
-
-  private renderOrigins(settings: SettingsDraft): void {
-    const existing = this.containerEl.querySelector(".trama-approved-origins");
-    existing?.remove();
-    const rows = this.containerEl.createDiv({ cls: "trama-approved-origins" });
-    if (!settings.approvedOrigins.length)
-      rows.createEl("p", { text: "No private origins are approved." });
-    for (const origin of settings.approvedOrigins) {
-      new Setting(rows)
-        .setName(`${origin.scheme}://${origin.host}:${origin.port}`)
-        .addButton((button) =>
-          button.setButtonText("Remove").onClick(() => void this.removeOrigin(origin, settings))
-        );
-    }
-  }
-
-  private async removeOrigin(origin: EndpointApproval, settings: SettingsDraft): Promise<void> {
-    const saved = await this.persistDiscrete((current) => ({
-      ...current,
-      approvedOrigins: current.approvedOrigins.filter((item) => !sameOrigin(item, origin)),
-    }));
-    if (!saved) return;
-    settings.approvedOrigins = saved.approvedOrigins.map((item) => ({ ...item }));
-    this.renderOrigins(settings);
   }
 
   private async persist(
@@ -624,10 +543,10 @@ export class TramaSettingsTab extends PluginSettingTab {
 function effectiveEmbeddingProfile(settings: TramaSettings): string | undefined {
   if (!settings.embedding.modelId.trim()) return undefined;
   try {
-    const endpoint = new EndpointPolicy({ approvals: settings.approvedOrigins }).normalize(
-      settings.embedding.endpoint
-    );
-    return noteEmbeddingProfile({ ...settings.embedding, endpoint });
+    return noteEmbeddingProfile({
+      ...settings.embedding,
+      endpoint: settings.embedding.endpoint.trim(),
+    });
   } catch {
     return undefined;
   }
@@ -638,15 +557,6 @@ function cloneSettings(settings: TramaSettings): SettingsDraft {
     consoleDebug: settings.consoleDebug,
     chat: { ...settings.chat },
     embedding: { ...settings.embedding },
-    approvedOrigins: settings.approvedOrigins.map((origin) => ({ ...origin })),
     excludedFolders: [...settings.excludedFolders],
   };
-}
-
-function sameOrigin(left: EndpointApproval, right: EndpointApproval): boolean {
-  return (
-    left.scheme === right.scheme &&
-    left.host.toLowerCase() === right.host.toLowerCase() &&
-    left.port === right.port
-  );
 }

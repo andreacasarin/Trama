@@ -26,9 +26,9 @@ Keep the existing centroids, vector payloads, logical keys, constraints, and SQL
 
 ## Rationale and evidence
 
-In the paired fresh 3,000-note experiment dated 2026-10-12, removing `WITHOUT ROWID` only from `note_vectors` reduced exported size from 41,312,256 to 25,583,616 bytes (38.1%) and eliminated vector overflow pages. The centroid-bearing `note_index` and vector payload were unchanged. This is workload-specific evidence, not a general claim that rowid is faster or smaller.
+In the paired fresh 3,000-note experiment dated 2026-10-12, using the same corpus and deterministic zero-delay 768-dimensional provider, removing `WITHOUT ROWID` only from `note_vectors` reduced exported size from 41,312,256 to 25,583,616 bytes (38.1%) and eliminated vector overflow pages. The centroid-bearing `note_index` and vector payload were unchanged. The 3,000-note profile used three samples after one warmup. This is workload-specific evidence, not a general claim that rowid is faster or smaller.
 
-See the [vector rowid experiment](../../docs/langchain-performance-assessment.md#vector-rowid-experiment--2026-10-12) and [SQLite's storage tradeoffs](https://www.sqlite.org/withoutrowid.html).
+The historical source was `docs/langchain-performance-assessment.md`, “Vector rowid experiment — 2026-10-12.” The paired fresh-database experiment retained the centroid-bearing `note_index` and vector payload; its measurements above are workload-specific, not a general performance claim. See [SQLite's storage tradeoffs](https://www.sqlite.org/withoutrowid.html).
 
 ## Consequences and reconsideration
 

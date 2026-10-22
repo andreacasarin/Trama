@@ -24,6 +24,17 @@
   margin: 0;
 }
 
+.trama-voce__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trama-voce__new-chat {
+  padding: 4px 8px;
+}
+
 .trama-voce__transcript {
   display: flex;
   flex: 1 1 auto;
@@ -157,10 +168,21 @@
 }
 
 .trama-voce__input {
+  display: block;
   flex: 1 1 auto;
   width: 100%;
   min-height: 88px;
   resize: vertical;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  outline: none;
+}
+
+.trama-voce__input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+  pointer-events: none;
 }
 
 .trama-voce__action,
@@ -183,6 +205,50 @@
 
 .trama-voce__feedback {
   min-height: 1lh;
+}
+
+.trama-voce__activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 1.4em;
+  padding: 0 2px;
+}
+
+.trama-voce__activity-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: trama-voce-dot 900ms ease-in-out infinite;
+}
+
+.trama-voce__activity-dot:nth-child(2) {
+  animation-delay: 150ms;
+}
+
+.trama-voce__activity-dot:nth-child(3) {
+  animation-delay: 300ms;
+}
+
+@keyframes trama-voce-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trama-voce__activity-dot {
+    animation: none;
+    opacity: 0.7;
+  }
 }
 
 @media (max-width: 700px) {
