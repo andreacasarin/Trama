@@ -223,7 +223,9 @@ export class TramaPlugin extends Plugin {
         if (!settings.chat.modelId.trim())
           throw new Error("Set a local chat model in Trama settings before sending a message.");
       },
-      this.consoleDebug
+      this.consoleDebug,
+      settings.chat.contextWindowTokens ?? DEFAULT_SETTINGS.chat.contextWindowTokens,
+      settings.chat.maxOutputTokens
     );
     if (wasConfigured && this.ui) {
       for (const leaf of app.workspace.getLeavesOfType("trama-voce"))
@@ -279,7 +281,16 @@ export class TramaPlugin extends Plugin {
       new URL(embeddingEndpoint);
       const validated = {
         ...next,
-        chat: { ...next.chat, endpoint: chatEndpoint },
+        chat: {
+          ...next.chat,
+          endpoint: chatEndpoint,
+          contextWindowTokens:
+            typeof next.chat.contextWindowTokens === "number" &&
+            Number.isSafeInteger(next.chat.contextWindowTokens) &&
+            next.chat.contextWindowTokens > 0
+              ? next.chat.contextWindowTokens
+              : (current.chat.contextWindowTokens ?? DEFAULT_SETTINGS.chat.contextWindowTokens),
+        },
         embedding: { ...next.embedding, endpoint: embeddingEndpoint },
         excludedFolders: normalizeExcludedFolders(next.excludedFolders),
       };

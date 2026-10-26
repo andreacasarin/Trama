@@ -35,16 +35,19 @@ describe("native read-only vault tools", () => {
       async () => null
     );
     const tools = createVaultTools(vault, retrieval);
-    const read = tools.find(({ name }) => name === "read_note")!;
-    const follow = tools.find(({ name }) => name === "follow_link")!;
-    expect(read.description).toContain("exact vault-relative .md path");
-    expect(read.description).toContain("follow_link");
-    expect(follow.description).toContain("complete [[wikilink]]");
-    expect(follow.description).toContain("sourcePath");
-    const outcome = await invokeOutcome(read, { path: "  Source note.md  " });
+    const read = tools.find(({ name }) => name === "read_notes")!;
+    expect(read.description).toContain("canonical vault-relative .md paths");
+    expect(read.description).toContain("complete [[wikilinks]]");
+    expect(read.description).toContain("sourcePath");
+    const outcome = await invokeOutcome(read, { paths: ["  Source note.md  "] });
     expect(readNote).toHaveBeenCalledWith("  Source note.md  ", expect.any(AbortSignal));
-    expect(outcome).toMatchObject({ ok: true, data: { content: "current note" } });
-    await expect(read.invoke({ path: "note.md", surprise: true })).rejects.toThrow();
+    expect(outcome).toMatchObject({
+      ok: true,
+      data: {
+        results: [{ requestedPath: "  Source note.md  ", note: { content: "current note" } }],
+      },
+    });
+    await expect(read.invoke({ paths: ["note.md"], surprise: true })).rejects.toThrow();
 
     const discover = tools.find(({ name }) => name === "discover_links")!;
     await expect(discover.invoke({ path: "note.md", extra: 1 })).rejects.toThrow();
@@ -66,53 +69,59 @@ describe("native read-only vault tools", () => {
       { readNote, resolveLink, discoverLinks: async () => [] },
       retrieval
     );
-    const read = tools.find(({ name }) => name === "read_note")!;
+    const read = tools.find(({ name }) => name === "read_notes")!;
 
-    const success = await invokeOutcome(read, { path: "Principles to live by" });
-    expect(resolveLink).toHaveBeenCalledWith(
+    const paths = [
       "Principles to live by",
-      null,
-      expect.any(AbortSignal)
-    );
-    expect(readNote).toHaveBeenLastCalledWith(
-      "Journal/Principles to live by.md",
-      expect.any(AbortSignal)
-    );
-    expect(success).toMatchObject({
-      ok: true,
-      data: { content: "Body: Journal/Principles to live by.md" },
-      provenance: [{ path: "Journal/Principles to live by.md" }],
-    });
-
-    await read.invoke({ path: "[[Principles to live by#Values|Principles]]" });
-    expect(resolveLink).toHaveBeenLastCalledWith(
       "[[Principles to live by#Values|Principles]]",
-      null,
-      expect.any(AbortSignal)
-    );
-    expect(readNote).toHaveBeenLastCalledWith(
-      "Journal/Principles to live by.md",
-      expect.any(AbortSignal)
-    );
-
-    await read.invoke({ path: "Root.md" });
-    expect(readNote).toHaveBeenLastCalledWith("Root.md", expect.any(AbortSignal));
-    expect(resolveLink).toHaveBeenCalledTimes(2);
-
-    const missing = await invokeOutcome(read, { path: "Unavailable title" });
-    expect(missing).toMatchObject({
-      ok: false,
-      error: { message: expect.stringContaining("No visible note matches 'Unavailable title'") },
-      provenance: [],
+      "Root.md",
+      "Principles to live by",
+      "Unavailable title",
+    ];
+    const batch = await invokeOutcome(read, { paths });
+    expect(resolveLink).toHaveBeenCalledTimes(4);
+    expect(resolveLink).toHaveBeenNthCalledWith(1, paths[0], null, expect.any(AbortSignal));
+    expect(resolveLink).toHaveBeenNthCalledWith(2, paths[1], null, expect.any(AbortSignal));
+    expect(resolveLink).toHaveBeenNthCalledWith(3, paths[3], null, expect.any(AbortSignal));
+    expect(readNote).toHaveBeenCalledWith("Root.md", expect.any(AbortSignal));
+    expect(batch).toMatchObject({
+      ok: true,
+      data: {
+        results: [
+          { requestedPath: paths[0], note: { path: "Journal/Principles to live by.md" } },
+          { requestedPath: paths[1], note: { path: "Journal/Principles to live by.md" } },
+          { requestedPath: paths[2], note: { path: "Root.md" } },
+          { requestedPath: paths[3], note: { path: "Journal/Principles to live by.md" } },
+          {
+            requestedPath: paths[4],
+            error: {
+              message: expect.stringContaining("No visible note matches 'Unavailable title'"),
+            },
+          },
+        ],
+      },
+      provenance: [
+        { path: "Journal/Principles to live by.md" },
+        { path: "Journal/Principles to live by.md" },
+        { path: "Root.md" },
+        { path: "Journal/Principles to live by.md" },
+      ],
     });
   });
 
   it("carries retrieval status and bounded path provenance in the tool result", async () => {
     const retrieval = new VaultRetrieval(
-      async () => ({ hits: [{ path: "result.md", score: 1 }], mode: "lexical", degraded: false }),
+      async () => ({
+        hits: [
+          { path: "missing.md", score: 2 },
+          { path: "result.md", score: 1 },
+        ],
+        mode: "lexical",
+        degraded: false,
+      }),
       undefined,
       undefined,
-      async (path) => ({ path, content: "matching evidence" })
+      async (path) => (path === "missing.md" ? null : { path, content: "matching evidence" })
     );
     const tools = createVaultTools(
       {
@@ -129,7 +138,11 @@ describe("native read-only vault tools", () => {
     expect(outcome).toMatchObject({
       ok: true,
       data: {
-        results: [{ path: "result.md", context: "matching evidence" }],
+        results: [{ path: "result.md", context: "matching evidence", contextTruncated: false }],
+        candidateCount: 2,
+        hydratedCount: 1,
+        returnedCount: 1,
+        omittedCount: 1,
         mode: "lexical",
         degraded: true,
         degradationReason: "semantic-unavailable",
@@ -138,7 +151,7 @@ describe("native read-only vault tools", () => {
     });
   });
 
-  it("returns readable follow-link evidence and preserves invalid-request errors", async () => {
+  it("reads source-relative link batches with provenance and preserves ambiguity errors", async () => {
     const retrieval = new VaultRetrieval(
       async () => ({ hits: [], mode: "lexical", degraded: false }),
       undefined,
@@ -158,17 +171,18 @@ describe("native read-only vault tools", () => {
     };
     const tools = createVaultTools(vault, retrieval);
     const followed = await invokeOutcome(
-      tools.find(({ name }) => name === "follow_link")!,
-      {
-        link: "Target",
-        sourcePath: "Source.md",
-      }
+      tools.find(({ name }) => name === "read_notes")!,
+      { paths: ["Target"], sourcePath: "Source.md" }
     );
     expect(followed).toMatchObject({
       ok: true,
       data: {
-        path: "Target.md",
-        note: { path: "Target.md", content: "bounded target body", startLine: 12, endLine: 16 },
+        results: [
+          {
+            requestedPath: "Target",
+            note: { path: "Target.md", content: "bounded target body", startLine: 12, endLine: 16 },
+          },
+        ],
       },
       provenance: [
         { path: "Source.md", startLine: 3, endLine: 3 },
@@ -180,13 +194,13 @@ describe("native read-only vault tools", () => {
       new StructuredError("invalid_request", "The link is ambiguous.", false)
     );
     const ambiguous = await invokeOutcome(
-      tools.find(({ name }) => name === "follow_link")!,
-      {
-        link: "Ambiguous",
-        sourcePath: "Source.md",
-      }
+      tools.find(({ name }) => name === "read_notes")!,
+      { paths: ["Ambiguous"], sourcePath: "Source.md" }
     );
-    expect(ambiguous).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    expect(ambiguous).toMatchObject({
+      ok: true,
+      data: { results: [{ requestedPath: "Ambiguous", error: { code: "invalid_request" } }] },
+    });
   });
 
   it("returns large tool results and later results without character-budget truncation", async () => {
@@ -197,22 +211,32 @@ describe("native read-only vault tools", () => {
       async () => null
     );
     const body = `${"x".repeat(100_000)} END OF NOTE`;
+    let activeReads = 0;
+    let maximumActiveReads = 0;
     const tools = createVaultTools(
       {
-        readNote: async (path) => ({ path, content: `${body} ${path}` }),
+        readNote: async (path) => {
+          activeReads++;
+          maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+          await Promise.resolve();
+          activeReads--;
+          return { path, content: `${body} ${path}` };
+        },
         discoverLinks: async () => [],
         resolveLink: async () => null,
       },
       retrieval
     );
-    const read = tools.find(({ name }) => name === "read_note")!;
-    const first = await read.invoke({ path: "First.md" });
-    const second = await read.invoke({ path: "Second.md" });
-    expect(String(first)).toContain("END OF NOTE First.md");
+    const read = tools.find(({ name }) => name === "read_notes")!;
+    const paths = ["First.md", "Third.md", "Fourth.md", "Fifth.md", "Sixth.md"];
+    const first = await read.invoke({ paths });
+    const second = await read.invoke({ paths: ["Second.md"] });
+    expect(maximumActiveReads).toBe(4);
+    for (const path of paths) expect(String(first)).toContain(`END OF NOTE ${path}`);
     expect(String(second)).toContain("END OF NOTE Second.md");
   });
 
-  it("keeps discover-link character payloads and search contexts intact within result-count limits", async () => {
+  it("keeps discover-link payloads intact and labels bounded search excerpts", async () => {
     const body = `${"x".repeat(2_000)} END OF SEARCH CONTEXT`;
     const retrieval = new VaultRetrieval(
       async () => ({ hits: [{ path: "result.md", score: 1 }], mode: "lexical", degraded: false }),
@@ -246,7 +270,12 @@ describe("native read-only vault tools", () => {
       }
     );
     expect(search).toMatchObject({
-      data: { results: [{ path: "result.md", context: body }] },
+      data: {
+        results: [{ path: "result.md", context: body.slice(0, 1_000), contextTruncated: true }],
+        hydratedCount: 1,
+        returnedCount: 1,
+        omittedCount: 0,
+      },
     });
   });
 
@@ -269,7 +298,7 @@ describe("native read-only vault tools", () => {
     }));
     const retrieval = new VaultRetrieval(call as any, undefined, undefined, async (path) => ({
       path,
-      content: "result",
+      content: "result ".repeat(200),
     }));
     const tools = createVaultTools(
       {
@@ -322,9 +351,14 @@ describe("native read-only vault tools", () => {
       expect.any(AbortSignal)
     );
     expect(found.data).toMatchObject({
-      results: expect.arrayContaining([expect.objectContaining({ path: "Result-124.md" })]),
+      candidateCount: 130,
+      results: expect.arrayContaining([expect.objectContaining({ path: "Result-0.md" })]),
     });
-    expect((found.data as any).results).toHaveLength(125);
+    const foundData = found.data as any;
+    expect(foundData.returnedCount).toBe(foundData.results.length);
+    expect(foundData.omittedCount).toBe(130 - foundData.returnedCount);
+    expect(foundData.omittedCount).toBeGreaterThan(0);
+    expect(JSON.stringify(foundData).length).toBeLessThanOrEqual(12_000);
 
     const defaultResult = await invokeOutcome(search, { query: "query" });
     expect(call).toHaveBeenLastCalledWith(

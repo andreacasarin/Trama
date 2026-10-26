@@ -7,6 +7,7 @@ import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import type {
   NoteStoreCall,
   NoteStoreHybridResult,
+  NoteStoreHit,
   NoteStoreRelatedResult,
 } from "./note-sqlite/protocol";
 
@@ -25,6 +26,12 @@ export interface VaultRetrievalStatus {
 export interface VaultRetrievalOutput {
   readonly documents: readonly Document[];
   readonly status: VaultRetrievalStatus;
+}
+
+export interface VaultSearchCandidates {
+  readonly hits: readonly NoteStoreHit[];
+  readonly status: VaultRetrievalStatus;
+  readonly signal: AbortSignal;
 }
 
 export interface LiveMarkdown {
@@ -99,6 +106,77 @@ export class VaultRetrieval {
     this.searchController = new AbortController();
   }
 
+  async searchCandidates(
+    input: VaultRetrievalInput,
+    signal?: AbortSignal
+  ): Promise<VaultSearchCandidates> {
+    signal = signal
+      ? AbortSignal.any([signal, this.searchController.signal])
+      : this.searchController.signal;
+    checkAbort(signal);
+    const query = input.query.trim();
+    if (!query)
+      throw new StructuredError("invalid_request", "Search query must not be empty.", false);
+    if (input.mode !== "hybrid" && input.mode !== "lexical")
+      throw new StructuredError("invalid_request", "Search mode is invalid.", false);
+    let vector: number[] | undefined;
+    let degradationReason: VaultRetrievalStatus["degradationReason"];
+    if (input.mode === "hybrid" && this.embeddings && this.profile) {
+      try {
+        vector = await (this.embeddings.withSignal?.(signal) ?? this.embeddings).embedQuery(query);
+      } catch (error) {
+        if (signal?.aborted || isCancelled(error)) throw error;
+        if (!(error instanceof EmbeddingProviderError)) throw error;
+        degradationReason = "query-embedding-failed";
+        this.consoleDebug?.warn("Query embedding failed; using lexical search", error);
+      }
+    } else if (input.mode === "hybrid") {
+      degradationReason = "semantic-unavailable";
+    }
+    checkAbort(signal);
+    const result = (await this.call(
+      "noteStoreHybrid",
+      {
+        query,
+        ...(vector && this.profile ? { vector, profile: this.profile } : {}),
+        k: Math.max(20, input.limit ?? 10),
+      },
+      signal
+    )) as NoteStoreHybridResult;
+    checkAbort(signal);
+    if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
+    const degraded = Boolean(degradationReason) || result.degraded;
+    return {
+      hits: result.hits,
+      status: {
+        mode: result.mode,
+        degraded,
+        ...(degradationReason ? { degradationReason } : {}),
+      },
+      signal,
+    };
+  }
+
+  async readSearchCandidate(
+    hit: NoteStoreHit,
+    signal?: AbortSignal
+  ): Promise<Document | undefined> {
+    checkAbort(signal);
+    const note = await this.readNote(hit.path, signal);
+    checkAbort(signal);
+    if (!note) return undefined;
+    return new Document({
+      id: hit.path,
+      pageContent: note.content,
+      metadata: {
+        path: hit.path,
+        score: hit.score,
+        ...(hit.lexicalScore === undefined ? {} : { lexicalScore: hit.lexicalScore }),
+        ...(hit.semanticScore === undefined ? {} : { semanticScore: hit.semanticScore }),
+      },
+    });
+  }
+
   invalidateRelated(): void {
     this.relatedGeneration++;
     this.relatedRequest?.controller.abort();
@@ -165,58 +243,22 @@ export class VaultRetrieval {
     input: VaultRetrievalInput,
     signal?: AbortSignal
   ): Promise<VaultRetrievalOutput> {
-    signal = signal
-      ? AbortSignal.any([signal, this.searchController.signal])
-      : this.searchController.signal;
-    checkAbort(signal);
-    const query = input.query.trim();
-    if (!query)
-      throw new StructuredError("invalid_request", "Search query must not be empty.", false);
-    if (input.mode !== "hybrid" && input.mode !== "lexical")
-      throw new StructuredError("invalid_request", "Search mode is invalid.", false);
     const finish = this.consoleDebug?.start("Vault search", { mode: input.mode });
 
     try {
-      let vector: number[] | undefined;
-      let degradationReason: VaultRetrievalStatus["degradationReason"];
-      if (input.mode === "hybrid" && this.embeddings && this.profile) {
-        try {
-          vector = await (this.embeddings.withSignal?.(signal) ?? this.embeddings).embedQuery(
-            query
-          );
-        } catch (error) {
-          if (signal?.aborted || isCancelled(error)) throw error;
-          if (!(error instanceof EmbeddingProviderError)) throw error;
-          degradationReason = "query-embedding-failed";
-          this.consoleDebug?.warn("Query embedding failed; using lexical search", error);
-        }
-      } else if (input.mode === "hybrid") {
-        degradationReason = "semantic-unavailable";
-      }
-      checkAbort(signal);
-      const result = (await this.call(
-        "noteStoreHybrid",
-        {
-          query,
-          ...(vector && this.profile ? { vector, profile: this.profile } : {}),
-          k: Math.max(20, input.limit ?? 10),
-        },
-        signal
-      )) as NoteStoreHybridResult;
-      if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
-      const documents = await this.hydrate(result.hits, signal, input.limit);
-      const degraded = Boolean(degradationReason) || result.degraded;
-      finish?.("completed", { resultCount: documents.length, degraded });
+      const candidates = await this.searchCandidates(input, signal);
+      const documents = await this.hydrate(candidates.hits, candidates.signal, input.limit);
+      checkAbort(candidates.signal);
+      finish?.("completed", {
+        resultCount: documents.length,
+        degraded: candidates.status.degraded,
+      });
       return {
         documents,
-        status: {
-          mode: result.mode,
-          degraded,
-          ...(degradationReason ? { degradationReason } : {}),
-        },
+        status: candidates.status,
       };
     } catch (error) {
-      finish?.(signal?.aborted || isCancelled(error) ? "cancelled" : "failed");
+      finish?.(isCancelled(error) ? "cancelled" : "failed");
       throw error;
     }
   }
@@ -235,20 +277,8 @@ export class VaultRetrieval {
     for (const hit of hits) {
       if (limit !== undefined && documents.length >= limit) break;
       checkAbort(signal);
-      const note = await this.readNote(hit.path, signal);
-      if (!note) continue;
-      documents.push(
-        new Document({
-          id: hit.path,
-          pageContent: note.content,
-          metadata: {
-            path: hit.path,
-            score: hit.score,
-            ...(hit.lexicalScore === undefined ? {} : { lexicalScore: hit.lexicalScore }),
-            ...(hit.semanticScore === undefined ? {} : { semanticScore: hit.semanticScore }),
-          },
-        })
-      );
+      const document = await this.readSearchCandidate(hit, signal);
+      if (document) documents.push(document);
     }
     return documents;
   }

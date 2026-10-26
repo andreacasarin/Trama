@@ -15,7 +15,12 @@ export interface VaultToolOutcome {
 
 export type VaultToolFactory = () => StructuredToolInterface[];
 
-const PATH_ARGUMENT = z.object({ path: z.string().min(1) }).strict();
+const PATHS_ARGUMENT = z
+  .object({
+    paths: z.array(z.string().min(1)).min(1),
+    sourcePath: z.string().min(1).optional(),
+  })
+  .strict();
 const DISCOVER_LINKS_ARGUMENT = z
   .object({
     path: z.string().min(1),
@@ -26,12 +31,6 @@ const DISCOVER_LINKS_ARGUMENT = z
       .safe()
       .describe("Maximum links to return (default: 25).")
       .optional(),
-  })
-  .strict();
-const FOLLOW_LINK_ARGUMENT = z
-  .object({
-    link: z.string().min(1),
-    sourcePath: z.string().min(1),
   })
   .strict();
 const SEARCH_ARGUMENT = z
@@ -53,6 +52,8 @@ const SEARCH_ARGUMENT = z
 
 const DEFAULT_LINK_LIMIT = 25;
 const DEFAULT_SEARCH_LIMIT = 10;
+const SEARCH_PREVIEW_CHARS = 1_000;
+const SEARCH_OUTPUT_CHARS = 12_000;
 
 function failure(error: unknown, provenance: readonly ProvenanceRecord[] = []): VaultToolOutcome {
   const cancelled = error instanceof Error && /cancel/i.test(error.message);
@@ -65,6 +66,84 @@ function failure(error: unknown, provenance: readonly ProvenanceRecord[] = []): 
       retryable: cancelled ? false : (structured?.retryable ?? true),
     },
     provenance,
+  };
+}
+
+async function readOneNote(
+  vault: ReadonlyVault,
+  path: string,
+  signal: AbortSignal,
+  sourcePath?: string
+): Promise<{ note: unknown; provenance: readonly ProvenanceRecord[] }> {
+  const isPath = !sourcePath && (path.trim() !== path || path.toLowerCase().endsWith(".md"));
+  const details =
+    sourcePath && !isPath
+      ? vault.resolveLinkDetails
+        ? await vault.resolveLinkDetails(path, sourcePath, signal)
+        : { path: await vault.resolveLink(path, sourcePath, signal) }
+      : undefined;
+  const targetPath = isPath
+    ? path
+    : (details?.path ?? (sourcePath ? null : await vault.resolveLink(path, null, signal)));
+  if (!targetPath)
+    throw new Error(
+      `No visible note matches '${path}'. Use an exact vault-relative .md path or a unique note title.`
+    );
+  const note = await vault.readNote(targetPath, signal);
+  return {
+    note,
+    provenance: [
+      ...(details
+        ? [
+            {
+              path: sourcePath!,
+              ...(details.startLine !== undefined || details.endLine !== undefined
+                ? { startLine: details.startLine, endLine: details.endLine }
+                : {}),
+            },
+          ]
+        : []),
+      { path: note.path, startLine: note.startLine, endLine: note.endLine },
+    ],
+  };
+}
+
+async function readNotes(
+  vault: ReadonlyVault,
+  paths: readonly string[],
+  signal: AbortSignal,
+  sourcePath?: string
+): Promise<VaultToolOutcome> {
+  const results: {
+    requestedPath: string;
+    note?: unknown;
+    error?: StructuredErrorShape;
+    provenance?: readonly ProvenanceRecord[];
+  }[] = [];
+  for (let offset = 0; offset < paths.length; offset += 4) {
+    if (signal.aborted) return failure(new Error("Operation cancelled"));
+    const batch = paths.slice(offset, offset + 4);
+    const completed = await Promise.all(
+      batch.map(async (requestedPath) => {
+        try {
+          const result = await readOneNote(vault, requestedPath, signal, sourcePath);
+          return { requestedPath, ...result };
+        } catch (error) {
+          return { requestedPath, error: failure(error).error };
+        }
+      })
+    );
+    if (signal.aborted) return failure(new Error("Operation cancelled"));
+    results.push(...completed);
+  }
+  return {
+    ok: true,
+    data: {
+      results: results.map(({ requestedPath, note, error }) =>
+        error ? { requestedPath, error } : { requestedPath, note }
+      ),
+    },
+    provenance: results.flatMap((result) => result.provenance ?? []),
   };
 }
 
@@ -102,31 +181,14 @@ export function createVaultTools(
 
   return [
     tool(
-      wrap<{ path: string }>(async ({ path }, signal) => {
-        try {
-          const targetPath =
-            path.trim() !== path || path.toLowerCase().endsWith(".md")
-              ? path
-              : await vault.resolveLink(path, null, signal);
-          if (!targetPath)
-            throw new Error(
-              `No visible note matches '${path}'. Use an exact vault-relative .md path or a unique note title.`
-            );
-          const note = await vault.readNote(targetPath, signal);
-          return {
-            ok: true,
-            data: note,
-            provenance: [{ path: note.path, startLine: note.startLine, endLine: note.endLine }],
-          };
-        } catch (error) {
-          return failure(error);
-        }
-      }),
+      wrap<{ paths: string[]; sourcePath?: string }>(async ({ paths, sourcePath }, signal) =>
+        readNotes(vault, paths, signal, sourcePath)
+      ),
       {
-        name: "read_note",
+        name: "read_notes",
         description:
-          "Read a Markdown note by exact vault-relative .md path, unique note title, or complete [[wikilink]]. Use follow_link for source-relative links.",
-        schema: PATH_ARGUMENT,
+          "Read full content from multiple Markdown notes in one call. Provide canonical vault-relative .md paths when known, or unique titles and complete [[wikilinks]]. Set sourcePath to resolve supplied links relative to their source note.",
+        schema: PATHS_ARGUMENT,
         responseFormat: "content_and_artifact",
       }
     ),
@@ -149,43 +211,9 @@ export function createVaultTools(
       }),
       {
         name: "discover_links",
-        description: "Discover resolved and unresolved links in a note.",
-        schema: DISCOVER_LINKS_ARGUMENT,
-        responseFormat: "content_and_artifact",
-      }
-    ),
-    tool(
-      wrap<{ link: string; sourcePath: string }>(async ({ link, sourcePath }, signal) => {
-        try {
-          const details = vault.resolveLinkDetails
-            ? await vault.resolveLinkDetails(link, sourcePath, signal)
-            : { path: await vault.resolveLink(link, sourcePath, signal) };
-          if (!details) return { ok: true, data: { path: null }, provenance: [] };
-          const target = details.path ? await vault.readNote(details.path, signal) : null;
-          return {
-            ok: true,
-            data: { path: details.path, note: target },
-            provenance: [
-              {
-                path: sourcePath,
-                ...(details.startLine !== undefined || details.endLine !== undefined
-                  ? { startLine: details.startLine, endLine: details.endLine }
-                  : {}),
-              },
-              ...(target
-                ? [{ path: target.path, startLine: target.startLine, endLine: target.endLine }]
-                : []),
-            ],
-          };
-        } catch (error) {
-          return failure(error, [{ path: sourcePath }]);
-        }
-      }),
-      {
-        name: "follow_link",
         description:
-          "Resolve link text or a complete [[wikilink]] relative to the sourcePath note that contains it.",
-        schema: FOLLOW_LINK_ARGUMENT,
+          "Discover resolved and unresolved outgoing links, with a bounded result count (default: 25).",
+        schema: DISCOVER_LINKS_ARGUMENT,
         responseFormat: "content_and_artifact",
       }
     ),
@@ -193,18 +221,49 @@ export function createVaultTools(
       wrap<{ query: string; limit?: number }>(async ({ query, limit }, signal) => {
         try {
           const resultLimit = limit ?? DEFAULT_SEARCH_LIMIT;
-          const { documents, status } = await retrieval.runnable.invoke(
+          const {
+            hits,
+            status,
+            signal: searchSignal,
+          } = await retrieval.searchCandidates(
             { query, mode: "hybrid", limit: resultLimit },
-            { signal }
+            signal
           );
-          const results = documents.slice(0, resultLimit).map((document) => ({
-            path: String(document.metadata.path),
-            context: document.pageContent,
-          }));
+          const results: { path: string; context: string; contextTruncated: boolean }[] = [];
+          let hydratedCount = 0;
+          for (const hit of hits) {
+            if (results.length >= resultLimit) break;
+            const document = await retrieval.readSearchCandidate(hit, searchSignal);
+            if (!document) continue;
+            hydratedCount++;
+            const context = document.pageContent.slice(0, SEARCH_PREVIEW_CHARS);
+            const candidate = {
+              path: String(document.metadata.path),
+              context,
+              contextTruncated: document.pageContent.length > context.length,
+            };
+            const nextResults = [...results, candidate];
+            const data = {
+              results: nextResults,
+              candidateCount: hits.length,
+              hydratedCount,
+              returnedCount: nextResults.length,
+              omittedCount: hits.length - nextResults.length,
+              mode: status.mode,
+              degraded: status.degraded,
+              degradationReason: status.degradationReason,
+            };
+            if (JSON.stringify(data).length > SEARCH_OUTPUT_CHARS) break;
+            results.push(candidate);
+          }
           return {
             ok: true,
             data: {
               results,
+              candidateCount: hits.length,
+              hydratedCount,
+              returnedCount: results.length,
+              omittedCount: hits.length - results.length,
               mode: status.mode,
               degraded: status.degraded,
               degradationReason: status.degradationReason,
@@ -217,7 +276,8 @@ export function createVaultTools(
       }),
       {
         name: "vault_search",
-        description: "Search the current vault index and return matching note paths with context.",
+        description:
+          "Search the vault for ranked discovery excerpts with canonical note paths. Excerpts and the total response are bounded; read_notes returns full note content when needed.",
         schema: SEARCH_ARGUMENT,
         responseFormat: "content_and_artifact",
       }

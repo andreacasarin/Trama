@@ -77,6 +77,24 @@
   overflow-wrap: anywhere;
 }
 
+.trama-voce__reasoning-summary {
+  margin-bottom: 10px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.trama-voce__reasoning-summary-label {
+  margin-bottom: 3px;
+  font-weight: 600;
+}
+
+.trama-voce__compaction-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
 .trama-voce__message--collapsed {
   max-height: 12rem;
   overflow: hidden;

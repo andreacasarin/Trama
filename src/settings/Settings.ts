@@ -3,6 +3,7 @@ export interface ChatSettings {
   readonly modelId: string;
   readonly temperature: number;
   readonly maxOutputTokens?: number;
+  readonly contextWindowTokens?: number;
   readonly reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 }
 export interface EmbeddingSettings {
@@ -19,7 +20,12 @@ export interface TramaSettings {
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   consoleDebug: false,
-  chat: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", temperature: 0.2 }),
+  chat: Object.freeze({
+    endpoint: "http://127.0.0.1:1234/v1",
+    modelId: "",
+    temperature: 0.2,
+    contextWindowTokens: 4096,
+  }),
   embedding: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", dimensions: 768 }),
   excludedFolders: Object.freeze([]),
 });
@@ -68,6 +74,10 @@ export class SettingsStore {
           Number.isFinite(chat.temperature) && chat.temperature >= 0 && chat.temperature <= 1
             ? chat.temperature
             : 0.2,
+        contextWindowTokens:
+          Number.isSafeInteger(chat.contextWindowTokens) && chat.contextWindowTokens > 0
+            ? chat.contextWindowTokens
+            : DEFAULT_SETTINGS.chat.contextWindowTokens,
         ...(Number.isSafeInteger(chat.maxOutputTokens) && chat.maxOutputTokens >= 1024
           ? { maxOutputTokens: chat.maxOutputTokens }
           : {}),

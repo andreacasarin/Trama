@@ -126,6 +126,28 @@ export class TramaSettingsTab extends PluginSettingTab {
         }),
       "Leave blank for the model default."
     );
+    this.text(
+      "Context window tokens",
+      "chat.contextWindowTokens",
+      () => String(this.plugin.getSettings().chat.contextWindowTokens),
+      String(settings.chat.contextWindowTokens),
+      (raw) => {
+        const count = Number(raw);
+        if (Number.isSafeInteger(count) && count > 0) settings.chat.contextWindowTokens = count;
+      },
+      (raw) => {
+        const value = Number(raw);
+        return Number.isSafeInteger(value) && value > 0
+          ? { value, display: String(value) }
+          : undefined;
+      },
+      async (value) =>
+        this.persist((current) => ({
+          ...current,
+          chat: { ...current.chat, contextWindowTokens: value },
+        })),
+      "Approximate usable model context, including the reserved output space."
+    );
     new Setting(containerEl).setName("Reasoning effort").addDropdown((dropdown) => {
       dropdown.addOption("auto", "Auto");
       for (const value of REASONING_EFFORTS)

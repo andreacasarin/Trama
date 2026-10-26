@@ -29,6 +29,9 @@ interface RenderedTurn {
   readonly id: string;
   readonly row: HTMLDivElement;
   markdownComponent?: Component;
+  turn?: ChatState["turns"][number];
+  reasoning?: HTMLDivElement;
+  compaction?: HTMLDivElement;
 }
 
 interface AssistantTurnAction {
@@ -526,10 +529,26 @@ export class VoceView extends ItemView {
   }
 
   private updateRenderedTurn(rendered: RenderedTurn, turn: ChatState["turns"][number]): void {
+    if (
+      rendered.turn &&
+      this.turnContentSignature(rendered.turn) === this.turnContentSignature(turn)
+    ) {
+      this.updateTurnIndicators(rendered, turn);
+      rendered.turn = turn;
+      this.renderedTailSignature = this.turnSignature(turn);
+      return;
+    }
+    const previousCompactionStatus =
+      rendered.turn?.role === "assistant" ? rendered.turn.compactionStatus : undefined;
+    const compactionChanged =
+      previousCompactionStatus !== (turn.role === "assistant" ? turn.compactionStatus : undefined);
     if (rendered.markdownComponent) this.removeChild(rendered.markdownComponent);
     const component = this.addChild(new Component());
     rendered.markdownComponent = component;
     this.renderedTailSignature = this.turnSignature(turn);
+    rendered.turn = turn;
+    rendered.reasoning = undefined;
+    rendered.compaction = undefined;
     rendered.row.empty();
     const bubble = rendered.row.createDiv({
       cls: [
@@ -537,6 +556,7 @@ export class VoceView extends ItemView {
         turn.role === "user" ? "trama-voce__bubble--user" : "trama-voce__bubble--assistant",
       ],
     });
+    this.updateTurnIndicators(rendered, turn, bubble, compactionChanged);
     const isCollapsible =
       !(turn.role === "assistant" && turn.status === "working") &&
       turn.content.length > COLLAPSIBLE_MESSAGE_LENGTH;
@@ -550,6 +570,11 @@ export class VoceView extends ItemView {
       ],
       attr: { "data-source-path": sourcePath },
     });
+    if (turn.role === "assistant" && turn.status === "incomplete")
+      bubble.createDiv({
+        cls: "mod-warning trama-voce__error",
+        text: "This response is incomplete.",
+      });
     void MarkdownRenderer.render(this.app, turn.content, message, sourcePath, component).then(
       () => {
         if (
@@ -585,9 +610,70 @@ export class VoceView extends ItemView {
       this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
   }
 
-  private turnSignature(turn: ChatState["turns"][number]): string {
+  private updateTurnIndicators(
+    rendered: RenderedTurn,
+    turn: ChatState["turns"][number],
+    parent = rendered.row.firstElementChild as HTMLDivElement | null,
+    announceCompaction = (rendered.turn?.role === "assistant"
+      ? rendered.turn.compactionStatus
+      : undefined) !== (turn.role === "assistant" ? turn.compactionStatus : undefined)
+  ): void {
+    if (!parent) return;
+    if (turn.role === "assistant" && turn.reasoningSummary) {
+      const reasoning =
+        rendered.reasoning ?? parent.createDiv({ cls: "trama-voce__reasoning-summary" });
+      reasoning.empty();
+      reasoning.createDiv({
+        cls: "trama-voce__reasoning-summary-label",
+        text: "Reasoning summary",
+      });
+      reasoning.createDiv({ text: turn.reasoningSummary });
+      rendered.reasoning = reasoning;
+    } else {
+      rendered.reasoning?.remove();
+      rendered.reasoning = undefined;
+    }
+    if (turn.role === "assistant" && turn.compactionStatus) {
+      const status =
+        turn.compactionStatus === "running"
+          ? "Condensing earlier conversation…"
+          : "Earlier conversation condensed to fit the context window. Some details may be missing; your current request and recent context are retained. The visible transcript is unchanged.";
+      const compaction =
+        rendered.compaction ??
+        parent.createDiv({
+          cls: "trama-voce__compaction-status",
+          ...(announceCompaction ? { attr: { role: "status", "aria-live": "polite" } } : {}),
+        });
+      if (announceCompaction) {
+        if (compaction.getAttribute("role") !== "status") compaction.setAttribute("role", "status");
+        if (compaction.getAttribute("aria-live") !== "polite")
+          compaction.setAttribute("aria-live", "polite");
+      }
+      if (compaction.textContent !== status) compaction.setText(status);
+      rendered.compaction = compaction;
+    } else {
+      rendered.compaction?.remove();
+      rendered.compaction = undefined;
+    }
+  }
+
+  private turnContentSignature(turn: ChatState["turns"][number]): string {
     return turn.role === "assistant"
       ? JSON.stringify([turn.id, turn.role, turn.content, turn.status, turn.sources])
+      : JSON.stringify([turn.id, turn.role, turn.content, turn.attachments, turn.skill?.path]);
+  }
+
+  private turnSignature(turn: ChatState["turns"][number]): string {
+    return turn.role === "assistant"
+      ? JSON.stringify([
+          turn.id,
+          turn.role,
+          turn.content,
+          turn.reasoningSummary,
+          turn.status,
+          turn.compactionStatus,
+          turn.sources,
+        ])
       : JSON.stringify([turn.id, turn.role, turn.content, turn.attachments, turn.skill?.path]);
   }
 
