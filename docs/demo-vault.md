@@ -63,9 +63,11 @@ you have performed it in Obsidian.
   activate it by keyboard. Paste a copied response into the composer to verify its
   full text, then clear the draft.
 - Edit the second prompt: confirm it returns to the composer with its attachments,
-  and the second prompt and all subsequent messages disappear. Send a revision
-  and confirm the conversation continues from the first exchange. Edit the first
-  prompt and confirm the transcript becomes empty before resending.
+  while every message stays visible. Confirm an X icon appears directly above
+  Send; cancel the edit with it and confirm the conversation
+  is unchanged. Edit again and send a revision: only then should the second prompt
+  and all subsequent messages be replaced, continuing from the first exchange.
+  Edit the first prompt and confirm the existing transcript remains until Send.
 
 ## Voce UX delivery assessment
 

@@ -30,11 +30,14 @@ Serialize plugin loading, settings persistence, and reconfiguration through one 
 
 ### Agent and privacy boundaries
 
-Editing a user message restores the native checkpoint immediately before that
+Selecting Edit only prepares a composer draft; it leaves native history and the
+visible conversation intact. Sending the revised prompt, after preflight and
+nonempty-input validation, restores the native checkpoint immediately before that
 prompt and removes the prompt and all later turns from the visible projection.
 Keep only a per-user-turn reference to its preceding completed checkpoint; do not
 reconstruct provider history from visible messages. Return the original prompt and
-attachments to the composer for revision. Editing the first prompt starts fresh
+attachments to the composer for revision; cancelling the edit only clears this
+draft. Sending a revision of the first prompt starts fresh
 native history on the next send. Reject edits while a turn is running, and clear
 checkpoint references on reset or when their visible turns are discarded.
 

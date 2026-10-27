@@ -106,6 +106,7 @@ export class VoceView extends ItemView {
   private input!: VoceComposer;
   private inlineSuggest?: VoceInlineSuggest;
   private actionButton!: HTMLButtonElement;
+  private cancelEditButton!: HTMLButtonElement;
   private readonly renderedTurns: RenderedTurn[] = [];
   private renderedTailSignature?: string;
   private transcriptActivity?: HTMLDivElement;
@@ -115,6 +116,7 @@ export class VoceView extends ItemView {
   private readonly expandedSourceTurnIds = new Set<string>();
   private latestAssistantTurnId?: string;
   private localError?: string;
+  private editingTurnId?: string;
   private skillResolutionGeneration = 0;
   private skillResolutionAbort?: AbortController;
   private preparingSkill = false;
@@ -157,6 +159,7 @@ export class VoceView extends ItemView {
     this.activeAttachmentPicker = undefined;
     this.unsubscribe?.();
     this.session = session;
+    this.editingTurnId = undefined;
     this.turnExpansionOverrides.clear();
     this.expandedSourceTurnIds.clear();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
@@ -255,7 +258,16 @@ export class VoceView extends ItemView {
         return;
       }
     });
-    this.actionButton = new ButtonComponent(composeRow).buttonEl;
+    const composerActions = composeRow.createDiv({ cls: "trama-voce__composer-actions" });
+    this.cancelEditButton = composerActions.createEl("button", {
+      cls: "clickable-icon trama-voce__action",
+      attr: { type: "button", "aria-label": "Cancel edit" },
+    });
+    this.cancelEditButton.hidden = true;
+    setIcon(this.cancelEditButton, "x");
+    setTooltip(this.cancelEditButton, "Cancel edit");
+    this.cancelEditButton.addEventListener("click", () => this.cancelEdit());
+    this.actionButton = new ButtonComponent(composerActions).buttonEl;
     this.actionButton.classList.add("clickable-icon", "trama-voce__action");
     this.actionButton.type = "button";
     this.actionButton.addEventListener("click", () => {
@@ -284,6 +296,7 @@ export class VoceView extends ItemView {
 
   override onClose(): Promise<void> {
     this.isViewOpen = false;
+    this.editingTurnId = undefined;
     this.abortSkillResolution();
     this.inlineSuggest?.invalidate();
     this.suggestionGeneration++;
@@ -321,6 +334,7 @@ export class VoceView extends ItemView {
     this.relatedSuggestions = [];
     this.relatedSourcePath = undefined;
     this.input.value = "";
+    this.editingTurnId = undefined;
     this.selectedAttachmentPaths = [];
     this.localError = undefined;
     this.turnExpansionOverrides.clear();
@@ -458,8 +472,14 @@ export class VoceView extends ItemView {
       }
       this.followTranscript = true;
       this.lastAppliedTranscriptTop = this.transcript.scrollTop;
-      const pendingSend = session.send({ content, attachmentPaths, skill });
+      const pendingSend = session.send({
+        content,
+        attachmentPaths,
+        skill,
+        editTurnId: this.editingTurnId,
+      });
       if (session.getState().running) {
+        this.editingTurnId = undefined;
         this.input.value = "";
         this.selectedAttachmentPaths = [];
         this.renderAttachments();
@@ -956,7 +976,7 @@ export class VoceView extends ItemView {
         return;
       }
       this.inlineSuggest?.invalidate();
-      this.session.edit(turn.id);
+      this.editingTurnId = turn.id;
       this.input.value = turn.content;
       this.selectedAttachmentPaths = turn.attachments.map((note) => note.path);
       this.localError = undefined;
@@ -1014,8 +1034,21 @@ export class VoceView extends ItemView {
     });
   }
 
+  private cancelEdit(): void {
+    this.abortSkillResolution();
+    this.inlineSuggest?.invalidate();
+    this.editingTurnId = undefined;
+    this.input.value = "";
+    this.selectedAttachmentPaths = [];
+    this.localError = undefined;
+    this.renderAttachments();
+    this.renderFeedback(this.session.getState());
+    this.input.focus();
+  }
+
   private renderFeedback(state: ChatState): void {
     this.feedback.empty();
+    this.cancelEditButton.hidden = !this.editingTurnId || state.running;
     const message = this.localError ?? (state.error ? errorMessage(state.error) : undefined);
     if (message) {
       this.feedback.createDiv({ cls: "mod-warning trama-voce__error", text: message });

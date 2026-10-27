@@ -243,6 +243,17 @@
   gap: 8px;
 }
 
+.trama-voce__composer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trama-voce__composer-actions > [hidden] {
+  display: none;
+}
+
 .trama-voce__input {
   display: block;
   flex: 1 1 auto;

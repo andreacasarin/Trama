@@ -37,22 +37,29 @@ describe("Voce native agent session", () => {
     await session.send({ content: "Discard this", attachmentPaths: [] });
     const listener = vi.fn();
     session.subscribe(listener);
-    expect(session.edit(original.id)).toEqual(original);
+    const pendingEdit = session.send({
+      content: "Replacement",
+      attachmentPaths: [],
+      editTurnId: original.id,
+    });
     expect(session.getState().turns.map((turn) => turn.content)).toEqual([
       "Keep this",
       "Answer to Keep this",
     ]);
     expect(listener).toHaveBeenLastCalledWith(session.getState());
-    await session.send({ content: "Replacement", attachmentPaths: [] });
+    await pendingEdit;
     const request = model.inputs.at(-1)!.join("\n");
     expect(request).toContain("Keep this");
     expect(request).toContain("Answer to Keep this");
     expect(request).toContain("Replacement");
     expect(request).not.toContain("Replace this");
     expect(request).not.toContain("Discard this");
-    session.edit(session.getState().turns[0].id);
-    expect(session.getState().turns).toEqual([]);
-    await session.send({ content: "Fresh start", attachmentPaths: [] });
+    await session.send({
+      content: "Fresh start",
+      attachmentPaths: [],
+      editTurnId: session.getState().turns[0].id,
+    });
+    expect(session.getState().turns).toHaveLength(2);
     expect(model.inputs.at(-1)!.join("\n")).not.toContain("Keep this");
     expect(model.inputs.at(-1)!.join("\n")).not.toContain("Replacement");
   });
@@ -63,8 +70,13 @@ describe("Voce native agent session", () => {
     });
     await session.send({ content: "Prompt", attachmentPaths: [] });
     const state = session.getState();
-    expect(() => session.edit(state.turns[1].id)).toThrow("User message could not be found");
-    expect(() => session.edit("missing")).toThrow("User message could not be found");
+    for (const editTurnId of [state.turns[1].id, "missing"])
+      await expect(
+        session.send({ content: "Revision", attachmentPaths: [], editTurnId })
+      ).rejects.toThrow("User message could not be found");
+    await expect(
+      session.send({ content: "  ", attachmentPaths: [], editTurnId: state.turns[0].id })
+    ).rejects.toThrow("Message cannot be empty");
     expect(session.getState()).toBe(state);
   });
 

@@ -81,7 +81,10 @@ function response(id: string, status: AssistantConversationTurn["status"] = "com
 
 function setup() {
   const copy = vi.fn(async () => {});
-  const session = { getState: vi.fn(() => ({ turns: [], running: false })), edit: vi.fn() };
+  const session = {
+    getState: vi.fn(() => ({ turns: [], running: false })),
+    send: vi.fn(async () => {}),
+  };
   const view = new VoceView(
     new WorkspaceLeaf(),
     session as unknown as ChatSession,
@@ -90,6 +93,7 @@ function setup() {
     copy
   ) as any;
   view.transcript = new ElementStub();
+  view.cancelEditButton = { hidden: true };
   view.input = { value: "", focus: vi.fn() };
   view.renderAttachments = vi.fn();
   view.renderFeedback = vi.fn();
@@ -217,7 +221,9 @@ describe("Voce transcript", () => {
     expect(button.attributes["aria-label"]).toBe("Edit message");
     expect(button.children).toHaveLength(0);
     button.listeners.get("click")!();
-    expect(session.edit).toHaveBeenCalledWith(turn.id);
+    expect(view.editingTurnId).toBe(turn.id);
+    expect(session.send).not.toHaveBeenCalled();
+    expect(row(1).find("trama-voce__message")).toBeDefined();
     expect(view.input.value).toBe(turn.content);
     expect(view.selectedAttachmentPaths).toEqual(["Notes.md"]);
     expect(view.input.focus).toHaveBeenCalledOnce();
@@ -232,7 +238,52 @@ describe("Voce transcript", () => {
     row(0).find("trama-voce__message-action")!.listeners.get("click")!();
     expect(view.input.value).toBe("Unsent draft");
     expect(view.localError).toContain("Stop the current response");
-    expect(session.edit).not.toHaveBeenCalled();
+    expect(session.send).not.toHaveBeenCalled();
+  });
+
+  it("submits the edit target only when Send is used", async () => {
+    const { view, session, render, row } = setup();
+    render([
+      { id: "user", role: "user", content: "Original", attachments: [] },
+      response("answer"),
+    ]);
+    row(0).find("trama-voce__message-action")!.listeners.get("click")!();
+    expect(session.send).not.toHaveBeenCalled();
+    view.input.value = "Revised";
+    view.render = vi.fn();
+    session.send.mockImplementation(async () => {
+      session.getState.mockReturnValue({ turns: [], running: true });
+    });
+    await view.submit();
+    expect(session.send).toHaveBeenCalledWith({
+      content: "Revised",
+      attachmentPaths: [],
+      skill: undefined,
+      editTurnId: "user",
+    });
+    expect(view.editingTurnId).toBeUndefined();
+    expect(view.input.value).toBe("");
+  });
+
+  it("cancels an edit without sending or removing conversation rows", () => {
+    const { view, session, render, row } = setup();
+    render([
+      { id: "user", role: "user", content: "Original", attachments: [] },
+      response("answer"),
+    ]);
+    row(0).find("trama-voce__message-action")!.listeners.get("click")!();
+    view.feedback = new ElementStub();
+    view.updateActionButton = vi.fn();
+    (VoceView.prototype as any).renderFeedback.call(view, session.getState());
+    expect(view.cancelEditButton.hidden).toBe(false);
+    expect(view.feedback.children).toHaveLength(0);
+    view.cancelEdit();
+    expect(view.editingTurnId).toBeUndefined();
+    expect(view.input.value).toBe("");
+    expect(view.transcript.children).toHaveLength(2);
+    expect(session.send).not.toHaveBeenCalled();
+    (VoceView.prototype as any).renderFeedback.call(view, session.getState());
+    expect(view.cancelEditButton.hidden).toBe(true);
   });
 });
 

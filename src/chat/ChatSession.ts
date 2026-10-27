@@ -21,6 +21,7 @@ export interface SendTurnInput {
   readonly content: string;
   readonly attachmentPaths: readonly string[];
   readonly skill?: { readonly path: string; readonly content: string };
+  readonly editTurnId?: string;
 }
 
 export interface AttachedNote {
@@ -292,8 +293,8 @@ export class ChatSession {
     return this.state;
   }
 
-  /** Restores the native history before a prompt and returns it for editing. */
-  edit(turnId: string): UserConversationTurn {
+  /** Restores native history only when a revised prompt is submitted. */
+  private rewind(turnId: string): void {
     if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
     const index = this.state.turns.findIndex((turn) => turn.id === turnId);
     const turn = this.state.turns[index];
@@ -304,7 +305,6 @@ export class ChatSession {
       this.checkpointsBeforeUserTurns.delete(removed.id);
     this.state = { turns: Object.freeze(this.state.turns.slice(0, index)), running: false };
     for (const listener of this.listeners) listener(this.state);
-    return turn;
   }
 
   subscribe(listener: (state: ChatState) => void): () => void {
@@ -318,6 +318,7 @@ export class ChatSession {
     if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
     if (!input.content.trim())
       throw new StructuredError("invalid_request", "Message cannot be empty.", false);
+    if (input.editTurnId) this.rewind(input.editTurnId);
     if (!this.lastCompletedCheckpointId) this.checkpointer = new MemorySaver();
     const checkpointer = this.checkpointer;
     const paths = [...new Set(input.attachmentPaths)];

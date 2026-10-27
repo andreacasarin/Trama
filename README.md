@@ -39,10 +39,11 @@ Hover over an assistant message to copy its response, or over a user message to
 edit its prompt. The compact icons and local message day/time appear only on
 hover or keyboard focus, including anywhere in the footer across the message's
 width. Assistant actions align right; user actions align left. Both icon buttons have padded click targets and are
-accessible by keyboard. Edit moves the original prompt and attachments into the composer,
-removes that prompt and every later message from the transcript, and restores the
-model's conversation context to before that prompt. Sending the revised prompt
-continues from there. Wait for the current response to finish or stop it before editing.
+accessible by keyboard. Edit loads the original prompt and attachments into the
+composer while leaving the conversation intact. Only sending the revised prompt
+removes the original prompt and later messages and restores the model's context
+to before that prompt. The **Cancel edit** X icon above Send clears the edit draft without changing the
+conversation. Wait for the current response to finish or stop it before editing.
 
 Voce edits Markdown as plain text; submitted messages render in the conversation
 transcript. Typing `[[` opens Obsidian's inline note suggestions, while `/` at the
