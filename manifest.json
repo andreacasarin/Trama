@@ -1,7 +1,7 @@
 {
   "id": "trama",
   "name": "Trama",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "minAppVersion": "1.7.2",
   "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
   "author": "Andrea Casarin"

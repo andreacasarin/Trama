@@ -183,9 +183,7 @@ export class VoceInlineSuggest extends AbstractInputSuggest<InlineSuggestion> {
 
   renderSuggestion(suggestion: InlineSuggestion, element: HTMLElement): void {
     element.setText(
-      suggestion.kind === "note"
-        ? suggestion.path
-        : `/${suggestion.command.alias ?? "?"}`
+      suggestion.kind === "note" ? suggestion.path : `/${suggestion.command.alias ?? "?"}`
     );
     if (suggestion.kind === "skill" && suggestion.command.description)
       element.createDiv({
