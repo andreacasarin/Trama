@@ -34,7 +34,9 @@ describe("demo vault", () => {
       }
     }
     const skill = notes.get("zettelkasten/Voce demo skill")!;
-    expect(skill).toMatch(/^---\ntrama-voce-skill: true\ntrama-voce-command: demo-guide\n---\n/);
+    expect(skill).toMatch(
+      /^---\ntrama-voce-skill: true\ntrama-voce-command: demo-guide\ntrama-voce-description: .+\n---\n/
+    );
     expect([...skill.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)].map((match) => match[1])).toEqual(
       ["Lexical search remembers exact words", "Embeddings represent meaning"]
     );

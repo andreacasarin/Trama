@@ -173,9 +173,10 @@ export class VoceInlineSuggest extends AbstractInputSuggest<InlineSuggestion> {
     const suggestions =
       trigger.kind === "note"
         ? matches(this.notes(), (path) => path).map((path) => ({ kind: "note" as const, path }))
-        : matches(this.skills(), (command) => `${command.alias ?? ""} ${command.path}`).map(
-            (command) => ({ kind: "skill" as const, command })
-          );
+        : matches(
+            this.skills(),
+            (command) => `${command.alias ?? ""} ${command.path} ${command.description ?? ""}`
+          ).map((command) => ({ kind: "skill" as const, command }));
     this.openState = suggestions.length > 0;
     return suggestions;
   }
@@ -184,8 +185,13 @@ export class VoceInlineSuggest extends AbstractInputSuggest<InlineSuggestion> {
     element.setText(
       suggestion.kind === "note"
         ? suggestion.path
-        : `/${suggestion.command.alias ?? "?"} — ${suggestion.command.path}`
+        : `/${suggestion.command.alias ?? "?"}`
     );
+    if (suggestion.kind === "skill" && suggestion.command.description)
+      element.createDiv({
+        cls: "setting-item-description trama-voce__skill-description",
+        text: suggestion.command.description,
+      });
   }
 
   override selectSuggestion(suggestion: InlineSuggestion, event: MouseEvent | KeyboardEvent): void {

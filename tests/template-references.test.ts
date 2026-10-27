@@ -77,6 +77,20 @@ describe("Voce skill commands", () => {
     expect(skillCommandReference(catalog[0])).toBe("/coach-analyst");
   });
 
+  it("keeps optional descriptions from cached metadata and ignores empty or non-text values", () => {
+    const descriptions = ["  Explain the evidence  ", "   ", undefined, 42];
+    const commands = skillCommandCatalog(
+      descriptions.map((description, index) => ({
+        path: `Skills/${index}.md`,
+        marker: true,
+        alias: `skill-${index}`,
+        description,
+      }))
+    );
+    expect(commands[0].description).toBe("Explain the evidence");
+    for (const command of commands.slice(1)) expect(command).not.toHaveProperty("description");
+  });
+
   it("validates the fresh marker and alias, then strips YAML frontmatter", () => {
     const source =
       "---\ntrama-voce-skill: true\ntrama-voce-command: coach-analyst\n---\nAnalyze this request";

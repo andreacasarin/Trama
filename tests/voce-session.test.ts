@@ -12,6 +12,62 @@ import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 const tools: VaultToolFactory = () => [];
 
 describe("Voce native agent session", () => {
+  it("rewinds visible turns and native model history before an edited prompt", async () => {
+    class RecordingModel extends FakeToolCallingModel {
+      readonly inputs: string[][] = [];
+      override bindTools() {
+        return this;
+      }
+      override _generate(messages: BaseMessage[]) {
+        this.inputs.push(messages.map((message) => String(message.content)));
+        const answer = `Answer to ${messages.at(-1)?.content}`;
+        return Promise.resolve({
+          generations: [{ text: answer, message: new AIMessage(answer) }],
+          llmOutput: {},
+        });
+      }
+    }
+    const model = new RecordingModel({ toolCalls: [[]] });
+    const session = new ChatSession(model, tools, {
+      readNote: async (path) => ({ path, content: "note" }),
+    });
+    await session.send({ content: "Keep this", attachmentPaths: [] });
+    const second = await session.send({ content: "Replace this", attachmentPaths: [] });
+    const original = second.turns[2];
+    await session.send({ content: "Discard this", attachmentPaths: [] });
+    const listener = vi.fn();
+    session.subscribe(listener);
+    expect(session.edit(original.id)).toEqual(original);
+    expect(session.getState().turns.map((turn) => turn.content)).toEqual([
+      "Keep this",
+      "Answer to Keep this",
+    ]);
+    expect(listener).toHaveBeenLastCalledWith(session.getState());
+    await session.send({ content: "Replacement", attachmentPaths: [] });
+    const request = model.inputs.at(-1)!.join("\n");
+    expect(request).toContain("Keep this");
+    expect(request).toContain("Answer to Keep this");
+    expect(request).toContain("Replacement");
+    expect(request).not.toContain("Replace this");
+    expect(request).not.toContain("Discard this");
+    session.edit(session.getState().turns[0].id);
+    expect(session.getState().turns).toEqual([]);
+    await session.send({ content: "Fresh start", attachmentPaths: [] });
+    expect(model.inputs.at(-1)!.join("\n")).not.toContain("Keep this");
+    expect(model.inputs.at(-1)!.join("\n")).not.toContain("Replacement");
+  });
+
+  it("rejects editing an assistant or missing message without changing the conversation", async () => {
+    const session = new ChatSession(new FakeToolCallingModel({ toolCalls: [[]] }), tools, {
+      readNote: async (path) => ({ path, content: "note" }),
+    });
+    await session.send({ content: "Prompt", attachmentPaths: [] });
+    const state = session.getState();
+    expect(() => session.edit(state.turns[1].id)).toThrow("User message could not be found");
+    expect(() => session.edit("missing")).toThrow("User message could not be found");
+    expect(session.getState()).toBe(state);
+  });
+
   it("keeps attachment text in its selected turn, preserves citations, and resets native history", async () => {
     class RecordingModel extends FakeToolCallingModel {
       readonly inputs: string[][] = [];
@@ -40,6 +96,7 @@ describe("Voce native agent session", () => {
       }),
     });
     const first = await session.send({ content: "first question", attachmentPaths: ["source.md"] });
+    for (const turn of first.turns) expect(turn.createdAt).toEqual(expect.any(Number));
     expect(first.turns[0]).toMatchObject({
       attachments: [{ path: "source.md", startLine: 4, endLine: 7 }],
     });
@@ -48,6 +105,8 @@ describe("Voce native agent session", () => {
     });
 
     await session.send({ content: "second question", attachmentPaths: ["new-source.md"] });
+    expect(session.getState().turns[0].createdAt).toBe(first.turns[0].createdAt);
+    expect(session.getState().turns[1].createdAt).toBe(first.turns[1].createdAt);
     expect(model.inputs[0].join("\n")).toContain("first private note body");
     const secondTurn = model.inputs.at(-1)?.join("\n") ?? "";
     expect(secondTurn).toContain("first question");

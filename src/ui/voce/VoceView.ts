@@ -10,7 +10,12 @@ import {
   setTooltip,
   WorkspaceLeaf,
 } from "obsidian";
-import { AssistantConversationTurn, ChatSession, ChatState } from "@/chat/ChatSession";
+import {
+  AssistantConversationTurn,
+  ChatSession,
+  ChatState,
+  UserConversationTurn,
+} from "@/chat/ChatSession";
 import { removeNoteReference, resolveNoteReferences } from "@/chat/NoteReferences";
 import { resolveSkillCommands, skillBody, type SkillCommand } from "@/chat/TemplateReferences";
 import { StructuredError } from "@/domain/errors";
@@ -106,7 +111,9 @@ export class VoceView extends ItemView {
   private transcriptActivity?: HTMLDivElement;
   private activeAttachmentPicker?: AttachmentPickerModal;
   private selectedAttachmentPaths: string[] = [];
-  private readonly expandedTurnIds = new Set<string>();
+  private readonly turnExpansionOverrides = new Map<string, boolean>();
+  private readonly expandedSourceTurnIds = new Set<string>();
+  private latestAssistantTurnId?: string;
   private localError?: string;
   private skillResolutionGeneration = 0;
   private skillResolutionAbort?: AbortController;
@@ -150,7 +157,8 @@ export class VoceView extends ItemView {
     this.activeAttachmentPicker = undefined;
     this.unsubscribe?.();
     this.session = session;
-    this.expandedTurnIds.clear();
+    this.turnExpansionOverrides.clear();
+    this.expandedSourceTurnIds.clear();
     this.unsubscribe = this.session.subscribe((state) => this.render(state));
   }
 
@@ -315,7 +323,8 @@ export class VoceView extends ItemView {
     this.input.value = "";
     this.selectedAttachmentPaths = [];
     this.localError = undefined;
-    this.expandedTurnIds.clear();
+    this.turnExpansionOverrides.clear();
+    this.expandedSourceTurnIds.clear();
     this.session.reset();
     this.renderAttachments();
     this.input.focus();
@@ -497,12 +506,30 @@ export class VoceView extends ItemView {
   }
 
   private renderTranscriptTurns(turns: ChatState["turns"]): void {
+    const previousAssistantTurnId = this.latestAssistantTurnId;
+    this.latestAssistantTurnId = undefined;
+    for (let index = turns.length - 1; index >= 0; index--) {
+      if (turns[index].role !== "assistant") continue;
+      this.latestAssistantTurnId = turns[index].id;
+      break;
+    }
     const previousLength = this.renderedTurns.length;
     const prefixMatches =
       previousLength <= turns.length &&
       this.renderedTurns.every((rendered, index) => rendered.id === turns[index].id);
     const rebuild = !prefixMatches;
     if (rebuild) this.clearTranscriptTurns();
+    if (!rebuild && previousAssistantTurnId !== this.latestAssistantTurnId) {
+      const previousAssistantIndex = this.renderedTurns.findIndex(
+        (turn) => turn.id === previousAssistantTurnId
+      );
+      if (previousAssistantIndex !== -1)
+        this.updateRenderedTurn(
+          this.renderedTurns[previousAssistantIndex],
+          turns[previousAssistantIndex],
+          true
+        );
+    }
     const firstNewTurn = rebuild ? 0 : previousLength;
     if (!rebuild && previousLength) {
       const previousTail = this.renderedTurns[previousLength - 1];
@@ -528,8 +555,13 @@ export class VoceView extends ItemView {
     this.updateRenderedTurn(rendered, turn);
   }
 
-  private updateRenderedTurn(rendered: RenderedTurn, turn: ChatState["turns"][number]): void {
+  private updateRenderedTurn(
+    rendered: RenderedTurn,
+    turn: ChatState["turns"][number],
+    force = false
+  ): void {
     if (
+      !force &&
       rendered.turn &&
       this.turnContentSignature(rendered.turn) === this.turnContentSignature(turn)
     ) {
@@ -560,7 +592,8 @@ export class VoceView extends ItemView {
     const isCollapsible =
       !(turn.role === "assistant" && turn.status === "working") &&
       turn.content.length > COLLAPSIBLE_MESSAGE_LENGTH;
-    const isExpanded = this.expandedTurnIds.has(turn.id);
+    const isExpanded =
+      this.turnExpansionOverrides.get(turn.id) ?? turn.id === this.latestAssistantTurnId;
     const sourcePath = this.turnSourcePath(turn);
     const message = bubble.createDiv({
       cls: [
@@ -608,6 +641,7 @@ export class VoceView extends ItemView {
     }
     if (turn.role === "assistant" && turn.status === "complete")
       this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
+    if (turn.role === "user") this.renderUserActions(bubble, turn);
   }
 
   private updateTurnIndicators(
@@ -751,11 +785,19 @@ export class VoceView extends ItemView {
   }
 
   private renderSources(parent: HTMLDivElement, turn: AssistantConversationTurn): void {
-    const sources = parent.createDiv({ cls: "trama-voce__sources" });
-    sources.createDiv({
-      cls: "setting-item-description trama-voce__sources-label",
-      text: "Sources",
+    const disclosure = parent.createEl("details", { cls: "trama-voce__source-disclosure" });
+    disclosure.open = this.expandedSourceTurnIds.has(turn.id);
+    disclosure.createEl("summary", {
+      text: `Sources (${turn.sources.length})`,
     });
+    disclosure.addEventListener("toggle", () => {
+      if (!disclosure.isConnected) return;
+      if (disclosure.open) this.expandedSourceTurnIds.add(turn.id);
+      else this.expandedSourceTurnIds.delete(turn.id);
+      this.recordTranscriptScrollIntent();
+      this.restoreTranscriptPosition();
+    });
+    const sources = disclosure.createDiv({ cls: "trama-voce__sources" });
     for (const note of turn.sources)
       this.renderInternalLink(sources, note.path, provenanceLabel(note), "trama-voce__chip");
   }
@@ -879,8 +921,53 @@ export class VoceView extends ItemView {
     ];
   }
 
-  private renderAssistantActions(parent: HTMLDivElement, turn: AssistantConversationTurn): void {
+  private createMessageActions(
+    parent: HTMLDivElement,
+    turn: ChatState["turns"][number]
+  ): HTMLDivElement {
     const actions = parent.createDiv({ cls: "trama-voce__message-actions" });
+    if (turn.createdAt !== undefined) {
+      const date = new Date(turn.createdAt);
+      actions.createEl("time", {
+        cls: "trama-voce__message-time",
+        text: date.toLocaleString(undefined, {
+          weekday: "long",
+          hour: "numeric",
+          minute: "2-digit",
+        }),
+        attr: { datetime: date.toISOString(), title: date.toLocaleString() },
+      });
+    }
+    return actions;
+  }
+
+  private renderUserActions(parent: HTMLDivElement, turn: UserConversationTurn): void {
+    const actions = this.createMessageActions(parent, turn);
+    const button = actions.createEl("button", {
+      cls: "clickable-icon trama-voce__message-action",
+      attr: { type: "button", "aria-label": "Edit message" },
+    });
+    setIcon(button, "pencil");
+    setTooltip(button, "Edit message");
+    button.addEventListener("click", () => {
+      if (this.preparingSkill || this.session.getState().running) {
+        this.localError = "Stop the current response or wait for it to finish before editing.";
+        this.renderFeedback(this.session.getState());
+        return;
+      }
+      this.inlineSuggest?.invalidate();
+      this.session.edit(turn.id);
+      this.input.value = turn.content;
+      this.selectedAttachmentPaths = turn.attachments.map((note) => note.path);
+      this.localError = undefined;
+      this.renderAttachments();
+      this.renderFeedback(this.session.getState());
+      this.input.focus();
+    });
+  }
+
+  private renderAssistantActions(parent: HTMLDivElement, turn: AssistantConversationTurn): void {
+    const actions = this.createMessageActions(parent, turn);
     for (const action of this.assistantActions(turn)) {
       const button = actions.createEl("button", {
         cls: "clickable-icon trama-voce__message-action",
@@ -918,8 +1005,7 @@ export class VoceView extends ItemView {
     let expanded = isExpanded;
     button.addEventListener("click", () => {
       expanded = !expanded;
-      if (expanded) this.expandedTurnIds.add(turnId);
-      else this.expandedTurnIds.delete(turnId);
+      this.turnExpansionOverrides.set(turnId, expanded);
       message.classList.toggle("trama-voce__message--collapsed", !expanded);
       button.textContent = expanded ? "Show less" : "Show more";
       button.setAttribute("aria-expanded", String(expanded));

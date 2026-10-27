@@ -2,6 +2,7 @@ import { getFrontMatterInfo, parseYaml } from "obsidian";
 
 export interface SkillCommand {
   readonly path: string;
+  readonly description?: string;
   readonly alias?: string;
   readonly issue?: "invalid_alias" | "duplicate_alias";
   readonly conflictingPaths?: readonly string[];
@@ -20,6 +21,7 @@ export interface ResolvedSkillCommands {
 
 interface CachedSkillMetadata {
   readonly path: string;
+  readonly description?: unknown;
   readonly marker: unknown;
   readonly alias: unknown;
 }
@@ -39,11 +41,13 @@ export function skillCommandCatalog(metadata: readonly CachedSkillMetadata[]): S
     aliases.set(entry.alias, [...(aliases.get(entry.alias) ?? []), entry.path]);
   }
   return marked.map((entry) => {
-    if (!validAlias(entry.alias)) return { path: entry.path, issue: "invalid_alias" };
+    const description = typeof entry.description === "string" ? entry.description.trim() : "";
+    const base = { path: entry.path, ...(description ? { description } : {}) };
+    if (!validAlias(entry.alias)) return { ...base, issue: "invalid_alias" };
     const conflictingPaths = aliases.get(entry.alias)!;
     return conflictingPaths.length > 1
-      ? { path: entry.path, alias: entry.alias, issue: "duplicate_alias", conflictingPaths }
-      : { path: entry.path, alias: entry.alias };
+      ? { ...base, alias: entry.alias, issue: "duplicate_alias", conflictingPaths }
+      : { ...base, alias: entry.alias };
   });
 }
 

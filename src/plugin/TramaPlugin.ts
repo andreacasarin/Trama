@@ -681,6 +681,7 @@ export class TramaPlugin extends Plugin {
           path,
           marker: frontmatter?.["trama-voce-skill"],
           alias: frontmatter?.["trama-voce-command"],
+          description: frontmatter?.["trama-voce-description"],
         };
       })
     );

@@ -33,6 +33,7 @@ export interface AttachedNote {
 interface ConversationTurnBase {
   readonly id: string;
   readonly content: string;
+  readonly createdAt?: number;
 }
 
 export interface UserConversationTurn extends ConversationTurnBase {
@@ -258,6 +259,7 @@ export class ChatSession {
   private state: ChatState = EMPTY_STATE;
   private checkpointer = new MemorySaver();
   private lastCompletedCheckpointId?: string;
+  private readonly checkpointsBeforeUserTurns = new Map<string, string | undefined>();
   private active: AbortController | undefined;
   private activeTurnId?: string;
   private generation = 0;
@@ -280,6 +282,7 @@ export class ChatSession {
     this.cancel();
     this.checkpointer = new MemorySaver();
     this.lastCompletedCheckpointId = undefined;
+    this.checkpointsBeforeUserTurns.clear();
     this.state = EMPTY_STATE;
     this.activeTurnId = undefined;
     for (const listener of this.listeners) listener(this.state);
@@ -287,6 +290,21 @@ export class ChatSession {
 
   getState(): ChatState {
     return this.state;
+  }
+
+  /** Restores the native history before a prompt and returns it for editing. */
+  edit(turnId: string): UserConversationTurn {
+    if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
+    const index = this.state.turns.findIndex((turn) => turn.id === turnId);
+    const turn = this.state.turns[index];
+    if (!turn || turn.role !== "user")
+      throw new StructuredError("invalid_request", "User message could not be found.", false);
+    this.lastCompletedCheckpointId = this.checkpointsBeforeUserTurns.get(turnId);
+    for (const removed of this.state.turns.slice(index))
+      this.checkpointsBeforeUserTurns.delete(removed.id);
+    this.state = { turns: Object.freeze(this.state.turns.slice(0, index)), running: false };
+    for (const listener of this.listeners) listener(this.state);
+    return turn;
   }
 
   subscribe(listener: (state: ChatState) => void): () => void {
@@ -338,10 +356,12 @@ export class ChatSession {
       const userTurn: UserConversationTurn = Object.freeze({
         id: this.turnId(),
         role: "user",
+        createdAt: Date.now(),
         content: input.content,
         attachments: Object.freeze(notes.map(asAttachedNote)),
         ...(input.skill ? { skill: { path: input.skill.path } } : {}),
       });
+      this.checkpointsBeforeUserTurns.set(userTurn.id, this.lastCompletedCheckpointId);
       this.publish(identity, {
         turns: Object.freeze([
           ...this.state.turns,
@@ -781,7 +801,8 @@ export class ChatSession {
                 turn.reasoningSummary,
                 turn.compactionStatus === "complete" || this.activeTurnProgress?.compacted
                   ? "complete"
-                  : undefined
+                  : undefined,
+                turn.createdAt
               )
             : turn
         )
@@ -853,11 +874,13 @@ export class ChatSession {
     sources: readonly ProvenanceRecord[],
     status: AssistantConversationTurn["status"],
     reasoningSummary = "",
-    compactionStatus?: AssistantConversationTurn["compactionStatus"]
+    compactionStatus?: AssistantConversationTurn["compactionStatus"],
+    createdAt = Date.now()
   ): AssistantConversationTurn {
     return Object.freeze({
       id,
       role: "assistant",
+      createdAt,
       content,
       ...(reasoningSummary.trim() ? { reasoningSummary } : {}),
       provenance: Object.freeze(dedupeProvenance(provenance)),

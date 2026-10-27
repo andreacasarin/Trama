@@ -1,6 +1,7 @@
 ---
 trama-voce-skill: true
 trama-voce-command: demo-guide
+trama-voce-description: Compare lexical search and embeddings using the demo notes.
 ---
 
 # Voce demo skill
