@@ -94,8 +94,10 @@ changed-file ESLint, and all 81 tests in the same five suites. Message creation
 times remain in the session projection, outside provider messages and persisted
 storage; this presentation change needs no additional ADR.
 
-Native UI validation is blocked as of 2026-10-26: Computer Use returned
-“Computer Use was not approved to use Obsidian.” No host checks are recorded as
+Native UI validation was attempted again on 2026-10-27. The current build and
+installation into the marked generated demo vault passed. Computer Use returned
+“Computer Use was not approved to use Obsidian,” so native validation remains
+blocked by app access. No host checks are recorded as
 passed. Simulated-element tests cover Trama-owned state and rendering contracts;
 they do not validate native layout, pointer targets, clipboard, keyboard navigation,
 disclosure events, or streaming scroll behavior. Complete the checklist in the
