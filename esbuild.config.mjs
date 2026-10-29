@@ -1,4 +1,5 @@
 import esbuild from "esbuild";
+import { generateNotices } from "./scripts/generate-notices.mjs";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +9,9 @@ const runtimeBuildId = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), ".cache/runtime-build.json"), "utf8")
 ).buildId;
 
-await esbuild.build({
+const main = await esbuild.build({
   entryPoints: ["src/main.ts"],
+  metafile: true,
   bundle: true,
   external: ["obsidian"],
   format: "cjs",
@@ -39,3 +41,5 @@ const root = dirname(fileURLToPath(import.meta.url));
 for (const source of [join(root, "sqlite3.mjs"), join(root, "sqlite3.wasm")]) {
   if (!existsSync(source)) throw new Error(`Missing materialized SQLite asset: ${source}`);
 }
+
+await generateNotices(Object.keys(main.metafile.inputs));

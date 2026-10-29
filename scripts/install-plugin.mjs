@@ -1,18 +1,14 @@
 import {
   access,
   copyFile,
-  cp,
   lstat,
   mkdir,
-  mkdtemp,
   readFile,
   readdir,
   realpath,
-  rename,
-  rm,
   writeFile,
 } from "node:fs/promises";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -54,78 +50,30 @@ async function verifyBuildIdentity(directory, buildId) {
   }
 }
 
-export async function installPlugin({
-  vaultPath,
-  projectRoot: root = projectRoot,
-  afterActivation,
-  preserveExistingFiles = true,
-} = {}) {
+export async function installPlugin({ vaultPath, projectRoot: root = projectRoot } = {}) {
   if (!vaultPath)
     throw new Error('Provide the Obsidian vault path: npm run install:plugin -- "/path/to/vault"');
-  const resolvedVault = path.resolve(vaultPath);
-  const obsidianDirectory = path.join(resolvedVault, ".obsidian");
+  const obsidianDirectory = path.join(path.resolve(vaultPath), ".obsidian");
   const pluginDirectory = path.join(obsidianDirectory, "plugins", PLUGIN_ID);
   await access(obsidianDirectory).catch(() => {
-    throw new Error(`Not an Obsidian vault: ${resolvedVault} (missing .obsidian directory)`);
+    throw new Error(`Not an Obsidian vault: ${vaultPath} (missing .obsidian directory)`);
   });
-  for (const fileName of PLUGIN_FILES)
-    await access(path.join(root, fileName)).catch(() => {
-      throw new Error(`Missing build artifact: ${fileName}`);
-    });
-
-  await mkdir(path.dirname(pluginDirectory), { recursive: true });
-  const stagingDirectory = await mkdtemp(path.join(path.dirname(pluginDirectory), ".trama-stage-"));
-  const backupDirectory = `${pluginDirectory}.backup-${randomUUID()}`;
-  let movedLive = false;
-  let activated = false;
-  let hadLive = false;
-  try {
-    hadLive = await access(pluginDirectory).then(
-      () => true,
-      () => false
-    );
-    if (hadLive && preserveExistingFiles)
-      await cp(pluginDirectory, stagingDirectory, { recursive: true });
-    const hashes = {};
-    for (const fileName of PLUGIN_FILES) {
-      const source = path.join(root, fileName);
-      await installFile(source, path.join(stagingDirectory, fileName));
-      const sourceHash = await sha256(source);
-      if ((await sha256(path.join(stagingDirectory, fileName))) !== sourceHash)
-        throw new Error(`Staged artifact verification failed: ${fileName}`);
-      hashes[fileName] = sourceHash;
-    }
-    const runtimeMetadata = JSON.parse(
-      await readFile(path.join(root, ".cache/runtime-build.json"), "utf8")
-    );
-    const buildId = runtimeMetadata.buildId;
-    if (!buildId) throw new Error("Generated runtime build identity is missing.");
-    const manifest = { buildId, hashes };
-    await writeFile(
-      path.join(stagingDirectory, runtimeManifestName),
-      `${JSON.stringify(manifest, null, 2)}\n`
-    );
-    await verifyArtifacts(stagingDirectory, manifest);
-    await verifyBuildIdentity(stagingDirectory, buildId);
-
-    if (hadLive) {
-      await rename(pluginDirectory, backupDirectory);
-      movedLive = true;
-    }
-    await rename(stagingDirectory, pluginDirectory);
-    activated = true;
-    if (afterActivation) await afterActivation(pluginDirectory);
-    await verifyArtifacts(pluginDirectory, manifest);
-    await verifyBuildIdentity(pluginDirectory, buildId);
-    await rm(backupDirectory, { recursive: true, force: true });
-  } catch (error) {
-    if (activated) await rm(pluginDirectory, { recursive: true, force: true });
-    if (movedLive) await rename(backupDirectory, pluginDirectory);
-    throw error;
-  } finally {
-    await rm(stagingDirectory, { recursive: true, force: true });
-    if (!movedLive || activated) await rm(backupDirectory, { recursive: true, force: true });
-  }
+  const { buildId } = JSON.parse(
+    await readFile(path.join(root, ".cache/runtime-build.json"), "utf8")
+  );
+  if (!buildId) throw new Error("Generated runtime build identity is missing.");
+  await verifyBuildIdentity(root, buildId);
+  const hashes = {};
+  for (const name of PLUGIN_FILES) hashes[name] = await sha256(path.join(root, name));
+  await mkdir(pluginDirectory, { recursive: true });
+  for (const name of PLUGIN_FILES)
+    await installFile(path.join(root, name), path.join(pluginDirectory, name));
+  const manifest = { buildId, hashes };
+  await verifyArtifacts(pluginDirectory, manifest);
+  await writeFile(
+    path.join(pluginDirectory, runtimeManifestName),
+    `${JSON.stringify(manifest, null, 2)}\n`
+  );
   return pluginDirectory;
 }
 
@@ -164,7 +112,7 @@ export async function installTestVaults(install = installPlugin) {
   if (!demoExists) await prepareDemoVault(); // Already installs Trama.
   await validateDemoVault();
   await rejectSymlinks(demoVaultPath);
-  if (demoExists) await install({ vaultPath: demoVaultPath, preserveExistingFiles: true });
+  if (demoExists) await install({ vaultPath: demoVaultPath });
   return [path.join(demoVaultPath, ".obsidian/plugins", PLUGIN_ID)];
 }
 

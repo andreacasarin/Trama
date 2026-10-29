@@ -99,7 +99,7 @@ export async function prepareBenchmarkVault() {
   const plugins = (await entry(pluginsFile)) ? JSON.parse(await readFile(pluginsFile, "utf8")) : [];
   if (!Array.isArray(plugins) || plugins.some((id) => id !== "trama"))
     throw new Error("Refusing to change other community plugins.");
-  await installPlugin({ vaultPath: benchmarkVaultPath, preserveExistingFiles: true });
+  await installPlugin({ vaultPath: benchmarkVaultPath });
   await writeFile(pluginsFile, '["trama"]\n');
   await validateBenchmarkVault();
   return { vaultPath: benchmarkVaultPath, vaultName: benchmarkVaultName, noteCount: notes.length };

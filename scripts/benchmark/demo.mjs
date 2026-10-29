@@ -100,7 +100,7 @@ export async function prepareDemoVault() {
   for (const { destination, content } of files)
     if (!(await entry(destination))) await writeFile(destination, content, { flag: "wx" });
   await mkdir(path.join(demoVaultPath, ".obsidian"), { recursive: true });
-  await installPlugin({ vaultPath: demoVaultPath, preserveExistingFiles: true });
+  await installPlugin({ vaultPath: demoVaultPath });
   await validateDemoVault();
   await writeFile(pluginsFile, '["trama"]\n');
   return { vaultPath: demoVaultPath, vaultName: demoVaultName, noteCount: files.length };

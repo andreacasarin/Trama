@@ -67,6 +67,15 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit development dependencies
+        run: npm audit --audit-level=high
+
+      - name: Check license inventory
+        run: npm run verify:licenses
+
       - name: Check derived versions
         run: npm run version:check
 

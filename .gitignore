@@ -19,3 +19,5 @@ test-vaults/**/.trama/
 # outputs are materialized at the ignored repository root by the cache builder.
 !vendor/sqlite-wasm/LICENSES.md
 !vendor/sqlite-wasm/supply-chain.json
+
+THIRD-PARTY-NOTICES.txt

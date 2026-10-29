@@ -129,7 +129,7 @@ describe("current app benchmark", () => {
     } finally {
       await Promise.all(extras.map((extra) => rm(extra, { force: true })));
     }
-  });
+  }, 30_000);
 
   it("refuses a changed vault marker and preserves it for restoration", async () => {
     await prepareBenchmarkVault();

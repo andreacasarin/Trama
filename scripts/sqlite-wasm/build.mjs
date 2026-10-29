@@ -81,8 +81,6 @@ function dockerArgs(context, destination, noCache) {
     SQLITE_SHA256: lock.sqlite.archiveSha256,
     SQLITE_AMALGAMATION_URL: lock.sqlite.amalgamationUrl,
     SQLITE_AMALGAMATION_SHA256: lock.sqlite.amalgamationArchiveSha256,
-    SQLITE_VECTOR_URL: lock.sqliteVector.url,
-    SQLITE_VECTOR_SHA256: lock.sqliteVector.archiveSha256,
     SQLITE_OPT: [...lock.build.flags, "-DSQLITE_C=../../sqlite3.c"]
       .map((flag) => (flag.startsWith("-DSQLITE_DEFAULT_UNIX_VFS=") ? `'${flag}'` : flag))
       .join(" "),

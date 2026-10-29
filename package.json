@@ -7,7 +7,7 @@
     "node": "24.x"
   },
   "scripts": {
-    "build": "node scripts/generate-build-identity.mjs && node scripts/sqlite-wasm/build.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
+    "build": "npm run verify:licenses && node scripts/generate-build-identity.mjs && node scripts/sqlite-wasm/build.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
     "version": "node scripts/sync-version.mjs",
     "version:sync": "node scripts/sync-version.mjs",
     "version:check": "node scripts/sync-version.mjs --check",
@@ -19,19 +19,20 @@
     "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
     "lint": "eslint .",
     "test": "npm run build && vitest run",
-    "benchmark:compare": "node scripts/benchmark/compare.mjs"
+    "benchmark:compare": "node scripts/benchmark/compare.mjs",
+    "verify:licenses": "node scripts/verify-licenses.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@types/node": "^22.0.0",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "eslint": "^9.18.0",
     "fflate": "^0.8.3",
-    "obsidian": "^1.8.7",
+    "obsidian": "^1.14.4",
     "prettier": "^3.8.3",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.68.0",
-    "vitest": "^3.0.0"
+    "vitest": "^5.0.5"
   },
   "dependencies": {
     "@langchain/classic": "1.0.52",
@@ -40,6 +41,7 @@
     "@langchain/openai": "^1.6.2",
     "@langchain/textsplitters": "^1.0.2",
     "langchain": "^1.5.16",
-    "zod": "^4.6.5"
-  }
+    "zod": "^4.6.7"
+  },
+  "license": "MIT"
 }

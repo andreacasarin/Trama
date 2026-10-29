@@ -13,15 +13,6 @@
     "license": "public-domain",
     "evidence": "https://www.sqlite.org/releaselog/3_53_4.html"
   },
-  "sqliteVector": {
-    "version": "1.0.0",
-    "sourceArchive": "sqlite-vector-1.0.0.tar.gz",
-    "url": "https://github.com/sqliteai/sqlite-vector/archive/refs/tags/1.0.0.tar.gz",
-    "archiveSha256": "dc93c5f2fac6e2d221f619cfa85ff5983ef1c4784664443f5511d0abc864707f",
-    "sourceCommit": "b68d34a",
-    "license": "Apache-2.0",
-    "evidence": "https://github.com/sqliteai/sqlite-vector/releases/tag/1.0.0"
-  },
   "emscripten": {
     "version": "4.0.11",
     "image": "emscripten/emsdk",
@@ -34,7 +25,11 @@
   "build": {
     "optimization": "-O2 -g3",
     "threaded": false,
-    "exports": ["sqlite3__wasm_db_reset", "sqlite3__wasm_vfs_unlink", "sqlite3__wasm_init_wasmfs"],
+    "exports": [
+      "sqlite3__wasm_db_reset",
+      "sqlite3__wasm_vfs_unlink",
+      "sqlite3__wasm_init_wasmfs"
+    ],
     "flags": [
       "-DSQLITE_ENABLE_FTS5",
       "-DSQLITE_ENABLE_RTREE",
@@ -60,8 +55,21 @@
       "-DSQLITE_WASM_ENABLE_C_TESTS",
       "-DSQLITE_CORE"
     ],
-    "emccFlags": ["-O2", "-g3", "-Isqlite-vector", "--minify 0", "--no-entry", "-sWASM_BIGINT=1", "-sMODULARIZE", "-sDYNAMIC_EXECUTION=0", "-sNO_POLYFILL", "-sIMPORTED_MEMORY", "-sALLOW_MEMORY_GROWTH", "-sALLOW_TABLE_GROWTH", "-sENVIRONMENT=web,worker"],
-    "extraInit": "sqlite3_wasm_extra_init.c statically registers sqlite3_vector_init",
+    "emccFlags": [
+      "-O2",
+      "-g3",
+      "--minify 0",
+      "--no-entry",
+      "-sWASM_BIGINT=1",
+      "-sMODULARIZE",
+      "-sDYNAMIC_EXECUTION=0",
+      "-sNO_POLYFILL",
+      "-sIMPORTED_MEMORY",
+      "-sALLOW_MEMORY_GROWTH",
+      "-sALLOW_TABLE_GROWTH",
+      "-sENVIRONMENT=web,worker"
+    ],
+    "extraInit": "sqlite3_wasm_extra_init.c statically registers trama_sqlite_init",
     "architecture": "single-threaded Emscripten wasm32; no pthreads, no shared memory, no runtime extension loading"
   }
 }

@@ -6,8 +6,6 @@ ARG SQLITE_URL
 ARG SQLITE_SHA256
 ARG SQLITE_AMALGAMATION_URL
 ARG SQLITE_AMALGAMATION_SHA256
-ARG SQLITE_VECTOR_URL
-ARG SQLITE_VECTOR_SHA256
 ARG SQLITE_OPT
 ARG EMCC_FLAGS
 ARG EMCC_OPT
@@ -18,13 +16,10 @@ WORKDIR /src
 RUN set -eux; \
     curl --fail --location --retry 3 "$SQLITE_URL" -o /tmp/sqlite.zip; \
     curl --fail --location --retry 3 "$SQLITE_AMALGAMATION_URL" -o /tmp/amalgamation.zip; \
-    curl --fail --location --retry 3 "$SQLITE_VECTOR_URL" -o /tmp/sqlite-vector.tar.gz; \
     echo "$SQLITE_SHA256  /tmp/sqlite.zip" | sha256sum --check; \
     echo "$SQLITE_AMALGAMATION_SHA256  /tmp/amalgamation.zip" | sha256sum --check; \
-    echo "$SQLITE_VECTOR_SHA256  /tmp/sqlite-vector.tar.gz" | sha256sum --check; \
     unzip -q /tmp/sqlite.zip; \
-    unzip -q /tmp/amalgamation.zip; \
-    tar -xzf /tmp/sqlite-vector.tar.gz
+    unzip -q /tmp/amalgamation.zip
 
 COPY sqlite3_wasm_extra_init.c /build/
 
@@ -32,9 +27,6 @@ RUN set -eux; \
     emcc --version | grep ' 4.0.11'; \
     cp sqlite-amalgamation-3530400/sqlite3.c sqlite-src-3530400/sqlite3.c; \
     cp sqlite-amalgamation-3530400/sqlite3.h sqlite-src-3530400/sqlite3.h; \
-    mkdir -p sqlite-src-3530400/ext/wasm/sqlite-vector/fp16; \
-    cp sqlite-vector-1.0.0/src/* sqlite-src-3530400/ext/wasm/sqlite-vector/; \
-    cp sqlite-vector-1.0.0/libs/fp16/* sqlite-src-3530400/ext/wasm/sqlite-vector/fp16/; \
     cp /build/sqlite3_wasm_extra_init.c sqlite-src-3530400/ext/wasm/; \
     cd sqlite-src-3530400; \
     ./configure --disable-shared --enable-static >/dev/null; \

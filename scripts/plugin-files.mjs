@@ -5,4 +5,6 @@ export const PLUGIN_FILES = [
   "sqlite3.wasm",
   "manifest.json",
   "styles.css",
+  "LICENSE",
+  "THIRD-PARTY-NOTICES.txt",
 ];

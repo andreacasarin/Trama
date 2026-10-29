@@ -25,6 +25,8 @@ const runtimeFiles = [
   "sqlite3.wasm",
   "manifest.json",
   "styles.css",
+  "LICENSE",
+  "THIRD-PARTY-NOTICES.txt",
 ];
 
 async function digest(file: string): Promise<string> {
@@ -94,13 +96,13 @@ describe("plugin installer", () => {
     const build = JSON.parse(
       await readFile(path.join(process.cwd(), ".cache/runtime-build.json"), "utf8")
     );
-    expect(build.buildId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(build.buildId).toMatch(/^[0-9a-f]{64}$/);
     expect(build.buildId).not.toBe("development");
     for (const fileName of ["main.js", "sqlite-worker.mjs"])
       expect(await readFile(path.join(process.cwd(), fileName), "utf8")).toContain(build.buildId);
   });
 
-  it("installs fresh, preserves upgrade data, and rolls back post-activation corruption", async () => {
+  it("installs fresh and preserves settings and unrelated files after an interrupted upgrade", async () => {
     const vault = await mkdtemp(path.join(os.tmpdir(), "trama-vault-"));
     try {
       await mkdir(path.join(vault, ".obsidian", "plugins"), { recursive: true });
@@ -123,23 +125,22 @@ describe("plugin installer", () => {
       );
       await expect(readFile(path.join(upgraded, "unknown.dat"), "utf8")).resolves.toBe("keep me\n");
 
-      const before = new Map(
-        await Promise.all(
-          ["data.json", "unknown.dat", ...runtimeFiles, "runtime-manifest.json"].map(
-            async (fileName) => [fileName, await readFile(path.join(upgraded, fileName))] as const
-          )
-        )
-      );
+      // A directory at a release-file destination makes copying fail without
+      // replacing or removing the surrounding plugin directory.
+      await rm(path.join(upgraded, "sqlite-worker.mjs"));
+      await mkdir(path.join(upgraded, "sqlite-worker.mjs"));
       await expect(
-        installPlugin({
-          vaultPath: vault,
-          projectRoot: process.cwd(),
-          afterActivation: async (directory: string) =>
-            writeFile(path.join(directory, "main.js"), "corrupted post-activation artifact\n"),
-        })
-      ).rejects.toThrow("Runtime artifact verification failed: main.js");
-      for (const [fileName, bytes] of before)
-        await expect(readFile(path.join(upgraded, fileName))).resolves.toEqual(bytes);
+        installPlugin({ vaultPath: vault, projectRoot: process.cwd() })
+      ).rejects.toThrow();
+      await expect(readFile(path.join(upgraded, "data.json"), "utf8")).resolves.toBe(
+        '{"preserved":true}\n'
+      );
+      await expect(readFile(path.join(upgraded, "unknown.dat"), "utf8")).resolves.toBe("keep me\n");
+      expect(await readdir(path.dirname(upgraded))).toEqual(["trama"]);
+      await rm(path.join(upgraded, "sqlite-worker.mjs"), { recursive: true });
+      await expect(installPlugin({ vaultPath: vault, projectRoot: process.cwd() })).resolves.toBe(
+        upgraded
+      );
     } finally {
       await rm(vault, { recursive: true, force: true });
     }

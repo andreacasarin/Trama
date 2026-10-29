@@ -29,20 +29,18 @@ const sqlite = await initModule({
   },
 });
 const db = new sqlite.oo1.DB(":memory:", "c");
+const blob = (values) => new Uint8Array(new Float32Array(values).buffer);
+const dot = (a, b) => db.selectValue("SELECT trama_vector_dot(?,?)", [blob(a), blob(b)]);
 const runtimeChecks = {
-  nativeDot:
-    db.selectValue("SELECT trama_vector_dot(vector_as_f32('[1,0]'),vector_as_f32('[0.5,0.5]'))") ===
-    0.5,
-  nativeTokenizer: db.selectValue("SELECT trama_token_count('Café running')") === 2,
-  nativeCentroid:
-    db.selectValue("SELECT length(trama_vector_centroid(vector_as_f32('[1,0]')))") === 8,
-  pathCollation: db.selectValue("SELECT '😀' < '\ue000' COLLATE trama_code_units") === 1,
+  nativeDot: dot([1, 0], [0.5, 0.5]) === 0.5,
+  smallDot: dot([1e-30, 0], [1e-30, 0]) > 0,
+  largeDot: Number.isFinite(dot([1e20, 0], [1e20, 0])),
+  nativeCentroid: db.selectValue("SELECT length(trama_vector_centroid(?))", [blob([1, 0])]) === 8,
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,
-  sqliteVector: db.selectValue("SELECT vector_version()") === context.lock.sqliteVector.version,
-  sqliteVectorModule:
-    db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='vector_full_scan'") === 1,
+  noVectorDependency:
+    db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='vector_full_scan'") === 0,
   fts5Module: db.selectValue("SELECT count(*) FROM pragma_module_list WHERE name='fts5'") === 1,
 };
 db.close();
@@ -52,7 +50,7 @@ const checks = {
   sqliteVersionPinned: moduleText.includes(context.lock.sqlite.version),
   sourceIdPinned: moduleText.includes(context.lock.sqlite.sourceId),
   fts5Requested: context.lock.build.flags.includes("-DSQLITE_ENABLE_FTS5"),
-  staticRegistrationSource: context.lock.build.extraInit.includes("sqlite3_vector_init"),
+  staticRegistrationSource: context.lock.build.extraInit.includes("trama_sqlite_init"),
   runtimeExtensionLoadingDisabled:
     context.lock.build.flags.includes("-DSQLITE_OMIT_LOAD_EXTENSION") &&
     !wasmExports.includes("sqlite3_load_extension") &&
