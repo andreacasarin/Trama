@@ -42,10 +42,8 @@ describe("Voce native agent session", () => {
       attachmentPaths: [],
       editTurnId: original.id,
     });
-    expect(session.getState().turns.map((turn) => turn.content)).toEqual([
-      "Keep this",
-      "Answer to Keep this",
-    ]);
+    // Attachment preflight must not destructively rewind visible or native history.
+    expect(session.getState().turns).toHaveLength(6);
     expect(listener).toHaveBeenLastCalledWith(session.getState());
     await pendingEdit;
     const request = model.inputs.at(-1)!.join("\n");
@@ -63,6 +61,40 @@ describe("Voce native agent session", () => {
     expect(model.inputs.at(-1)!.join("\n")).not.toContain("Keep this");
     expect(model.inputs.at(-1)!.join("\n")).not.toContain("Replacement");
   });
+
+  it.each(["failed", "cancelled"])(
+    "preserves history when edited attachments are %s",
+    async (outcome) => {
+      let rejectRead!: (reason: Error) => void;
+      const session = new ChatSession(new FakeToolCallingModel({ toolCalls: [[]] }), tools, {
+        readNote: () =>
+          new Promise((_resolve, reject) => {
+            rejectRead = reject;
+          }),
+      });
+      await session.send({ content: "Keep", attachmentPaths: [] });
+      await session.send({ content: "Original", attachmentPaths: [] });
+      await session.send({ content: "Later", attachmentPaths: [] });
+      const original = session.getState().turns;
+      const accepted = vi.fn();
+      const pending = session.send(
+        { content: "Revision", attachmentPaths: ["missing.md"], editTurnId: original[2].id },
+        accepted
+      );
+      if (outcome === "cancelled") session.cancel();
+      rejectRead(new Error("Attachment unavailable"));
+      await pending;
+      expect(session.getState().turns).toEqual(original);
+      expect(accepted).not.toHaveBeenCalled();
+      // Checkpoint history is still usable after the failed preflight.
+      await session.send(
+        { content: "Retry", attachmentPaths: [], editTurnId: original[2].id },
+        accepted
+      );
+      expect(session.getState().turns).toHaveLength(4);
+      expect(accepted).toHaveBeenCalledOnce();
+    }
+  );
 
   it("rejects editing an assistant or missing message without changing the conversation", async () => {
     const session = new ChatSession(new FakeToolCallingModel({ toolCalls: [[]] }), tools, {

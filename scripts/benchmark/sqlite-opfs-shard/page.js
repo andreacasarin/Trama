@@ -1,4 +1,4 @@
-/* global document, Worker, crypto, TextEncoder, TextDecoder, fetch, navigator */
+/* global document, Worker, crypto, TextEncoder, TextDecoder, fetch, navigator, URL, Blob, location */
 const result = document.querySelector("#result");
 const workerUrl = "/note-worker.mjs";
 let sequence = 0;
@@ -129,12 +129,73 @@ async function storageFiles(name) {
 }
 
 async function main() {
+  const corruptBootstrap = URL.createObjectURL(
+    new Blob(
+      [
+        `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify({ moduleUrl: new URL("/sqlite3.mjs", location.href).href, wasmUrl: new URL("/fixtures/bad-hash.sqlite3", location.href).href })};await import(${JSON.stringify(new URL(workerUrl, location.href).href)});self.postMessage({ready:true});`,
+      ],
+      { type: "text/javascript" }
+    )
+  );
+  const corruptWorker = new Worker(corruptBootstrap, { type: "module" });
+  await new Promise((resolve) =>
+    corruptWorker.addEventListener("message", resolve, { once: true })
+  );
+  let invalidWasmRejected = false;
+  try {
+    await rpc(corruptWorker, "init", { namespace: namespace() });
+  } catch {
+    invalidWasmRejected = true;
+  } finally {
+    corruptWorker.terminate();
+    URL.revokeObjectURL(corruptBootstrap);
+  }
+  assert(invalidWasmRejected, "corrupt WASM asset did not fail initialization");
   const profile = await hashText("opfs-proof-profile");
   const otherProfile = await hashText("opfs-proof-private-query");
   const sourceNs = namespace();
   const targetNs = namespace();
   const source = await createWorker(sourceNs);
   const target = await createWorker(targetNs);
+  // Legacy SQLite-Vector shards remain readable; tiny/large Float32 values share the JS contract.
+  const compatibility = await createWorker(namespace());
+  const roundTrip = await createWorker(namespace());
+  for (const name of ["legacy-valid", "tiny-vector", "large-vector"]) {
+    const bytes = await malformedFixture(name);
+    const imported = await rpc(compatibility, "embeddingCacheSqliteImport", {
+      profile,
+      checksum: await hashBytes(bytes),
+      dimensions: 8,
+      bytes,
+      now: Date.now(),
+    });
+    assert(imported.imported === 1, `${name} failed native validation`);
+  }
+  await rpc(compatibility, "embeddingCacheSqliteReconcile", { profile, checksums: [] });
+  const compatibleShard = await rpc(compatibility, "embeddingCacheSqliteExport", {
+    profile,
+    dimensions: 8,
+    limit: 128,
+  });
+  assert(
+    compatibleShard?.hashes.length === 3,
+    "missing shards were not released for republication"
+  );
+  const roundTripped = await rpc(roundTrip, "embeddingCacheSqliteImport", {
+    profile,
+    checksum: await hashBytes(compatibleShard.bytes),
+    dimensions: 8,
+    bytes: compatibleShard.bytes,
+    now: Date.now(),
+  });
+  assert(
+    roundTripped.imported === 3,
+    "legacy/extreme vectors did not round-trip through new shards"
+  );
+  await assertPoolClean(compatibility, "compatibility export");
+  await assertPoolClean(roundTrip, "compatibility import");
+  await rpc(compatibility, "close");
+  await rpc(roundTrip, "close");
   const hashes = [];
   const allBytes = [];
   for (let i = 0; i < 129; i++) {
@@ -172,6 +233,9 @@ async function main() {
     markdown: "PRIVATE NOTE CORPUS MUST NEVER ENTER SHARD",
     vectors: [],
   });
+
+  const sourceRevision = { path: "private-note.md", revision: "private-source-revision" };
+  await rpc(source, "noteStoreRememberSources", { profile, sources: [sourceRevision] });
 
   const artifacts = [];
   for (let i = 0; i < 2; i++) {
@@ -228,12 +292,13 @@ async function main() {
   assert(await rejectedImport(target, profile, 8, badSchema), "malformed schema was accepted");
   await assertPoolClean(target, "invalid schema validation");
 
-  const invalidHashArtifact = await malformedFixture("bad-hash");
-  assert(
-    await rejectedImport(target, profile, 8, invalidHashArtifact),
-    "malformed hash was accepted"
-  );
-  await assertPoolClean(target, "invalid hash validation");
+  for (const name of ["bad-hash", "nul-suffix-hash", "nul-ending-hash", "nul-short-hash"]) {
+    const invalidHashArtifact = await malformedFixture(name);
+    assert(await rejectedImport(target, profile, 8, invalidHashArtifact), `${name} was accepted`);
+    await assertPoolClean(target, `${name} validation`);
+  }
+  const zeroArtifact = await malformedFixture("zero-vector");
+  assert(await rejectedImport(target, profile, 8, zeroArtifact), "zero vector shard was accepted");
   const nonfiniteArtifact = await malformedFixture("nonfinite-vector");
   assert(
     await rejectedImport(target, profile, 8, nonfiniteArtifact),
@@ -367,6 +432,14 @@ async function main() {
 
   await rpc(source, "close");
   await rpc(target, "close");
+  const reopenedSource = await createWorker(sourceNs);
+  assert(
+    (
+      await rpc(reopenedSource, "noteStoreCheckSources", { profile, sources: [sourceRevision] })
+    ).join(",") === "private-note.md",
+    "source revision did not persist after reopen"
+  );
+  await rpc(reopenedSource, "close");
   const reopened = await createWorker(targetNs);
   assert(
     (await rpc(reopened, "embeddingCacheKeys", { profile, task: "document", limit: 200 }))
@@ -407,6 +480,7 @@ async function main() {
     ok: true,
     profile,
     dimensions: 8,
+    compatibility: { legacy: true, tiny: true, large: true, roundTrip: true, reconciliation: true },
     artifactBytes: artifacts.map((item) => item.bytes.byteLength),
     artifactChecksums: artifacts.map((item) => item.checksum),
     artifactRows: artifacts.map((item) => item.hashes.length),
@@ -415,7 +489,10 @@ async function main() {
       appId: invalidRejected,
       schema: true,
       hash: true,
+      nulHash: true,
       nonfinite: true,
+      zero: true,
+      invalidWasm: invalidWasmRejected,
       oversize: true,
       cancelled: cancellation === "AbortError",
       localCollisionPreserved: true,

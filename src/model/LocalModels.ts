@@ -1,3 +1,4 @@
+import { validateVector } from "@/domain/vectors";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { ChatOpenAI } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -103,22 +104,27 @@ class GuardedOpenAIEmbeddings extends OpenAIEmbeddings {
       throw new EmbeddingProviderError("The embedding provider request failed.", error);
     }
     const inputCount = Array.isArray(request.input) ? request.input.length : 1;
-    if (!Array.isArray(response.data) || response.data.length !== inputCount)
+    if (!response || !Array.isArray(response.data) || response.data.length !== inputCount)
       throw new EmbeddingProviderError("The embedding provider returned an incomplete batch.");
     const ordered = new Array<(typeof response.data)[number]>(inputCount);
     for (const item of response.data) {
       if (
+        !item ||
+        typeof item !== "object" ||
         !Number.isInteger(item.index) ||
         item.index < 0 ||
         item.index >= inputCount ||
         ordered[item.index]
       )
         throw new EmbeddingProviderError("The embedding provider returned invalid indexes.");
-      if (
-        item.embedding.length !== this.expectedDimensions ||
-        item.embedding.some((value) => !Number.isFinite(value))
-      )
-        throw new EmbeddingProviderError("The embedding provider returned an invalid vector.");
+      try {
+        validateVector(item.embedding, this.expectedDimensions);
+      } catch (error) {
+        throw new EmbeddingProviderError(
+          "The embedding provider returned an invalid vector.",
+          error
+        );
+      }
       ordered[item.index] = item;
     }
     return { ...response, data: ordered };

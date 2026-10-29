@@ -332,14 +332,11 @@ describe("native read-only vault tools", () => {
     );
     const maximum = await invokeOutcome(discover, {
       path: "Source.md",
-      limit: Number.MAX_SAFE_INTEGER,
+      limit: 1000,
     });
-    expect(discoverLinks).toHaveBeenLastCalledWith(
-      "Source.md",
-      expect.any(AbortSignal),
-      Number.MAX_SAFE_INTEGER
-    );
+    expect(discoverLinks).toHaveBeenLastCalledWith("Source.md", expect.any(AbortSignal), 1001);
     expect(maximum.data).toMatchObject({ links: links.slice(0, 3), truncated: false });
+    await expect(discover.invoke({ path: "Source.md", limit: 1001 })).rejects.toThrow();
     await expect(discover.invoke({ path: "Source.md", limit: 0 })).rejects.toThrow();
     await expect(discover.invoke({ path: "Source.md", limit: 1.5 })).rejects.toThrow();
     await expect(discover.invoke({ path: "Source.md", surprise: true })).rejects.toThrow();

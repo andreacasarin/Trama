@@ -1,3 +1,4 @@
+import { isCancelled } from "@/domain/errors";
 import { Notice, Plugin } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { skillCommandCatalog } from "@/chat/TemplateReferences";
@@ -336,7 +337,7 @@ export class TramaPlugin extends Plugin {
   }
 
   updateIndex(): Promise<void> {
-    return this.runIndex(false);
+    return this.runIndex(false, false, true);
   }
   rebuildIndex(): Promise<void> {
     return this.runIndex(true);
@@ -477,7 +478,7 @@ export class TramaPlugin extends Plugin {
     return discoverLocalModels(endpoint ?? settings[target].endpoint);
   }
 
-  private runIndex(rebuild: boolean, automatic = false): Promise<void> {
+  private runIndex(rebuild: boolean, automatic = false, verifyContent = false): Promise<void> {
     if (this.clearRun) {
       new Notice("The local index is being cleared.");
       return Promise.resolve();
@@ -510,7 +511,7 @@ export class TramaPlugin extends Plugin {
     let operation: ReturnType<ManualIndex["update"]>;
     let completed = false;
     try {
-      operation = rebuild ? manualIndex.rebuild() : manualIndex.update();
+      operation = rebuild ? manualIndex.rebuild() : manualIndex.update(verifyContent);
     } catch (error) {
       operation = Promise.reject(error);
     }
@@ -589,7 +590,7 @@ export class TramaPlugin extends Plugin {
   private startAutomaticIndexing(app: any): void {
     if (this.disposed || this.automaticReady) return;
     this.automaticReady = true;
-    const schedule = (vaultEvent = false) => {
+    const schedule = (vaultEvent = false, verifyContent = false) => {
       if (
         this.disposed ||
         !this.automaticReady ||
@@ -603,7 +604,7 @@ export class TramaPlugin extends Plugin {
         return;
       }
       if (!this.indexedNotes) return;
-      void this.runIndex(false, true);
+      void this.runIndex(false, true, verifyContent);
     };
     const changed = (file: any) => {
       if (this.isVisibleMarkdown(file?.path)) this.debounceAutomaticIndex(() => schedule(true));
@@ -616,7 +617,7 @@ export class TramaPlugin extends Plugin {
           this.debounceAutomaticIndex(() => schedule(true));
       })
     );
-    this.registerInterval(window.setInterval(schedule, 300_000));
+    this.registerInterval(window.setInterval(() => schedule(false, true), 300_000));
     schedule();
   }
 
@@ -725,11 +726,4 @@ function unavailableEmbeddings(): EmbeddingsInterface<number[]> & {} {
     );
   };
   return { embedDocuments: fail, embedQuery: fail };
-}
-
-function isCancelled(error: unknown): boolean {
-  return Boolean(
-    (error instanceof DOMException && error.name === "AbortError") ||
-    (error && typeof error === "object" && "code" in error && error.code === "cancelled")
-  );
 }

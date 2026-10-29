@@ -24,7 +24,7 @@ describe("V1 plugin composition", () => {
     const openVoce = { setSession: vi.fn() };
     const openFilo = { setRelated: vi.fn() };
     const openLente = { setSearch: vi.fn() };
-    const WorkerStub = vi.fn(() => {
+    const WorkerStub = vi.fn(function () {
       const listeners = new Set<(event: any) => void>();
       const worker = {
         postMessage: vi.fn((request: any) => {
@@ -43,8 +43,9 @@ describe("V1 plugin composition", () => {
                 },
               });
         }),
-        addEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
-          listeners.add(listener)
+        addEventListener: vi.fn(
+          (_type: string, listener: (event: any) => void) =>
+            _type === "message" && listeners.add(listener)
         ),
         removeEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
           listeners.delete(listener)
@@ -79,7 +80,10 @@ describe("V1 plugin composition", () => {
             "trama-filo": [{ view: openFilo }],
             "trama-lente": [{ view: openLente }],
           })[type] ?? [],
-        on: () => ({ unsubscribe: vi.fn() }),
+        on: () => ({}),
+        offref: vi.fn(),
+        revealLeaf: vi.fn(),
+        getLeaf: vi.fn(),
         trigger: vi.fn(),
       },
       metadataCache: { getFirstLinkpathDest: () => null, getFileCache: () => null },
@@ -114,6 +118,14 @@ describe("V1 plugin composition", () => {
           "trama-clear-index",
         ])
       );
+      const openCommand = commands.mock.calls
+        .map(([command]) => command as any)
+        .find((command) => command.id === "open-voce");
+      openCommand.callback();
+      expect(app.workspace.revealLeaf).toHaveBeenCalledWith(
+        expect.objectContaining({ view: openVoce })
+      );
+      expect(app.workspace.getLeaf).not.toHaveBeenCalled();
       await plugin.saveSettings(plugin.getSettings());
       expect(lifecycle).toEqual(["create-1"]);
       expect(workers).toHaveLength(1);
@@ -290,6 +302,7 @@ describe("V1 plugin composition", () => {
     plugin.retrieval = { invalidateRelated: vi.fn() };
     const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
     await plugin.updateIndex();
+    expect(plugin.manualIndex.update).toHaveBeenCalledWith(true);
     expect(debugInfo).toHaveBeenCalledTimes(2);
     expect(debugInfo.mock.calls[0][0]).toContain("Updating note index started");
     expect(debugInfo.mock.calls[1][0]).toContain("Updating note index completed");
@@ -1196,7 +1209,7 @@ describe("V1 plugin composition", () => {
 
   it("rejects startup and closes the candidate worker when SQLite initialization fails", async () => {
     const workers: any[] = [];
-    const WorkerStub = vi.fn(() => {
+    const WorkerStub = vi.fn(function () {
       const listeners = new Set<(event: any) => void>();
       const worker = {
         postMessage: vi.fn((request: any) => {
@@ -1210,8 +1223,9 @@ describe("V1 plugin composition", () => {
                 },
               });
         }),
-        addEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
-          listeners.add(listener)
+        addEventListener: vi.fn(
+          (_type: string, listener: (event: any) => void) =>
+            _type === "message" && listeners.add(listener)
         ),
         removeEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
           listeners.delete(listener)
@@ -1260,7 +1274,7 @@ describe("V1 plugin composition", () => {
     const closeSeen = new Promise<void>((resolve) => (closeStarted = resolve));
     const firstClose = new Promise<void>((resolve) => (releaseFirstClose = resolve));
     const workers: any[] = [];
-    const WorkerStub = vi.fn(() => {
+    const WorkerStub = vi.fn(function () {
       const listeners = new Set<(event: any) => void>();
       const worker = {
         postMessage: vi.fn((request: any) => {
@@ -1285,8 +1299,9 @@ describe("V1 plugin composition", () => {
               });
           }
         }),
-        addEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
-          listeners.add(listener)
+        addEventListener: vi.fn(
+          (_type: string, listener: (event: any) => void) =>
+            _type === "message" && listeners.add(listener)
         ),
         removeEventListener: vi.fn((_type: string, listener: (event: any) => void) =>
           listeners.delete(listener)

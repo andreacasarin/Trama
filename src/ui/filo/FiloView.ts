@@ -3,7 +3,7 @@ import type { Document } from "@langchain/core/documents";
 import type { IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { appendNoteResultRow } from "@/ui/noteResultRow";
-import type { IconName } from "obsidian";
+import type { IconName, EventRef } from "obsidian";
 
 export const FILO_VIEW_TYPE = "trama-filo";
 interface RelatedSource {
@@ -17,7 +17,7 @@ interface RelatedSource {
 export class FiloView extends ItemView {
   private status: IndexStatus;
   private unsubscribe?: () => void;
-  private event?: { unsubscribe?: () => void };
+  private event?: EventRef;
   private controller?: AbortController;
   private generation = 0;
   private activePath?: string;
@@ -59,13 +59,14 @@ export class FiloView extends ItemView {
       if (isBuilding || finishedBuilding) this.refresh();
       else this.render();
     });
-    this.event = (this.app as any).workspace.on("active-leaf-change", () => this.refresh());
+    this.event = this.app.workspace.on("active-leaf-change", () => this.refresh());
     this.refresh();
     return Promise.resolve();
   }
   override onClose(): Promise<void> {
     this.unsubscribe?.();
-    this.event?.unsubscribe?.();
+    if (this.event) this.app.workspace.offref(this.event);
+    this.event = undefined;
     this.cancel();
     return Promise.resolve();
   }
@@ -141,7 +142,7 @@ export class FiloView extends ItemView {
     }
     const documents = this.documents.filter((document) => {
       const path = String(document.metadata.path ?? document.id ?? "");
-      return Boolean(path && path !== this.activePath);
+      return Boolean(path && path !== this.activePath && this.app.vault.getFileByPath(path));
     });
     if (!documents.length) {
       root.createDiv({ text: "No related notes found." });

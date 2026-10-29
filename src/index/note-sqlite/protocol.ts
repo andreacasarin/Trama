@@ -42,7 +42,20 @@ export interface NoteStoreRelatedResult {
   readonly available: boolean;
 }
 
+export interface NoteSourceRevision {
+  readonly path: string;
+  readonly revision: string;
+}
+
 export interface NoteStoreRpc {
+  noteStoreCheckSources: {
+    readonly sources: readonly NoteSourceRevision[];
+    readonly profile: string;
+  };
+  noteStoreRememberSources: {
+    readonly sources: readonly NoteSourceRevision[];
+    readonly profile: string;
+  };
   embeddingCacheGet: {
     readonly profile: string;
     readonly task: "document" | "query";
@@ -68,6 +81,10 @@ export interface NoteStoreRpc {
     readonly limit: number;
   };
   embeddingCacheSqliteCheckArtifacts: {
+    readonly profile: string;
+    readonly checksums: readonly string[];
+  };
+  embeddingCacheSqliteReconcile: {
     readonly profile: string;
     readonly checksums: readonly string[];
   };

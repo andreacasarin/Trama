@@ -1,9 +1,11 @@
+import { validateVector } from "@/domain/vectors";
+import { checkAbort } from "@/domain/errors";
 import { Document, type DocumentInterface } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { VectorStore } from "@langchain/core/vectorstores";
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
 import { sha256 } from "@langchain/core/utils/hash";
-import type { NoteStoreCall } from "./note-sqlite/protocol";
+import type { NoteStoreCall, NoteSourceRevision } from "./note-sqlite/protocol";
 
 interface ScopedEmbeddings extends EmbeddingsInterface<number[]> {
   withSignal?(signal?: AbortSignal): EmbeddingsInterface<number[]>;
@@ -94,6 +96,22 @@ export class SqliteNoteVectorStore extends VectorStore {
       this.profile,
       signal,
       this.dimensions
+    );
+  }
+
+  checkSources(sources: readonly NoteSourceRevision[]): Promise<string[]> {
+    return this.call(
+      "noteStoreCheckSources",
+      { sources, profile: this.profile },
+      this.runSignal
+    ) as Promise<string[]>;
+  }
+
+  rememberSources(sources: readonly NoteSourceRevision[]): Promise<unknown> {
+    return this.call(
+      "noteStoreRememberSources",
+      { sources, profile: this.profile },
+      this.runSignal
     );
   }
 
@@ -228,10 +246,7 @@ export class SqliteNoteVectorStore extends VectorStore {
     for (let index = 0; index < documents.length; index++) {
       if (documents[index].metadata.path !== path || documents[index].metadata.ordinal !== index)
         throw new TypeError("Chunks must have one path and consecutive ordinals");
-      if (vectors[index].length !== this.dimensions && this.dimensions !== 0)
-        throw new TypeError("Embedding dimensions do not match the configured profile");
-      if (!vectors[index].length || vectors[index].some((value) => !Number.isFinite(value)))
-        throw new TypeError("Embedding vectors must contain finite values");
+      validateVector(vectors[index], this.dimensions || undefined);
     }
     await this.call(
       "noteStoreReplace",
@@ -262,12 +277,7 @@ export class SqliteNoteVectorStore extends VectorStore {
     query: number[],
     k: number
   ): Promise<[DocumentInterface, number][]> {
-    if (
-      query.some((value) => !Number.isFinite(value)) ||
-      !query.length ||
-      (this.dimensions && query.length !== this.dimensions)
-    )
-      throw new TypeError("Query vector dimensions or values are invalid");
+    validateVector(query, this.dimensions || undefined);
     const hits = (await this.call("noteStoreSemantic", {
       vector: query,
       profile: this.profile,
@@ -284,8 +294,4 @@ export class SqliteNoteVectorStore extends VectorStore {
     }
     return result;
   }
-}
-
-function checkAbort(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
 }

@@ -35,13 +35,15 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     this.emptyStateText = "Searching…";
     try {
       const result = await this.search.invoke(
-        { query: trimmed, mode: "hybrid" },
+        { query: trimmed, mode: "hybrid", content: "metadata" },
         { signal: controller.signal }
       );
       if (!this.isCurrent(revision, controller, trimmed)) return [];
       const suggestions = result.documents.flatMap((document) => {
         const path = String(document.metadata.path ?? document.id ?? "");
-        return path ? [{ path, title: path.split("/").pop()?.replace(/\.md$/i, "") ?? path }] : [];
+        return path && this.app.vault.getFileByPath(path)
+          ? [{ path, title: path.split("/").pop()?.replace(/\.md$/i, "") ?? path }]
+          : [];
       });
       this.emptyStateText = this.describe(result);
       this.controller = undefined;

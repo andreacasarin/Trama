@@ -1,3 +1,4 @@
+import { checkAbort, isCancelled } from "@/domain/errors";
 import type { DataAdapter } from "obsidian";
 import {
   EMBEDDING_ARTIFACT_MAX_ENTRIES,
@@ -11,6 +12,7 @@ type SharedShardCache = Pick<
   SqliteEmbeddingCache,
   | "profileFingerprint"
   | "unimportedSqliteShards"
+  | "reconcileDocumentShards"
   | "importDocumentShard"
   | "exportNextDocumentShard"
   | "markDocumentShardPublished"
@@ -37,7 +39,7 @@ export class VaultEmbeddingCache {
   }
 
   static async clearManagedFiles(
-    adapter: Pick<DataAdapter, "exists" | "list" | "remove">,
+    adapter: Pick<DataAdapter, "exists" | "list" | "remove" | "writeBinary">,
     signal: AbortSignal
   ): Promise<number> {
     checkAbort(signal);
@@ -57,6 +59,11 @@ export class VaultEmbeddingCache {
         checkAbort(signal);
         const name = path.slice(path.lastIndexOf("/") + 1);
         if (path !== `${folder}/${name}` || !MANAGED_ARTIFACT.test(name)) continue;
+        // Persist intent before deletion so other devices do not restore a deliberate Clear.
+        if (name.endsWith(".sqlite3")) {
+          await adapter.writeBinary(`${folder}/${name.slice(0, 64)}.cleared`, new ArrayBuffer(0));
+          checkAbort(signal);
+        }
         await adapter.remove(path);
         checkAbort(signal);
         removed++;
@@ -73,33 +80,45 @@ export class VaultEmbeddingCache {
     try {
       await this.ensureFolder();
       const { files } = await this.adapter.list(this.folder);
-      const names = files.map((path) => path.slice(path.lastIndexOf("/") + 1));
+      const names = files
+        .filter(
+          (path) =>
+            path.startsWith(`${this.folder}/`) && !path.slice(this.folder.length + 1).includes("/")
+        )
+        .map((path) => path.slice(path.lastIndexOf("/") + 1));
+      const cleared = new Set(
+        names
+          .filter((name) => /^[0-9a-f]{64}\.cleared$/.test(name))
+          .map((name) => name.slice(0, 64))
+      );
       const checksums = names
         .filter((name) => /^[0-9a-f]{64}\.sqlite3$/.test(name))
         .map((name) => name.slice(0, 64));
-      counts.invalid = names.length - checksums.length;
+      counts.invalid = names.length - checksums.length - cleared.size;
+      await this.cache.reconcileDocumentShards([...new Set([...checksums, ...cleared])], signal);
       for (let offset = 0; offset < checksums.length; offset += EMBEDDING_ARTIFACT_MAX_ENTRIES) {
         const page = checksums.slice(offset, offset + EMBEDDING_ARTIFACT_MAX_ENTRIES);
         const pending = new Set(await this.cache.unimportedSqliteShards(page, signal));
         for (const checksum of page) {
           checkAbort(signal);
-          if (!pending.has(checksum)) continue;
-          const bytes = await this.readBoundedArtifact(
-            `${this.folder}/${checksum}.sqlite3`,
-            signal
-          );
-          if (!bytes) {
-            counts.invalid++;
-            continue;
-          }
-          if ((await sha256Bytes(bytes)) !== checksum) {
-            counts.checksumFailures++;
-            continue;
-          }
+          if (!pending.has(checksum) || cleared.has(checksum)) continue;
           try {
+            const bytes = await this.readBoundedArtifact(
+              `${this.folder}/${checksum}.sqlite3`,
+              signal
+            );
+            if (!bytes) {
+              counts.invalid++;
+              continue;
+            }
+            if ((await sha256Bytes(bytes)) !== checksum) {
+              counts.checksumFailures++;
+              continue;
+            }
             await this.cache.importDocumentShard(checksum, bytes, signal);
             counts.imported++;
           } catch (error) {
+            if (isCancelled(error)) throw error;
             checkAbort(signal);
             counts.failures++;
             firstError ??= error;
@@ -115,7 +134,7 @@ export class VaultEmbeddingCache {
         counts.failures || counts.checksumFailures || counts.invalid ? "warn" : "info"
       );
     } catch (error) {
-      finish?.(signal.aborted ? "cancelled" : "failed", counts);
+      finish?.(signal.aborted || isCancelled(error) ? "cancelled" : "failed", counts);
       throw error;
     }
   }
@@ -160,6 +179,10 @@ export class VaultEmbeddingCache {
         if (!published || (await sha256Bytes(published)) !== checksum)
           throw new Error("Published SQLite embedding shard failed its checksum.");
       }
+      // A freshly generated publication may intentionally reuse a previously cleared checksum.
+      const marker = `${this.folder}/${checksum}.cleared`;
+      if (await this.adapter.exists(marker)) await this.adapter.remove(marker);
+      checkAbort(signal);
       await this.cache.markDocumentShardPublished(checksum, shard.hashes, signal);
     }
   }
@@ -198,8 +221,4 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
 function randomSuffix(): string {
   return crypto.randomUUID();
-}
-
-function checkAbort(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
 }

@@ -3,9 +3,9 @@ import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
-import type { NoteStoreMethod, NoteStoreRpc } from "@/index/note-sqlite/protocol";
-import { loadTestSqlite } from "./note-sqlite-test-client";
+import { NoteStoreClient } from "@/index/note-sqlite/client";
+import type {} from "@/index/note-sqlite/protocol";
+import { loadTestSqlite, TestNoteWorker as Worker } from "./note-sqlite-test-client";
 
 class Embeddings implements EmbeddingsInterface<number[]> {
   async embedDocuments(texts: string[]): Promise<number[][]> {
@@ -13,42 +13,6 @@ class Embeddings implements EmbeddingsInterface<number[]> {
   }
   async embedQuery(): Promise<number[]> {
     return [1, 0];
-  }
-}
-
-class Worker implements NoteStoreWorkerLike {
-  private listeners = new Set<(event: any) => void>();
-  constructor(private database: NoteSqliteDatabase) {}
-  addEventListener(_type: "message" | "error", listener: (event: any) => void): void {
-    this.listeners.add(listener);
-  }
-  removeEventListener(_type: "message" | "error", listener: (event: any) => void): void {
-    this.listeners.delete(listener);
-  }
-  postMessage(raw: unknown): void {
-    const request = raw as { id: number; method: string; payload: unknown };
-    if (request.method === "init" || request.method === "close") {
-      for (const listener of this.listeners)
-        listener({ data: { id: request.id, ok: true, result: undefined } });
-      return;
-    }
-    if (request.method === "cancel") return;
-    void this.database
-      .call(request.method as NoteStoreMethod, request.payload as NoteStoreRpc[NoteStoreMethod])
-      .then((result) => {
-        for (const listener of this.listeners)
-          listener({ data: { id: request.id, ok: true, result } });
-      })
-      .catch((error) => {
-        for (const listener of this.listeners)
-          listener({
-            data: {
-              id: request.id,
-              ok: false,
-              error: { name: error.name, message: error.message },
-            },
-          });
-      });
   }
 }
 

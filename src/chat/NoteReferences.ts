@@ -1,3 +1,4 @@
+import { noteTarget, noteCandidates as candidates } from "@/domain/notePaths";
 export interface NoteReferenceIssue {
   readonly target: string;
   readonly reason: "not_found" | "ambiguous";
@@ -16,30 +17,12 @@ interface WikilinkMatch {
 
 const WIKILINK = /\[\[([^[]+?)\]\]/g;
 
-function noteTarget(value: string): string {
-  return value.split("|", 1)[0].split(/[#^]/, 1)[0].trim();
-}
-
-function withoutMarkdownExtension(path: string): string {
-  return path.toLowerCase().endsWith(".md") ? path.slice(0, -3) : path;
-}
-
 function wikilinks(content: string): readonly WikilinkMatch[] {
   return [...content.matchAll(WIKILINK)].map((match) => ({
     start: match.index,
     end: match.index + match[0].length,
-    target: noteTarget(match[1]),
+    target: noteTarget(match[0]),
   }));
-}
-
-function candidates(target: string, catalog: readonly string[]): readonly string[] {
-  const normalizedTarget = withoutMarkdownExtension(target.replace(/^\/+/, ""));
-  const exact = catalog.filter((path) => withoutMarkdownExtension(path) === normalizedTarget);
-  if (exact.length || normalizedTarget.includes("/")) return exact;
-  return catalog.filter((path) => {
-    const normalizedPath = withoutMarkdownExtension(path);
-    return normalizedPath.slice(normalizedPath.lastIndexOf("/") + 1) === normalizedTarget;
-  });
 }
 
 /** Resolves Obsidian wikilinks to visible Markdown paths without consulting the active note. */

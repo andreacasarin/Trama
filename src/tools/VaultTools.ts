@@ -3,7 +3,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import type { ProvenanceRecord, ReadonlyVault } from "@/domain/vault";
 import type { StructuredErrorShape } from "@/domain/errors";
-import { StructuredError } from "@/domain/errors";
+import { StructuredError, isCancelled } from "@/domain/errors";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export interface VaultToolOutcome {
@@ -17,19 +17,20 @@ export type VaultToolFactory = () => StructuredToolInterface[];
 
 const PATHS_ARGUMENT = z
   .object({
-    paths: z.array(z.string().min(1)).min(1),
-    sourcePath: z.string().min(1).optional(),
+    paths: z.array(z.string().min(1).max(4096)).min(1).max(100),
+    sourcePath: z.string().min(1).max(4096).optional(),
   })
   .strict();
 const DISCOVER_LINKS_ARGUMENT = z
   .object({
-    path: z.string().min(1),
+    path: z.string().min(1).max(4096),
     limit: z
       .number()
       .int()
       .positive()
       .safe()
-      .describe("Maximum links to return (default: 25).")
+      .max(1000)
+      .describe("Maximum links to return (default: 25, maximum: 1000).")
       .optional(),
   })
   .strict();
@@ -39,13 +40,15 @@ const SEARCH_ARGUMENT = z
       .string()
       .trim()
       .min(1)
+      .max(4096)
       .describe("An exact term, phrase, or natural-language concept to search for."),
     limit: z
       .number()
       .int()
       .positive()
       .safe()
-      .describe("Maximum search results to return (default: 10).")
+      .max(1000)
+      .describe("Maximum search results to return (default: 10, maximum: 1000).")
       .optional(),
   })
   .strict();
@@ -56,7 +59,7 @@ const SEARCH_PREVIEW_CHARS = 1_000;
 const SEARCH_OUTPUT_CHARS = 12_000;
 
 function failure(error: unknown, provenance: readonly ProvenanceRecord[] = []): VaultToolOutcome {
-  const cancelled = error instanceof Error && /cancel/i.test(error.message);
+  const cancelled = isCancelled(error);
   const structured = error instanceof StructuredError ? error : undefined;
   return {
     ok: false,
@@ -75,7 +78,7 @@ async function readOneNote(
   signal: AbortSignal,
   sourcePath?: string
 ): Promise<{ note: unknown; provenance: readonly ProvenanceRecord[] }> {
-  const isPath = !sourcePath && (path.trim() !== path || path.toLowerCase().endsWith(".md"));
+  const isPath = path.trim() !== path || path.toLowerCase().endsWith(".md");
   const details =
     sourcePath && !isPath
       ? vault.resolveLinkDetails
@@ -121,7 +124,7 @@ async function readNotes(
     provenance?: readonly ProvenanceRecord[];
   }[] = [];
   for (let offset = 0; offset < paths.length; offset += 4) {
-    if (signal.aborted) return failure(new Error("Operation cancelled"));
+    if (signal.aborted) return failure(new DOMException("Operation cancelled", "AbortError"));
     const batch = paths.slice(offset, offset + 4);
     const completed = await Promise.all(
       batch.map(async (requestedPath) => {
@@ -133,7 +136,7 @@ async function readNotes(
         }
       })
     );
-    if (signal.aborted) return failure(new Error("Operation cancelled"));
+    if (signal.aborted) return failure(new DOMException("Operation cancelled", "AbortError"));
     results.push(...completed);
   }
   return {

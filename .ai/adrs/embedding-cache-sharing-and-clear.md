@@ -16,6 +16,10 @@ Use LangChain `CacheBackedEmbeddings` and `EncoderBackedStore` with a local SQLi
 
 Query vectors remain local, with a 1,000-entry limit per model/dimension profile and 30-day expiry. Document entries survive Rebuild. Local values win deduplication. Model or dimension changes select a separate cache profile; old profiles remain reusable if settings switch back. No settings change automatically clears data.
 
+After validating a provider query vector, a non-cancellation cache-write failure
+does not prevent search from using it. Provider failures and invalid vectors still
+fail normally; cancellation is propagated even if the cache write resolves.
+
 ### Document-only SQLite shards
 
 Share immutable document-only files at `Trama/embedding-cache-v2/<profileSHA>/<artifactSHA>.sqlite3`. Each file contains hashed Float32 vectors and profile/dimension/task metadata, no input text, endpoint, or query vectors. Validate checksums, SQLite schema and integrity, metadata, dimensions, and finite vectors before importing. Ignore old JSON artifacts and receipts without migrating or deleting them.
@@ -24,6 +28,14 @@ Use native SQL to select and copy entries into file-backed scratch databases, `V
 
 Import compatible shards before manual or eligible automatic indexing. Publish after indexing and full cleanup succeed. Failed or cancelled indexing publishes nothing. File installation and SQL receipts are separate steps; multi-file publication is not atomic. A sharing failure or cancellation may leave completed immutable files and reports “Index updated; sharing incomplete/cancelled.” A later eligible automatic run or manual Update retries outstanding work, without an immediate failure retry loop.
 
+Unreadable individual shards are skipped and summarized without blocking local
+indexing; subsequent runs retry them. Other non-cancellation import failures,
+including unavailable shared directories, allow local indexing to continue and
+report sharing as incomplete even if publication succeeds. Reconcile publication receipts in SQL using
+the directory inventory already read for import. Missing files become eligible
+for republication from local cache without another provider request. No corpus
+vectors cross into JavaScript for reconciliation.
+
 The user's vault-sync transport carries these files; never share the mutable local index. Obsidian Sync requires “Sync all other types” on each device. There is no separate startup uploader, third-party cache service, custom transport, or credential sharing. A device with a compatible cache profile can rebuild from complete document-cache hits without a working provider; a cache miss still requires its configured provider. No provider-health preflight is added.
 
 ### Rebuild and explicit Clear
@@ -31,6 +43,13 @@ The user's vault-sync transport carries these files; never share the mutable loc
 Ordinary reset and Rebuild clear indexed state and RecordManager state while retaining document/query caches, receipts, and shared files. **Clear index and embedding cache** additionally clears all local document/query profiles, import/publication receipts, and known managed SQLite artifacts and temporary files under the shared cache root across profiles. It needs no configured model.
 
 Clear leaves notes, settings, vault identity, the OPFS namespace, unrelated files, and other devices' local caches intact. Shared-file deletion follows vault sync and cannot guarantee deletion on every device. Cancel pending searches and reset submitted Lente results before clearing, so existing requests cannot repopulate the deleted cache and Clear does not replay a query.
+
+Before removing each shared shard, Clear writes an empty `<artifactSHA>.cleared`
+marker beside it. Keep that marker so other devices retain the publication
+receipt instead of restoring an intentionally deleted shard. Markers contain
+only artifact hashes and follow the same vault sync transport. A fresh publication
+can remove its matching marker, allowing explicit rebuilding after Clear. Missing
+markers or out-of-order sync cannot provide a global atomic deletion guarantee.
 
 The SQL clear commits or rolls back before shared-file removal starts. Cancellation before commit preserves prior local state. Failure or cancellation afterward reports local clearing with shared cleanup incomplete, leaves automatic indexing paused, and permits retrying Clear. Cross-store clearing is not atomic.
 

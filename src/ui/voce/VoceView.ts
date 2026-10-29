@@ -308,7 +308,10 @@ export class VoceView extends ItemView {
     this.activeAttachmentPicker?.close();
     this.activeAttachmentPicker = undefined;
     this.clearTranscriptTurns();
-    this.session.reset();
+    const otherView = this.app.workspace
+      ?.getLeavesOfType?.(VOCE_VIEW_TYPE)
+      .some((leaf) => leaf !== this.leaf && (leaf.view as VoceView).session === this.session);
+    if (!otherView) this.session.reset();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     return Promise.resolve();
@@ -472,19 +475,23 @@ export class VoceView extends ItemView {
       }
       this.followTranscript = true;
       this.lastAppliedTranscriptTop = this.transcript.scrollTop;
-      const pendingSend = session.send({
-        content,
-        attachmentPaths,
-        skill,
-        editTurnId: this.editingTurnId,
-      });
-      if (session.getState().running) {
-        this.editingTurnId = undefined;
-        this.input.value = "";
-        this.selectedAttachmentPaths = [];
-        this.renderAttachments();
-      }
-      await pendingSend;
+      await session.send(
+        { content, attachmentPaths, skill, editTurnId: this.editingTurnId },
+        () => {
+          if (
+            this.session !== session ||
+            !this.isViewOpen ||
+            skillGeneration !== this.skillResolutionGeneration
+          )
+            return;
+          this.editingTurnId = undefined;
+          if (this.input.value === content) {
+            this.input.value = "";
+            this.selectedAttachmentPaths = [];
+            this.renderAttachments();
+          }
+        }
+      );
     } catch (error) {
       this.consoleDebug?.error("Chat turn setup failed", undefined, {
         errorCode: errorCode(error),

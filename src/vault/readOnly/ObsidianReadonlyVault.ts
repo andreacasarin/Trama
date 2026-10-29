@@ -1,6 +1,7 @@
+import { noteCandidates } from "@/domain/notePaths";
 import { MetadataCache, TFile, Vault, type CachedMetadata } from "obsidian";
 import type { ReadonlyNote, ReadonlyVault, VaultLink } from "@/domain/vault";
-import { StructuredError } from "@/domain/errors";
+import { StructuredError, checkAbort } from "@/domain/errors";
 
 const MARKDOWN = /\.md$/i;
 
@@ -18,12 +19,12 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
   }
 
   async readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote> {
-    this.checkCancelled(signal);
+    checkAbort(signal);
     const normalized = this.normalizePath(path);
     const file = this.vault.getFileByPath(normalized);
     if (!file || !MARKDOWN.test(file.path)) throw new Error("Note not found");
     const content = await this.vault.read(file);
-    this.checkCancelled(signal);
+    checkAbort(signal);
     return {
       path: normalized,
       content,
@@ -38,28 +39,24 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     sourcePath: string | null,
     signal: AbortSignal
   ): Promise<string | null> {
-    this.checkCancelled(signal);
+    checkAbort(signal);
     const clean = this.linkText(link).split("#", 1)[0].split("^", 1)[0].trim();
     if (sourcePath === null) {
       if (!clean) throw new Error("Invalid vault note name");
       const exact = MARKDOWN.test(clean) ? clean : `${clean}.md`;
       this.normalizePath(exact);
       const markdownFiles = this.vault.getMarkdownFiles?.() ?? [];
-      const exactFile = markdownFiles.find(
-        (file) => !this.isHidden(file.path) && file.path === exact
-      );
-      if (exactFile) return this.normalizePath(exactFile.path);
-      if (clean.includes("/")) return null;
-      const candidates = markdownFiles.filter(
-        (file) => !this.isHidden(file.path) && file.name.toLowerCase() === exact.toLowerCase()
+      const candidates = noteCandidates(
+        clean,
+        markdownFiles.filter((file) => !this.isHidden(file.path)).map((file) => file.path)
       );
       if (candidates.length > 1)
         throw new StructuredError(
           "invalid_request",
-          `Ambiguous note name '${clean}'; candidates: ${candidates.map((file) => file.path).join(", ")}`,
+          `Ambiguous note name '${clean}'; candidates: ${candidates.join(", ")}`,
           false
         );
-      return candidates[0] ? this.normalizePath(candidates[0].path) : null;
+      return candidates[0] ? this.normalizePath(candidates[0]) : null;
     }
     const source = this.normalizePath(sourcePath);
     if (!clean) return source;
@@ -93,7 +90,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     signal: AbortSignal,
     maxLinks = Number.POSITIVE_INFINITY
   ): Promise<readonly VaultLink[]> {
-    this.checkCancelled(signal);
+    checkAbort(signal);
     const sourcePath = this.normalizePath(path);
     const file = this.vault.getFileByPath(sourcePath);
     if (!file) throw new Error("Note not found");
@@ -101,7 +98,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     const links = this.cachedLinks(cache);
     const output: VaultLink[] = [];
     for (const link of links.slice(0, Math.max(0, Math.floor(maxLinks)))) {
-      this.checkCancelled(signal);
+      checkAbort(signal);
       output.push({
         link: link.link,
         sourcePath,
@@ -168,9 +165,5 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
       (left, right) => left.position.start.offset - right.position.start.offset
     );
     return [...frontmatter, ...body];
-  }
-
-  private checkCancelled(signal: AbortSignal): void {
-    if (signal.aborted) throw new Error("Operation cancelled");
   }
 }

@@ -5,9 +5,9 @@ import { ManualIndex, type ManualIndexNote, type ManualIndexVault } from "@/inde
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
-import type { NoteStoreMethod, NoteStoreRpc, NoteStoreCall } from "@/index/note-sqlite/protocol";
-import { loadTestSqlite } from "./note-sqlite-test-client";
+import { NoteStoreClient } from "@/index/note-sqlite/client";
+import type { NoteStoreCall } from "@/index/note-sqlite/protocol";
+import { loadTestSqlite, TestNoteWorker as LocalNoteWorker } from "./note-sqlite-test-client";
 
 class TestEmbeddings implements EmbeddingsInterface<number[]> {
   calls = 0;
@@ -45,40 +45,6 @@ class MemoryVault implements ManualIndexVault {
     const content = this.notes.get(path);
     if (content === undefined) throw new Error(`Missing ${path}`);
     return { path, content };
-  }
-}
-
-class LocalNoteWorker implements NoteStoreWorkerLike {
-  private readonly listeners = new Map<string, Set<(event: any) => void>>();
-  constructor(private readonly database: NoteSqliteDatabase) {}
-  addEventListener(type: "message" | "error" | "messageerror", listener: (event: any) => void) {
-    const group = this.listeners.get(type) ?? new Set();
-    group.add(listener);
-    this.listeners.set(type, group);
-  }
-  removeEventListener(type: "message" | "error" | "messageerror", listener: (event: any) => void) {
-    this.listeners.get(type)?.delete(listener);
-  }
-  postMessage(raw: unknown): void {
-    const request = raw as { id: number; method: string; payload: unknown };
-    if (request.method === "init" || request.method === "close") {
-      this.emit({ id: request.id, ok: true, result: undefined });
-      return;
-    }
-    if (request.method === "cancel") return;
-    void this.database
-      .call(request.method as NoteStoreMethod, request.payload as NoteStoreRpc[NoteStoreMethod])
-      .then((result) => this.emit({ id: request.id, ok: true, result }))
-      .catch((error) =>
-        this.emit({
-          id: request.id,
-          ok: false,
-          error: { name: error.name, message: error.message },
-        })
-      );
-  }
-  private emit(data: unknown): void {
-    for (const listener of this.listeners.get("message") ?? []) listener({ data });
   }
 }
 

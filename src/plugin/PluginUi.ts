@@ -75,7 +75,11 @@ export function registerPluginUi(
       id,
       name,
       icon,
-      callback: () => void app.workspace.getLeaf(true).setViewState({ type, active: true }),
+      callback: () => {
+        const existing = app.workspace.getLeavesOfType(type)[0];
+        if (existing) void app.workspace.revealLeaf(existing);
+        else void app.workspace.getLeaf(true).setViewState({ type, active: true });
+      },
     });
   plugin.addCommand({
     id: "search-with-lente",

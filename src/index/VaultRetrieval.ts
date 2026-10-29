@@ -1,7 +1,7 @@
 import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { RunnableLambda, type RunnableConfig } from "@langchain/core/runnables";
-import { StructuredError } from "@/domain/errors";
+import { StructuredError, checkAbort, isCancelled } from "@/domain/errors";
 import { EmbeddingProviderError } from "@/model/LocalModels";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import type {
@@ -15,6 +15,7 @@ export interface VaultRetrievalInput {
   readonly query: string;
   readonly mode: "hybrid" | "lexical";
   readonly limit?: number;
+  readonly content?: "full" | "metadata";
 }
 
 export interface VaultRetrievalStatus {
@@ -82,7 +83,7 @@ export class VaultRetrieval {
     const finish = this.consoleDebug?.start("Filo related-note lookup");
     try {
       const result = await this.relatedHits(sourcePath, signal, limit);
-      const documents = await this.hydrate(result.hits, signal);
+      const documents = result.hits.map(metadataDocument);
       finish?.("completed", { resultCount: documents.length, available: result.available });
       return { documents, available: result.available };
     } catch (error) {
@@ -115,6 +116,16 @@ export class VaultRetrieval {
       : this.searchController.signal;
     checkAbort(signal);
     const query = input.query.trim();
+    if (
+      query.length > 4096 ||
+      (input.limit !== undefined &&
+        (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1000))
+    )
+      throw new StructuredError(
+        "invalid_request",
+        "Search query or result limit exceeds its bounds.",
+        false
+      );
     if (!query)
       throw new StructuredError("invalid_request", "Search query must not be empty.", false);
     if (input.mode !== "hybrid" && input.mode !== "lexical")
@@ -247,7 +258,10 @@ export class VaultRetrieval {
 
     try {
       const candidates = await this.searchCandidates(input, signal);
-      const documents = await this.hydrate(candidates.hits, candidates.signal, input.limit);
+      const documents =
+        input.content === "metadata"
+          ? candidates.hits.slice(0, input.limit).map(metadataDocument)
+          : await this.hydrate(candidates.hits, candidates.signal, input.limit);
       checkAbort(candidates.signal);
       finish?.("completed", {
         resultCount: documents.length,
@@ -303,13 +317,6 @@ function waitForConsumer<T>(promise: Promise<T>, signal: AbortSignal): Promise<T
   });
 }
 
-function checkAbort(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new StructuredError("cancelled", "Search cancelled.", false);
-}
-
-function isCancelled(error: unknown): boolean {
-  return Boolean(
-    (error instanceof DOMException && error.name === "AbortError") ||
-    (error && typeof error === "object" && "code" in error && error.code === "cancelled")
-  );
+function metadataDocument(hit: NoteStoreHit): Document {
+  return new Document({ id: hit.path, pageContent: "", metadata: { ...hit } });
 }

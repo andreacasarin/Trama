@@ -25,7 +25,7 @@ mkdirSync(outputDir, { recursive: true });
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const read = (path) => readFileSync(path);
 const fixtureProfile = digest(Buffer.from("opfs-proof-profile"));
-function createInvalidFixture(path, hash, vector) {
+function createShardFixture(path, hash, vector) {
   const blob = Buffer.from(vector).toString("hex");
   const sql = `PRAGMA journal_mode=DELETE;
 PRAGMA application_id=1414679873;
@@ -34,7 +34,7 @@ CREATE TABLE metadata(profile TEXT NOT NULL,dimensions INTEGER NOT NULL,task TEX
 CREATE TABLE vectors(hash TEXT NOT NULL UNIQUE,vector BLOB NOT NULL);
 CREATE TABLE _sqliteai_vector(tblname TEXT,colname TEXT,key TEXT,value ANY,PRIMARY KEY(tblname,colname,key));
 INSERT INTO metadata VALUES('${fixtureProfile}',8,'document');
-INSERT INTO vectors VALUES('${hash}',X'${blob}');
+INSERT INTO vectors VALUES(CAST(X'${Buffer.from(hash).toString("hex")}' AS TEXT),X'${blob}');
 VACUUM;`;
   const created = spawnSync("/usr/bin/sqlite3", [path], {
     input: sql,
@@ -67,8 +67,24 @@ async function stopChild() {
 }
 
 try {
-  createInvalidFixture(join(site, "bad-hash.sqlite3"), `G${"0".repeat(63)}`, normalVector);
-  createInvalidFixture(join(site, "nonfinite-vector.sqlite3"), "1".repeat(64), nonfiniteVector);
+  for (const [name, hash] of [
+    ["bad-hash", `G${"0".repeat(63)}`],
+    ["nul-suffix-hash", "a".repeat(64) + "\0suffix"],
+    ["nul-ending-hash", "a".repeat(64) + "\0"],
+    ["nul-short-hash", "a".repeat(63) + "\0"],
+  ])
+    createShardFixture(join(site, `${name}.sqlite3`), hash, normalVector);
+  createShardFixture(join(site, "nonfinite-vector.sqlite3"), "1".repeat(64), nonfiniteVector);
+  createShardFixture(join(site, "zero-vector.sqlite3"), "2".repeat(64), Buffer.alloc(8 * 4));
+  createShardFixture(join(site, "legacy-valid.sqlite3"), "3".repeat(64), normalVector);
+  for (const [name, value, hash] of [
+    ["tiny-vector", 1e-30, "4"],
+    ["large-vector", 1e20, "5"],
+  ]) {
+    const bytes = Buffer.alloc(8 * 4);
+    bytes.writeFloatLE(value, 0);
+    createShardFixture(join(site, `${name}.sqlite3`), hash.repeat(64), bytes);
+  }
   const built = await build({
     entryPoints: [join(root, "src/index/note-sqlite/worker.ts")],
     outfile: join(site, "note-worker.mjs"),
@@ -119,7 +135,18 @@ try {
     const file = pathname === "/" ? "page.html" : pathname.slice(1);
     const fixture = file.startsWith("fixtures/") ? file.slice("fixtures/".length) : undefined;
     const safeFixture =
-      fixture && ["bad-hash.sqlite3", "nonfinite-vector.sqlite3"].includes(fixture);
+      fixture &&
+      [
+        "bad-hash.sqlite3",
+        "nul-suffix-hash.sqlite3",
+        "nul-ending-hash.sqlite3",
+        "nul-short-hash.sqlite3",
+        "nonfinite-vector.sqlite3",
+        "zero-vector.sqlite3",
+        "legacy-valid.sqlite3",
+        "tiny-vector.sqlite3",
+        "large-vector.sqlite3",
+      ].includes(fixture);
     const types = {
       "page.html": "text/html",
       "page.js": "text/javascript",

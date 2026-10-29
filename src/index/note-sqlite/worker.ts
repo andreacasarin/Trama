@@ -47,17 +47,16 @@ async function open(namespace: string): Promise<OpenDatabase> {
   const moduleUrl = assets?.moduleUrl ?? new URL("./sqlite3.mjs", import.meta.url).href;
   const response = await fetch(wasmUrl, { credentials: "same-origin" });
   if (!response.ok) throw new Error("SQLite WASM asset could not be loaded");
-  const wasm = await response.arrayBuffer();
+  const wasm = await WebAssembly.compile(await response.arrayBuffer());
   (globalThis as any).sqlite3ApiConfig = {
     disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
   };
   const init = (await import(moduleUrl)).default as Init;
   const sqlite = await init({
     instantiateWasm(imports, onSuccess) {
-      WebAssembly.instantiate(wasm, imports).then(({ instance, module }) =>
-        onSuccess(instance, module)
-      );
-      return {};
+      const instance = new WebAssembly.Instance(wasm, imports);
+      onSuccess(instance, wasm);
+      return instance.exports;
     },
   });
   const directory = `trama-note-v2-${namespace}`;

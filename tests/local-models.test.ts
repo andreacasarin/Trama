@@ -3,6 +3,7 @@ import {
   createLocalChatModel,
   createLocalEmbeddings,
   discoverLocalModels,
+  EmbeddingProviderError,
 } from "@/model/LocalModels";
 import { DEFAULT_SETTINGS } from "@/settings/Settings";
 
@@ -239,6 +240,40 @@ describe("OpenAI-compatible embeddings", () => {
     await expect(queryRequest).resolves.toEqual([1, 0]);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    [0, 0],
+    [1e100, 1],
+  ])("rejects invalid query vectors as provider failures: %j", async (...embedding) => {
+    const provider = createLocalEmbeddings({
+      endpoint,
+      modelId: "m",
+      dimensions: 2,
+      fetcher: async () =>
+        Response.json({
+          data: [{ index: 0, embedding }],
+          model: "m",
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        }),
+    });
+    await expect(provider.embedQuery("query")).rejects.toBeInstanceOf(EmbeddingProviderError);
+  });
+
+  it.each([null, {}, { data: null }, { data: [null] }, { data: [7] }, { data: [{ index: 0 }] }])(
+    "classifies malformed embedding responses as provider failures: %j",
+    async (body) => {
+      const provider = createLocalEmbeddings({
+        endpoint,
+        modelId: "m",
+        dimensions: 2,
+        fetcher: async () => Response.json(body),
+      });
+      await expect(provider.embedQuery("query")).rejects.toBeInstanceOf(EmbeddingProviderError);
+      await expect(provider.embedDocuments(["document"])).rejects.toBeInstanceOf(
+        EmbeddingProviderError
+      );
+    }
+  );
 
   it("rejects invalid response indexes and dimensions", async () => {
     for (const data of [

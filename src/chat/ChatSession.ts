@@ -294,17 +294,13 @@ export class ChatSession {
   }
 
   /** Restores native history only when a revised prompt is submitted. */
-  private rewind(turnId: string): void {
-    if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
-    const index = this.state.turns.findIndex((turn) => turn.id === turnId);
-    const turn = this.state.turns[index];
-    if (!turn || turn.role !== "user")
-      throw new StructuredError("invalid_request", "User message could not be found.", false);
-    this.lastCompletedCheckpointId = this.checkpointsBeforeUserTurns.get(turnId);
+  private rewind(index: number): void {
+    this.lastCompletedCheckpointId = this.checkpointsBeforeUserTurns.get(
+      this.state.turns[index].id
+    );
     for (const removed of this.state.turns.slice(index))
       this.checkpointsBeforeUserTurns.delete(removed.id);
-    this.state = { turns: Object.freeze(this.state.turns.slice(0, index)), running: false };
-    for (const listener of this.listeners) listener(this.state);
+    this.state = { ...this.state, turns: Object.freeze(this.state.turns.slice(0, index)) };
   }
 
   subscribe(listener: (state: ChatState) => void): () => void {
@@ -313,14 +309,16 @@ export class ChatSession {
     return () => this.listeners.delete(listener);
   }
 
-  async send(input: SendTurnInput): Promise<ChatState> {
+  async send(input: SendTurnInput, onAccepted?: () => void): Promise<ChatState> {
     this.preflight();
     if (this.active) throw new StructuredError("busy", "A chat turn is already running.", true);
     if (!input.content.trim())
       throw new StructuredError("invalid_request", "Message cannot be empty.", false);
-    if (input.editTurnId) this.rewind(input.editTurnId);
-    if (!this.lastCompletedCheckpointId) this.checkpointer = new MemorySaver();
-    const checkpointer = this.checkpointer;
+    const editIndex = input.editTurnId
+      ? this.state.turns.findIndex((turn) => turn.id === input.editTurnId)
+      : undefined;
+    if (editIndex !== undefined && this.state.turns[editIndex]?.role !== "user")
+      throw new StructuredError("invalid_request", "User message could not be found.", false);
     const paths = [...new Set(input.attachmentPaths)];
     const controller = new AbortController();
     const turnProgress: TurnReadProgress = {
@@ -335,7 +333,10 @@ export class ChatSession {
     this.publish(identity, { ...this.state, running: true, error: undefined });
     try {
       const notes = await this.readAttachments(paths, controller.signal);
-      if (!this.isCurrent(identity)) return this.state;
+      if (!this.isCurrent(identity) || controller.signal.aborted) return this.state;
+      if (editIndex !== undefined) this.rewind(editIndex);
+      if (!this.lastCompletedCheckpointId) this.checkpointer = new MemorySaver();
+      const checkpointer = this.checkpointer;
       const references = attachmentBlock(notes);
       const requestContext = [
         input.skill
@@ -371,6 +372,8 @@ export class ChatSession {
         ]),
         running: true,
       });
+
+      onAccepted?.();
 
       let toolOrdinal = 0;
       const middleware: AnyAgentMiddleware[] = [

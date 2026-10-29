@@ -6,12 +6,12 @@ import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbe
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
-import type { NoteStoreMethod, NoteStoreRpc, SqliteConnection } from "@/index/note-sqlite/protocol";
+import { NoteStoreClient } from "@/index/note-sqlite/client";
+import type { SqliteConnection } from "@/index/note-sqlite/protocol";
 import { EMBEDDING_ARTIFACT_MAX_FILE_BYTES } from "@/index/note-sqlite/protocol";
 import { VaultEmbeddingCache } from "@/plugin/VaultEmbeddingCache";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
-import { loadTestSqlite } from "./note-sqlite-test-client";
+import { loadTestSqlite, TestNoteWorker as LocalWorker } from "./note-sqlite-test-client";
 
 const profile = {
   endpoint: "http://127.0.0.1:1234/v1",
@@ -128,37 +128,6 @@ class MemoryAdapter {
   }
 }
 
-class LocalWorker implements NoteStoreWorkerLike {
-  private listeners = new Set<(event: any) => void>();
-  constructor(private readonly database: NoteSqliteDatabase) {}
-  addEventListener(_type: "message" | "error" | "messageerror", listener: (event: any) => void) {
-    this.listeners.add(listener);
-  }
-  removeEventListener(_type: "message" | "error" | "messageerror", listener: (event: any) => void) {
-    this.listeners.delete(listener);
-  }
-  postMessage(raw: unknown): void {
-    const request = raw as { id: number; method: string; payload: unknown };
-    if (request.method === "init" || request.method === "close" || request.method === "cancel") {
-      this.emit({ id: request.id, ok: true, result: undefined });
-      return;
-    }
-    void this.database
-      .call(request.method as NoteStoreMethod, request.payload as NoteStoreRpc[NoteStoreMethod])
-      .then((result) => this.emit({ id: request.id, ok: true, result }))
-      .catch((error) =>
-        this.emit({
-          id: request.id,
-          ok: false,
-          error: { name: error.name, message: error.message },
-        })
-      );
-  }
-  private emit(data: unknown): void {
-    for (const listener of this.listeners) listener({ data });
-  }
-}
-
 function queryRows(
   db: SqliteConnection,
   sql: string,
@@ -195,6 +164,7 @@ function testShardCache(
   return {
     profileFingerprint,
     unimportedSqliteShards: cache.unimportedSqliteShards.bind(cache),
+    reconcileDocumentShards: cache.reconcileDocumentShards.bind(cache),
     async exportNextDocumentShard(limit: number) {
       const hashes = (await database.call("embeddingCacheKeys", {
         profile: profileFingerprint,
@@ -293,6 +263,191 @@ async function setup(
 }
 
 describe("vault-shared document embedding artifacts", () => {
+  it.each(["mkdir", "list"] as const)(
+    "indexes and rebuilds locally when shared-cache %s fails, then retries sharing",
+    async (operation) => {
+      const adapter = new MemoryAdapter();
+      const provider = new TestEmbeddings();
+      const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
+      const failure = vi
+        .spyOn(adapter, operation)
+        .mockRejectedValue(new Error("Shared cache unavailable"));
+      try {
+        for (const run of [() => f.manual.update(), () => f.manual.rebuild()]) {
+          expect(await run()).toMatchObject({ visited: 1, numAdded: 1, sharing: "incomplete" });
+          expect(f.db.selectValue("SELECT count(*) FROM note_index")).toBe(1);
+        }
+        expect(provider.calls).toHaveLength(1);
+        failure.mockRestore();
+        expect((await f.manual.update()).sharing).toBe("complete");
+        expect([...adapter.files.keys()].some((path) => path.endsWith(".sqlite3"))).toBe(true);
+        expect(provider.calls).toHaveLength(1);
+      } finally {
+        await f.client.close();
+        f.db.close();
+      }
+    }
+  );
+
+  it.each(["mkdir", "list"] as const)(
+    "propagates cancellation from shared-cache %s",
+    async (operation) => {
+      const adapter = new MemoryAdapter();
+      const provider = new TestEmbeddings();
+      const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
+      adapter[operation] = async () => {
+        throw new DOMException("Cancelled", "AbortError");
+      };
+      try {
+        await expect(f.manual.update()).rejects.toMatchObject({ name: "AbortError" });
+        expect(provider.calls).toHaveLength(0);
+        expect(f.db.selectValue("SELECT count(*) FROM note_index")).toBe(0);
+      } finally {
+        await f.client.close();
+        f.db.close();
+      }
+    }
+  );
+
+  it("stops indexing when an aborted directory read rejects with an ordinary I/O error", async () => {
+    const adapter = new MemoryAdapter();
+    const provider = new TestEmbeddings();
+    const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
+    let started!: () => void;
+    let fail!: (error: Error) => void;
+    const reading = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    adapter.list = async () => {
+      started();
+      return new Promise((_resolve, reject) => {
+        fail = reject;
+      });
+    };
+    try {
+      const pending = f.manual.update();
+      await reading;
+      f.manual.cancel();
+      fail(new Error("Directory read interrupted"));
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(provider.calls).toHaveLength(0);
+      expect(f.db.selectValue("SELECT count(*) FROM note_index")).toBe(0);
+      expect(adapter.files.size).toBe(0);
+    } finally {
+      await f.client.close();
+      f.db.close();
+    }
+  });
+
+  it("republishes an accidentally deleted shard without another provider call", async () => {
+    const adapter = new MemoryAdapter();
+    const provider = new TestEmbeddings();
+    const { manual, shared, client, db } = await setup(
+      adapter,
+      new Map([["a.md", markdown]]),
+      provider
+    );
+    try {
+      await manual.update();
+      const shard = [...adapter.files.keys()].find((path) => path.endsWith(".sqlite3"))!;
+      expect(shard).toBeDefined();
+      const calls = provider.calls.length;
+      adapter.files.delete(shard);
+      const exec = vi.spyOn(db, "exec");
+      await shared.importAvailable(new AbortController().signal);
+      const reconcile = exec.mock.calls
+        .map(([statement]) => statement as any)
+        .find((statement) =>
+          statement.sql?.includes("DELETE FROM embedding_cache_sqlite_publications")
+        );
+      expect(reconcile.sql).toContain("json_each");
+      expect(reconcile.sql).not.toContain("SELECT vector");
+      const plan = queryRows(db, `EXPLAIN QUERY PLAN ${reconcile.sql}`, reconcile.bind);
+      expect(plan.map((row) => row.detail).join("\n")).toContain(
+        "embedding_cache_sqlite_publication_shards (profile=? AND checksum=?)"
+      );
+      await shared.publishAvailable(new AbortController().signal);
+      expect(adapter.files.has(shard)).toBe(true);
+      expect(provider.calls).toHaveLength(calls);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("does not restore intentionally cleared shards from another device's local cache", async () => {
+    const adapter = new MemoryAdapter();
+    const notes = new Map([["a.md", markdown]]);
+    const first = await setup(adapter, notes, new TestEmbeddings());
+    const second = await setup(adapter, notes, new TestEmbeddings());
+    try {
+      await first.manual.update();
+      await second.manual.update();
+      const shard = [...adapter.files.keys()].find((path) => path.endsWith(".sqlite3"))!;
+      await first.database.call("noteStoreClear", {});
+      await VaultEmbeddingCache.clearManagedFiles(adapter, new AbortController().signal);
+      expect(adapter.files.has(shard.replace(/\.sqlite3$/, ".cleared"))).toBe(true);
+      await second.manual.update();
+      expect([...adapter.files.keys()].some((path) => path.endsWith(".sqlite3"))).toBe(false);
+      // An explicit rebuild after Clear can generate and publish the vectors again.
+      await first.manual.update();
+      expect([...adapter.files.keys()].some((path) => path.endsWith(".sqlite3"))).toBe(true);
+    } finally {
+      await first.client.close();
+      await second.client.close();
+    }
+  });
+
+  it("skips a shard lost between stat and read, indexes locally, and retries import later", async () => {
+    const adapter = new MemoryAdapter();
+    const notes = new Map([["a.md", markdown]]);
+    const first = await setup(adapter, notes, new TestEmbeddings());
+    const provider = new TestEmbeddings();
+    const second = await setup(adapter, notes, provider);
+    try {
+      await first.manual.update();
+      const read = adapter.readBinary.bind(adapter);
+      let fail = true;
+      adapter.readBinary = async (path) => {
+        if (fail && path.endsWith(".sqlite3")) throw new Error("File disappeared during sync");
+        return read(path);
+      };
+      expect((await second.manual.update()).sharing).toBe("incomplete");
+      expect(
+        queryRows(second.db, "SELECT count(*) AS count FROM embedding_cache_sqlite_imports")[0]
+          .count
+      ).toBe(0);
+      fail = false;
+      expect(provider.calls).toHaveLength(1);
+      expect(queryRows(second.db, "SELECT count(*) AS count FROM note_index")[0].count).toBe(1);
+      await second.shared.importAvailable(new AbortController().signal);
+      expect(
+        queryRows(second.db, "SELECT count(*) AS count FROM embedding_cache_sqlite_imports")[0]
+          .count
+      ).toBeGreaterThan(0);
+    } finally {
+      await first.client.close();
+      await second.client.close();
+    }
+  });
+
+  it("propagates cancellation from an individual shard read", async () => {
+    const adapter = new MemoryAdapter();
+    const first = await setup(adapter, new Map([["a.md", markdown]]), new TestEmbeddings());
+    const second = await setup(adapter, new Map(), new TestEmbeddings());
+    try {
+      await first.manual.update();
+      adapter.readBinary = async () => {
+        throw new DOMException("Cancelled", "AbortError");
+      };
+      await expect(
+        second.shared.importAvailable(new AbortController().signal)
+      ).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      await first.client.close();
+      await second.client.close();
+    }
+  });
+
   it("clears SQLite index and cache atomically while ordinary reset retains reusable cache", async () => {
     const adapter = new MemoryAdapter();
     const notes = new Map([["clear.md", markdown]]);
@@ -429,12 +584,12 @@ describe("vault-shared document embedding artifacts", () => {
     ).rejects.toMatchObject({
       name: "AbortError",
     });
-    expect(adapter.files.size).toBe(1);
+    expect([...adapter.files.keys()].filter((path) => path.endsWith(".sqlite3"))).toHaveLength(1);
     adapter.remove = remove;
     expect(
       await VaultEmbeddingCache.clearManagedFiles(adapter as any, new AbortController().signal)
     ).toBe(1);
-    expect(adapter.files.size).toBe(0);
+    expect([...adapter.files.keys()].filter((path) => path.endsWith(".sqlite3"))).toHaveLength(0);
   });
 
   it("imports compatible vectors across endpoint changes into an independent index", async () => {
@@ -609,6 +764,7 @@ describe("vault-shared document embedding artifacts", () => {
     adapter.files.set(filename, bytes);
     const cache = {
       profileFingerprint: profileHash,
+      reconcileDocumentShards: vi.fn(async () => {}),
       unimportedSqliteShards: vi.fn(async (values: string[]) => values),
       importDocumentShard: vi.fn(async () => {
         throw new Error("SQLite shard import failed");
@@ -642,6 +798,7 @@ describe("vault-shared document embedding artifacts", () => {
     });
     const cache = {
       profileFingerprint: profileHash,
+      reconcileDocumentShards: vi.fn(async () => {}),
       unimportedSqliteShards: vi.fn(),
       importDocumentShard: vi.fn(),
       exportNextDocumentShard: vi.fn(),
@@ -708,7 +865,7 @@ describe("vault-shared document embedding artifacts", () => {
       expect(debugWarn).toHaveBeenCalledOnce();
       expect(debugWarn.mock.calls[0][0]).toContain("Embedding cache publication incomplete");
       expect(debugWarn.mock.calls[0][1]).toMatchObject({ message: "sharing write failed" });
-      expect(adapter.files.size).toBe(1);
+      expect([...adapter.files.keys()].filter((path) => path.endsWith(".sqlite3"))).toHaveLength(1);
       expect(Number(result.db.selectValue("SELECT count(*) FROM note_index"))).toBe(1);
       expect(
         Number(result.db.selectValue("SELECT count(*) FROM embedding_cache_sqlite_imports"))

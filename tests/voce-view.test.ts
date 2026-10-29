@@ -83,7 +83,7 @@ function setup() {
   const copy = vi.fn(async () => {});
   const session = {
     getState: vi.fn(() => ({ turns: [], running: false })),
-    send: vi.fn(async () => {}),
+    send: vi.fn(async (_input: unknown, _onAccepted?: () => void) => {}),
   };
   const view = new VoceView(
     new WorkspaceLeaf(),
@@ -251,19 +251,58 @@ describe("Voce transcript", () => {
     expect(session.send).not.toHaveBeenCalled();
     view.input.value = "Revised";
     view.render = vi.fn();
-    session.send.mockImplementation(async () => {
+    session.send.mockImplementation(async (_input, onAccepted) => {
       session.getState.mockReturnValue({ turns: [], running: true });
+      onAccepted?.();
     });
+    view.isViewOpen = true;
     await view.submit();
-    expect(session.send).toHaveBeenCalledWith({
-      content: "Revised",
-      attachmentPaths: [],
-      skill: undefined,
-      editTurnId: "user",
-    });
+    expect(session.send).toHaveBeenCalledWith(
+      {
+        content: "Revised",
+        attachmentPaths: [],
+        skill: undefined,
+        editTurnId: "user",
+      },
+      expect.any(Function)
+    );
     expect(view.editingTurnId).toBeUndefined();
     expect(view.input.value).toBe("");
   });
+
+  it.each([false, true])(
+    "keeps the draft until acceptance and preserves typing ahead: %s",
+    async (typedAhead) => {
+      const { view, session } = setup();
+      view.isViewOpen = true;
+      view.editingTurnId = "original";
+      view.input.value = "Revised";
+      view.selectedAttachmentPaths = ["note.md"];
+      view.render = vi.fn();
+      let finish!: () => void;
+      let accept!: () => void;
+      session.send.mockImplementation(async (_input, onAccepted) => {
+        accept = onAccepted!;
+        session.getState.mockReturnValue({ turns: [], running: true });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+      });
+      const pending = view.submit();
+      expect(view.input.value).toBe("Revised");
+      expect(view.editingTurnId).toBe("original");
+      expect(view.selectedAttachmentPaths).toEqual(["note.md"]);
+      finish(); // Simulate failed attachment preflight: no acceptance.
+      await pending;
+      expect(view.input.value).toBe("Revised");
+      expect(view.editingTurnId).toBe("original");
+      if (typedAhead) view.input.value = "Next draft";
+      accept();
+      expect(view.input.value).toBe(typedAhead ? "Next draft" : "");
+      expect(view.editingTurnId).toBeUndefined();
+      expect(view.selectedAttachmentPaths).toEqual(typedAhead ? ["note.md"] : []);
+    }
+  );
 
   it("cancels an edit without sending or removing conversation rows", () => {
     const { view, session, render, row } = setup();

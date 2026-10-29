@@ -1,3 +1,5 @@
+import { encodeVector, decodeVector } from "@/domain/vectors";
+import { checkAbort, isCancelled } from "@/domain/errors";
 import { CacheBackedEmbeddings } from "@langchain/classic/embeddings/cache_backed";
 import { EncoderBackedStore } from "@langchain/classic/storage/encoder_backed";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
@@ -41,7 +43,19 @@ class SqliteVectorBytes extends BaseStore<string, Uint8Array> {
       { profile: this.profile, task: this.task, hashes: keys, now: Date.now() },
       this.signal
     )) as (Uint8Array | undefined)[];
-    return values.map((value) => value?.slice());
+    const invalid: string[] = [];
+    const result = values.map((value, index) => {
+      if (!value) return undefined;
+      try {
+        decodeVector(value, this.dimensions);
+        return value.slice();
+      } catch {
+        invalid.push(keys[index]);
+        return undefined;
+      }
+    });
+    if (invalid.length) await this.mdelete(invalid);
+    return result;
   }
 
   async mset(entries: [string, Uint8Array][]): Promise<void> {
@@ -142,6 +156,14 @@ export class SqliteEmbeddingCache implements EmbeddingsInterface<number[]> {
     ) as Promise<string[]>;
   }
 
+  reconcileDocumentShards(checksums: readonly string[], signal?: AbortSignal): Promise<void> {
+    return this.call(
+      "embeddingCacheSqliteReconcile",
+      { profile: this.cacheProfile, checksums },
+      signal
+    ).then(() => undefined);
+  }
+
   importDocumentShard(
     checksum: string,
     bytes: Uint8Array,
@@ -188,49 +210,20 @@ export class SqliteEmbeddingCache implements EmbeddingsInterface<number[]> {
     const hash = cacheHash(text);
     const cached = (await this.queries.mget([hash]))[0];
     if (cached) return decodeVector(cached, this.dimensions);
-    const vector = validateVector(await this.underlying.embedQuery(text), this.dimensions);
+    const vector = await this.underlying.embedQuery(text);
+    const bytes = encodeVector(vector, this.dimensions);
     checkAbort(this.signal);
-    await this.queries.mset([[hash, encodeVector(vector, this.dimensions)]]);
+    try {
+      await this.queries.mset([[hash, bytes]]);
+    } catch (error) {
+      if (isCancelled(error)) throw error;
+      // Persistence is optional once a valid provider vector is available.
+    }
+    checkAbort(this.signal);
     return vector;
   }
 }
 
 function cacheHash(value: string): string {
   return sha256(value);
-}
-
-function encodeVector(vector: number[], dimensions: number): Uint8Array {
-  const valid = validateVector(vector, dimensions);
-  const bytes = new Uint8Array(dimensions * Float32Array.BYTES_PER_ELEMENT);
-  const view = new DataView(bytes.buffer);
-  for (let index = 0; index < dimensions; index++) view.setFloat32(index * 4, valid[index], true);
-  if (
-    Array.from({ length: dimensions }, (_, index) => view.getFloat32(index * 4, true)).some(
-      (value) => !Number.isFinite(value)
-    )
-  )
-    throw new TypeError("Embedding vector values exceed Float32 range");
-  return bytes;
-}
-
-function decodeVector(bytes: Uint8Array, dimensions: number): number[] {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength !== dimensions * 4)
-    throw new TypeError("Cached embedding dimensions are invalid");
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const vector = Array.from({ length: dimensions }, (_, index) => view.getFloat32(index * 4, true));
-  return validateVector(vector, dimensions);
-}
-
-function validateVector(vector: number[], dimensions: number): number[] {
-  if (
-    !Array.isArray(vector) ||
-    vector.length !== dimensions ||
-    vector.some((value) => !Number.isFinite(value))
-  )
-    throw new TypeError("Embedding vector dimensions or values are invalid");
-  return vector;
-}
-
-function checkAbort(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
 }

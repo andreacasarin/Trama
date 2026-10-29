@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-09
-- Updated: 2026-10-23
+- Updated: 2026-10-28
 
 ## Context
 
@@ -12,9 +12,15 @@ The proof of concept prioritizes reducing owned code through LangChain primitive
 
 ### Native indexing and SQL retrieval
 
+Keep exact cosine search as the current implementation. Do not add an approximate
+index until representative end-to-end measurements justify a separate spike.
+Keep one native double precision dot product for scoring and raw shard validation;
+reuse the validated Float32 magnitude when normalizing bounded inputs. No parallel
+precision modes, SIMD specialization, or search-engine dependency is introduced.
+
 Use LangChain's vector-store interface, default Markdown splitter, native `index()` lifecycle, and a SQLite RecordManager. LangChain owns content/metadata hashing, record UIDs, unchanged-note skipping, record refresh, and stale cleanup. Do not retain a parallel custom source-hash, reread, or prune lifecycle, migration, or compatibility layer. Compatibility covers the Obsidian adapters only.
 
-SQLite owns filtering, grouping, deduplication, ranking, and native vector scoring. Store note identity/path, embedding profile, chunk vectors, normalized note centroids, and contentless FTS data without raw Markdown bodies. Hydrate winning notes from the live vault. Hybrid search fuses body/path BM25 and maximum-chunk semantic ranking with reciprocal-rank fusion, using rank constant 60. Related-note lookup uses normalized centroids without provider access. LangChain defaults and these ranking values are approved V1 defaults; no separate tuning rationale was supplied. For the model-facing `vault_search` tool, retrieve ranked SQL candidates before hydrating live-vault notes. Iterate the full ranked SQL candidate pool, returning leading previews of up to 1,000 characters per hit, up to the requested result limit and within a 12,000-character serialized data cap. Stop before hydrating more candidates when the result limit is reached, or when the next preview would exceed the cap. Preserve ranking, canonical paths, and degradation status; report the full candidate-pool, hydrated, returned, and omitted counts. Missing notes are not hydrated. `hydratedCount` includes a successfully read candidate whose preview does not fit; `omittedCount` is candidate-pool count minus returned count; candidate count can exceed the requested result limit. Missing notes are skipped while counting successful live-vault hydration. This avoids hydrating lower-ranked candidates after the requested result count or serialized output cap is reached. Full reads remain available through `read_notes`.
+SQLite owns filtering, grouping, deduplication, ranking, and native vector scoring. Semantic scoring uses cosine similarity via dot products of normalized Float32 vectors, with double precision accumulation in Trama's small native SQL function. SQLite-Vector is no longer required. Validation uses the stored Float32 representation and the same arithmetic range; existing cache shards remain readable. Store note identity/path, embedding profile, chunk vectors, normalized note centroids, and contentless FTS data without raw Markdown bodies. Hydrate winning notes from the live vault. Hybrid search fuses body/path BM25 and maximum-chunk semantic ranking with reciprocal-rank fusion, using rank constant 60. Related-note lookup uses normalized centroids without provider access. LangChain defaults and these ranking values are approved V1 defaults; no separate tuning rationale was supplied. For the model-facing `vault_search` tool, retrieve ranked SQL candidates before hydrating live-vault notes. Iterate the full ranked SQL candidate pool, returning leading previews of up to 1,000 characters per hit, up to the requested result limit and within a 12,000-character serialized data cap. Stop before hydrating more candidates when the result limit is reached, or when the next preview would exceed the cap. Preserve ranking, canonical paths, and degradation status; report the full candidate-pool, hydrated, returned, and omitted counts. Missing notes are not hydrated. `hydratedCount` includes a successfully read candidate whose preview does not fit; `omittedCount` is candidate-pool count minus returned count; candidate count can exceed the requested result limit. Missing notes are skipped while counting successful live-vault hydration. This avoids hydrating lower-ranked candidates after the requested result count or serialized output cap is reached. Full reads remain available through `read_notes`.
 
 The controller reserves a RecordManager run watermark, submits windows of up to 100 notes with cleanup disabled and `sourceIdKey: "path"`, then calls `index()` with an empty source and full cleanup after every input succeeds, including an empty vault. The adapter combines embeddings across notes into batches of up to 512 chunks; oversized notes use bounded batches too. Path and embedding profile are indexed metadata and affect the native hash.
 

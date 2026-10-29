@@ -70,10 +70,7 @@ export class LenteView extends ItemView {
         void this.run(this.submitted);
       }
       if (event.key === "Escape") {
-        this.cancel();
-        this.output = undefined;
-        this.input.value = "";
-        this.render();
+        this.clearResults();
       }
     });
     new ButtonComponent(form)
@@ -123,7 +120,7 @@ export class LenteView extends ItemView {
     this.render();
     try {
       const output = await this.search.invoke(
-        { query, mode: "hybrid" },
+        { query, mode: "hybrid", content: "metadata" },
         { signal: controller.signal }
       );
       if (revision !== this.revision || controller.signal.aborted) return;
@@ -153,7 +150,7 @@ export class LenteView extends ItemView {
       return;
     }
     const documents = output.documents.filter((document) =>
-      Boolean(String(document.metadata.path ?? document.id ?? ""))
+      Boolean(this.app.vault.getFileByPath(String(document.metadata.path ?? document.id ?? "")))
     );
     this.resultsCount.textContent = documents.length
       ? `${documents.length} ${documents.length === 1 ? "result" : "results"}`

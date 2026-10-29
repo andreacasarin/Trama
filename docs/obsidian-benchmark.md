@@ -239,3 +239,72 @@ The comparator prints each side's raw three samples, medians, and after-minus-be
 ## Safety and interpretation
 
 Run mutation steps only in the marked generated benchmark vault. The committed `test-vaults/benchmark/` files are inputs, not targets. Do not rely on the active-vault selector or run the procedure in a personal vault. Keep SQLite filtering, grouping, ranking, and vector scoring in SQLite; this benchmark observes existing application operations and adds no production logger.
+
+## Revision-cache regression workload
+
+`npx vitest run tests/performance-regressions.test.ts --silent=false` measures
+three unchanged indexing runs on the same pinned 3,000-note, 400-character corpus,
+with deterministic two-dimensional vectors and the production SQLite/WASM runtime
+inside Node.js. This isolates local indexing work; it is not an Obsidian UI or
+provider-latency benchmark. The test asserts zero unchanged body reads and no
+provider calls, and verifies that content reconciliation still catches edits with
+unchanged file metadata. `tests/source-revisions.test.ts` also checks the SQL join
+shape, revision persistence, exclusions, renames, and deletion.
+
+A local comparison against `0c3982d` used Node.js 24.13.0, Vitest 5.0.5, the same
+SQLite assets, and the same corpus and vectors for both implementations:
+
+| Implementation | Unchanged samples (ms) | Median (ms) | Body reads per run |
+| -------------- | ---------------------- | ----------- | ------------------ |
+| Before         | 147.34, 119.32, 119.82 | 119.82      | 3,000              |
+| Revision cache | 18.22, 18.58, 17.78    | 18.22       | 0                  |
+
+These are local harness observations, not universal timing guarantees. Startup
+and file-event runs use persisted file revisions; manual Update and the five-minute content backstop
+still reread the vault. Changed notes retain native LangChain hashing and cleanup.
+The revision query drives indexed path lookups from the bounded input batch using
+`CROSS JOIN`, avoiding a query plan that rescans the corpus for every input path.
+
+## Native scoring comparison — 2026-10-27
+
+A paired Node.js 24.13.0 run on the same arm64 Mac compared the preceding demo
+build's SQLite-Vector Float32 scorer with the independent double precision scorer.
+Both used the same SQLite version, 3,000 stored vectors of 768 dimensions, five
+warmups, and 30 measured full scans. Each scan executed
+`SELECT sum(trama_vector_dot(vector,?)) FROM vectors`, returning only the aggregate.
+The query and all stored vectors used the same Float32 components
+`(i % 17 - 8) / 100`, normalized once using double precision and rounded to Float32.
+The vector bytes have SHA-256
+`de67eb751bf8a895587d098129459cadaa87767381fd67dfce3d481c938733da`.
+
+| Native arithmetic      | Median scan (ms) | Sum of 3,000 self-similarities |
+| ---------------------- | ---------------- | ------------------------------ |
+| SQLite-Vector Float32  | 1.204            | 3000.001072884                 |
+| Trama double precision | 2.768            | 3000.000039847                 |
+
+This is a microbenchmark, not end-to-end Obsidian latency. Double precision costs
+about 1.56 ms more per scan here. The deliberate tradeoff is consistent validation
+and finite scoring across the Float32 range, a small native implementation, and
+removal of the external vector library. Float32 normalization still introduces
+rounding, so self-similarity is approximately one.
+
+The compared WASM SHA-256 values were
+`a391b6b16e24c1421130cac383664f51bd5cab4c569de00c2c04cbe700c81493` (before) and
+`23af819bb43b7ff981912ab2d1b58bec385c594113cfa8f1b0172eff996eedb5` (after).
+Regression coverage in `tests/vector-scoring.test.ts` verifies extreme magnitudes,
+invalid inputs, scale-invariant cosine ranking, and the native/JavaScript contract.
+The isolated `scripts/benchmark/sqlite-opfs-shard.mjs` browser harness additionally
+verifies legacy shards, tiny/large vector round trips, receipt reconciliation,
+malformed shard rejection, persistence, and scratch-file cleanup with the production
+worker. Those checks do not substitute for native Obsidian UI validation.
+
+On 2026-10-28, the same production WASM kernel was used to compare shard vector
+validation with three self-dot evaluations per row against one. The paired query
+microbenchmark used 128 vectors of 768 Float32 dimensions, five warmups, and 50
+measured samples per variant, alternating execution order on Node.js 24.13.0 arm64.
+Components were `(i % 17 - 8) / 100`, without normalization; vector SHA-256 was
+`d9d03cb72f05bbea967dc8ea0e5ab2e0264ab602e8b16b6eefa8906311a88c1b`.
+Both queries rejected zero rows; median time decreased from 0.527 ms to 0.286 ms.
+This measures the validation query only, not full import or UI latency. Scoring
+arithmetic is unchanged. The scoring suite checks the production validation query
+has one native dot opcode and that cancellation still stops import before commit.

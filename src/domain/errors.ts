@@ -15,3 +15,16 @@ export class StructuredError extends Error implements StructuredErrorShape {
     super(message);
   }
 }
+
+export function checkAbort(signal?: AbortSignal, message = "Operation cancelled"): void {
+  if (signal?.aborted) throw new DOMException(message, "AbortError");
+}
+
+export function isCancelled(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    (("name" in error && error.name === "AbortError") ||
+      ("code" in error && error.code === "cancelled"))
+  );
+}

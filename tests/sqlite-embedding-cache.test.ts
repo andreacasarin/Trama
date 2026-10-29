@@ -4,7 +4,7 @@ import { sha256 } from "@langchain/core/utils/hash";
 import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import { embeddingEndpointFingerprint } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import type { SqliteConnection } from "@/index/note-sqlite/protocol";
+import type { NoteStoreCall, SqliteConnection } from "@/index/note-sqlite/protocol";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 
 class CountingEmbeddings implements EmbeddingsInterface<number[]> {
@@ -116,6 +116,59 @@ function queryRows(
 const profile = embeddingCacheIdentity("test", 2);
 
 describe("SQLite embedding cache", () => {
+  it.each(["resolve", "reject", "AbortError"] as const)(
+    "propagates cancellation during query-cache writes that %s",
+    async (outcome) => {
+      const f = await fixture();
+      const provider = new CountingEmbeddings();
+      const controller = new AbortController();
+      const call: NoteStoreCall = async (method, payload, signal) => {
+        if (method !== "embeddingCacheSet") return f.database.call(method, payload, signal);
+        if (outcome === "AbortError") throw new DOMException("Cancelled", "AbortError");
+        controller.abort();
+        if (outcome === "reject") throw new Error("Write interrupted");
+      };
+      const cache = new SqliteEmbeddingCache(provider, call, profile, 2).withSignal(
+        controller.signal
+      );
+      try {
+        await expect(cache.embedQuery("cancelled write")).rejects.toMatchObject({
+          name: "AbortError",
+        });
+        expect(provider.queryCalls).toEqual(["cancelled write"]);
+        expect(queryRows(f.db, "SELECT count(*) AS count FROM embedding_cache")[0].count).toBe(0);
+      } finally {
+        f.db.close();
+      }
+    }
+  );
+
+  it("still rejects invalid provider vectors before attempting a best-effort query-cache write", async () => {
+    const f = await fixture();
+    let writes = 0;
+    const call: NoteStoreCall = async (method, payload, signal) => {
+      if (method === "embeddingCacheSet") {
+        writes++;
+        throw new Error("Cache unavailable");
+      }
+      return f.database.call(method, payload, signal);
+    };
+    const cache = new SqliteEmbeddingCache(
+      { embedDocuments: async () => [], embedQuery: async () => [0, 0] },
+      call,
+      profile,
+      2
+    );
+    try {
+      await expect(cache.embedQuery("invalid vector")).rejects.toThrow(
+        "Embedding vector magnitude is invalid"
+      );
+      expect(writes).toBe(0);
+    } finally {
+      f.db.close();
+    }
+  });
+
   it("records only existing document hashes in one bounded set-based publication statement", async () => {
     const f = await publicationFixture();
     const cacheProfile = sha256(profile);
@@ -346,7 +399,7 @@ describe("SQLite embedding cache", () => {
       await first.embedDocuments(["same text "]);
       await otherProfile.embedDocuments(["same text"]);
       await expect(otherDimensions.embedDocuments(["same text"])).rejects.toThrow(
-        "Embedding vector dimensions or values are invalid"
+        "Embedding vector dimensions are invalid"
       );
       expect(provider.documentCalls).toEqual([
         ["same text"],

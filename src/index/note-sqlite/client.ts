@@ -39,6 +39,7 @@ function rpcError(error?: RpcError | string): Error {
 export class NoteStoreClient {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
+  private failure?: unknown;
   private closing = false;
   private closed = false;
   private closePromise?: Promise<void>;
@@ -63,6 +64,8 @@ export class NoteStoreClient {
       typeof detail.message === "string"
         ? (detail.error ?? new Error(detail.message))
         : new Error("Note store worker could not deserialize a message");
+    this.failure = error;
+    this.worker.terminate?.();
     for (const pending of this.pending.values()) {
       if (pending.signal && pending.abort)
         pending.signal.removeEventListener("abort", pending.abort);
@@ -86,8 +89,10 @@ export class NoteStoreClient {
   }
 
   readonly call: NoteStoreCall = async (method, payload, signal) => {
+    if (this.failure) throw this.failure;
     if (this.closing || this.closed) throw CLOSED;
     await this.ready;
+    if (this.failure) throw this.failure;
     if (this.closing || this.closed) throw CLOSED;
     if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
     return this.send(method, payload, signal);
@@ -116,7 +121,7 @@ export class NoteStoreClient {
             () => false
           )
         );
-        if (initialized) {
+        if (initialized && !this.failure) {
           for (const id of this.pending.keys()) {
             try {
               this.worker.postMessage({
@@ -136,7 +141,11 @@ export class NoteStoreClient {
         this.worker.removeEventListener?.("message", this.onMessage);
         this.worker.removeEventListener?.("error", this.onError);
         this.worker.removeEventListener?.("messageerror", this.onError);
-        for (const pending of this.pending.values()) pending.reject(CLOSED);
+        for (const pending of this.pending.values()) {
+          if (pending.signal && pending.abort)
+            pending.signal.removeEventListener("abort", pending.abort);
+          pending.reject(CLOSED);
+        }
         this.pending.clear();
         this.worker.terminate?.();
       }

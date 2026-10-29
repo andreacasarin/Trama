@@ -4,12 +4,12 @@ import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { SqliteEmbeddingCache, embeddingCacheIdentity } from "@/index/SqliteEmbeddingCache";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
-import { EmbeddingProviderError } from "@/model/LocalModels";
+import { createLocalEmbeddings, EmbeddingProviderError } from "@/model/LocalModels";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
-import type { NoteStoreMethod, NoteStoreRpc } from "@/index/note-sqlite/protocol";
-import { loadTestSqlite } from "./note-sqlite-test-client";
+import { NoteStoreClient } from "@/index/note-sqlite/client";
+import type { NoteStoreCall } from "@/index/note-sqlite/protocol";
+import { loadTestSqlite, TestNoteWorker as Worker } from "./note-sqlite-test-client";
 
 class Embeddings implements EmbeddingsInterface<number[]> {
   async embedDocuments(texts: string[]): Promise<number[][]> {
@@ -17,38 +17,6 @@ class Embeddings implements EmbeddingsInterface<number[]> {
   }
   async embedQuery(text: string): Promise<number[]> {
     return text.includes("alpha") ? [1, 0] : [0, 1];
-  }
-}
-
-class Worker implements NoteStoreWorkerLike {
-  private listeners = new Set<(event: any) => void>();
-  addEventListener(_type: "message" | "error", listener: (event: any) => void): void {
-    this.listeners.add(listener);
-  }
-  removeEventListener(_type: "message" | "error", listener: (event: any) => void): void {
-    this.listeners.delete(listener);
-  }
-  postMessage(raw: unknown): void {
-    const request = raw as { id: number; method: string; payload: unknown };
-    if (request.method === "init" || request.method === "close") {
-      this.emit({ id: request.id, ok: true, result: undefined });
-      return;
-    }
-    if (request.method === "cancel") return;
-    void this.db
-      .call(request.method as NoteStoreMethod, request.payload as NoteStoreRpc[NoteStoreMethod])
-      .then((result) => this.emit({ id: request.id, ok: true, result }))
-      .catch((error) =>
-        this.emit({
-          id: request.id,
-          ok: false,
-          error: { name: error.name, message: error.message },
-        })
-      );
-  }
-  constructor(private db: NoteSqliteDatabase) {}
-  private emit(data: unknown): void {
-    for (const listener of this.listeners) listener({ data });
   }
 }
 
@@ -70,6 +38,68 @@ async function fixture() {
 }
 
 describe("SQLite note retrieval", () => {
+  it("returns hybrid results when a valid query embedding cannot be cached because SQLite is full", async () => {
+    const f = await fixture();
+    const vector = [1, ...new Array<number>(1535).fill(0)];
+    const bytes = new Uint8Array(new Float32Array(vector).buffer);
+    const writeErrors: string[] = [];
+    const call: NoteStoreCall = async (method, payload, signal) => {
+      try {
+        return await f.client.call(method, payload, signal);
+      } catch (error) {
+        if (method === "embeddingCacheSet") writeErrors.push((error as Error).message);
+        throw error;
+      }
+    };
+    const embedQuery = vi.fn(async () => vector);
+    const cache = new SqliteEmbeddingCache(
+      { embedDocuments: async () => [], embedQuery },
+      call,
+      embeddingCacheIdentity("full", 1536),
+      1536
+    );
+    try {
+      await f.database.call("noteStoreReplace", {
+        uid: "a",
+        path: "a.md",
+        profile: "p",
+        markdown: "alpha sentinel",
+        vectors: [vector],
+      });
+      f.db.exec(`PRAGMA max_page_count=${Number(f.db.selectValue("PRAGMA page_count")) + 1}`);
+      let full = false;
+      for (let i = 0; i < 200; i++) {
+        try {
+          await f.database.call("embeddingCacheSet", {
+            profile: cache.profileFingerprint,
+            task: "query",
+            dimensions: 1536,
+            entries: [{ hash: i.toString(16).padStart(64, "0"), vector: bytes }],
+            now: Date.now(),
+          });
+        } catch (error) {
+          expect((error as Error).message).toContain("SQLITE_FULL");
+          full = true;
+          break;
+        }
+      }
+      expect(full).toBe(true);
+      const retrieval = new VaultRetrieval(call, cache, "p", async (path) => ({
+        path,
+        content: "alpha sentinel",
+      }));
+      const output = await retrieval.runnable.invoke({ query: "alpha", mode: "hybrid" });
+      expect(writeErrors).toHaveLength(1);
+      expect(writeErrors[0]).toContain("SQLITE_FULL");
+      expect(embedQuery).toHaveBeenCalledOnce();
+      expect(output.documents.map((document) => document.metadata.path)).toEqual(["a.md"]);
+      expect(output.status).toMatchObject({ mode: "hybrid", degraded: false });
+    } finally {
+      await f.client.close();
+      f.db.close();
+    }
+  });
+
   it("cancels non-view searches before cache clearing and permits subsequent searches", async () => {
     const f = await fixture();
     let release!: (vector: number[]) => void;
@@ -98,6 +128,36 @@ describe("SQLite note retrieval", () => {
       await retrieval.runnable.invoke({ query: "needle", mode: "hybrid" });
       expect(f.db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
     } finally {
+      f.db.close();
+    }
+  });
+
+  it("falls back to actual lexical results for a malformed embedding provider entry", async () => {
+    const f = await fixture();
+    try {
+      f.notes.set("alpha.md", "alpha sentinel");
+      await f.store.addDocuments([
+        new Document({
+          id: "alpha.md",
+          pageContent: "alpha sentinel",
+          metadata: { path: "alpha.md" },
+        }),
+      ]);
+      const provider = createLocalEmbeddings({
+        endpoint: "http://127.0.0.1:1234/v1",
+        modelId: "test",
+        dimensions: 2,
+        fetcher: async () => Response.json({ data: [null] }),
+      });
+      const retrieval = new VaultRetrieval(f.client.call, provider, "profile", async (path) => ({
+        path,
+        content: f.notes.get(path)!,
+      }));
+      const result = await retrieval.runnable.invoke({ query: "alpha", mode: "hybrid" });
+      expect(result.status.degradationReason).toBe("query-embedding-failed");
+      expect(result.documents.map((document) => document.metadata.path)).toEqual(["alpha.md"]);
+    } finally {
+      await f.client.close();
       f.db.close();
     }
   });
@@ -252,10 +312,10 @@ describe("SQLite note retrieval", () => {
     resolveHits({ hits: [{ path: "related.md", score: 0.8 }], available: true });
     await expect(hydrated).resolves.toMatchObject({
       available: true,
-      documents: [{ id: "related.md", pageContent: "# related.md" }],
+      documents: [{ id: "related.md", pageContent: "" }],
     });
     expect(call).toHaveBeenCalledTimes(1);
-    expect(readNote).toHaveBeenCalledTimes(1);
+    expect(readNote).not.toHaveBeenCalled();
   });
 
   it("returns path-only related suggestions without reading note bodies and refreshes after invalidation", async () => {

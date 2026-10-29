@@ -1,3 +1,5 @@
+import { decodeVector, validateVector } from "@/domain/vectors";
+import { checkAbort } from "@/domain/errors";
 import {
   EMBEDDING_ARTIFACT_MAX_ENTRIES,
   EMBEDDING_ARTIFACT_MAX_FILE_BYTES,
@@ -65,16 +67,12 @@ function validCacheScope(input: {
 }
 
 function validCacheVector(vector: Uint8Array, dimensions: number): boolean {
-  if (!(vector instanceof Uint8Array) || vector.byteLength !== dimensions * 4) return false;
-  const view = new DataView(vector.buffer, vector.byteOffset, vector.byteLength);
-  for (let index = 0; index < dimensions; index++) {
-    if (!Number.isFinite(view.getFloat32(index * 4, true))) return false;
+  try {
+    decodeVector(vector, dimensions);
+    return true;
+  } catch {
+    return false;
   }
-  return true;
-}
-
-function checkAbort(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
 }
 
 function validPath(path: unknown): asserts path is string {
@@ -88,17 +86,10 @@ function validKeys(keys: unknown): asserts keys is readonly string[] {
 }
 
 function vectorBytes(values: readonly number[], dimensions?: number): Uint8Array {
-  if (!Array.isArray(values) || values.length === 0 || (dimensions && values.length !== dimensions))
-    throw new TypeError("Vector dimensions are invalid");
-  let norm = 0;
-  for (const value of values) {
-    if (!Number.isFinite(value)) throw new TypeError("Vector values must be finite");
-    norm += value * value;
-  }
-  if (!Number.isFinite(norm) || norm === 0) throw new TypeError("Vector magnitude is invalid");
+  const scale = 1 / Math.sqrt(validateVector(values, dimensions));
   const output = new Float32Array(values.length);
-  const scale = 1 / Math.sqrt(norm);
-  for (let index = 0; index < values.length; index++) output[index] = values[index] * scale;
+  for (let index = 0; index < values.length; index++)
+    output[index] = Math.fround(values[index]) * scale;
   return new Uint8Array(output.buffer);
 }
 
@@ -121,6 +112,14 @@ export class NoteSqliteDatabase {
       embedding_profile TEXT,
       centroid BLOB
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS note_sources(
+      path TEXT PRIMARY KEY REFERENCES note_index(path) ON DELETE CASCADE,
+      uid TEXT NOT NULL,
+      revision TEXT NOT NULL
+    ) WITHOUT ROWID`);
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS note_index_profile ON note_index(embedding_profile,note_id)"
+    );
     db.exec(`CREATE TABLE IF NOT EXISTS note_vectors(
       note_id INTEGER NOT NULL REFERENCES note_index(note_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL CHECK(ordinal>=0),
@@ -164,6 +163,8 @@ export class NoteSqliteDatabase {
       published_at INTEGER NOT NULL,
       PRIMARY KEY(profile,hash)
     ) WITHOUT ROWID`);
+    db.exec(`CREATE INDEX IF NOT EXISTS embedding_cache_sqlite_publication_shards
+      ON embedding_cache_sqlite_publications(profile,checksum)`);
     db.exec("INSERT INTO note_record_clock(id,value) VALUES(1,0) ON CONFLICT(id) DO NOTHING");
   }
 
@@ -174,6 +175,42 @@ export class NoteSqliteDatabase {
   ): Promise<unknown> {
     checkAbort(signal);
     switch (method) {
+      case "noteStoreCheckSources":
+      case "noteStoreRememberSources": {
+        const { sources, profile } = payload as NoteStoreRpc["noteStoreCheckSources"];
+        if (
+          typeof profile !== "string" ||
+          !Array.isArray(sources) ||
+          sources.length > 100 ||
+          sources.some(
+            ({ path, revision }) => typeof path !== "string" || typeof revision !== "string"
+          )
+        )
+          throw new TypeError("Invalid note source revisions");
+        if (!sources.length) return [];
+        const input = JSON.stringify(sources);
+        if (method === "noteStoreRememberSources") {
+          this.db.exec({
+            sql: `INSERT INTO note_sources(path,uid,revision)
+            SELECT n.path,n.current_uid,json_extract(i.value,'$.revision')
+            FROM json_each(?) i CROSS JOIN note_index n ON n.path=json_extract(i.value,'$.path')
+            WHERE n.embedding_profile=?
+            ON CONFLICT(path) DO UPDATE SET uid=excluded.uid,revision=excluded.revision`,
+            bind: [input, profile],
+          });
+          return undefined;
+        }
+        return rows(
+          this.db,
+          `UPDATE note_records SET updated_at=? WHERE uid IN (
+          SELECT n.current_uid FROM json_each(?) i
+          CROSS JOIN note_sources s ON s.path=json_extract(i.value,'$.path') AND s.revision=json_extract(i.value,'$.revision')
+          CROSS JOIN note_index n ON n.path=s.path AND n.current_uid=s.uid
+          WHERE n.embedding_profile=?
+        ) RETURNING group_path AS path`,
+          [this.tickRecordClock(), input, profile]
+        ).map((row) => String(row.path));
+      }
       case "embeddingCacheGet":
         return this.embeddingCacheGet(payload as NoteStoreRpc["embeddingCacheGet"], signal);
       case "embeddingCacheSet":
@@ -187,6 +224,27 @@ export class NoteSqliteDatabase {
           payload as NoteStoreRpc["embeddingCacheSqliteCheckArtifacts"],
           signal
         );
+      case "embeddingCacheSqliteReconcile": {
+        const { profile, checksums } = payload as NoteStoreRpc["embeddingCacheSqliteReconcile"];
+        if (
+          !/^[0-9a-f]{64}$/.test(profile) ||
+          !Array.isArray(checksums) ||
+          checksums.some(
+            (checksum) => typeof checksum !== "string" || !/^[0-9a-f]{64}$/.test(checksum)
+          )
+        )
+          throw new TypeError("Invalid SQLite shard inventory");
+        checkAbort(signal);
+        // The current directory listing supplies the inventory; only receipt metadata is reconciled.
+        this.db.exec({
+          sql: `DELETE FROM embedding_cache_sqlite_publications INDEXED BY embedding_cache_sqlite_publication_shards
+            WHERE profile=? AND checksum IN (SELECT checksum FROM embedding_cache_sqlite_imports WHERE profile=?
+              AND checksum NOT IN (SELECT value FROM json_each(?)))`,
+          bind: [profile, profile, JSON.stringify(checksums)],
+        });
+        checkAbort(signal);
+        return;
+      }
       case "embeddingCacheSqliteImport":
         return this.embeddingCacheSqliteImport(
           payload as NoteStoreRpc["embeddingCacheSqliteImport"],
@@ -399,6 +457,11 @@ export class NoteSqliteDatabase {
     validCacheScope(input);
     if (!hashes.length) return;
     checkAbort(signal);
+    if (task === "document")
+      this.db.exec({
+        sql: `DELETE FROM embedding_cache_sqlite_publications WHERE profile=? AND hash IN (${hashes.map(() => "?").join(",")})`,
+        bind: [profile, ...hashes],
+      });
     this.db.exec({
       sql: `DELETE FROM embedding_cache WHERE profile=? AND task=? AND hash IN (${hashes.map(() => "?").join(",")})`,
       bind: [profile, task, ...hashes],
@@ -596,15 +659,17 @@ export class NoteSqliteDatabase {
         schema.map((row) => [String(row.name), String(row.sql).replace(/\s/g, "").toLowerCase()])
       );
       if (
-        schema.length !== 3 ||
+        (schema.length !== 2 && schema.length !== 3) ||
         schema.some((row) => row.type !== "table") ||
         normalized.get("metadata") !==
           "createtablemetadata(profiletextnotnull,dimensionsintegernotnull,tasktextnotnull)" ||
         normalized.get("vectors") !==
           "createtablevectors(hashtextnotnullunique,vectorblobnotnull)" ||
-        normalized.get("_sqliteai_vector") !==
-          "createtable_sqliteai_vector(tblnametext,colnametext,keytext,valueany,primarykey(tblname,colname,key))" ||
-        Number(rows(importedDb, "SELECT count(*) AS count FROM _sqliteai_vector")[0].count) !== 0
+        (schema.length === 3 &&
+          (normalized.get("_sqliteai_vector") !==
+            "createtable_sqliteai_vector(tblnametext,colnametext,keytext,valueany,primarykey(tblname,colname,key))" ||
+            Number(rows(importedDb, "SELECT count(*) AS count FROM _sqliteai_vector")[0].count) !==
+              0))
       )
         throw new TypeError("SQLite shard schema is invalid");
 
@@ -626,14 +691,15 @@ export class NoteSqliteDatabase {
       )
         throw new TypeError("SQLite shard profile or size is invalid");
       await yieldSqlite(signal);
+      // SQLite text checks stop at NUL; also check byte length to reject hidden suffixes.
       const malformed = Number(
         rows(
           importedDb,
           `SELECT count(*) AS count FROM vectors WHERE
-            typeof(hash)!='text' OR length(hash)!=64 OR hash GLOB '*[^0-9a-f]*' OR
+            typeof(hash)!='text' OR length(hash)!=64 OR length(CAST(hash AS BLOB))!=64 OR
+            hash GLOB '*[^0-9a-f]*' OR
             typeof(vector)!='blob' OR length(vector)!=? OR
-            typeof(trama_vector_dot(vector,vector)) NOT IN ('integer','real') OR
-            trama_vector_dot(vector,vector)<0 OR trama_vector_dot(vector,vector)>1e100`,
+            trama_vector_dot(vector,vector)<=0`,
           [dimensions * 4]
         )[0].count
       );
@@ -770,13 +836,13 @@ export class NoteSqliteDatabase {
     )
       throw new TypeError("Invalid note search request");
 
-    if (vector !== undefined) vectorBytes(vector);
+    const normalized = vector === undefined ? null : vectorBytes(vector);
 
     const stored =
       vector && profile
         ? rows(
             this.db,
-            "SELECT length(centroid) AS bytes FROM note_index WHERE embedding_profile=? AND centroid IS NOT NULL LIMIT 1",
+            "SELECT length(v.vector) AS bytes FROM note_vectors v JOIN note_index n USING(note_id) WHERE n.embedding_profile=? LIMIT 1",
             [profile]
           )[0]
         : undefined;
@@ -784,7 +850,7 @@ export class NoteSqliteDatabase {
     const semanticAvailable = stored !== undefined;
     if (stored && Number(stored.bytes) !== vector!.length * 4)
       throw new TypeError("Query vector dimensions do not match the profile");
-    const needle = semanticAvailable ? vectorBytes(vector!) : null;
+    const needle = semanticAvailable ? normalized : null;
     const expression = query === undefined ? "" : ftsTerms(query);
     const candidateLimit = Math.max(k, Math.min(200, k * 4));
     const lexicalCte = expression
