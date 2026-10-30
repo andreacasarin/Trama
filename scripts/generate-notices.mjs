@@ -43,8 +43,7 @@ export async function generateNotices(inputs) {
   sections.push("SQLite is in the public domain. https://sqlite.org/copyright.html");
   for (const file of ["emscripten-LICENSE.txt", "musl-COPYRIGHT.txt"])
     sections.push(file, await readFile(path.join("vendor/sqlite-wasm", file), "utf8"));
-  await writeFile(
-    "THIRD-PARTY-NOTICES.txt",
-    sections.join("\n\n----------------------------------------\n\n") + "\n"
-  );
+  const notices = sections.join("\n\n----------------------------------------\n\n") + "\n";
+  await writeFile("THIRD-PARTY-NOTICES.txt", notices);
+  return notices;
 }

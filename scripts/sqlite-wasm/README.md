@@ -34,3 +34,12 @@ The build fingerprint includes the native source; runtime verification checks
 extreme magnitudes, native functions, FTS5, and the absence of SQLite-Vector.
 Shard imports accept both the current two-table format and legacy shards with
 SQLite-Vector's empty metadata table; no index reset is required.
+
+## Plugin bundle
+
+`npm run build` keeps these pinned files as build inputs. Esbuild's binary loader
+embeds the WASM in the worker bundle at `.cache/sqlite.worker.js`, and its text
+loader embeds that generated worker in `main.js`. The runtime creates a Blob-backed
+module worker and supplies the WASM bytes directly; it does not fetch sidecar files.
+The community installer needs only `main.js`, `manifest.json`, and `styles.css`.
+Required license notices are included in `main.js` as well as the release ZIP.

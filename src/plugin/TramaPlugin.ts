@@ -38,7 +38,7 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 export class TramaPlugin extends Plugin {
   private readonly settingsStore = new SettingsStore();
   private readonly consoleDebug = new ConsoleDebug(() => this.getSettings().consoleDebug);
-  private readonly sqliteRuntime = new NoteSqliteRuntime(() => this.manifest);
+  private readonly sqliteRuntime = new NoteSqliteRuntime();
   private lifecycle = Promise.resolve();
   private disposed = false;
   private indexedNotes = false;
@@ -140,7 +140,7 @@ export class TramaPlugin extends Plugin {
     if (this.disposed) return;
     const namespace = await this.sqliteRuntime.resolveNamespace(app);
     if (this.disposed) return;
-    const worker = this.sqliteRuntime.createWorker(app);
+    const worker = this.sqliteRuntime.createWorker();
     const candidate = new NoteStoreClient(worker, namespace);
     try {
       await candidate.initialize();

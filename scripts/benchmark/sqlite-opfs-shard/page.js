@@ -1,4 +1,6 @@
-/* global document, Worker, crypto, TextEncoder, TextDecoder, fetch, navigator, URL, Blob, location */
+/* global document, Worker, crypto, TextEncoder, TextDecoder, fetch, navigator */
+import * as obsidian from "/obsidian.mjs";
+
 const result = document.querySelector("#result");
 const workerUrl = "/note-worker.mjs";
 let sequence = 0;
@@ -129,18 +131,54 @@ async function storageFiles(name) {
 }
 
 async function main() {
-  const corruptBootstrap = URL.createObjectURL(
-    new Blob(
-      [
-        `globalThis.__TRAMA_SQLITE_ASSETS__=${JSON.stringify({ moduleUrl: new URL("/sqlite3.mjs", location.href).href, wasmUrl: new URL("/fixtures/bad-hash.sqlite3", location.href).href })};await import(${JSON.stringify(new URL(workerUrl, location.href).href)});self.postMessage({ready:true});`,
-      ],
-      { type: "text/javascript" }
-    )
+  // Exercise the exact release main.js with only Obsidian supplied by the host.
+  const pluginModule = { exports: {} };
+  const code = await fetch("/main.js").then((response) => response.text());
+  new Function("require", "module", "exports", code)(
+    (name) => {
+      assert(name === "obsidian", `unexpected external dependency: ${name}`);
+      return obsidian;
+    },
+    pluginModule,
+    pluginModule.exports
   );
-  const corruptWorker = new Worker(corruptBootstrap, { type: "module" });
-  await new Promise((resolve) =>
-    corruptWorker.addEventListener("message", resolve, { once: true })
+  const runtime = new pluginModule.exports.default().sqliteRuntime;
+  const embeddedNs = namespace();
+  const profile = await hashText("opfs-proof-profile");
+  const embedded = runtime.createWorker();
+  await rpc(embedded, "init", { namespace: embeddedNs });
+  const fixture = await malformedFixture("legacy-valid");
+  const checksum = await hashBytes(fixture);
+  assert(
+    (await cancelImport(embedded, profile, 8, fixture, checksum)) === "AbortError",
+    "embedded worker lost import cancellation"
   );
+  assert(
+    (await rpc(embedded, "embeddingCacheKeys", { profile, task: "document", limit: 200 }))
+      .length === 0,
+    "embedded worker committed a cancelled import"
+  );
+  const imported = await rpc(embedded, "embeddingCacheSqliteImport", {
+    profile,
+    checksum,
+    dimensions: 8,
+    bytes: fixture,
+    now: Date.now(),
+  });
+  assert(imported.imported === 1, "embedded worker could not import a valid shard");
+  await rpc(embedded, "close");
+  embedded.terminate();
+  const embeddedReopened = runtime.createWorker();
+  await rpc(embeddedReopened, "init", { namespace: embeddedNs });
+  assert(
+    (await rpc(embeddedReopened, "embeddingCacheKeys", { profile, task: "document", limit: 200 }))
+      .length === 1,
+    "embedded worker did not preserve data across restart"
+  );
+  await rpc(embeddedReopened, "close");
+  embeddedReopened.terminate();
+
+  const corruptWorker = new Worker("/corrupt-worker.mjs", { type: "module" });
   let invalidWasmRejected = false;
   try {
     await rpc(corruptWorker, "init", { namespace: namespace() });
@@ -148,10 +186,8 @@ async function main() {
     invalidWasmRejected = true;
   } finally {
     corruptWorker.terminate();
-    URL.revokeObjectURL(corruptBootstrap);
   }
   assert(invalidWasmRejected, "corrupt WASM asset did not fail initialization");
-  const profile = await hashText("opfs-proof-profile");
   const otherProfile = await hashText("opfs-proof-private-query");
   const sourceNs = namespace();
   const targetNs = namespace();
@@ -493,6 +529,8 @@ async function main() {
       nonfinite: true,
       zero: true,
       invalidWasm: invalidWasmRejected,
+      embeddedWorkerCancellation: true,
+      embeddedWorkerPersistence: true,
       oversize: true,
       cancelled: cancellation === "AbortError",
       localCollisionPreserved: true,

@@ -1,7 +1,15 @@
 /* global Buffer, URL, setTimeout, clearTimeout, fetch, WebSocket */
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  copyFileSync,
+  existsSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,6 +58,7 @@ const nonfiniteVector = Buffer.from(normalVector);
 nonfiniteVector.writeUInt32LE(0x7fc00000, 0);
 let child;
 let server;
+const requests = [];
 
 async function stopChild() {
   if (!child || child.exitCode !== null) return;
@@ -85,7 +94,7 @@ try {
     bytes.writeFloatLE(value, 0);
     createShardFixture(join(site, `${name}.sqlite3`), hash.repeat(64), bytes);
   }
-  const built = await build({
+  const workerOptions = {
     entryPoints: [join(root, "src/index/note-sqlite/worker.ts")],
     outfile: join(site, "note-worker.mjs"),
     bundle: true,
@@ -95,6 +104,7 @@ try {
     sourcemap: false,
     logLevel: "silent",
     metafile: true,
+    loader: { ".wasm": "binary" },
     plugins: [
       {
         name: "d11-opfs-pool-inspector",
@@ -118,9 +128,32 @@ try {
         },
       },
     ],
+  };
+  const built = await build(workerOptions);
+  await build({
+    ...workerOptions,
+    outfile: join(site, "corrupt-worker.mjs"),
+    plugins: [
+      ...workerOptions.plugins,
+      {
+        name: "invalid-wasm-fixture",
+        setup(api) {
+          api.onLoad({ filter: /\.wasm$/ }, () => ({
+            contents: new Uint8Array([0]),
+            loader: "binary",
+          }));
+        },
+      },
+    ],
   });
-  copyFileSync(join(root, "sqlite3.mjs"), join(site, "sqlite3.mjs"));
-  copyFileSync(join(root, "sqlite3.wasm"), join(site, "sqlite3.wasm"));
+  await build({
+    entryPoints: [join(root, "tests/obsidian.ts")],
+    outfile: join(site, "obsidian.mjs"),
+    bundle: true,
+    format: "esm",
+    logLevel: "silent",
+  });
+  copyFileSync(join(root, "main.js"), join(site, "main.js"));
   copyFileSync(
     join(root, "scripts/benchmark/sqlite-opfs-shard/page.html"),
     join(site, "page.html")
@@ -132,6 +165,7 @@ try {
     response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
     response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
+    requests.push(pathname);
     const file = pathname === "/" ? "page.html" : pathname.slice(1);
     const fixture = file.startsWith("fixtures/") ? file.slice("fixtures/".length) : undefined;
     const safeFixture =
@@ -151,11 +185,12 @@ try {
       "page.html": "text/html",
       "page.js": "text/javascript",
       "note-worker.mjs": "text/javascript",
-      "sqlite3.mjs": "text/javascript",
-      "sqlite3.wasm": "application/wasm",
+      "corrupt-worker.mjs": "text/javascript",
+      "obsidian.mjs": "text/javascript",
+      "main.js": "text/javascript",
     };
     const sourceFile = safeFixture ? join(site, fixture) : join(site, file);
-    if ((!Object.hasOwn(types, file) && !safeFixture) || !readFileSync(sourceFile)) {
+    if ((!Object.hasOwn(types, file) && !safeFixture) || !existsSync(sourceFile)) {
       response.writeHead(404).end("not found");
       return;
     }
@@ -281,8 +316,12 @@ try {
   ]);
   if (!exit) child.kill("SIGTERM");
   if (!result.ok) throw new Error(`Browser integration failed: ${result.error}\n${result.stack}`);
+  if (requests.some((path) => /sqlite3\.(?:mjs|wasm)|sqlite-worker\.mjs/.test(path)))
+    throw new Error("The embedded runtime requested a sidecar asset");
   const report = {
     ...result,
+    noSidecarRequests: true,
+    requests,
     exportPath: "production NoteSqliteDatabase.embeddingCacheSqliteExport using SQL VACUUM INTO",
     testBundleInstrumentation:
       "read-only SAH pool names/count/capacity inspection; no RPC or SQLite changes",
@@ -292,10 +331,11 @@ try {
     isolation: { userDataDir: profileDir, origin: `http://127.0.0.1:${port}` },
     temporaryProfileRemoved: true,
     assets: {
+      main: digest(read(join(site, "main.js"))),
       worker: digest(read(join(site, "note-worker.mjs"))),
       workerSource: digest(read(join(root, "src/index/note-sqlite/worker.ts"))),
-      sqliteModule: digest(read(join(site, "sqlite3.mjs"))),
-      sqliteWasm: digest(read(join(site, "sqlite3.wasm"))),
+      sqliteModule: digest(read(join(root, "sqlite3.mjs"))),
+      sqliteWasm: digest(read(join(root, "sqlite3.wasm"))),
       browserHarness: digest(read(join(site, "page.js"))),
     },
     buildInputs: Object.keys(built.metafile.inputs),

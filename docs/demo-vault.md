@@ -14,8 +14,12 @@ Trama in it:
 npm run install:plugin -- --test-vaults
 ```
 
-It builds once, prepares the generated demo vault if needed, and installs or updates
-Trama there. The command validates the generated path before writing, prints the
+It builds once, creates and validates the real release ZIP under
+`.artifacts/releases/`, prepares the generated demo vault if needed, and installs
+Trama from that archive. It verifies installed bytes and removes the old separate
+worker/SQLite files and installer receipt. Notes, model settings, local index data,
+and unrelated plugin files are preserved. Reload Obsidian or disable and re-enable
+Trama after installation to load the new package. The command validates the generated path before writing, prints the
 path, and instructs you to add the demo vault to Obsidian and enable Trama.
 Setup sends no Obsidian CLI commands or model requests; no manual vault ID is
 needed for the standard flow.

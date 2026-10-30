@@ -280,10 +280,20 @@ CI also checks formatting, lint, versions, license metadata, and production and
 development dependency advisories. Build identities hash source and locked inputs
 deterministically.
 
-Release archives contain exactly `main.js`, `sqlite-worker.mjs`, `sqlite3.mjs`,
-`sqlite3.wasm`, `manifest.json`, `styles.css`, `LICENSE`, and
-`THIRD-PARTY-NOTICES.txt`. The local installer copies those files, preserves
-settings and unrelated files, and does not back up or swap directories. If an
+The build bundles the worker, SQLite's JavaScript module, and its WASM bytes into
+`main.js`. Sources remain separate; `.cache/sqlite.worker.js` is a generated
+intermediate. At runtime a module worker starts from a Blob URL, with no sidecar
+file reads or runtime downloads. Worker termination releases that URL. The SQL
+queue, cancellation protocol, and OPFS namespace are unchanged.
+
+Release archives contain `main.js`, `manifest.json`, `styles.css`, `LICENSE`, and
+`THIRD-PARTY-NOTICES.txt`. GitHub releases also attach `main.js`, `manifest.json`,
+and `styles.css` individually for the community installer. The full project license
+and third-party notices are embedded in `main.js` too, so standard installation
+retains them. The local installer builds and validates that same ZIP under
+`.artifacts/releases/`, installs its entries, and verifies the installed bytes.
+It removes the former managed runtime sidecars and installer receipt, preserves
+notes, settings, local index data, and unrelated files, and does not back up or swap directories. If an
 installation is interrupted, rerun it before loading the plugin.
 
 For a safe development walkthrough, use the [generated demo vault](demo-vault.md).

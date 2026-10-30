@@ -1,53 +1,29 @@
-import {
-  access,
-  copyFile,
-  lstat,
-  mkdir,
-  readFile,
-  readdir,
-  realpath,
-  writeFile,
-} from "node:fs/promises";
+import { access, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { PLUGIN_FILES } from "./plugin-files.mjs";
+import { packageRelease } from "./package-release.mjs";
+import { unzipSync } from "fflate";
 
 const PLUGIN_ID = "trama";
-const runtimeManifestName = "runtime-manifest.json";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const runFile = promisify(execFile);
-
-async function installFile(source, destination) {
-  try {
-    await copyFile(source, destination);
-  } catch (error) {
-    if (process.platform !== "darwin" || error?.code !== "EPERM") throw error;
-    await runFile("/bin/cp", ["-f", source, destination]);
-  }
-}
-
 async function sha256(pathname) {
   return createHash("sha256")
     .update(await readFile(pathname))
     .digest("hex");
 }
 
-async function verifyArtifacts(directory, manifest) {
-  for (const [fileName, expected] of Object.entries(manifest.hashes)) {
+async function verifyArtifacts(directory, hashes) {
+  for (const [fileName, expected] of Object.entries(hashes)) {
     if ((await sha256(path.join(directory, fileName))) !== expected)
       throw new Error(`Runtime artifact verification failed: ${fileName}`);
   }
 }
 
 async function verifyBuildIdentity(directory, buildId) {
-  for (const fileName of ["main.js", "sqlite-worker.mjs"]) {
-    const contents = await readFile(path.join(directory, fileName), "utf8");
-    if (!contents.includes(buildId))
-      throw new Error(`Runtime build identity mismatch: ${fileName}`);
-  }
+  const contents = await readFile(path.join(directory, "main.js"), "utf8");
+  if (!contents.includes(buildId)) throw new Error("Runtime build identity mismatch: main.js");
 }
 
 export async function installPlugin({ vaultPath, projectRoot: root = projectRoot } = {}) {
@@ -63,17 +39,19 @@ export async function installPlugin({ vaultPath, projectRoot: root = projectRoot
   );
   if (!buildId) throw new Error("Generated runtime build identity is missing.");
   await verifyBuildIdentity(root, buildId);
-  const hashes = {};
-  for (const name of PLUGIN_FILES) hashes[name] = await sha256(path.join(root, name));
+  const { version } = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  const { archive, hashes } = packageRelease({
+    version,
+    archive: `.artifacts/releases/trama-${version}.zip`,
+    projectRoot: root,
+  });
+  const files = unzipSync(await readFile(archive));
   await mkdir(pluginDirectory, { recursive: true });
-  for (const name of PLUGIN_FILES)
-    await installFile(path.join(root, name), path.join(pluginDirectory, name));
-  const manifest = { buildId, hashes };
-  await verifyArtifacts(pluginDirectory, manifest);
-  await writeFile(
-    path.join(pluginDirectory, runtimeManifestName),
-    `${JSON.stringify(manifest, null, 2)}\n`
-  );
+  for (const name of PLUGIN_FILES) await writeFile(path.join(pluginDirectory, name), files[name]);
+  await verifyArtifacts(pluginDirectory, hashes);
+  // These former managed files must not hide a missing embedded runtime in dev.
+  for (const name of ["sqlite-worker.mjs", "sqlite3.mjs", "sqlite3.wasm", "runtime-manifest.json"])
+    await rm(path.join(pluginDirectory, name), { force: true });
   return pluginDirectory;
 }
 
@@ -129,11 +107,16 @@ async function main() {
     process.stdout.write(`Demo: ${path.resolve(installed[0], "../../..")}\n`);
     process.stdout.write("Enable Community plugins and Trama in the demo vault.\n\n");
   }
+  const { version } = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
+  process.stdout.write(
+    `Package: ${path.join(projectRoot, `.artifacts/releases/trama-${version}.zip`)}\n`
+  );
   for (const directory of installed)
     process.stdout.write(`Installed ${PLUGIN_ID} in ${directory}\n`);
+  process.stdout.write("Reload Obsidian or disable and re-enable Trama to load the new package.\n");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`)
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href)
   main().catch((error) => {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;

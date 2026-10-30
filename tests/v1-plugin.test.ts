@@ -52,7 +52,8 @@ describe("V1 plugin composition", () => {
         ),
         terminate: vi.fn(() => lifecycle.push(`terminate-${workers.length}`)),
       };
-      workers.push(worker);
+      // Observe the original native hooks before the runtime wraps termination.
+      workers.push({ ...worker });
       lifecycle.push(`create-${workers.length}`);
       return worker;
     });
@@ -104,12 +105,9 @@ describe("V1 plugin composition", () => {
         defaultMod: false,
       });
       expect(fetchSpy).not.toHaveBeenCalled();
-      expect(WorkerStub).toHaveBeenCalledWith(
-        expect.stringMatching(
-          /^app:\/\/vault\/\.obsidian\/plugins\/trama\/sqlite-worker\.mjs\?v=test&nonce=/
-        ),
-        { type: "module" }
-      );
+      expect(WorkerStub).toHaveBeenCalledWith(expect.stringMatching(/^blob:/), {
+        type: "module",
+      });
       expect(commands.mock.calls.map(([command]) => (command as any).id)).toEqual(
         expect.arrayContaining([
           "trama-update-index",
@@ -1087,7 +1085,7 @@ describe("V1 plugin composition", () => {
   );
 
   it("assigns each vault a stable independent namespace and rejects a malformed identity", async () => {
-    const runtime = new NoteSqliteRuntime(() => undefined);
+    const runtime = new NoteSqliteRuntime();
     const makeApp = () => {
       const files = new Map<string, string>();
       const directories = new Set<string>();
@@ -1232,7 +1230,8 @@ describe("V1 plugin composition", () => {
         ),
         terminate: vi.fn(),
       };
-      workers.push(worker);
+      // Observe the original native hooks before the runtime wraps termination.
+      workers.push({ ...worker });
       return worker;
     });
     const originalWorker = globalThis.Worker;
@@ -1308,7 +1307,8 @@ describe("V1 plugin composition", () => {
         ),
         terminate: vi.fn(),
       };
-      workers.push(worker);
+      // Observe the original native hooks before the runtime wraps termination.
+      workers.push({ ...worker });
       return worker;
     });
     const originalWorker = globalThis.Worker;

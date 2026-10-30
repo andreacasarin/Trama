@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import {
   cp,
@@ -15,31 +14,30 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { unzipSync } from "fflate";
 // @ts-expect-error The installer is an executable ESM script without a project declaration file.
 import { installPlugin } from "../scripts/install-plugin.mjs";
 
 const runtimeFiles = [
   "main.js",
-  "sqlite-worker.mjs",
-  "sqlite3.mjs",
-  "sqlite3.wasm",
   "manifest.json",
   "styles.css",
   "LICENSE",
   "THIRD-PARTY-NOTICES.txt",
 ];
 
-async function digest(file: string): Promise<string> {
-  return createHash("sha256")
-    .update(await readFile(file))
-    .digest("hex");
-}
-
 describe("plugin installer", () => {
   it("creates the demo vault from a clean checkout and preserves it on subsequent CLI installs", async () => {
-    const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama-install-"));
+    const project = await mkdtemp(path.join(await realpath(os.tmpdir()), "trama install "));
     try {
-      for (const name of ["scripts", "src", "test-vaults", "tsconfig.json", ...runtimeFiles])
+      for (const name of [
+        "scripts",
+        "src",
+        "test-vaults",
+        "tsconfig.json",
+        "package.json",
+        ...runtimeFiles,
+      ])
         await cp(path.join(process.cwd(), name), path.join(project, name), { recursive: true });
       await mkdir(path.join(project, ".cache"));
       await cp(
@@ -65,6 +63,8 @@ describe("plugin installer", () => {
       expect(stdout).toContain("Enable Community plugins and Trama in the demo vault.");
       expect(stdout).not.toContain("Benchmark:");
       expect(stdout).toContain(path.join(demo, ".obsidian/plugins/trama"));
+      expect(stdout).toContain("Package:");
+      expect(stdout).toContain("Reload Obsidian");
       await expect(
         readFile(path.join(demo, ".obsidian/community-plugins.json"), "utf8")
       ).resolves.toBe('["trama"]\n');
@@ -92,13 +92,13 @@ describe("plugin installer", () => {
         promisify(execFile)(process.execPath, ["scripts/install-plugin.mjs", ...args])
       ).rejects.toThrow("Usage:");
   });
-  it("embeds the generated non-development build ID in both runtime artifacts", async () => {
+  it("embeds the generated non-development build ID in the self-contained runtime", async () => {
     const build = JSON.parse(
       await readFile(path.join(process.cwd(), ".cache/runtime-build.json"), "utf8")
     );
     expect(build.buildId).toMatch(/^[0-9a-f]{64}$/);
     expect(build.buildId).not.toBe("development");
-    for (const fileName of ["main.js", "sqlite-worker.mjs"])
+    for (const fileName of ["main.js"])
       expect(await readFile(path.join(process.cwd(), fileName), "utf8")).toContain(build.buildId);
   });
 
@@ -107,19 +107,32 @@ describe("plugin installer", () => {
     try {
       await mkdir(path.join(vault, ".obsidian", "plugins"), { recursive: true });
       const installed = await installPlugin({ vaultPath: vault, projectRoot: process.cwd() });
-      const manifest = JSON.parse(
-        await readFile(path.join(installed, "runtime-manifest.json"), "utf8")
+      const { version } = JSON.parse(await readFile("package.json", "utf8"));
+      const files = unzipSync(
+        await readFile(path.join(".artifacts/releases", `trama-${version}.zip`))
       );
-      const build = JSON.parse(
-        await readFile(path.join(process.cwd(), ".cache/runtime-build.json"), "utf8")
-      );
-      expect(manifest.buildId).toBe(build.buildId);
+      expect(Object.keys(files).sort()).toEqual([...runtimeFiles].sort());
+      expect((await readdir(installed)).sort()).toEqual([...runtimeFiles].sort());
       for (const fileName of runtimeFiles)
-        expect(manifest.hashes[fileName]).toBe(await digest(path.join(installed, fileName)));
+        expect(new Uint8Array(await readFile(path.join(installed, fileName)))).toEqual(
+          files[fileName]
+        );
 
+      const obsolete = [
+        "sqlite-worker.mjs",
+        "sqlite3.mjs",
+        "sqlite3.wasm",
+        "runtime-manifest.json",
+      ];
+      for (const fileName of obsolete) await writeFile(path.join(installed, fileName), "obsolete");
+      await writeFile(path.join(installed, "unrelated.sqlite3"), "preserve");
       await writeFile(path.join(installed, "data.json"), '{"preserved":true}\n');
       await writeFile(path.join(installed, "unknown.dat"), "keep me\n");
       const upgraded = await installPlugin({ vaultPath: vault, projectRoot: process.cwd() });
+      for (const fileName of obsolete) expect(await readdir(upgraded)).not.toContain(fileName);
+      await expect(readFile(path.join(upgraded, "unrelated.sqlite3"), "utf8")).resolves.toBe(
+        "preserve"
+      );
       await expect(readFile(path.join(upgraded, "data.json"), "utf8")).resolves.toBe(
         '{"preserved":true}\n'
       );
@@ -127,8 +140,8 @@ describe("plugin installer", () => {
 
       // A directory at a release-file destination makes copying fail without
       // replacing or removing the surrounding plugin directory.
-      await rm(path.join(upgraded, "sqlite-worker.mjs"));
-      await mkdir(path.join(upgraded, "sqlite-worker.mjs"));
+      await rm(path.join(upgraded, "main.js"));
+      await mkdir(path.join(upgraded, "main.js"));
       await expect(
         installPlugin({ vaultPath: vault, projectRoot: process.cwd() })
       ).rejects.toThrow();
@@ -137,7 +150,7 @@ describe("plugin installer", () => {
       );
       await expect(readFile(path.join(upgraded, "unknown.dat"), "utf8")).resolves.toBe("keep me\n");
       expect(await readdir(path.dirname(upgraded))).toEqual(["trama"]);
-      await rm(path.join(upgraded, "sqlite-worker.mjs"), { recursive: true });
+      await rm(path.join(upgraded, "main.js"), { recursive: true });
       await expect(installPlugin({ vaultPath: vault, projectRoot: process.cwd() })).resolves.toBe(
         upgraded
       );
@@ -146,7 +159,7 @@ describe("plugin installer", () => {
     }
   }, 60_000);
 
-  it("rejects stale runtime artifact pairs before activation", async () => {
+  it("rejects a stale runtime before installation", async () => {
     const vault = await mkdtemp(path.join(os.tmpdir(), "trama-vault-"));
     const project = await mkdtemp(path.join(os.tmpdir(), "trama-project-"));
     try {
@@ -159,7 +172,7 @@ describe("plugin installer", () => {
       const staleId = "00000000-0000-4000-8000-000000000000";
       for (const fileName of runtimeFiles) {
         let contents = await readFile(path.join(process.cwd(), fileName));
-        if (fileName === "main.js" || fileName === "sqlite-worker.mjs")
+        if (fileName === "main.js")
           contents = Buffer.from(contents.toString().split(build.buildId).join(staleId));
         await writeFile(path.join(project, fileName), contents);
       }

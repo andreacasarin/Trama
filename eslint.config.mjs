@@ -11,7 +11,7 @@ export default tseslint.config(
       "sqlite3.wasm",
       "coverage/**",
       ".artifacts/**",
-      ".cache/sqlite-wasm/**",
+      ".cache/**",
       ".ai/bench/**",
     ],
   },

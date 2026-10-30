@@ -1,15 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { unzipSync } from "fflate";
+import { unzipSync, zipSync } from "fflate";
 import { afterAll, describe, expect, it } from "vitest";
+// @ts-expect-error The release builder is a plain ESM script.
+import { packageRelease } from "../scripts/package-release.mjs";
 
 const PRODUCTION_FILES = [
   "main.js",
-  "sqlite-worker.mjs",
-  "sqlite3.mjs",
-  "sqlite3.wasm",
   "manifest.json",
   "styles.css",
   "LICENSE",
@@ -48,6 +47,15 @@ describe("release package", () => {
     expect(notices).toContain("@langchain/core@");
     expect(notices).toContain("Copyright (c) 2020 Jeremy Danyow");
     expect(files).toEqual([...PRODUCTION_FILES].sort());
+    // Obsidian installs only the standard files; notices must travel in main.js too.
+    const main = new TextDecoder().decode(members["main.js"]);
+    const embeddedLicenses = main
+      .split("\n")
+      .filter((line) => line.startsWith("// "))
+      .map((line) => line.slice(3))
+      .join("\n");
+    expect(embeddedLicenses).toContain(new TextDecoder().decode(members.LICENSE));
+    expect(embeddedLicenses).toContain(notices);
 
     // A fresh build from the same source must verify an already-uploaded asset.
     const identity = readFileSync(join(root, ".cache/runtime-build.json"), "utf8");
@@ -64,4 +72,16 @@ describe("release package", () => {
       { cwd: root }
     );
   }, 60_000);
+  it.each(["unexpected file", "corrupt main.js"])("rejects a release archive with %s", (kind) => {
+    const destination = join(temporaryDirectory, `${kind}.zip`);
+    packageRelease({ version, archive: destination });
+    const files = unzipSync(readFileSync(destination));
+    if (kind === "unexpected file")
+      files["../outside.txt"] = new TextEncoder().encode("unexpected");
+    else files["main.js"] = new TextEncoder().encode("corrupted");
+    writeFileSync(destination, zipSync(files));
+    expect(() => packageRelease({ version, archive: destination, verify: true })).toThrow(
+      kind === "unexpected file" ? "must contain exactly" : "content mismatch"
+    );
+  });
 });

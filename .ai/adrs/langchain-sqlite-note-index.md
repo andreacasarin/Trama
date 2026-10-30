@@ -12,6 +12,12 @@ The proof of concept prioritizes reducing owned code through LangChain primitive
 
 ### Native indexing and SQL retrieval
 
+The build embeds the SQLite module and WASM in the worker, then embeds that worker
+in `main.js` using esbuild's binary and text loaders. A Blob-backed module worker
+retains the existing RPC queue, cancellation, and OPFS storage identity. No runtime
+asset downloads or alternative execution path are introduced. Source files stay
+separate, and required licenses are embedded for standard community installation.
+
 Keep exact cosine search as the current implementation. Do not add an approximate
 index until representative end-to-end measurements justify a separate spike.
 Keep one native double precision dot product for scoring and raw shard validation;

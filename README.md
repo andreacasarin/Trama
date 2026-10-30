@@ -62,8 +62,8 @@ chat and embeddings separately.
    configuration folder, use it in place of `.obsidian`.
 3. Reload Obsidian, allow community plugins, and enable **Trama** in Settings.
 
-Keep all the files from the ZIP together: Trama's search engine needs the bundled
-SQLite files as well as `main.js`.
+The search engine and its worker are bundled into `main.js`; no extra runtime
+files or startup downloads are needed.
 
 ### 2. Connect your models
 
@@ -155,6 +155,10 @@ To build and install into the generated demo vault:
 ```sh
 npm run install:plugin -- --test-vaults
 ```
+
+This builds and installs the validated release ZIP into the demo vault, removes
+obsolete runtime sidecars, and preserves your notes and settings. Reload Obsidian
+or disable and re-enable Trama afterwards.
 
 See the [demo-vault guide](docs/demo-vault.md) for a walkthrough,
 [technical notes](docs/technical-notes.md) for behavior and architecture,

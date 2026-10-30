@@ -41,17 +41,14 @@ interface WorkerRequest {
 }
 
 async function open(namespace: string): Promise<OpenDatabase> {
-  const assets = (globalThis as any).__TRAMA_SQLITE_ASSETS__ as
-    { moduleUrl?: string; wasmUrl?: string } | undefined;
-  const wasmUrl = assets?.wasmUrl ?? new URL("./sqlite3.wasm", import.meta.url).href;
-  const moduleUrl = assets?.moduleUrl ?? new URL("./sqlite3.mjs", import.meta.url).href;
-  const response = await fetch(wasmUrl, { credentials: "same-origin" });
-  if (!response.ok) throw new Error("SQLite WASM asset could not be loaded");
-  const wasm = await WebAssembly.compile(await response.arrayBuffer());
+  const { default: bytes } = await import("../../../sqlite3.wasm");
+  const wasm = await WebAssembly.compile(bytes);
   (globalThis as any).sqlite3ApiConfig = {
     disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
   };
-  const init = (await import(moduleUrl)).default as Init;
+  // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
+  const { default: sqliteInit } = await import("../../../sqlite3.mjs");
+  const init = sqliteInit as Init;
   const sqlite = await init({
     instantiateWasm(imports, onSuccess) {
       const instance = new WebAssembly.Instance(wasm, imports);
