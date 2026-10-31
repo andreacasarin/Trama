@@ -22,7 +22,7 @@ fail normally; cancellation is propagated even if the cache write resolves.
 
 ### Document-only SQLite shards
 
-Share immutable document-only files at `Trama/embedding-cache-v2/<profileSHA>/<artifactSHA>.sqlite3`. Each file contains hashed Float32 vectors and profile/dimension/task metadata, no input text, endpoint, or query vectors. Validate checksums, SQLite schema and integrity, metadata, dimensions, and finite vectors before importing. Ignore old JSON artifacts and receipts without migrating or deleting them.
+Share immutable document-only files at `<storage-folder>/embeddings/<profileSHA>/<artifactSHA>.sqlite3`. Each file contains hashed Float32 vectors and profile/dimension/task metadata, no input text, endpoint, or query vectors. Validate checksums, SQLite schema and integrity, metadata, dimensions, and finite vectors before importing. Ignore old JSON artifacts and receipts without migrating or deleting them.
 
 Use native SQL to select and copy entries into file-backed scratch databases, `VACUUM INTO` to create compact shards, and the SQLite VFS pool for export/import. Bound each shard to 128 entries and less than 4 MiB. Import into the device-local cache and record receipts transactionally; record publication hashes with a bounded native `INSERT ... SELECT`. Keep cancellation checks between SQL steps and before commit.
 
@@ -40,7 +40,7 @@ The user's vault-sync transport carries these files; never share the mutable loc
 
 ### Rebuild and explicit Clear
 
-Ordinary reset and Rebuild clear indexed state and RecordManager state while retaining document/query caches, receipts, and shared files. **Clear index and embedding cache** additionally clears all local document/query profiles, import/publication receipts, and known managed SQLite artifacts and temporary files under the shared cache root across profiles. It needs no configured model.
+Ordinary reset and Rebuild clear indexed state and RecordManager state while retaining document/query caches, receipts, and shared files. **Clear index and embedding cache** additionally clears all local document/query profiles, import/publication receipts, and known managed SQLite artifacts and temporary files under the configured storage folder's `embeddings/` directory across profiles. It needs no configured model.
 
 Clear leaves notes, settings, vault identity, the OPFS namespace, unrelated files, and other devices' local caches intact. Shared-file deletion follows vault sync and cannot guarantee deletion on every device. Cancel pending searches and reset submitted Lente results before clearing, so existing requests cannot repopulate the deleted cache and Clear does not replay a query.
 

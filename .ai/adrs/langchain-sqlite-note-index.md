@@ -34,7 +34,7 @@ Register each prepared note's UID, path, and logical-clock tick in the same SQLi
 
 ### Vault and worker isolation
 
-Each vault receives a version-1 random 32-byte token, encoded as 64 hexadecimal characters in `.trama/note-v1/identity.json`. It selects the isolated OPFS database `trama-note-v2-<token>/notes.sqlite3`; copying the identity also copies the namespace. There is no shared-storage fallback.
+Each vault receives a version-1 random 32-byte token, encoded as 64 hexadecimal characters in `<storage-folder>/identity.json` (default `.trama/identity.json`). It selects the isolated OPFS database `trama-note-v2-<token>/notes.sqlite3`; copying the identity also copies the namespace. There is no shared-storage fallback.
 
 Initialize the worker before publishing services or UI. Process SQL requests in FIFO order, handle cancellation messages outside that queue, and yield between bounded SQL steps and before commit. Cancellation rolls back the active transaction while retaining earlier note commits. Closing aborts active work, waits for rollback, closes the database, and pauses the VFS non-destructively. Settings changes await close before reopening; each index instance owns its callbacks.
 

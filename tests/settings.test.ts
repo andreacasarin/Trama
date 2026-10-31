@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, normalizeExcludedFolders, SettingsStore } from "@/settings/Settings";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import { normalizeStorageFolder } from "@/settings/StorageFolder";
 
 describe("settings", () => {
   it("normalizes console debugging strictly and suppresses every console level when disabled", () => {
@@ -59,5 +60,21 @@ describe("settings", () => {
         "Bad\\Path",
       ])
     ).toEqual(["Projects", "Projects/Archive"]);
+  });
+
+  it("defaults storage to .trama and validates canonical vault-relative paths", () => {
+    expect(DEFAULT_SETTINGS.storageFolder).toBe(".trama");
+    expect(normalizeStorageFolder(" Notes /./ Trama ")).toBe("Notes/Trama");
+    for (const path of [
+      "",
+      "/absolute",
+      "C:/absolute",
+      "../outside",
+      "Notes/../outside",
+      "bad\\path",
+      ".obsidian",
+      ".obsidian/plugins",
+    ])
+      expect(() => normalizeStorageFolder(path)).toThrow();
   });
 });

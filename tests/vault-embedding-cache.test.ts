@@ -228,12 +228,14 @@ async function setup(
   notes: Map<string, string>,
   provider: TestEmbeddings,
   embeddingProfile = profile,
-  consoleDebug?: ConsoleDebug
+  consoleDebug?: ConsoleDebug,
+  storageFolder = ".trama",
+  deviceNamespace = "b".repeat(64)
 ) {
   const sqlite = await loadTestSqlite();
   const db = new sqlite.oo1.DB(":memory:", "c");
   const database = new NoteSqliteDatabase(db);
-  const client = new NoteStoreClient(new LocalWorker(database), "b".repeat(64));
+  const client = new NoteStoreClient(new LocalWorker(database), deviceNamespace);
   const cachedEmbeddings = new SqliteEmbeddingCache(
     provider,
     client.call,
@@ -250,7 +252,8 @@ async function setup(
     adapter,
     testShardCache(cachedEmbeddings, database, db, embeddingProfile.dimensions),
     embeddingProfile.dimensions,
-    consoleDebug
+    consoleDebug,
+    storageFolder
   );
   const manual = new ManualIndex(
     new MemoryVault(notes),
@@ -538,7 +541,7 @@ describe("vault-shared document embedding artifacts", () => {
     const otherProfile = "c".repeat(64);
     const checksum = "d".repeat(64);
     const temp = ".tmp-" + checksum + "-123e4567-e89b-42d3-a456-426614174000";
-    const root = "Trama/embedding-cache-v2";
+    const root = ".trama/embeddings";
     const paths = [
       root + "/" + profileHash + "/" + checksum + ".sqlite3",
       root + "/" + profileHash + "/" + temp,
@@ -564,9 +567,30 @@ describe("vault-shared document embedding artifacts", () => {
     expect([...adapter.files.keys()]).not.toEqual(expect.arrayContaining(paths.slice(0, 3)));
   });
 
+  it("clears managed files only under the selected custom storage folder", async () => {
+    const adapter = new MemoryAdapter();
+    const root = "Sync/Trama/embeddings";
+    const selected = `${root}/${profileHash}/${"a".repeat(64)}.sqlite3`;
+    const other = `.trama/embeddings/${profileHash}/${"b".repeat(64)}.sqlite3`;
+    for (const path of [selected, other]) {
+      adapter.folders.add(path.slice(0, path.lastIndexOf("/")));
+      adapter.files.set(path, new Uint8Array([1]));
+    }
+    adapter.folders.add(root);
+    expect(
+      await VaultEmbeddingCache.clearManagedFiles(
+        adapter as any,
+        new AbortController().signal,
+        "Sync/Trama"
+      )
+    ).toBe(1);
+    expect(adapter.files.has(selected)).toBe(false);
+    expect(adapter.files.has(other)).toBe(true);
+  });
+
   it("cancels shared-file cleanup after a deletion and safely retries remaining files", async () => {
     const adapter = new MemoryAdapter();
-    const root = "Trama/embedding-cache-v2";
+    const root = ".trama/embeddings";
     const folder = root + "/" + profileHash;
     const files = ["a", "b"].map((letter) => folder + "/" + letter.repeat(64) + ".sqlite3");
     adapter.folders.add(root);
@@ -608,7 +632,7 @@ describe("vault-shared document embedding artifacts", () => {
       const paths = [...adapter.files.keys()];
       expect(paths).toHaveLength(1);
       expect(paths[0]).toMatch(
-        new RegExp(`^Trama/embedding-cache-v2/${profileHash}/[0-9a-f]{64}\\.sqlite3$`)
+        new RegExp(`^.trama/embeddings/${profileHash}/[0-9a-f]{64}\\.sqlite3$`)
       );
       const artifact = adapter.files.get(paths[0])!;
       expect(new TextDecoder().decode(artifact.slice(0, 15))).toBe("SQLite format 3");
@@ -643,6 +667,88 @@ describe("vault-shared document embedding artifacts", () => {
       await second.client.close();
       first.db.close();
       second.db.close();
+    }
+  });
+
+  it("publishes and reuses custom-folder shards across independent device identities", async () => {
+    const adapter = new MemoryAdapter();
+    const notes = new Map([["folder/shared.md", markdown]]);
+    const firstProvider = new TestEmbeddings();
+    const first = await setup(
+      adapter,
+      notes,
+      firstProvider,
+      profile,
+      undefined,
+      "Sync/Trama",
+      "a".repeat(64)
+    );
+    const secondProvider = new TestEmbeddings();
+    const second = await setup(
+      adapter,
+      notes,
+      secondProvider,
+      profile,
+      undefined,
+      "Sync/Trama",
+      "b".repeat(64)
+    );
+    try {
+      expect((await first.manual.update()).sharing).toBe("complete");
+      expect([...adapter.files.keys()]).toHaveLength(1);
+      expect([...adapter.files.keys()][0]).toMatch(
+        new RegExp(`^Sync/Trama/embeddings/${profileHash}/[0-9a-f]{64}\\.sqlite3$`)
+      );
+      expect((await second.manual.update()).numAdded).toBe(1);
+      expect(secondProvider.calls).toEqual([]);
+      expect(Number(second.db.selectValue("SELECT count(*) FROM note_vectors"))).toBeGreaterThan(0);
+    } finally {
+      await first.client.close();
+      first.db.close();
+      await second.client.close();
+      second.db.close();
+    }
+  });
+
+  it("cancels a custom-folder publication before a storage switch can redirect its write", async () => {
+    const adapter = new MemoryAdapter();
+    const provider = new TestEmbeddings();
+    const result = await setup(
+      adapter,
+      new Map([["note.md", markdown]]),
+      provider,
+      profile,
+      undefined,
+      "Sync/Trama"
+    );
+    let releaseWrite!: () => void;
+    let startedWrite!: () => void;
+    const writeStarted = new Promise<void>((resolve) => (startedWrite = resolve));
+    const writeGate = new Promise<void>((resolve) => (releaseWrite = resolve));
+    const write = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, bytes) => {
+      if (path.startsWith("Sync/Trama/embeddings/") && path.includes(".tmp-")) {
+        startedWrite();
+        await writeGate;
+      }
+      await write(path, bytes);
+    };
+    try {
+      const update = result.manual.update();
+      await writeStarted;
+      result.manual.cancel();
+      releaseWrite();
+      await expect(update).resolves.toMatchObject({ sharing: "cancelled" });
+      expect(
+        [...adapter.files.keys()].some(
+          (path) =>
+            path.startsWith("Sync/Trama/embeddings/") &&
+            (path.endsWith(".sqlite3") || path.includes(".tmp-"))
+        )
+      ).toBe(false);
+    } finally {
+      await result.client.close();
+      result.db.close();
     }
   });
 
@@ -728,7 +834,7 @@ describe("vault-shared document embedding artifacts", () => {
 
   it("treats corrupt and oversized SQLite files as cache misses", async () => {
     const adapter = new MemoryAdapter();
-    const folder = `Trama/embedding-cache-v2/${profileHash}`;
+    const folder = `.trama/embeddings/${profileHash}`;
     adapter.folders.add(folder);
     const corrupt = new TextEncoder().encode("not a SQLite shard");
     const corruptHash = sha256(new TextDecoder().decode(corrupt));
@@ -753,7 +859,7 @@ describe("vault-shared document embedding artifacts", () => {
 
   it("summarizes shard import failures in one bounded warning", async () => {
     const adapter = new MemoryAdapter();
-    const folder = `Trama/embedding-cache-v2/${profileHash}`;
+    const folder = `.trama/embeddings/${profileHash}`;
     adapter.folders.add(folder);
     const bytes = new TextEncoder().encode("invalid sqlite artifact");
     const digest = new Uint8Array(

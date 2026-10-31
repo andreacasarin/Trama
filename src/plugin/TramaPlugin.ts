@@ -32,6 +32,7 @@ import {
 import { IndexStatusController } from "@/ui/index/IndexStatus";
 import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
+import { normalizeStorageFolder } from "@/settings/StorageFolder";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 
@@ -54,6 +55,7 @@ export class TramaPlugin extends Plugin {
   private indexRun?: {
     readonly manualIndex: ManualIndex;
     readonly excludedFolders: readonly string[];
+    readonly storageFolder: string;
     readonly label: string;
     promise: Promise<void>;
   };
@@ -70,11 +72,14 @@ export class TramaPlugin extends Plugin {
     (this.app as any).vault
       .getMarkdownFiles()
       .map((file: { path: string }) => file.path)
-      .filter((path: string) => this.isVisibleMarkdown(path));
+      .filter((path: string) => this.isVisibleMarkdown(path) && !this.isStoragePath(path));
 
   onload(): Promise<void> {
     return this.enqueue(async () => {
-      this.settingsStore.load(await this.loadData().catch(() => undefined));
+      this.settingsStore.load(
+        await this.loadData().catch(() => undefined),
+        (this.app as any)?.vault?.configDir || ".obsidian"
+      );
       if (this.disposed) return;
       const app = this.app as any;
       if (!app?.vault || !app.workspace || !app.metadataCache) return;
@@ -138,7 +143,7 @@ export class TramaPlugin extends Plugin {
     if (previousClear) await previousClear.promise;
     await previousClient?.close();
     if (this.disposed) return;
-    const namespace = await this.sqliteRuntime.resolveNamespace(app);
+    const namespace = await this.sqliteRuntime.resolveNamespace(app, settings.storageFolder);
     if (this.disposed) return;
     const worker = this.sqliteRuntime.createWorker();
     const candidate = new NoteStoreClient(worker, namespace);
@@ -179,10 +184,15 @@ export class TramaPlugin extends Plugin {
           app.vault.adapter,
           embeddings as SqliteEmbeddingCache,
           profile.dimensions,
-          this.consoleDebug
+          this.consoleDebug,
+          settings.storageFolder
         )
       : undefined;
-    const readonlyVault = new ObsidianReadonlyVault(app.vault, app.metadataCache);
+    const readonlyVault = new ObsidianReadonlyVault(
+      app.vault,
+      app.metadataCache,
+      settings.storageFolder
+    );
     this.readonlyVault = readonlyVault;
     const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isIndexableMarkdown(path));
     const store = new SqliteNoteVectorStore(
@@ -213,7 +223,8 @@ export class TramaPlugin extends Plugin {
           return null;
         }
       },
-      this.consoleDebug
+      this.consoleDebug,
+      settings.storageFolder
     );
     const chatModel: BaseChatModel = createLocalChatModel(settings.chat);
     this.session = new ChatSession(
@@ -282,6 +293,10 @@ export class TramaPlugin extends Plugin {
       new URL(embeddingEndpoint);
       const validated = {
         ...next,
+        storageFolder: normalizeStorageFolder(
+          next.storageFolder,
+          (this.app as any)?.vault?.configDir || ".obsidian"
+        ),
         chat: {
           ...next.chat,
           endpoint: chatEndpoint,
@@ -297,7 +312,8 @@ export class TramaPlugin extends Plugin {
       };
       const runtimeChanged =
         JSON.stringify(current.chat) !== JSON.stringify(validated.chat) ||
-        JSON.stringify(current.embedding) !== JSON.stringify(validated.embedding);
+        JSON.stringify(current.embedding) !== JSON.stringify(validated.embedding) ||
+        current.storageFolder !== validated.storageFolder;
       const staged = this.settingsStore.stage(validated);
       await this.saveData(staged);
       if (this.disposed) return;
@@ -313,7 +329,10 @@ export class TramaPlugin extends Plugin {
     return this.enqueue(async () => {
       if (this.disposed) return;
       const previous = this.getSettings();
-      this.settingsStore.load(await this.loadData());
+      this.settingsStore.load(
+        await this.loadData(),
+        (this.app as any)?.vault?.configDir || ".obsidian"
+      );
       const current = this.getSettings();
       const previousProfile = effectiveEmbeddingProfile(previous);
       const currentProfile = effectiveEmbeddingProfile(current);
@@ -323,7 +342,8 @@ export class TramaPlugin extends Plugin {
         previousProfile !== currentProfile;
       const runtimeChanged =
         JSON.stringify(previous.chat) !== JSON.stringify(current.chat) ||
-        JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding);
+        JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding) ||
+        previous.storageFolder !== current.storageFolder;
       if (runtimeChanged && this.app) await this.configureServices(this.app as any);
       this.settingsTab?.refreshExternalSettings();
       if (embeddingProfileChanged && this.indexedNotes)
@@ -381,7 +401,8 @@ export class TramaPlugin extends Plugin {
     });
     this.showOperationNotice("Clearing local index…");
     const finishLog = this.consoleDebug.start("Index clear");
-    const run = { client, controller, promise: Promise.resolve() };
+    const storageFolder = this.getSettings().storageFolder;
+    const run = { client, controller, storageFolder, promise: Promise.resolve() };
     this.clearRun = run;
     let committed = false;
     const operation = (async () => {
@@ -405,7 +426,7 @@ export class TramaPlugin extends Plugin {
         this.operationNotice?.setMessage("Clearing shared embedding cache files…");
         const adapter = (this.app as any)?.vault?.adapter;
         if (!adapter) throw new Error("Vault storage is unavailable for shared cache cleanup.");
-        await VaultEmbeddingCache.clearManagedFiles(adapter, controller.signal);
+        await VaultEmbeddingCache.clearManagedFiles(adapter, controller.signal, run.storageFolder);
         if (this.clearRun !== run || this.disposed) return;
         finishLog("completed");
         this.status?.setStatus({
@@ -494,6 +515,7 @@ export class TramaPlugin extends Plugin {
     const run = {
       manualIndex,
       excludedFolders: [...this.getSettings().excludedFolders],
+      storageFolder: this.getSettings().storageFolder,
       label: rebuild ? "Rebuilding note index" : "Updating note index",
       promise: Promise.resolve(),
     };
@@ -691,10 +713,16 @@ export class TramaPlugin extends Plugin {
   private isIndexableMarkdown(path: string): boolean {
     return (
       this.isVisibleMarkdown(path) &&
+      !this.isStoragePath(path) &&
       !(this.indexRun?.excludedFolders ?? this.getSettings().excludedFolders).some((folder) =>
         path.startsWith(`${folder}/`)
       )
     );
+  }
+
+  private isStoragePath(path: string): boolean {
+    const folder = this.indexRun?.storageFolder ?? this.getSettings().storageFolder;
+    return path === folder || path.startsWith(`${folder}/`);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {

@@ -2,6 +2,37 @@ import { describe, expect, it, vi } from "vitest";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 
 describe("Obsidian read-only vault", () => {
+  it("hides the selected storage folder from direct reads and link resolution", async () => {
+    const hidden = { path: "Sync/Trama/identity.md", name: "identity.md" };
+    const visible = { path: "Notes/Visible.md", name: "Visible.md" };
+    const vault = {
+      configDir: ".obsidian",
+      getFileByPath: vi.fn((path: string) =>
+        path === hidden.path ? hidden : path === visible.path ? visible : null
+      ),
+      getMarkdownFiles: () => [hidden, visible],
+      read: vi.fn(async () => "content"),
+    };
+    const metadataCache = {
+      getFirstLinkpathDest: vi.fn((path: string) => (path === "Hidden" ? hidden : null)),
+      getFileCache: vi.fn(() => null),
+    };
+    const readonlyVault = new ObsidianReadonlyVault(
+      vault as never,
+      metadataCache as never,
+      "Sync/Trama"
+    );
+    await expect(
+      readonlyVault.readNote(hidden.path, new AbortController().signal)
+    ).rejects.toThrow();
+    await expect(
+      readonlyVault.resolveLink("Hidden", null, new AbortController().signal)
+    ).resolves.toBeNull();
+    await expect(
+      readonlyVault.readNote(visible.path, new AbortController().signal)
+    ).resolves.toMatchObject({ path: visible.path });
+  });
+
   it("returns complete Markdown content while preserving accessible-path and cancellation checks", async () => {
     const content = Array.from(
       { length: 210 },

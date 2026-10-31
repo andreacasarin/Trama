@@ -10,9 +10,13 @@ This reference covers storage, maintenance, and the details behind Voce's behavi
 Trama uses LangChain for embeddings, Markdown splitting, agents, and tools, with
 LangGraph owning the active conversation's in-memory checkpoints.
 
-Each vault has a stable identity in `.trama/note-v1/identity.json`. Its SQLite
-database lives in that identity's OPFS namespace. Copying the identity file also
-copies the namespace identity; it does not copy the database itself.
+Each vault has a stable identity in
+`<storage-folder>/identity.json`; the storage folder defaults to `.trama` and
+can be changed in Settings. Its SQLite database lives in that identity's local
+OPFS namespace. Copying the identity file also copies the namespace identity; it
+does not copy the database itself. Changing the storage folder selects its
+identity and OPFS namespace without moving or migrating files from the previous
+folder.
 
 SQLite stores note metadata, chunk vectors, lexical search data, and normalized
 note centroids. It performs filtering, ranking, and vector scoring. Vectors are
@@ -54,9 +58,11 @@ the active transaction while retaining earlier completed commits. Failures skip
 cleanup and leave previously indexed lexical data available. Changes during a run
 are picked up by a later update.
 
-Folder exclusions apply to a folder and its descendants on the next successful
-update. They do not purge shared embedding files or restrict chat attachments
-and note reads. Filo refreshes after index updates without a provider call.
+User-configured folder exclusions apply to indexing a folder and its descendants
+on the next successful update. They do not purge shared embedding files or
+restrict chat attachments and note reads. Separately, the configured storage
+folder and its descendants are excluded from indexing and vault-reading tools.
+Filo refreshes after index updates without a provider call.
 
 ## Shared embedding cache
 
@@ -64,7 +70,7 @@ Updates import compatible document embeddings before indexing and publish them
 after indexing and cleanup succeed. Files are immutable SQLite shards stored at:
 
 ```text
-Trama/embedding-cache-v2/<profileHash>/<contentHash>.sqlite3
+<storage-folder>/embeddings/<profileHash>/<contentHash>.sqlite3
 ```
 
 They contain document vectors and cache metadata, never note text, queries, chat,
@@ -94,7 +100,7 @@ palette, without requiring a configured model. It clears:
 - The local note index and document/query embedding caches.
 - Local cache import and publication receipts.
 - Known managed cache files, including temporary files, across profiles in the
-  vault's `Trama/embedding-cache-v2` folder.
+  configured storage folder's `embeddings/` directory.
 
 It preserves notes, settings, vault identity, the OPFS namespace, unrelated files,
 and other devices' local caches. Rebuild and ordinary index reset retain caches.
@@ -138,7 +144,9 @@ synced settings are retained with nonblocking advice instead.
 All settings are stored in the plugin's `data.json`, follow Obsidian Sync's
 plugin-settings sync when enabled, and reload after external changes.
 Changes to chat or embedding settings reconfigure services and reset the active
-Voce conversation.
+Voce conversation. Applying a storage-folder change, including one received through
+external settings sync, reconfigures storage to use that folder’s identity and
+OPFS namespace.
 
 Console debugging is off by default. When enabled, it records operation timings,
 counts, and caught errors locally. Voce diagnostics report turn/tool status,

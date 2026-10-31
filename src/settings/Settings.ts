@@ -1,3 +1,5 @@
+import { DEFAULT_STORAGE_FOLDER, normalizeStorageFolder } from "@/settings/StorageFolder";
+
 export interface ChatSettings {
   readonly endpoint: string;
   readonly modelId: string;
@@ -16,6 +18,7 @@ export interface TramaSettings {
   readonly chat: ChatSettings;
   readonly embedding: EmbeddingSettings;
   readonly excludedFolders: readonly string[];
+  readonly storageFolder: string;
 }
 
 export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
@@ -28,6 +31,7 @@ export const DEFAULT_SETTINGS: TramaSettings = Object.freeze({
   }),
   embedding: Object.freeze({ endpoint: "http://127.0.0.1:1234/v1", modelId: "", dimensions: 768 }),
   excludedFolders: Object.freeze([]),
+  storageFolder: DEFAULT_STORAGE_FOLDER,
 });
 
 export type ReasoningEffort = NonNullable<ChatSettings["reasoningEffort"]>;
@@ -49,7 +53,7 @@ export function normalizeReasoningEffort(value: unknown): ReasoningEffort | unde
 
 export class SettingsStore {
   private value = DEFAULT_SETTINGS;
-  load(value: unknown): TramaSettings {
+  load(value: unknown, configDir = ".obsidian"): TramaSettings {
     if (!value || typeof value !== "object") return (this.value = DEFAULT_SETTINGS);
     const data = value as Record<string, any>;
     const chat = data.chat && typeof data.chat === "object" ? data.chat : {};
@@ -92,6 +96,13 @@ export class SettingsStore {
             : DEFAULT_SETTINGS.embedding.dimensions,
       },
       excludedFolders: normalizeExcludedFolders(data.excludedFolders),
+      storageFolder: (() => {
+        try {
+          return normalizeStorageFolder(data.storageFolder ?? DEFAULT_STORAGE_FOLDER, configDir);
+        } catch {
+          return DEFAULT_STORAGE_FOLDER;
+        }
+      })(),
     };
     return (this.value = Object.freeze(settings));
   }

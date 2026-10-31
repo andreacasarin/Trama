@@ -444,4 +444,82 @@ describe("SQLite note retrieval", () => {
       f.db.close();
     }
   });
+
+  it("filters stale selected-storage hits from metadata, related, and direct retrieval", async () => {
+    const storageHit = { path: "Sync/Trama/old.md", score: 10 };
+    const visibleHit = { path: "Notes/visible.md", score: 8 };
+    const call = vi.fn(async (method: string) =>
+      method === "noteStoreRelated"
+        ? { hits: [storageHit, visibleHit], available: true }
+        : { mode: "lexical" as const, degraded: false, hits: [storageHit, visibleHit] }
+    );
+    const readNote = vi.fn(async (path: string) => ({ path, content: "visible" }));
+    const retrieval = new VaultRetrieval(
+      call as any,
+      undefined,
+      "profile",
+      readNote,
+      undefined,
+      "Sync/Trama"
+    );
+
+    const metadata = await retrieval.runnable.invoke({
+      query: "needle",
+      mode: "lexical",
+      content: "metadata",
+      limit: 2,
+    });
+    expect(metadata.documents.map((document) => document.id)).toEqual([visibleHit.path]);
+    expect((await retrieval.relatedPaths("source.md", new AbortController().signal)).paths).toEqual(
+      [visibleHit.path]
+    );
+    expect(
+      (await retrieval.related("source.md", new AbortController().signal)).documents.map(
+        (document) => document.id
+      )
+    ).toEqual([visibleHit.path]);
+    expect(await retrieval.readSearchCandidate(storageHit)).toBeUndefined();
+    expect(readNote).not.toHaveBeenCalled();
+    call.mockClear();
+    await expect(
+      retrieval.relatedPaths(storageHit.path, new AbortController().signal)
+    ).resolves.toEqual({ paths: [], available: false });
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("hides stale notes already indexed inside the selected visible folder", async () => {
+    const f = await fixture();
+    try {
+      const paths = ["Sync/Trama/old.md", "Notes/visible.md"];
+      const docs = paths.map((path) => {
+        const content = "needle stored before this folder became Trama storage";
+        f.notes.set(path, content);
+        return new Document({ id: path, pageContent: content, metadata: { path } });
+      });
+      await f.store.addDocuments(docs);
+      const retrieval = new VaultRetrieval(
+        f.client.call,
+        undefined,
+        f.store.embeddingProfile,
+        async (path) => ({ path, content: f.notes.get(path) ?? "" }),
+        undefined,
+        "Sync/Trama"
+      );
+
+      const metadata = await retrieval.runnable.invoke({
+        query: "needle",
+        mode: "lexical",
+        content: "metadata",
+        limit: 10,
+      });
+      expect(metadata.documents.map((document) => document.id)).toEqual(["Notes/visible.md"]);
+      const related = await retrieval.relatedPaths(
+        "Notes/visible.md",
+        new AbortController().signal
+      );
+      expect(related.paths).not.toContain("Sync/Trama/old.md");
+    } finally {
+      f.db.close();
+    }
+  });
 });

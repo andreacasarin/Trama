@@ -2,6 +2,7 @@ import { Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import { DEFAULT_STORAGE_FOLDER, normalizeStorageFolder } from "@/settings/StorageFolder";
 import {
   normalizeReasoningEffort,
   normalizeExcludedFolders,
@@ -17,6 +18,7 @@ interface SettingsDraft {
   chat: Mutable<ChatSettings>;
   embedding: Mutable<EmbeddingSettings>;
   excludedFolders: string[];
+  storageFolder: string;
 }
 interface ParsedText<T> {
   value: T;
@@ -190,6 +192,41 @@ export class TramaSettingsTab extends PluginSettingTab {
       "OpenAI-compatible base URL shared by Filo search, related-note suggestions, and Voce."
     );
     this.modelSetting("embedding", settings, displayGeneration);
+
+    this.heading("Storage");
+    let storageInput: HTMLInputElement;
+    new Setting(containerEl)
+      .setName("Storage folder")
+      .setDesc(
+        "Stores the vault identity and reusable embeddings. The default hidden folder may be excluded from sync. Choose a visible folder, such as Trama, and include it in your sync service to share embeddings across devices."
+      )
+      .addText((text) => {
+        storageInput = text.inputEl;
+        text.setValue(settings.storageFolder);
+      })
+      .addButton((button) =>
+        button
+          .setButtonText("Apply")
+          .setCta()
+          .onClick(() => {
+            try {
+              const folder = normalizeStorageFolder(
+                storageInput.value,
+                this.app.vault.configDir || ".obsidian"
+              );
+              void this.persistDiscrete((current) => ({ ...current, storageFolder: folder })).then(
+                (saved) => {
+                  if (saved) {
+                    settings.storageFolder = saved.storageFolder;
+                    storageInput.value = saved.storageFolder;
+                  }
+                }
+              );
+            } catch (error) {
+              new Notice(error instanceof Error ? error.message : "Invalid storage folder.");
+            }
+          })
+      );
     this.text(
       "Embedding dimensions",
       "embedding.dimensions",
@@ -580,5 +617,6 @@ function cloneSettings(settings: TramaSettings): SettingsDraft {
     chat: { ...settings.chat },
     embedding: { ...settings.embedding },
     excludedFolders: [...settings.excludedFolders],
+    storageFolder: settings.storageFolder ?? DEFAULT_STORAGE_FOLDER,
   };
 }

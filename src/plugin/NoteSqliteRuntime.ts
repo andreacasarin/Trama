@@ -1,8 +1,9 @@
 import workerSource from "../../.cache/sqlite.worker.js?raw";
 import type { NoteStoreWorkerLike } from "@/index/note-sqlite/client";
+import { DEFAULT_STORAGE_FOLDER, storagePaths } from "@/settings/StorageFolder";
 
 export class NoteSqliteRuntime {
-  async resolveNamespace(app: any): Promise<string> {
+  async resolveNamespace(app: any, folder = DEFAULT_STORAGE_FOLDER): Promise<string> {
     const adapter = app?.vault?.adapter;
     if (
       !adapter ||
@@ -12,7 +13,7 @@ export class NoteSqliteRuntime {
       typeof adapter.write !== "function"
     )
       throw new Error("Vault-local SQLite identity storage is unavailable.");
-    const identityPath = ".trama/note-v1/identity.json";
+    const { identity: identityPath } = storagePaths(folder);
     if (await adapter.exists(identityPath)) {
       return this.readNamespace(await adapter.read(identityPath));
     }
@@ -21,15 +22,14 @@ export class NoteSqliteRuntime {
       throw new Error("Secure vault-local SQLite identity generation is unavailable.");
     globalThis.crypto.getRandomValues(bytes);
     const namespace = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
-    try {
-      await adapter.mkdir(".trama");
-    } catch (error) {
-      if (!(await adapter.exists(".trama"))) throw error;
-    }
-    try {
-      await adapter.mkdir(".trama/note-v1");
-    } catch (error) {
-      if (!(await adapter.exists(".trama/note-v1"))) throw error;
+    const parts = folder.split("/");
+    for (let index = 1; index <= parts.length; index++) {
+      const path = parts.slice(0, index).join("/");
+      try {
+        await adapter.mkdir(path);
+      } catch (error) {
+        if (!(await adapter.exists(path))) throw error;
+      }
     }
     await adapter.write(identityPath, JSON.stringify({ version: 1, namespace }));
     const written = await adapter.read(identityPath);

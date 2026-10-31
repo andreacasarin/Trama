@@ -4,6 +4,7 @@ import { RunnableLambda, type RunnableConfig } from "@langchain/core/runnables";
 import { StructuredError, checkAbort, isCancelled } from "@/domain/errors";
 import { EmbeddingProviderError } from "@/model/LocalModels";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import { DEFAULT_STORAGE_FOLDER } from "@/settings/StorageFolder";
 import type {
   NoteStoreCall,
   NoteStoreHybridResult,
@@ -67,7 +68,8 @@ export class VaultRetrieval {
       | undefined,
     private readonly profile: string | undefined,
     private readonly readNote: LiveMarkdownReader,
-    private readonly consoleDebug?: ConsoleDebug
+    private readonly consoleDebug?: ConsoleDebug,
+    private readonly storageFolder = DEFAULT_STORAGE_FOLDER
   ) {
     this.runnable = RunnableLambda.from<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>(
       (input, config) => this.search(input, config.signal)
@@ -158,7 +160,7 @@ export class VaultRetrieval {
     if (!degradationReason && result.degraded) degradationReason = result.degradationReason;
     const degraded = Boolean(degradationReason) || result.degraded;
     return {
-      hits: result.hits,
+      hits: result.hits.filter((hit) => !this.isStoragePath(hit.path)),
       status: {
         mode: result.mode,
         degraded,
@@ -173,6 +175,7 @@ export class VaultRetrieval {
     signal?: AbortSignal
   ): Promise<Document | undefined> {
     checkAbort(signal);
+    if (this.isStoragePath(hit.path)) return undefined;
     const note = await this.readNote(hit.path, signal);
     checkAbort(signal);
     if (!note) return undefined;
@@ -200,6 +203,7 @@ export class VaultRetrieval {
     limit: number
   ): Promise<NoteStoreRelatedResult> {
     checkAbort(signal);
+    if (this.isStoragePath(sourcePath)) return { hits: [], available: false };
     if (!this.profile) return { hits: [], available: false };
     const k = Math.max(0, Math.min(20, Math.floor(limit)));
     let request = this.relatedRequest;
@@ -247,7 +251,12 @@ export class VaultRetrieval {
         if (this.relatedRequest === request) this.relatedRequest = undefined;
       });
     }
-    return waitForConsumer(request.promise, signal);
+    const result = await waitForConsumer(request.promise, signal);
+    return { ...result, hits: result.hits.filter((hit) => !this.isStoragePath(hit.path)) };
+  }
+
+  private isStoragePath(path: string): boolean {
+    return path === this.storageFolder || path.startsWith(`${this.storageFolder}/`);
   }
 
   private async search(

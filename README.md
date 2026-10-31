@@ -90,18 +90,20 @@ or stop an operation at any time.
 
 ## Your notes, your models
 
-- **Local storage.** The search index lives on your device. Trama also writes reusable
-  document embeddings under `Trama/embedding-cache-v2` in your vault, so your usual
-  sync service can carry them between devices. These files contain vectors and
-  cache metadata, without note text, chat, or queries.
+- **Local storage.** The search index lives on your device. Trama stores a vault
+  identity and reusable document embeddings in the configured storage folder,
+  which defaults to hidden `.trama/`. Embeddings live in
+  `<storage-folder>/embeddings/`; choose a visible folder such as `Trama` and
+  include it in your sync service if you want to share them between devices.
+  These files contain vectors and cache metadata, without note text, chat, or queries.
 - **You choose the endpoint.** Chat requests send your prompt, selected skill,
   attachments, and retrieved context to the configured chat server. Indexing sends
   note content to the embedding server; semantic search sends the query. With a
   local server, those requests go to that server. A remote endpoint receives that
   content instead.
 - **Read-only note tools.** Voce can search and read notes. Its vault tools cannot
-  edit or delete them. Folder exclusions apply to indexing; they do not restrict
-  notes you attach or read in chat.
+  edit or delete them. Folder exclusions apply to indexing only. The configured
+  storage folder is excluded from both indexing and vault-reading tools.
 - **Session-only conversations.** Trama does not save chat history to disk. Use
   **New chat** to clear it; closing the last Voce pane also resets the conversation.
 

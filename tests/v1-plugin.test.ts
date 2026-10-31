@@ -32,7 +32,8 @@ describe("V1 plugin composition", () => {
           if (
             request.method === "init" ||
             request.method === "close" ||
-            request.method === "noteStoreHasNotes"
+            request.method === "noteStoreHasNotes" ||
+            request.method === "noteStoreClear"
           )
             for (const listener of listeners)
               listener({
@@ -63,6 +64,7 @@ describe("V1 plugin composition", () => {
       vault: {
         configDir: ".obsidian",
         getMarkdownFiles: () => [],
+        getAllFolders: () => [],
         getFileByPath: () => null,
         read: async () => "",
         adapter: {
@@ -131,6 +133,68 @@ describe("V1 plugin composition", () => {
       expect(openVoce.setSession).toHaveBeenCalledWith(plugin.session);
       expect(openFilo.setRelated).toHaveBeenCalledWith(plugin.retrieval);
       expect(openLente.setSearch).toHaveBeenCalledWith(plugin.retrieval.runnable);
+      const oldClient = plugin.client;
+      plugin.loadData = vi.fn(async () => ({
+        ...plugin.getSettings(),
+        storageFolder: "Sync/Trama",
+      }));
+      plugin.settingsTab = { refreshExternalSettings: vi.fn() };
+      await plugin.onExternalSettingsChange();
+      expect(plugin.getSettings().storageFolder).toBe("Sync/Trama");
+      expect(plugin.client).not.toBe(oldClient);
+      expect(files.has("Sync/Trama/identity.json")).toBe(true);
+      expect(WorkerStub).toHaveBeenCalledTimes(3);
+
+      const beforeIndexSwitch = plugin.client;
+      const indexing = plugin.manualIndex;
+      const cancelIndex = vi.spyOn(indexing, "cancel");
+      let finishPublication!: () => void;
+      const publication = new Promise<void>((resolve) => (finishPublication = resolve));
+      const update = vi.spyOn(indexing, "update").mockReturnValue(publication as any);
+      const activeUpdate = plugin.updateIndex();
+      expect(update).toHaveBeenCalledOnce();
+      const indexSwitch = plugin.saveSettings((current: any) => ({
+        ...current,
+        storageFolder: "Sync/Trama/next",
+      }));
+      await vi.waitFor(() => expect(cancelIndex).toHaveBeenCalledOnce());
+      expect(lifecycle).not.toContain("close-3");
+      finishPublication();
+      await indexSwitch;
+      await activeUpdate;
+      expect(plugin.client).not.toBe(beforeIndexSwitch);
+      expect(files.has("Sync/Trama/next/identity.json")).toBe(true);
+      expect(lifecycle.indexOf("close-3")).toBeGreaterThan(lifecycle.indexOf("create-3"));
+      expect(lifecycle.indexOf("close-3")).toBeLessThan(lifecycle.indexOf("create-4"));
+
+      const beforeClearSwitch = plugin.client;
+      let cleanupSignal!: AbortSignal;
+      const cleanup = vi
+        .spyOn(VaultEmbeddingCache, "clearManagedFiles")
+        .mockImplementation((_adapter, signal) => {
+          cleanupSignal = signal;
+          return new Promise((_resolve, reject) =>
+            signal.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true }
+            )
+          );
+        });
+      const activeClear = plugin.clearIndex();
+      await vi.waitFor(() => expect(cleanupSignal).toBeInstanceOf(AbortSignal));
+      const clearSwitch = plugin.saveSettings((current: any) => ({
+        ...current,
+        storageFolder: "Sync/Trama/final",
+      }));
+      await vi.waitFor(() => expect(cleanupSignal.aborted).toBe(true));
+      await clearSwitch;
+      await activeClear;
+      cleanup.mockRestore();
+      expect(plugin.client).not.toBe(beforeClearSwitch);
+      expect(files.has("Sync/Trama/final/identity.json")).toBe(true);
+      expect(lifecycle.indexOf("close-4")).toBeGreaterThan(lifecycle.indexOf("create-4"));
+      expect(lifecycle.indexOf("close-4")).toBeLessThan(lifecycle.indexOf("create-5"));
       plugin.onunload();
       await vi.waitFor(() =>
         expect(workers[0].postMessage).toHaveBeenCalledWith(
@@ -161,6 +225,31 @@ describe("V1 plugin composition", () => {
     expect(plugin.isIndexableMarkdown("Projects/Archive/old.md")).toBe(false);
     expect(plugin.isIndexableMarkdown("Projects Archive/one.md")).toBe(true);
     expect(plugin.isVisibleMarkdown("Projects/one.md")).toBe(true);
+  });
+
+  it("applies a canonical storage folder and rejects invalid folders before persistence", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const saved: any[] = [];
+    plugin.app = { vault: { configDir: ".obsidian" } };
+    plugin.saveData = vi.fn(async (value: unknown) => saved.push(value));
+    plugin.configureServices = vi.fn(async () => undefined);
+    await plugin.saveSettings((current: any) => ({
+      ...current,
+      storageFolder: " Sync /./Trama//",
+    }));
+    expect(plugin.getSettings().storageFolder).toBe("Sync/Trama");
+    expect(saved[0].storageFolder).toBe("Sync/Trama");
+    expect(plugin.configureServices).toHaveBeenCalledOnce();
+    await expect(
+      plugin.saveSettings((current: any) => ({ ...current, storageFolder: "../outside" }))
+    ).rejects.toThrow();
+    await expect(
+      plugin.saveSettings((current: any) => ({ ...current, storageFolder: ".obsidian/plugins" }))
+    ).rejects.toThrow();
+    expect(saved).toHaveLength(1);
+    expect(plugin.getSettings().storageFolder).toBe("Sync/Trama");
+    expect(plugin.isIndexableMarkdown("Sync/Trama/note.md")).toBe(false);
+    expect(plugin.isIndexableMarkdown("Sync/Tramatic/note.md")).toBe(true);
   });
 
   it("reloads all externally synchronized settings and reapplies runtime model dimensions", async () => {
@@ -1111,7 +1200,11 @@ describe("V1 plugin composition", () => {
     expect(secondNamespace).toMatch(/^[0-9a-f]{64}$/);
     expect(firstNamespace).not.toBe(secondNamespace);
     expect(await runtime.resolveNamespace(first.app)).toBe(firstNamespace);
-    first.files.set(".trama/note-v1/identity.json", "{}");
+    const customNamespace = await runtime.resolveNamespace(first.app, "Sync/Trama");
+    expect(customNamespace).not.toBe(firstNamespace);
+    expect(first.files.has("Sync/Trama/identity.json")).toBe(true);
+    expect(await runtime.resolveNamespace(first.app, "Sync/Trama")).toBe(customNamespace);
+    first.files.set(".trama/identity.json", "{}");
     await expect(runtime.resolveNamespace(first.app)).rejects.toThrow(/identity is invalid/);
   });
 

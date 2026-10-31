@@ -2,6 +2,7 @@ import { noteCandidates } from "@/domain/notePaths";
 import { MetadataCache, TFile, Vault, type CachedMetadata } from "obsidian";
 import type { ReadonlyNote, ReadonlyVault, VaultLink } from "@/domain/vault";
 import { StructuredError, checkAbort } from "@/domain/errors";
+import { DEFAULT_STORAGE_FOLDER } from "@/settings/StorageFolder";
 
 const MARKDOWN = /\.md$/i;
 
@@ -13,9 +14,10 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     private readonly vault: Pick<Vault, "getFileByPath" | "read" | "configDir"> & {
       getMarkdownFiles?: () => readonly TFile[];
     },
-    private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">
+    private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">,
+    storageFolder = DEFAULT_STORAGE_FOLDER
   ) {
-    this.hidden = [".trama", this.vault.configDir || ".obsidian"];
+    this.hidden = [storageFolder, this.vault.configDir || ".obsidian"];
   }
 
   async readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote> {

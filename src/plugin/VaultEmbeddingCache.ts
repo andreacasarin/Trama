@@ -7,6 +7,7 @@ import {
 } from "@/index/note-sqlite/protocol";
 import type { SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import { DEFAULT_STORAGE_FOLDER, storagePaths } from "@/settings/StorageFolder";
 
 type SharedShardCache = Pick<
   SqliteEmbeddingCache,
@@ -18,7 +19,6 @@ type SharedShardCache = Pick<
   | "markDocumentShardPublished"
 >;
 
-const ROOT = "Trama/embedding-cache-v2";
 const PROFILE_FOLDER = /^[0-9a-f]{64}$/;
 const MANAGED_ARTIFACT =
   /^(?:[0-9a-f]{64}\.sqlite3|\.tmp-[0-9a-f]{64}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
@@ -33,15 +33,21 @@ export class VaultEmbeddingCache {
     >,
     private readonly cache: SharedShardCache,
     private readonly dimensions: number,
-    private readonly consoleDebug?: ConsoleDebug
+    private readonly consoleDebug?: ConsoleDebug,
+    storageFolder = DEFAULT_STORAGE_FOLDER
   ) {
-    this.folder = `${ROOT}/${cache.profileFingerprint}`;
+    this.root = storagePaths(storageFolder).embeddings;
+    this.folder = `${this.root}/${cache.profileFingerprint}`;
   }
+
+  private readonly root: string;
 
   static async clearManagedFiles(
     adapter: Pick<DataAdapter, "exists" | "list" | "remove" | "writeBinary">,
-    signal: AbortSignal
+    signal: AbortSignal,
+    storageFolder = DEFAULT_STORAGE_FOLDER
   ): Promise<number> {
+    const ROOT = storagePaths(storageFolder).embeddings;
     checkAbort(signal);
     const rootExists = await adapter.exists(ROOT);
     checkAbort(signal);
@@ -188,9 +194,7 @@ export class VaultEmbeddingCache {
   }
 
   private async ensureFolder(): Promise<void> {
-    const root = "Trama";
-    const shared = `${root}/embedding-cache-v2`;
-    for (const path of [root, shared, this.folder]) {
+    for (const path of [this.root, this.folder]) {
       if (!(await this.adapter.exists(path))) await this.adapter.mkdir(path);
     }
   }
