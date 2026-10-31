@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { unzipSync, zipSync } from "fflate";
@@ -59,17 +59,37 @@ describe("release package", () => {
 
     // A fresh build from the same source must verify an already-uploaded asset.
     const identity = readFileSync(join(root, ".cache/runtime-build.json"), "utf8");
-    execFileSync(process.execPath, ["scripts/generate-build-identity.mjs"], { cwd: root });
-    expect(readFileSync(join(root, ".cache/runtime-build.json"), "utf8")).toBe(identity);
+    // Rebuild in isolation: other suites install and verify the current build.
+    const rebuildRoot = join(temporaryDirectory, "rebuild");
+    mkdirSync(rebuildRoot);
+    for (const name of [
+      "src",
+      "scripts",
+      "vendor",
+      "LICENSE",
+      "package.json",
+      "package-lock.json",
+      "manifest.json",
+      "styles.css",
+      "esbuild.config.mjs",
+      "tsconfig.json",
+      "sqlite3.mjs",
+      "sqlite3.wasm",
+      ".cache/runtime-build.json",
+    ])
+      cpSync(join(root, name), join(rebuildRoot, name), { recursive: true });
+    cpSync(join(root, "node_modules"), join(rebuildRoot, "node_modules"), { recursive: true });
+    execFileSync(process.execPath, ["scripts/generate-build-identity.mjs"], { cwd: rebuildRoot });
+    expect(readFileSync(join(rebuildRoot, ".cache/runtime-build.json"), "utf8")).toBe(identity);
     execFileSync(process.execPath, ["esbuild.config.mjs", "production"], {
-      cwd: root,
+      cwd: rebuildRoot,
       stdio: "pipe",
     });
 
     execFileSync(
       process.execPath,
       ["scripts/package-release.mjs", "--verify", "--version", version, "--archive", archive],
-      { cwd: root }
+      { cwd: rebuildRoot }
     );
   }, 60_000);
   it.each(["unexpected file", "corrupt main.js"])("rejects a release archive with %s", (kind) => {
