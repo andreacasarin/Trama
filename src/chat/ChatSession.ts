@@ -497,7 +497,7 @@ export class ChatSession {
         "Be concise and result-first unless the request or selected skill specifies otherwise.",
         "Ask a clarification only when ambiguity would materially change the outcome.",
         "Follow the selected skill's explicit source, depth, and retrieval limits; linked skills do not activate automatically.",
-        "Tool availability is not permission to expand the source scope. If search is prohibited, do not call vault_search. If sources are restricted to supplied notes or links, do not discover unrelated sources or follow additional link levels.",
+        "Tool availability is not permission to expand the source scope. If search is prohibited, do not call vault_search. If sources are restricted to supplied notes or links, do not discover unrelated sources or follow links beyond the permitted depth.",
         "Use read_notes for known paths and supplied titles or links; no preliminary search is needed. Use discover_links only for permitted outgoing links. Use vault_search only to discover unknown sources within the allowed scope.",
         "Read required sources with tools before answering; discovering a link or search hit does not count as reading.",
         "Prefer canonical targetPath values from discover_links and batch known paths with read_notes.",

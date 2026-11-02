@@ -368,4 +368,58 @@ describe("native read-only vault tools", () => {
     await expect(search.invoke({ query: "query", limit: 2.5 })).rejects.toThrow();
     await expect(search.invoke({ query: "query", unexpected: true })).rejects.toThrow();
   });
+
+  it.each([
+    {
+      reason: "success envelope",
+      initialLimit: 10,
+      paddedIndex: 9,
+      targetLength: 12_001,
+      returned: 9,
+    },
+    {
+      reason: "final read count width",
+      initialLimit: 9,
+      paddedIndex: 8,
+      targetLength: 12_000,
+      returned: 8,
+    },
+  ])(
+    "includes $reason in the search response character budget",
+    async ({ initialLimit, paddedIndex, targetLength, returned }) => {
+      let padding = "";
+      const retrieval = new VaultRetrieval(
+        async () => ({
+          hits: Array.from({ length: 10 }, (_, index) => ({
+            path: `Note-${index}${index === paddedIndex ? padding : ""}.md`,
+            score: 10 - index,
+          })),
+          mode: "lexical",
+          degraded: false,
+        }),
+        undefined,
+        undefined,
+        async (path) => ({ path, content: "x".repeat(1000) })
+      );
+      const search = createVaultTools(
+        {
+          readNote: async (path) => ({ path, content: "note" }),
+          discoverLinks: async () => [],
+          resolveLink: async () => null,
+        },
+        retrieval
+      ).find(({ name }) => name === "vault_search")!;
+      const initial = await search.invoke({ query: "query", limit: initialLimit });
+      expect(JSON.parse(initial).data.returnedCount).toBe(initialLimit);
+
+      // Position an excerpt at the boundary before further reads change the metadata.
+      padding = "x".repeat(targetLength - initial.length);
+      const bounded = await search.invoke({ query: "query" });
+      expect(bounded.length).toBeLessThanOrEqual(12_000);
+      expect(JSON.parse(bounded)).toMatchObject({
+        ok: true,
+        data: { returnedCount: returned, omittedCount: 10 - returned },
+      });
+    }
+  );
 });

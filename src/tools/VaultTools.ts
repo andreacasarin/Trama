@@ -271,14 +271,15 @@ export function createVaultTools(
             const data = {
               results: nextResults,
               candidateCount: hits.length,
-              hydratedCount,
+              // Later reads can increase this count even if their excerpts do not fit.
+              hydratedCount: hits.length,
               returnedCount: nextResults.length,
               omittedCount: hits.length - nextResults.length,
               mode: status.mode,
               degraded: status.degraded,
               degradationReason: status.degradationReason,
             };
-            if (JSON.stringify(data).length > SEARCH_OUTPUT_CHARS) break;
+            if (JSON.stringify({ ok: true, data }).length > SEARCH_OUTPUT_CHARS) break;
             results.push(candidate);
           }
           return {
