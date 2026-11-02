@@ -7,6 +7,7 @@ import { VoceComposer, VoceInlineSuggest } from "@/ui/voce/VoceComposer";
 /** The small Obsidian element surface used by transcript rendering. */
 class ElementStub {
   children: ElementStub[] = [];
+  parent?: ElementStub;
   classes = new Set<string>();
   attributes: Record<string, string> = {};
   textContent = "";
@@ -38,11 +39,25 @@ class ElementStub {
     child.classes = new Set(classes);
     child.attributes = options.attr ?? {};
     child.textContent = options.text ?? "";
+    child.parent = this;
     this.children.push(child);
     return child;
   }
 
+  appendChild(child: ElementStub): void {
+    child.remove();
+    child.parent = this;
+    this.children.push(child);
+  }
+
+  remove(): void {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = undefined;
+  }
+
   empty(): void {
+    for (const child of this.children) child.parent = undefined;
     this.children = [];
   }
 
@@ -179,6 +194,45 @@ describe("Voce transcript", () => {
     expect(collapsed(1)).toBe(false);
     render([response("first"), response("latest")]);
     expect(collapsed(1)).toBe(false);
+  });
+
+  it("keeps the working indicator through reasoning and answer streaming, then removes it", () => {
+    const { render, row } = setup();
+    const working = { ...response("working", "working"), content: "" };
+    render([working]);
+    expect(row(0).find("trama-voce__activity")).toBeDefined();
+
+    render([{ ...working, reasoningSummary: "Checking the request" }]);
+    expect(row(0).find("trama-voce__reasoning-summary")).toBeDefined();
+    let bubble = row(0).firstElementChild!;
+    let activity = bubble.find("trama-voce__activity")!;
+    expect(bubble.children.at(-1)).toBe(activity);
+
+    const sourced = {
+      ...working,
+      reasoningSummary: "Checking the request",
+      sources: [{ path: "Notes/Source.md", startLine: 3, endLine: 8 }],
+    };
+    render([sourced]);
+    bubble = row(0).firstElementChild!;
+    activity = bubble.find("trama-voce__activity")!;
+    expect(bubble.find("trama-voce__source-disclosure")).toBeDefined();
+    expect(bubble.children.at(-1)).toBe(activity);
+
+    render([{ ...sourced, content: "Partial answer" }]);
+    bubble = row(0).firstElementChild!;
+    const message = bubble.find("trama-voce__message")!;
+    activity = bubble.find("trama-voce__activity")!;
+    expect(bubble.classes.has("trama-voce__bubble--assistant")).toBe(true);
+    expect(bubble.children.indexOf(activity)).toBeGreaterThan(bubble.children.indexOf(message));
+    expect(activity.children).toHaveLength(3);
+    render([{ ...sourced, content: "Partial answer", status: "complete" }]);
+    expect(row(0).find("trama-voce__activity")).toBeUndefined();
+
+    render([{ ...working, id: "stopped", status: "stopped" }]);
+    expect(row(0).find("trama-voce__activity")).toBeUndefined();
+    render([{ ...working, id: "failed", status: "failed" }]);
+    expect(row(0).find("trama-voce__activity")).toBeUndefined();
   });
 
   it("keeps manual expansion choices when another response arrives", () => {

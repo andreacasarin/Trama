@@ -37,6 +37,7 @@ interface RenderedTurn {
   turn?: ChatState["turns"][number];
   reasoning?: HTMLDivElement;
   compaction?: HTMLDivElement;
+  activity?: HTMLDivElement;
 }
 
 interface AssistantTurnAction {
@@ -608,6 +609,7 @@ export class VoceView extends ItemView {
     rendered.turn = turn;
     rendered.reasoning = undefined;
     rendered.compaction = undefined;
+    rendered.activity = undefined;
     rendered.row.empty();
     const bubble = rendered.row.createDiv({
       cls: [
@@ -647,8 +649,6 @@ export class VoceView extends ItemView {
         this.restoreTranscriptPosition();
       }
     );
-    if (turn.role === "assistant" && turn.status === "working" && !turn.content)
-      this.renderActivity(bubble);
     if (isCollapsible) this.renderExpandAction(bubble, turn.id, isExpanded, message);
     if (turn.role === "assistant" && turn.sources.length)
       this.renderSources(bubble, turn as AssistantConversationTurn);
@@ -672,6 +672,8 @@ export class VoceView extends ItemView {
     )
       this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
     if (turn.role === "user") this.renderUserActions(bubble, turn);
+    if (turn.role === "assistant" && turn.status === "working")
+      rendered.activity = this.renderActivity(bubble);
   }
 
   private updateTurnIndicators(
@@ -718,6 +720,10 @@ export class VoceView extends ItemView {
     } else {
       rendered.compaction?.remove();
       rendered.compaction = undefined;
+    }
+    if (rendered.activity) {
+      rendered.activity.remove();
+      parent.appendChild(rendered.activity);
     }
   }
 
@@ -777,13 +783,14 @@ export class VoceView extends ItemView {
     this.desiredTranscriptOffset = scrollTop;
   }
 
-  private renderActivity(parent: HTMLDivElement): void {
+  private renderActivity(parent: HTMLDivElement): HTMLDivElement {
     const activity = parent.createDiv({
       cls: "trama-voce__activity",
       attr: { role: "status", "aria-label": "Preparing response", "aria-live": "polite" },
     });
     for (let index = 0; index < 3; index++)
       activity.createEl("span", { cls: "trama-voce__activity-dot" });
+    return activity;
   }
 
   private turnSourcePath(turn: ChatState["turns"][number]): string {
