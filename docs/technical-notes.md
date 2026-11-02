@@ -128,6 +128,41 @@ actions; eligible automatic indexing can call the embedding provider on cache
 misses. Trama requests disabled response storage from the provider; the server's
 own data handling still depends on that provider.
 
+### Chat tool contract
+
+The chat endpoint must support `/responses`, streamed function-call arguments,
+and function-call outputs. Support for `/chat/completions` alone is insufficient.
+Trama sends native JSON Schema function definitions through LangChain, with
+`strict: false` for servers without strict decoding. Optional arguments remain
+optional, while local validation rejects unknown fields and invalid arguments.
+The server is responsible for applying the loaded model's tool-aware chat
+template and parsing its output into API function calls; Trama does not insert
+model-specific tool markup into prompts.
+
+The tools separate known-note reads (`read_notes`), outgoing-link discovery
+(`discover_links`), and vault-wide discovery (`vault_search`). Their descriptions
+and the system prompt specify when each applies and defer to the current request
+and skill's source restrictions. Known paths and supplied links need no preliminary
+search. These restrictions guide model behavior; they are not runtime access
+controls derived from skill prose.
+
+Executed vault tools return JSON strings: `{ "ok": true, "data": ... }` or
+`{ "ok": false, "error": { "code": ..., "message": ..., "retryable": ... } }`.
+A successful `read_notes` batch can contain per-note errors in `data.results`;
+callers must inspect each entry. Provenance artifacts remain local. Every tool
+result is paired with its function call ID, including failures and parallel
+calls. Link discovery does not read target notes, and search excerpts do not
+count as full-note reads. Invalid arguments and unknown tools are rejected by
+the native agent before the vault operation and returned as error tool messages
+so the model can correct its call.
+
+Provider-boundary regression tests check serialized schemas, optional arguments,
+fragmented streaming arguments, call/result pairing across parallel rounds,
+Unicode links, partial and complete tool failures, and recovery from invalid
+arguments and unknown tools. These tests use synthetic
+responses; they do not establish instruction-following quality for a particular
+model or verify a server's chat template.
+
 Settings are grouped under Voce (chat), Filo (shared embeddings and exclusions),
 and Maintenance (Update, Rebuild, Stop, Clear, and Console debugging). Each model
 selector has a Discover control; selecting a model saves it. Reasoning effort

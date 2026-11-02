@@ -841,7 +841,20 @@ describe("Voce native agent session", () => {
         ...args: Parameters<FakeToolCallingModel["_generate"]>
       ): ReturnType<FakeToolCallingModel["_generate"]> {
         inputs.push([...args[0]]);
-        return super._generate(...args);
+        // The stock fake echoes the entire history, including system instructions,
+        // exponentially inflating later turns. This test concerns cancellation.
+        return super._generate(...args).then((result) => ({
+          ...result,
+          generations: result.generations.map((generation) => ({
+            ...generation,
+            text: "Recorded response",
+            message: new AIMessage({
+              content: "Recorded response",
+              id: generation.message.id,
+              tool_calls: (generation.message as AIMessage).tool_calls,
+            }),
+          })),
+        }));
       }
     }
     const model = new RecordingModel({
@@ -892,7 +905,9 @@ describe("Voce native agent session", () => {
 
     releasePendingRead({ path: "Pending.md", content: "body Pending.md" });
     await cancelled;
-    await session.send({ content: "after late completion", attachmentPaths: [] });
+    const afterLate = await session.send({ content: "after late completion", attachmentPaths: [] });
+    expect(afterLate.error).toBeUndefined();
+    expect(afterLate.turns.at(-1)).toMatchObject({ status: "complete" });
     const afterLateInput = inputs.at(-1)!;
     expect(afterLateInput.map((message) => String(message.content)).join("\n")).toContain(
       "after cancellation"

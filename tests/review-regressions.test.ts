@@ -150,7 +150,8 @@ describe("release review regressions", () => {
     const result = JSON.parse(
       await tool.invoke({ paths: ["Target.md", "[[Target]]"], sourcePath: "Folder/Source.md" })
     );
-    expect(result.results.map((entry: any) => entry.note.path)).toEqual([
+    expect(result.ok).toBe(true);
+    expect(result.data.results.map((entry: any) => entry.note.path)).toEqual([
       "Target.md",
       "Folder/Target.md",
     ]);
