@@ -205,6 +205,21 @@ describe("Voce transcript", () => {
     expect(copy).toHaveBeenCalledWith(turn.content);
   });
 
+  it("offers Copy for stopped partial responses but not empty or working responses", () => {
+    const { render, row, copy } = setup();
+    const stopped = response("stopped", "stopped");
+    render([stopped]);
+    const button = row(0).find("trama-voce__message-action")!;
+    expect(button.attributes["aria-label"]).toBe("Copy response");
+    button.listeners.get("click")!();
+    expect(copy).toHaveBeenCalledWith(stopped.content);
+
+    render([{ ...stopped, id: "empty", content: "" }]);
+    expect(row(0).find("trama-voce__message-action")).toBeUndefined();
+    render([response("working", "working")]);
+    expect(row(0).find("trama-voce__message-action")).toBeUndefined();
+  });
+
   it("offers Edit on user messages and restores the original prompt and attachments", () => {
     const { view, session, render, row, copy } = setup();
     const turn: ConversationTurn = {

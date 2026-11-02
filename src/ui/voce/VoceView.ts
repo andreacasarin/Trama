@@ -666,7 +666,10 @@ export class VoceView extends ItemView {
         turn.skill.path
       );
     }
-    if (turn.role === "assistant" && turn.status === "complete")
+    if (
+      turn.role === "assistant" &&
+      (turn.status === "complete" || (turn.status === "stopped" && turn.content.length > 0))
+    )
       this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
     if (turn.role === "user") this.renderUserActions(bubble, turn);
   }
