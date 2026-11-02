@@ -721,10 +721,8 @@ export class VoceView extends ItemView {
       rendered.compaction?.remove();
       rendered.compaction = undefined;
     }
-    if (rendered.activity) {
-      rendered.activity.remove();
+    if (rendered.activity && parent.lastElementChild !== rendered.activity)
       parent.appendChild(rendered.activity);
-    }
   }
 
   private turnContentSignature(turn: ChatState["turns"][number]): string {
@@ -786,7 +784,7 @@ export class VoceView extends ItemView {
   private renderActivity(parent: HTMLDivElement): HTMLDivElement {
     const activity = parent.createDiv({
       cls: "trama-voce__activity",
-      attr: { role: "status", "aria-label": "Preparing response", "aria-live": "polite" },
+      attr: { role: "status", "aria-label": "Response in progress", "aria-live": "polite" },
     });
     for (let index = 0; index < 3; index++)
       activity.createEl("span", { cls: "trama-voce__activity-dot" });

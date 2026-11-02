@@ -25,6 +25,10 @@ class ElementStub {
     return this.children[0];
   }
 
+  get lastElementChild(): ElementStub | undefined {
+    return this.children.at(-1);
+  }
+
   createDiv(options?: any): ElementStub {
     return this.createEl("div", options);
   }
@@ -68,6 +72,10 @@ class ElementStub {
 
   setAttribute(name: string, value: string): void {
     this.attributes[name] = value;
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes[name] ?? null;
   }
 
   addEventListener(name: string, listener: () => void): void {
@@ -206,6 +214,19 @@ describe("Voce transcript", () => {
     expect(row(0).find("trama-voce__reasoning-summary")).toBeDefined();
     let bubble = row(0).firstElementChild!;
     let activity = bubble.find("trama-voce__activity")!;
+    expect(bubble.children.at(-1)).toBe(activity);
+
+    const removeActivity = vi.spyOn(activity, "remove");
+    const appendActivity = vi.spyOn(bubble, "appendChild");
+    render([{ ...working, reasoningSummary: "Checking more of the request" }]);
+    expect(bubble.find("trama-voce__activity")).toBe(activity);
+    expect(removeActivity).not.toHaveBeenCalled();
+    expect(appendActivity).not.toHaveBeenCalled();
+
+    render([
+      { ...working, reasoningSummary: "Checking more of the request", compactionStatus: "running" },
+    ]);
+    expect(bubble.find("trama-voce__compaction-status")).toBeDefined();
     expect(bubble.children.at(-1)).toBe(activity);
 
     const sourced = {
