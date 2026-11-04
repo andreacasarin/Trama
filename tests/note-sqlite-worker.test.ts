@@ -1,9 +1,12 @@
 import { MarkdownTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import type { SqliteConnection } from "@/index/note-sqlite/protocol";
+import type {
+  NoteStoreInitTimings,
+  SqliteConnection,
+} from "@/index/note-sqlite/protocol";
 import { attachNoteStoreWorker } from "@/index/note-sqlite/worker";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 
@@ -17,6 +20,7 @@ type Response = {
 class QueuedWorkerHarness implements NoteStoreWorkerLike {
   private readonly listeners = new Map<string, Set<(event: any) => void>>();
   readonly responses: Response[] = [];
+  readonly requests: any[] = [];
   terminated = false;
   closed = false;
   private readonly scope: {
@@ -26,8 +30,9 @@ class QueuedWorkerHarness implements NoteStoreWorkerLike {
   };
 
   constructor(
-    open: (namespace: string) => Promise<{
+    open: (namespace: string, diagnostics: boolean) => Promise<{
       database: Pick<NoteSqliteDatabase, "call">;
+      timings?: NoteStoreInitTimings;
       close(): void;
     }>
   ) {
@@ -57,6 +62,7 @@ class QueuedWorkerHarness implements NoteStoreWorkerLike {
   }
 
   postMessage(message: unknown): void {
+    this.requests.push(message);
     this.scope.onmessage?.({ data: message } as MessageEvent<any>);
   }
 
@@ -85,6 +91,66 @@ const entry = (path: string, markdown: string) => ({
 });
 
 describe("SQLite note worker transport", () => {
+  it("returns diagnostic initialization timings once when opted in", async () => {
+    const timings: NoteStoreInitTimings = {
+      "wasm-load-compile": 1,
+      "wasm-load": 1,
+      "wasm-compile": 0,
+      "sqlite-bootstrap": 2,
+      "opfs-install": 3,
+      "opfs-reserve": 4,
+      "db-open": 5,
+      "schema-setup": 6,
+    };
+    const opened: Array<{ namespace: string; diagnostics: boolean }> = [];
+    const database = { call: vi.fn() } as unknown as Pick<NoteSqliteDatabase, "call">;
+    const worker = new QueuedWorkerHarness(async (namespace, diagnostics) => {
+      opened.push({ namespace, diagnostics });
+      return { database, timings, close: vi.fn() };
+    });
+    const client = new NoteStoreClient(worker, namespaceA, true);
+
+    expect(await client.initialize()).toEqual(timings);
+    expect(await client.initialize()).toBeUndefined();
+    expect(worker.requests[0]).toEqual({
+      id: 1,
+      method: "init",
+      payload: { namespace: namespaceA, diagnostics: true },
+    });
+    expect(opened).toEqual([{ namespace: namespaceA, diagnostics: true }]);
+    expect(await worker.response(1)).toMatchObject({ ok: true, result: { timings } });
+
+    worker.postMessage({
+      id: 99,
+      method: "init",
+      payload: { namespace: namespaceA, diagnostics: true },
+    });
+    expect(await worker.response(99)).toMatchObject({ ok: true, result: undefined });
+    expect(opened).toHaveLength(1);
+    await client.close();
+  });
+
+  it("omits diagnostics and never reads a clock when worker init diagnostics are off", async () => {
+    const now = vi.spyOn(performance, "now");
+    const timings: NoteStoreInitTimings = { "wasm-load-compile": 1 };
+    const database = { call: vi.fn() } as unknown as Pick<NoteSqliteDatabase, "call">;
+    const worker = new QueuedWorkerHarness(async () => ({ database, timings, close: vi.fn() }));
+    const client = new NoteStoreClient(worker, namespaceA);
+    try {
+      expect(await client.initialize()).toBeUndefined();
+      expect(worker.requests[0]).toEqual({
+        id: 1,
+        method: "init",
+        payload: { namespace: namespaceA },
+      });
+      expect(await worker.response(1)).toMatchObject({ ok: true, result: undefined });
+      expect(now).not.toHaveBeenCalled();
+      await client.close();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("rejects initialization on a worker module error and closes the failed candidate", async () => {
     const listeners = new Map<string, Set<(event: any) => void>>();
     let terminated = false;

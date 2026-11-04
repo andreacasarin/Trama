@@ -1,5 +1,11 @@
 import { NoteSqliteDatabase, type SqliteEmbeddingShardPool } from "./database";
-import type { NoteStoreInit, NoteStoreMethod, NoteStoreRpc, SqliteConnection } from "./protocol";
+import type {
+  NoteStoreInit,
+  NoteStoreInitTimings,
+  NoteStoreMethod,
+  NoteStoreRpc,
+  SqliteConnection,
+} from "./protocol";
 
 type Sqlite = {
   installOpfsSAHPoolVfs(options: {
@@ -25,8 +31,11 @@ type Init = (options: {
 
 interface OpenDatabase {
   readonly database: Pick<NoteSqliteDatabase, "call">;
+  readonly timings?: NoteStoreInitTimings;
   close(): void;
 }
+
+type OpenDatabaseFactory = (namespace: string, diagnostics: boolean) => Promise<OpenDatabase>;
 
 interface WorkerScope {
   onmessage: ((event: MessageEvent<WorkerRequest>) => void) | null;
@@ -40,15 +49,35 @@ interface WorkerRequest {
   readonly payload: unknown;
 }
 
-async function open(namespace: string): Promise<OpenDatabase> {
-  const { default: bytes } = await import("../../../sqlite3.wasm");
-  const wasm = await WebAssembly.compile(bytes);
+async function open(namespace: string, diagnostics: boolean): Promise<OpenDatabase> {
+  const timings: NoteStoreInitTimings = {};
+  let startedAt = diagnostics ? performance.now() : undefined;
+  // esbuild lowers this literal require to a lazy bundled initializer without a namespace wrapper.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const bytes = require("../../../sqlite3.wasm") as Uint8Array<ArrayBuffer>;
+  const loadedAt = startedAt !== undefined ? performance.now() : undefined;
   (globalThis as any).sqlite3ApiConfig = {
     disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
   };
+  const compileStarted = diagnostics ? performance.now() : undefined;
+  const compiling = WebAssembly.compile(bytes).then((module) => {
+    if (startedAt !== undefined && loadedAt !== undefined && compileStarted !== undefined) {
+      const compiledAt = performance.now();
+      timings["wasm-load-compile"] = Math.round(compiledAt - startedAt);
+      timings["wasm-load"] = Math.round(loadedAt - startedAt);
+      timings["wasm-compile"] = Math.round(compiledAt - compileStarted);
+    }
+    return module;
+  });
+  const glueStarted = diagnostics ? performance.now() : undefined;
   // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
-  const { default: sqliteInit } = await import("../../../sqlite3.mjs");
+  const loadingGlue: Promise<{ default: unknown }> = import("../../../sqlite3.mjs").then((module) => {
+    if (glueStarted !== undefined) timings["sqlite-bootstrap"] = performance.now() - glueStarted;
+    return module;
+  });
+  const [wasm, { default: sqliteInit }] = await Promise.all([compiling, loadingGlue]);
   const init = sqliteInit as Init;
+  const initStarted = diagnostics ? performance.now() : undefined;
   const sqlite = await init({
     instantiateWasm(imports, onSuccess) {
       const instance = new WebAssembly.Instance(wasm, imports);
@@ -56,14 +85,30 @@ async function open(namespace: string): Promise<OpenDatabase> {
       return instance.exports;
     },
   });
+  if (initStarted !== undefined) {
+    timings["sqlite-bootstrap"] = Math.round((timings["sqlite-bootstrap"] ?? 0) + performance.now() - initStarted);
+    startedAt = performance.now();
+  }
   const directory = `trama-note-v2-${namespace}`;
   const pool = await sqlite.installOpfsSAHPoolVfs({
     name: directory,
     directory,
     initialCapacity: 8,
   });
+  if (startedAt !== undefined) {
+    timings["opfs-install"] = Math.round(performance.now() - startedAt);
+    startedAt = performance.now();
+  }
   await pool.reserveMinimumCapacity(8);
+  if (startedAt !== undefined) {
+    timings["opfs-reserve"] = Math.round(performance.now() - startedAt);
+    startedAt = performance.now();
+  }
   const connection = new pool.OpfsSAHPoolDb("/notes.sqlite3", "c");
+  if (startedAt !== undefined) {
+    timings["db-open"] = Math.round(performance.now() - startedAt);
+    startedAt = performance.now();
+  }
   const shardPool: SqliteEmbeddingShardPool = {
     vfsName: pool.vfsName,
     mainPath: "/notes.sqlite3",
@@ -72,8 +117,11 @@ async function open(namespace: string): Promise<OpenDatabase> {
     importDb: (path, bytes) => pool.importDb(path, bytes),
     unlink: (path) => pool.unlink(path),
   };
+  const database = new NoteSqliteDatabase(connection, shardPool);
+  if (startedAt !== undefined) timings["schema-setup"] = Math.round(performance.now() - startedAt);
   return {
-    database: new NoteSqliteDatabase(connection, shardPool),
+    database,
+    ...(diagnostics ? { timings } : {}),
     close() {
       try {
         connection.close();
@@ -92,7 +140,7 @@ function serializedError(error: unknown): { name: string; message: string } {
 
 export function attachNoteStoreWorker(
   scope: WorkerScope,
-  openDatabase: (namespace: string) => Promise<OpenDatabase>
+  openDatabase: OpenDatabaseFactory
 ): void {
   const cancelled = new Map<number, AbortController>();
   let database: OpenDatabase | undefined;
@@ -137,22 +185,30 @@ export function attachNoteStoreWorker(
         }
         try {
           if (method === "init") {
-            const requested = (payload as NoteStoreInit | undefined)?.namespace;
+            const initPayload = payload as NoteStoreInit | undefined;
+            const requested = initPayload?.namespace;
+            const diagnostics = initPayload?.diagnostics === true;
             if (typeof requested !== "string" || !/^[0-9a-f]{64}$/.test(requested))
               throw new TypeError("Invalid vault storage namespace");
             if (closed) throw new Error("Note store worker is closed");
             if (namespace && requested !== namespace)
               throw new Error("Note store worker cannot change vault namespace");
+            let timings: NoteStoreInitTimings | undefined;
             if (!database) {
               namespace ??= requested;
-              const opened = await openDatabase(requested);
+              const opened = await openDatabase(requested, diagnostics);
               if (closed) {
                 opened.close();
                 throw new Error("Note store worker is closed");
               }
               database = opened;
+              if (diagnostics) timings = opened.timings;
             }
-            scope.postMessage({ id, ok: true, result: undefined });
+            scope.postMessage({
+              id,
+              ok: true,
+              result: timings ? { timings } : undefined,
+            });
             return;
           }
           if (closed) throw new Error("Note store worker is closed");

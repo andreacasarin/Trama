@@ -122,8 +122,12 @@ describe("release review regressions", () => {
     const app = { workspace: { getLeavesOfType: () => leaves } };
     const firstLeaf = { app } as any;
     const secondLeaf = { app } as any;
-    const first = new VoceView(firstLeaf, session);
-    const second = new VoceView(secondLeaf, session);
+    const first = new VoceView(firstLeaf, () => session);
+    const second = new VoceView(secondLeaf, () => session);
+    (first as any).currentSession = session;
+    (second as any).currentSession = session;
+    (first as any).isViewOpen = true;
+    (second as any).isViewOpen = true;
     leaves.push({ view: second });
     await first.onClose();
     expect(session.getState().turns.length).toBeGreaterThan(0);

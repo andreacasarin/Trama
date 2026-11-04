@@ -153,6 +153,26 @@ export type NoteStoreMethod = keyof NoteStoreRpc;
 
 export interface NoteStoreInit {
   readonly namespace: string;
+  readonly diagnostics?: boolean;
+}
+
+export const NOTE_STORE_INIT_PHASES = [
+  "wasm-load-compile",
+  "wasm-load",
+  "wasm-compile",
+  "sqlite-bootstrap",
+  "opfs-install",
+  "opfs-reserve",
+  "db-open",
+  "schema-setup",
+] as const;
+
+export type NoteStoreInitPhase = (typeof NOTE_STORE_INIT_PHASES)[number];
+
+export type NoteStoreInitTimings = Partial<Record<NoteStoreInitPhase, number>>;
+
+export interface NoteStoreInitResult {
+  readonly timings?: NoteStoreInitTimings;
 }
 
 export type NoteStoreCall = <M extends NoteStoreMethod>(

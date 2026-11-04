@@ -1,4 +1,11 @@
-import type { NoteStoreCall, NoteStoreInit, NoteStoreMethod, NoteStoreRpc } from "./protocol";
+import type {
+  NoteStoreCall,
+  NoteStoreInit,
+  NoteStoreInitResult,
+  NoteStoreInitTimings,
+  NoteStoreMethod,
+  NoteStoreRpc,
+} from "./protocol";
 
 export interface NoteStoreWorkerLike {
   postMessage(message: unknown): void;
@@ -43,6 +50,7 @@ export class NoteStoreClient {
   private closing = false;
   private closed = false;
   private closePromise?: Promise<void>;
+  private initTimingsConsumed = false;
   private readonly ready: Promise<unknown>;
   private readonly onMessage = (event: MessageEvent) => {
     const message = event.data as {
@@ -76,16 +84,22 @@ export class NoteStoreClient {
 
   constructor(
     private readonly worker: NoteStoreWorkerLike,
-    namespace: string
+    namespace: string,
+    diagnostics = false
   ) {
     worker.addEventListener("message", this.onMessage);
     worker.addEventListener("error", this.onError);
     worker.addEventListener("messageerror", this.onError);
-    this.ready = this.send("init", { namespace });
+    const init: NoteStoreInit = diagnostics ? { namespace, diagnostics: true } : { namespace };
+    this.ready = this.send("init", init);
   }
 
-  initialize(): Promise<void> {
-    return this.ready.then(() => undefined);
+  initialize(): Promise<NoteStoreInitTimings | undefined> {
+    return this.ready.then((result) => {
+      if (this.initTimingsConsumed) return undefined;
+      this.initTimingsConsumed = true;
+      return (result as NoteStoreInitResult | undefined)?.timings;
+    });
   }
 
   readonly call: NoteStoreCall = async (method, payload, signal) => {

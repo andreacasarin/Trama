@@ -3,6 +3,10 @@ export type ConsoleDebugLevel = "info" | "warn" | "error";
 export class ConsoleDebug {
   constructor(private readonly enabled: () => boolean) {}
 
+  isEnabled(): boolean {
+    return this.enabled();
+  }
+
   info(label: string, fields?: Record<string, string | number | boolean>): void {
     this.write("info", label, undefined, fields);
   }

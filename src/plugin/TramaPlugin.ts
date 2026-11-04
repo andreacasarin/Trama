@@ -12,6 +12,7 @@ import {
 } from "@/index/SqliteNoteVectorStore";
 import { VaultRetrieval } from "@/index/VaultRetrieval";
 import { NoteStoreClient } from "@/index/note-sqlite/client";
+import { NOTE_STORE_INIT_PHASES, type NoteStoreInitTimings } from "@/index/note-sqlite/protocol";
 import {
   createLocalChatModel,
   createLocalEmbeddings,
@@ -76,10 +77,12 @@ export class TramaPlugin extends Plugin {
 
   onload(): Promise<void> {
     return this.enqueue(async () => {
+      const startupStartedAt = performance.now();
       this.settingsStore.load(
         await this.loadData().catch(() => undefined),
         (this.app as any)?.vault?.configDir || ".obsidian"
       );
+      this.logStartupElapsed("settings", startupStartedAt);
       if (this.disposed) return;
       const app = this.app as any;
       if (!app?.vault || !app.workspace || !app.metadataCache) return;
@@ -97,13 +100,16 @@ export class TramaPlugin extends Plugin {
         })
       );
       try {
+        const servicesStartedAt = this.startupTimer();
         await this.configureServices(app);
+        this.logStartupElapsed("services", servicesStartedAt);
         if (this.disposed) return;
+        const uiStartedAt = this.startupTimer();
         const ui = await loadPluginUi();
         if (this.disposed) return;
         this.ui = ui;
         this.settingsTab = registerPluginUi(this, app, ui, {
-          session: () => this.session!,
+          session: () => this.getOrCreateSession(),
           status: this.status!,
           retrieval: () => this.retrieval!,
           noteCatalog: this.catalog,
@@ -112,7 +118,12 @@ export class TramaPlugin extends Plugin {
           readSkill: (path, signal) => this.readonlyVault!.readNote(path, signal),
           consoleDebug: this.consoleDebug,
         });
-        app.workspace.onLayoutReady?.(() => this.startAutomaticIndexing(app));
+        this.logStartupElapsed("ui", uiStartedAt);
+        app.workspace.onLayoutReady?.(() => {
+          this.logStartupElapsed("layout-ready", startupStartedAt);
+          this.startAutomaticIndexing(app);
+        });
+        this.logStartupElapsed("onload", startupStartedAt);
       } catch (error) {
         this.consoleDebug.error("Plugin initialization failed", error);
         if (!this.disposed)
@@ -125,7 +136,6 @@ export class TramaPlugin extends Plugin {
   private async configureServices(app: any): Promise<void> {
     if (this.disposed) return;
     const settings = this.getSettings();
-    const wasConfigured = Boolean(this.client);
     const previousRun = this.indexRun;
     const previousClear = this.clearRun;
     const previousClient = this.client;
@@ -143,22 +153,30 @@ export class TramaPlugin extends Plugin {
     if (previousClear) await previousClear.promise;
     await previousClient?.close();
     if (this.disposed) return;
+    const namespaceStartedAt = this.startupTimer();
     const namespace = await this.sqliteRuntime.resolveNamespace(app, settings.storageFolder);
+    this.logStartupElapsed("namespace", namespaceStartedAt);
     if (this.disposed) return;
     const worker = this.sqliteRuntime.createWorker();
-    const candidate = new NoteStoreClient(worker, namespace);
+    const candidate = new NoteStoreClient(worker, namespace, settings.consoleDebug);
+    const workerStartedAt = this.startupTimer();
     try {
-      await candidate.initialize();
+      const timings = await candidate.initialize();
+      this.logWorkerStartup(timings);
     } catch (error) {
       await candidate.close();
       throw error;
     }
+    this.logStartupElapsed("worker-ready", workerStartedAt);
     if (this.disposed) {
       await candidate.close();
       return;
     }
     this.client = candidate;
+    const indexStartedAt = this.startupTimer();
     this.indexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
+    this.logStartupElapsed("index-presence", indexStartedAt);
+    const compositionStartedAt = this.startupTimer();
     const profile = {
       endpoint: settings.embedding.endpoint,
       modelId: settings.embedding.modelId,
@@ -193,6 +211,8 @@ export class TramaPlugin extends Plugin {
       app.metadataCache,
       settings.storageFolder
     );
+    this.session?.reset();
+    this.session = undefined;
     this.readonlyVault = readonlyVault;
     const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isIndexableMarkdown(path));
     const store = new SqliteNoteVectorStore(
@@ -226,8 +246,27 @@ export class TramaPlugin extends Plugin {
       this.consoleDebug,
       settings.storageFolder
     );
+    if (this.ui) {
+      for (const leaf of app.workspace.getLeavesOfType("trama-voce")) {
+        const view = leaf.view;
+        if (view?.isOpen) view.setSession?.(this.getOrCreateSession());
+      }
+      for (const leaf of app.workspace.getLeavesOfType("trama-filo"))
+        leaf.view?.setRelated?.(this.retrieval);
+      for (const leaf of app.workspace.getLeavesOfType("trama-lente"))
+        leaf.view?.setSearch?.(this.retrieval.runnable);
+    }
+    this.refreshVoceSuggestions();
+    this.logStartupElapsed("service-compose", compositionStartedAt);
+  }
+
+  private getOrCreateSession(): ChatSession {
+    if (this.session) return this.session;
+    const startedAt = this.startupTimer();
+    const settings = this.getSettings();
+    const readonlyVault = this.readonlyVault!;
     const chatModel: BaseChatModel = createLocalChatModel(settings.chat);
-    this.session = new ChatSession(
+    const session = new ChatSession(
       chatModel,
       () => createVaultTools(readonlyVault, this.retrieval!),
       readonlyVault,
@@ -239,15 +278,29 @@ export class TramaPlugin extends Plugin {
       settings.chat.contextWindowTokens ?? DEFAULT_SETTINGS.chat.contextWindowTokens,
       settings.chat.maxOutputTokens
     );
-    if (wasConfigured && this.ui) {
-      for (const leaf of app.workspace.getLeavesOfType("trama-voce"))
-        leaf.view?.setSession?.(this.session);
-      for (const leaf of app.workspace.getLeavesOfType("trama-filo"))
-        leaf.view?.setRelated?.(this.retrieval);
-      for (const leaf of app.workspace.getLeavesOfType("trama-lente"))
-        leaf.view?.setSearch?.(this.retrieval.runnable);
+    this.session = session;
+    this.logStartupElapsed("first-chat", startedAt);
+    return session;
+  }
+
+  private startupTimer(): number | undefined {
+    return this.getSettings().consoleDebug ? performance.now() : undefined;
+  }
+
+  private logStartupElapsed(label: string, startedAt?: number): void {
+    if (startedAt !== undefined && this.getSettings().consoleDebug)
+      this.consoleDebug.info(`Startup ${label}`, {
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+  }
+
+  private logWorkerStartup(timings?: NoteStoreInitTimings): void {
+    if (!this.getSettings().consoleDebug || !timings) return;
+    for (const phase of NOTE_STORE_INIT_PHASES) {
+      const elapsedMs = timings[phase];
+      if (typeof elapsedMs === "number" && Number.isFinite(elapsedMs))
+        this.consoleDebug.info(`Startup worker ${phase}`, { elapsedMs });
     }
-    this.refreshVoceSuggestions();
   }
 
   onunload(): void {

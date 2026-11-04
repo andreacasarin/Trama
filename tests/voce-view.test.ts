@@ -15,6 +15,7 @@ class ElementStub {
   isConnected = true;
   listeners = new Map<string, () => void>();
   classList = {
+    add: (...names: string[]) => names.forEach((name) => this.classes.add(name)),
     toggle: (name: string, enabled: boolean) => {
       if (enabled) this.classes.add(name);
       else this.classes.delete(name);
@@ -78,6 +79,8 @@ class ElementStub {
     return this.attributes[name] ?? null;
   }
 
+  focus(): void {}
+
   addEventListener(name: string, listener: () => void): void {
     this.listeners.set(name, listener);
   }
@@ -102,6 +105,15 @@ function response(id: string, status: AssistantConversationTurn["status"] = "com
   } as AssistantConversationTurn;
 }
 
+function openableView(app: any, createSession: () => ChatSession): any {
+  const view = new VoceView(new WorkspaceLeaf(), createSession) as any;
+  view.app = app;
+  view.contentEl = new ElementStub();
+  view.renderAttachments = vi.fn();
+  view.refreshSuggestions = vi.fn(async () => {});
+  return view;
+}
+
 function setup() {
   const copy = vi.fn(async () => {});
   const session = {
@@ -110,11 +122,12 @@ function setup() {
   };
   const view = new VoceView(
     new WorkspaceLeaf(),
-    session as unknown as ChatSession,
+    () => session as unknown as ChatSession,
     undefined,
     undefined,
     copy
   ) as any;
+  view.currentSession = session;
   view.transcript = new ElementStub();
   view.cancelEditButton = { hidden: true };
   view.input = { value: "", focus: vi.fn() };
@@ -128,6 +141,80 @@ function setup() {
 }
 
 describe("Voce transcript", () => {
+  it("opens multiple panes against the same lazily provided conversation", async () => {
+    const session = {
+      getState: vi.fn(() => ({ turns: [], running: false })),
+      subscribe: vi.fn(() => vi.fn()),
+      reset: vi.fn(),
+    } as unknown as ChatSession;
+    const createSession = vi.fn(() => session);
+    const workspace = { on: vi.fn(() => ({})), getActiveFile: () => null, getLeavesOfType: () => [] };
+    const app = { workspace };
+    const first = openableView(app, createSession);
+    const second = openableView(app, createSession);
+
+    await first.onOpen();
+    await second.onOpen();
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect((first as any).currentSession).toBe(session);
+    expect((second as any).currentSession).toBe(session);
+    expect(session.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves the current session factory result when the same pane reopens", async () => {
+    const makeSession = () =>
+      ({
+        getState: vi.fn(() => ({ turns: [], running: false })),
+        subscribe: vi.fn(() => vi.fn()),
+        reset: vi.fn(),
+      }) as unknown as ChatSession;
+    const original = makeSession();
+    const replacement = makeSession();
+    let currentSession = original;
+    const createSession = vi.fn(() => currentSession);
+    const app = {
+      workspace: { on: vi.fn(() => ({})), getActiveFile: () => null, getLeavesOfType: () => [] },
+    };
+    const view = openableView(app, createSession);
+
+    await view.onOpen();
+    expect(original.subscribe).toHaveBeenCalledOnce();
+    await view.onClose();
+    currentSession = replacement;
+    await view.onOpen();
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(replacement.subscribe).toHaveBeenCalledOnce();
+    expect((view as any).currentSession).toBe(replacement);
+  });
+
+  it("does not create a lazy session until opened or while closing unopened", async () => {
+    const session = {
+      getState: vi.fn(() => ({ turns: [], running: false })),
+      subscribe: vi.fn(() => vi.fn()),
+    } as unknown as ChatSession;
+    const createSession = vi.fn(() => session);
+    const view = new VoceView(new WorkspaceLeaf(), createSession) as any;
+    view.app = { workspace: { getLeavesOfType: () => [] } };
+
+    expect(createSession).not.toHaveBeenCalled();
+    await view.refreshSuggestions();
+    await view.onClose();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("does not retry session creation while closing after a failed open", async () => {
+    const error = new Error("Session unavailable");
+    const createSession = vi.fn(() => { throw error; });
+    const view = new VoceView(new WorkspaceLeaf(), createSession) as any;
+    view.app = { workspace: { getLeavesOfType: () => [] } };
+
+    expect(() => view.onOpen()).toThrow(error);
+    await view.onClose();
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
   it("shows a message's creation time beside its action without inventing missing dates", () => {
     const { render, row } = setup();
     const createdAt = new Date("2026-10-27T12:53:00Z").getTime();

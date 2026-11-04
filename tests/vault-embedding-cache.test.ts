@@ -270,6 +270,7 @@ describe("vault-shared document embedding artifacts", () => {
     "indexes and rebuilds locally when shared-cache %s fails, then retries sharing",
     async (operation) => {
       const adapter = new MemoryAdapter();
+      if (operation === "list") adapter.folders.add(`.trama/embeddings/${profileHash}`);
       const provider = new TestEmbeddings();
       const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
       const failure = vi
@@ -292,10 +293,11 @@ describe("vault-shared document embedding artifacts", () => {
     }
   );
 
-  it.each(["mkdir", "list"] as const)(
+  it.each(["exists", "list"] as const)(
     "propagates cancellation from shared-cache %s",
     async (operation) => {
       const adapter = new MemoryAdapter();
+      if (operation === "list") adapter.folders.add(`.trama/embeddings/${profileHash}`);
       const provider = new TestEmbeddings();
       const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
       adapter[operation] = async () => {
@@ -314,6 +316,7 @@ describe("vault-shared document embedding artifacts", () => {
 
   it("stops indexing when an aborted directory read rejects with an ordinary I/O error", async () => {
     const adapter = new MemoryAdapter();
+    adapter.folders.add(`.trama/embeddings/${profileHash}`);
     const provider = new TestEmbeddings();
     const f = await setup(adapter, new Map([["a.md", markdown]]), provider);
     let started!: () => void;
@@ -896,6 +899,7 @@ describe("vault-shared document embedding artifacts", () => {
 
   it("reports an aborted cache import as a normal timed cancellation", async () => {
     const adapter = new MemoryAdapter();
+    adapter.folders.add(`.trama/embeddings/${profileHash}`);
     const controller = new AbortController();
     const aborted = new DOMException("Import cancelled", "AbortError");
     adapter.list = vi.fn(async () => {
@@ -923,12 +927,122 @@ describe("vault-shared document embedding artifacts", () => {
     expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
       "[Trama] Embedding cache import cancelled"
     );
-    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugInfo.mock.calls.find(([label]) => label === "[Trama] Embedding cache import cancelled")?.[1])
+      .toMatchObject({ elapsedMs: expect.any(Number) });
+    expect(debugInfo.mock.calls.at(-1)?.[0]).toBe("[Trama] Embedding cache import phases");
+    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ listMs: expect.any(Number), receiptBatches: 0, attemptedShards: 0 });
     expect(debugWarn).not.toHaveBeenCalled();
     expect(debugError).not.toHaveBeenCalled();
     debugInfo.mockRestore();
     debugWarn.mockRestore();
     debugError.mockRestore();
+  });
+
+  it("preserves an import failure and reports its partial phases once", async () => {
+    const adapter = new MemoryAdapter();
+    adapter.folders.add(`.trama/embeddings/${profileHash}`);
+    const failure = new Error("listing failed");
+    vi.spyOn(adapter, "list").mockRejectedValue(failure);
+    const cache = { profileFingerprint: profileHash, reconcileDocumentShards: vi.fn(), unimportedSqliteShards: vi.fn(), importDocumentShard: vi.fn(), exportNextDocumentShard: vi.fn(), markDocumentShardPublished: vi.fn() };
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const shared = new VaultEmbeddingCache(adapter as any, cache as any, 2, new ConsoleDebug(() => true));
+      await expect(shared.importAvailable(new AbortController().signal)).rejects.toBe(failure);
+      const phases = info.mock.calls.filter(([label]) => label === "[Trama] Embedding cache import phases");
+      expect(phases).toHaveLength(1);
+      expect(phases[0][1]).toMatchObject({ listMs: expect.any(Number), listedFiles: 0, receiptBatches: 0 });
+      expect(cache.reconcileDocumentShards).not.toHaveBeenCalled();
+    } finally { info.mockRestore(); }
+  });
+
+  it("reports bounded import phases for new and receipted shards without extra operations", async () => {
+    const adapter = new MemoryAdapter();
+    const bytes = new TextEncoder().encode("diagnostic shard");
+    const checksum = await sha256Bytes(bytes);
+    adapter.folders.add(`.trama/embeddings/${profileHash}`);
+    adapter.files.set(`.trama/embeddings/${profileHash}/${checksum}.sqlite3`, bytes);
+    let pending = true;
+    const cache = {
+      profileFingerprint: profileHash,
+      reconcileDocumentShards: vi.fn(async () => {}),
+      unimportedSqliteShards: vi.fn(async (values: string[]) => pending ? values : []),
+      importDocumentShard: vi.fn(async () => { pending = false; }),
+      exportNextDocumentShard: vi.fn(), markDocumentShardPublished: vi.fn(),
+    };
+    const exists = vi.spyOn(adapter, "exists");
+    const list = vi.spyOn(adapter, "list");
+    const stat = vi.spyOn(adapter, "stat");
+    const read = vi.spyOn(adapter, "readBinary");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const shared = new VaultEmbeddingCache(adapter as any, cache as any, 2, new ConsoleDebug(() => true));
+    try {
+      await shared.importAvailable(new AbortController().signal);
+      const phases = info.mock.calls.find(([label]) => label === "[Trama] Embedding cache import phases")?.[1] as Record<string, number>;
+      expect(Object.keys(phases).sort()).toEqual([
+        "folderMs", "listMs", "inventoryMs", "reconcileMs", "receiptMs", "shardReadMs",
+        "checksumMs", "shardImportMs", "listedFiles", "validShards", "clearMarkers",
+        "receiptBatches", "pendingShards", "attemptedShards", "bytesRead",
+      ].sort());
+      expect(phases).toMatchObject({ listedFiles: 1, validShards: 1, clearMarkers: 0, receiptBatches: 1, pendingShards: 1, attemptedShards: 1, bytesRead: bytes.byteLength });
+      expect(Object.values(phases).every((value) => typeof value === "number" && Number.isFinite(value))).toBe(true);
+      expect(JSON.stringify(phases)).not.toContain(checksum);
+      expect([exists.mock.calls.length, list.mock.calls.length, stat.mock.calls.length, read.mock.calls.length, cache.reconcileDocumentShards.mock.calls.length, cache.unimportedSqliteShards.mock.calls.length, cache.importDocumentShard.mock.calls.length]).toEqual([1, 1, 1, 1, 1, 1, 1]);
+      info.mockClear();
+      await shared.importAvailable(new AbortController().signal);
+      const warm = info.mock.calls.find(([label]) => label === "[Trama] Embedding cache import phases")?.[1];
+      expect(warm).toMatchObject({ pendingShards: 0, attemptedShards: 0, bytesRead: 0, shardReadMs: 0, checksumMs: 0, shardImportMs: 0 });
+      expect([exists.mock.calls.length, list.mock.calls.length, stat.mock.calls.length, read.mock.calls.length, cache.reconcileDocumentShards.mock.calls.length, cache.unimportedSqliteShards.mock.calls.length, cache.importDocumentShard.mock.calls.length]).toEqual([2, 2, 1, 1, 2, 2, 1]);
+    } finally { info.mockRestore(); }
+  });
+
+  it("does not collect import diagnostics or read clocks when debug is disabled", async () => {
+    const adapter = new MemoryAdapter();
+    const cache = { profileFingerprint: profileHash, reconcileDocumentShards: vi.fn(async () => {}), unimportedSqliteShards: vi.fn(async () => []), importDocumentShard: vi.fn(), exportNextDocumentShard: vi.fn(), markDocumentShardPublished: vi.fn() };
+    const now = vi.spyOn(performance, "now");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await new VaultEmbeddingCache(adapter as any, cache as any, 2, new ConsoleDebug(() => false)).importAvailable(new AbortController().signal);
+      expect(now).not.toHaveBeenCalled();
+      expect(info).not.toHaveBeenCalled();
+    } finally { now.mockRestore(); info.mockRestore(); }
+  });
+
+  it("reconciles an absent or removed profile folder without creating or listing it", async () => {
+    const adapter = new MemoryAdapter();
+    const folder = `.trama/embeddings/${profileHash}`;
+    const cache = { profileFingerprint: profileHash, reconcileDocumentShards: vi.fn(async () => {}), unimportedSqliteShards: vi.fn(async () => []), importDocumentShard: vi.fn(), exportNextDocumentShard: vi.fn(), markDocumentShardPublished: vi.fn() };
+    const exists = vi.spyOn(adapter, "exists");
+    const list = vi.spyOn(adapter, "list");
+    const mkdir = vi.spyOn(adapter, "mkdir");
+    const shared = new VaultEmbeddingCache(adapter as any, cache as any, 2);
+    await shared.importAvailable(new AbortController().signal);
+    adapter.folders.add(folder);
+    const checksum = "a".repeat(64);
+    adapter.files.set(`${folder}/${checksum}.sqlite3`, new Uint8Array([1]));
+    await shared.importAvailable(new AbortController().signal);
+    adapter.folders.delete(folder);
+    adapter.files.clear();
+    await shared.importAvailable(new AbortController().signal);
+    expect(exists.mock.calls).toEqual([[folder], [folder], [folder]]);
+    expect(list.mock.calls).toEqual([[folder]]);
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(cache.reconcileDocumentShards.mock.calls).toEqual([[[], expect.any(AbortSignal)], [[checksum], expect.any(AbortSignal)], [[], expect.any(AbortSignal)]]);
+    expect(cache.unimportedSqliteShards).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not list a profile folder when cancelled during its existence check", async () => {
+    const adapter = new MemoryAdapter();
+    const controller = new AbortController();
+    vi.spyOn(adapter, "exists").mockImplementation(async () => {
+      controller.abort();
+      return true;
+    });
+    const list = vi.spyOn(adapter, "list");
+    const cache = { profileFingerprint: profileHash, reconcileDocumentShards: vi.fn(), unimportedSqliteShards: vi.fn(), importDocumentShard: vi.fn(), exportNextDocumentShard: vi.fn(), markDocumentShardPublished: vi.fn() };
+    const shared = new VaultEmbeddingCache(adapter as any, cache as any, 2);
+    await expect(shared.importAvailable(controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(list).not.toHaveBeenCalled();
+    expect(cache.reconcileDocumentShards).not.toHaveBeenCalled();
   });
 
   it("checks file metadata before reading a published artifact for verification", async () => {

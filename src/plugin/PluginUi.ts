@@ -48,7 +48,7 @@ export function registerPluginUi(
     (leaf) =>
       new ui.VoceView(
         leaf,
-        dependencies.session(),
+        dependencies.session,
         dependencies.noteCatalog,
         dependencies.currentNote,
         undefined,

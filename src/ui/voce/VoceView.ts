@@ -99,6 +99,7 @@ class AttachmentPickerModal extends FuzzySuggestModal<string> {
 
 /** Native Obsidian view for Voce's clean user-visible conversation projection. */
 export class VoceView extends ItemView {
+  private currentSession?: ChatSession;
   private unsubscribe: (() => void) | undefined;
   private root!: HTMLDivElement;
   private transcript!: HTMLDivElement;
@@ -133,7 +134,7 @@ export class VoceView extends ItemView {
 
   constructor(
     leaf: WorkspaceLeaf,
-    private session: ChatSession,
+    private readonly createSession: () => ChatSession,
     private readonly noteCatalog: () => readonly string[] = () => [],
     private readonly noteSuggestions: () => readonly string[] = () => [],
     private readonly copyText: (content: string) => Promise<void> = (content) =>
@@ -148,6 +149,10 @@ export class VoceView extends ItemView {
     super(leaf);
   }
 
+  private get session(): ChatSession {
+    return this.currentSession!;
+  }
+
   /** Rebinds an open view after settings replace the session graph. */
   setSession(session: ChatSession): void {
     this.followTranscript = true;
@@ -159,7 +164,7 @@ export class VoceView extends ItemView {
     this.activeAttachmentPicker?.close();
     this.activeAttachmentPicker = undefined;
     this.unsubscribe?.();
-    this.session = session;
+    this.currentSession = session;
     this.editingTurnId = undefined;
     this.turnExpansionOverrides.clear();
     this.expandedSourceTurnIds.clear();
@@ -168,6 +173,10 @@ export class VoceView extends ItemView {
 
   getViewType(): string {
     return VOCE_VIEW_TYPE;
+  }
+
+  get isOpen(): boolean {
+    return this.isViewOpen;
   }
 
   getDisplayText(): string {
@@ -179,6 +188,7 @@ export class VoceView extends ItemView {
   }
 
   override onOpen(): Promise<void> {
+    this.currentSession = this.createSession();
     this.isViewOpen = true;
     this.followTranscript = true;
     this.desiredTranscriptOffset = 0;
@@ -311,8 +321,14 @@ export class VoceView extends ItemView {
     this.clearTranscriptTurns();
     const otherView = this.app.workspace
       ?.getLeavesOfType?.(VOCE_VIEW_TYPE)
-      .some((leaf) => leaf !== this.leaf && (leaf.view as VoceView).session === this.session);
-    if (!otherView) this.session.reset();
+      .some(
+        (leaf) =>
+          leaf !== this.leaf &&
+          (leaf.view as VoceView).isOpen &&
+          (leaf.view as VoceView).currentSession !== undefined &&
+          (leaf.view as VoceView).currentSession === this.currentSession
+      );
+    if (!otherView) this.currentSession?.reset();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     return Promise.resolve();

@@ -16,12 +16,80 @@ describe("V1 plugin composition", () => {
     (Notice as any).instances = [];
   });
 
+  it("checks the model settings captured by an existing chat session", async () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    plugin.readonlyVault = {};
+    const session = plugin.getOrCreateSession();
+    const current = plugin.getSettings();
+    plugin.settingsStore.load({
+      ...current,
+      chat: { ...current.chat, modelId: "new-model" },
+    }, ".obsidian");
+    await expect(session.send({ content: "Hello", attachmentPaths: [] })).rejects.toThrow(
+      "Set a local chat model in Trama settings before sending a message."
+    );
+  });
+
+  it("logs only numeric startup elapsed fields when console debug is enabled", () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      plugin.settingsStore.load({ consoleDebug: true }, ".obsidian");
+      const startedAt = plugin.startupTimer();
+      expect(startedAt).toEqual(expect.any(Number));
+      plugin.logStartupElapsed("namespace", startedAt);
+      expect(info).toHaveBeenCalledWith("[Trama] Startup namespace", {
+        elapsedMs: expect.any(Number),
+      });
+
+      info.mockClear();
+      plugin.settingsStore.load({ consoleDebug: false }, ".obsidian");
+      expect(plugin.startupTimer()).toBeUndefined();
+      plugin.logStartupElapsed("namespace", startedAt);
+      expect(info).not.toHaveBeenCalled();
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("logs worker initialization phases only through enabled console debug", () => {
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const timings = {
+      "wasm-load-compile": 1,
+      "wasm-load": 1,
+      "wasm-compile": 0,
+      "sqlite-bootstrap": 2,
+      "opfs-install": 3,
+      "opfs-reserve": 4,
+      "db-open": 5,
+      "schema-setup": 6,
+    };
+    try {
+      plugin.settingsStore.load({ consoleDebug: true }, ".obsidian");
+      plugin.logWorkerStartup(timings);
+      expect(info.mock.calls).toEqual(
+        Object.entries(timings).map(([phase, elapsedMs]) => [
+          `[Trama] Startup worker ${phase}`,
+          { elapsedMs },
+        ])
+      );
+
+      info.mockClear();
+      plugin.settingsStore.load({ consoleDebug: false }, ".obsidian");
+      plugin.logWorkerStartup(timings);
+      expect(info).not.toHaveBeenCalled();
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   it("starts without provider requests, registers manual index controls, and closes the worker", async () => {
     const files = new Map<string, string>();
     const directories = new Set<string>();
     const workers: any[] = [];
     const lifecycle: string[] = [];
-    const openVoce = { setSession: vi.fn() };
+    const openVoce = { isOpen: true, setSession: vi.fn() };
     const openFilo = { setRelated: vi.fn() };
     const openLente = { setSearch: vi.fn() };
     const WorkerStub = vi.fn(function () {
@@ -99,8 +167,13 @@ describe("V1 plugin composition", () => {
     const commands = vi.spyOn(plugin, "addCommand");
     const hoverSource = vi.spyOn(plugin, "registerHoverLinkSource");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const consoleInfo = vi.spyOn(console, "info");
     try {
       await plugin.onload();
+      expect(plugin.session).toBeUndefined();
+      expect(
+        consoleInfo.mock.calls.filter(([label]) => String(label).startsWith("[Trama] Startup"))
+      ).toHaveLength(0);
       expect(hoverSource).toHaveBeenCalledOnce();
       expect(hoverSource).toHaveBeenCalledWith("trama-results", {
         display: "Trama results",
@@ -146,6 +219,9 @@ describe("V1 plugin composition", () => {
       expect(WorkerStub).toHaveBeenCalledTimes(3);
 
       const beforeIndexSwitch = plugin.client;
+      const oldVault = plugin.readonlyVault;
+      plugin.session = undefined;
+      openVoce.isOpen = false;
       const indexing = plugin.manualIndex;
       const cancelIndex = vi.spyOn(indexing, "cancel");
       let finishPublication!: () => void;
@@ -159,10 +235,19 @@ describe("V1 plugin composition", () => {
       }));
       await vi.waitFor(() => expect(cancelIndex).toHaveBeenCalledOnce());
       expect(lifecycle).not.toContain("close-3");
+      const interimSession = plugin.getOrCreateSession();
+      expect(interimSession.vault).toBe(oldVault);
+      const resetInterim = vi.spyOn(interimSession, "reset");
+      openVoce.isOpen = true;
       finishPublication();
       await indexSwitch;
       await activeUpdate;
       expect(plugin.client).not.toBe(beforeIndexSwitch);
+      expect(resetInterim).toHaveBeenCalledOnce();
+      expect(plugin.session).not.toBe(interimSession);
+      expect(plugin.session.vault).toBe(plugin.readonlyVault);
+      expect(plugin.session.vault).not.toBe(oldVault);
+      expect(openVoce.setSession).toHaveBeenLastCalledWith(plugin.session);
       expect(files.has("Sync/Trama/next/identity.json")).toBe(true);
       expect(lifecycle.indexOf("close-3")).toBeGreaterThan(lifecycle.indexOf("create-3"));
       expect(lifecycle.indexOf("close-3")).toBeLessThan(lifecycle.indexOf("create-4"));
@@ -204,6 +289,7 @@ describe("V1 plugin composition", () => {
       await vi.waitFor(() => expect(workers[0].terminate).toHaveBeenCalledOnce());
     } finally {
       fetchSpy.mockRestore();
+      consoleInfo.mockRestore();
       globalThis.Worker = originalWorker;
       plugin.onunload();
     }
