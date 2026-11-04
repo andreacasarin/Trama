@@ -71,10 +71,12 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
   });
   const glueStarted = diagnostics ? performance.now() : undefined;
   // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
-  const loadingGlue: Promise<{ default: unknown }> = import("../../../sqlite3.mjs").then((module) => {
-    if (glueStarted !== undefined) timings["sqlite-bootstrap"] = performance.now() - glueStarted;
-    return module;
-  });
+  const loadingGlue: Promise<{ default: unknown }> = import("../../../sqlite3.mjs").then(
+    (module) => {
+      if (glueStarted !== undefined) timings["sqlite-bootstrap"] = performance.now() - glueStarted;
+      return module;
+    }
+  );
   const [wasm, { default: sqliteInit }] = await Promise.all([compiling, loadingGlue]);
   const init = sqliteInit as Init;
   const initStarted = diagnostics ? performance.now() : undefined;
@@ -86,7 +88,9 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
     },
   });
   if (initStarted !== undefined) {
-    timings["sqlite-bootstrap"] = Math.round((timings["sqlite-bootstrap"] ?? 0) + performance.now() - initStarted);
+    timings["sqlite-bootstrap"] = Math.round(
+      (timings["sqlite-bootstrap"] ?? 0) + performance.now() - initStarted
+    );
     startedAt = performance.now();
   }
   const directory = `trama-note-v2-${namespace}`;
@@ -138,10 +142,7 @@ function serializedError(error: unknown): { name: string; message: string } {
   return { name, message: message.slice(0, 1000) };
 }
 
-export function attachNoteStoreWorker(
-  scope: WorkerScope,
-  openDatabase: OpenDatabaseFactory
-): void {
+export function attachNoteStoreWorker(scope: WorkerScope, openDatabase: OpenDatabaseFactory): void {
   const cancelled = new Map<number, AbortController>();
   let database: OpenDatabase | undefined;
   let namespace: string | undefined;

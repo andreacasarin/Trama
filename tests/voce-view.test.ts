@@ -148,7 +148,11 @@ describe("Voce transcript", () => {
       reset: vi.fn(),
     } as unknown as ChatSession;
     const createSession = vi.fn(() => session);
-    const workspace = { on: vi.fn(() => ({})), getActiveFile: () => null, getLeavesOfType: () => [] };
+    const workspace = {
+      on: vi.fn(() => ({})),
+      getActiveFile: () => null,
+      getLeavesOfType: () => [],
+    };
     const app = { workspace };
     const first = openableView(app, createSession);
     const second = openableView(app, createSession);
@@ -206,7 +210,9 @@ describe("Voce transcript", () => {
 
   it("does not retry session creation while closing after a failed open", async () => {
     const error = new Error("Session unavailable");
-    const createSession = vi.fn(() => { throw error; });
+    const createSession = vi.fn(() => {
+      throw error;
+    });
     const view = new VoceView(new WorkspaceLeaf(), createSession) as any;
     view.app = { workspace: { getLeavesOfType: () => [] } };
 

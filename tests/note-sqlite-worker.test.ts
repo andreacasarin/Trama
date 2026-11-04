@@ -3,10 +3,7 @@ import { Document } from "@langchain/core/documents";
 import { describe, expect, it, vi } from "vitest";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
-import type {
-  NoteStoreInitTimings,
-  SqliteConnection,
-} from "@/index/note-sqlite/protocol";
+import type { NoteStoreInitTimings, SqliteConnection } from "@/index/note-sqlite/protocol";
 import { attachNoteStoreWorker } from "@/index/note-sqlite/worker";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 
@@ -30,7 +27,10 @@ class QueuedWorkerHarness implements NoteStoreWorkerLike {
   };
 
   constructor(
-    open: (namespace: string, diagnostics: boolean) => Promise<{
+    open: (
+      namespace: string,
+      diagnostics: boolean
+    ) => Promise<{
       database: Pick<NoteSqliteDatabase, "call">;
       timings?: NoteStoreInitTimings;
       close(): void;

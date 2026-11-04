@@ -45,8 +45,10 @@ the glue import can overlap compilation. The remaining phases are
 for pool capacity reservation, `Startup worker db-open` for the database connection,
 and `Startup worker schema-setup` for database construction plus PRAGMA/schema setup.
 These worker records appear only after the first successful initialization when
-Console Debug was enabled. Each phase is sent once and consumed once; repeat
-initialization does not replay the measurements. The outer `Startup worker-ready`
+Console Debug was enabled. The outer `Startup worker-ready` duration is logged
+immediately after initialization succeeds and before these phase records are
+printed. Each phase is sent once and consumed once; repeat initialization does
+not replay the measurements. The outer `Startup worker-ready`
 span includes additional work, so phase values need not sum to it.
 
 `Startup services` includes service composition, so these values overlap and must
@@ -81,23 +83,23 @@ its required folders separately. The times are wall-clock durations of existing 
 include queue, transport, and response wait; they are not SQL CPU time or a
 main-thread profile. Publication is separate and is not measured by this summary.
 
-| Field | Meaning |
-| --- | --- |
-| folderMs | Check whether this profile’s cache folder exists. |
-| listMs | Time the adapter file listing. |
-| inventoryMs | Parse the returned filenames and prepare the current inventory. |
-| reconcileMs | Wait for the receipt reconciliation RPC. |
-| receiptMs | Aggregate waits for shard receipt-check RPCs. |
-| shardReadMs | Aggregate adapter stat/read waits for eligible shards. |
-| checksumMs | Compute checksums for shards that were read. |
-| shardImportMs | Wait for shard import RPCs. |
-| listedFiles | Number of paths returned by the adapter listing. |
-| validShards | Number of valid shard filenames found. |
-| clearMarkers | Number of unique clear-marker checksums found. |
-| receiptBatches | Receipt-check RPC calls started. |
-| pendingShards | Sum of pending shard checks returned by receipt calls, before clear-marker skips. |
-| attemptedShards | Shards not skipped by receipts or clear markers, counted before attempting a read. |
-| bytesRead | Bytes returned by successful adapter readBinary calls, even if later rejected or cancelled. |
+| Field           | Meaning                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| folderMs        | Check whether this profile’s cache folder exists.                                           |
+| listMs          | Time the adapter file listing.                                                              |
+| inventoryMs     | Parse the returned filenames and prepare the current inventory.                             |
+| reconcileMs     | Wait for the receipt reconciliation RPC.                                                    |
+| receiptMs       | Aggregate waits for shard receipt-check RPCs.                                               |
+| shardReadMs     | Aggregate adapter stat/read waits for eligible shards.                                      |
+| checksumMs      | Compute checksums for shards that were read.                                                |
+| shardImportMs   | Wait for shard import RPCs.                                                                 |
+| listedFiles     | Number of paths returned by the adapter listing.                                            |
+| validShards     | Number of valid shard filenames found.                                                      |
+| clearMarkers    | Number of unique clear-marker checksums found.                                              |
+| receiptBatches  | Receipt-check RPC calls started.                                                            |
+| pendingShards   | Sum of pending shard checks returned by receipt calls, before clear-marker skips.           |
+| attemptedShards | Shards not skipped by receipts or clear markers, counted before attempting a read.          |
+| bytesRead       | Bytes returned by successful adapter readBinary calls, even if later rejected or cancelled. |
 
 Read outcome counts remain on the existing cache import completion record. Interpret
 them together with the phase counters: zero imported shards alone does not mean no

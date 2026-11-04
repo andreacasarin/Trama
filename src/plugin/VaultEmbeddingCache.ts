@@ -82,32 +82,44 @@ export class VaultEmbeddingCache {
     checkAbort(signal);
     const diagnostics = this.consoleDebug?.isEnabled()
       ? {
-          folderMs: 0, listMs: 0, inventoryMs: 0, reconcileMs: 0, receiptMs: 0,
-          shardReadMs: 0, checksumMs: 0, shardImportMs: 0,
-          listedFiles: 0, validShards: 0, clearMarkers: 0, receiptBatches: 0,
-          pendingShards: 0, attemptedShards: 0, bytesRead: 0,
+          folderMs: 0,
+          listMs: 0,
+          inventoryMs: 0,
+          reconcileMs: 0,
+          receiptMs: 0,
+          shardReadMs: 0,
+          checksumMs: 0,
+          shardImportMs: 0,
+          listedFiles: 0,
+          validShards: 0,
+          clearMarkers: 0,
+          receiptBatches: 0,
+          pendingShards: 0,
+          attemptedShards: 0,
+          bytesRead: 0,
         }
       : undefined;
     const finish = diagnostics ? this.consoleDebug?.start("Embedding cache import") : undefined;
-    const measure = async <T>(key: keyof NonNullable<typeof diagnostics>, operation: () => Promise<T>) => {
-      const started = performance.now();
-      try {
-        return await operation();
-      } finally {
-        if (diagnostics) diagnostics[key] += performance.now() - started;
-      }
-    };
+    const measure: <T>(
+      key: keyof NonNullable<typeof diagnostics>,
+      operation: () => Promise<T>
+    ) => Promise<T> = diagnostics
+      ? async (key, operation) => {
+          const started = performance.now();
+          try {
+            return await operation();
+          } finally {
+            diagnostics[key] += performance.now() - started;
+          }
+        }
+      : (_key, operation) => operation();
     const counts = { imported: 0, invalid: 0, checksumFailures: 0, failures: 0 };
     let firstError: unknown;
     try {
-      const exists = diagnostics
-        ? await measure("folderMs", () => this.adapter.exists(this.folder))
-        : await this.adapter.exists(this.folder);
+      const exists = await measure("folderMs", () => this.adapter.exists(this.folder));
       checkAbort(signal);
       const { files } = exists
-        ? diagnostics
-          ? await measure("listMs", () => this.adapter.list(this.folder))
-          : await this.adapter.list(this.folder)
+        ? await measure("listMs", () => this.adapter.list(this.folder))
         : { files: [] };
       if (diagnostics) diagnostics.listedFiles = files.length;
       const inventoryStart = diagnostics ? performance.now() : undefined;
@@ -132,16 +144,12 @@ export class VaultEmbeddingCache {
         diagnostics.clearMarkers = cleared.size;
         diagnostics.inventoryMs += performance.now() - inventoryStart;
       }
-      if (diagnostics)
-        await measure("reconcileMs", () => this.cache.reconcileDocumentShards(inventory, signal));
-      else await this.cache.reconcileDocumentShards(inventory, signal);
+      await measure("reconcileMs", () => this.cache.reconcileDocumentShards(inventory, signal));
       for (let offset = 0; offset < checksums.length; offset += EMBEDDING_ARTIFACT_MAX_ENTRIES) {
         const page = checksums.slice(offset, offset + EMBEDDING_ARTIFACT_MAX_ENTRIES);
         if (diagnostics) diagnostics.receiptBatches++;
         const pending = new Set(
-          diagnostics
-            ? await measure("receiptMs", () => this.cache.unimportedSqliteShards(page, signal))
-            : await this.cache.unimportedSqliteShards(page, signal)
+          await measure("receiptMs", () => this.cache.unimportedSqliteShards(page, signal))
         );
         if (diagnostics) diagnostics.pendingShards += pending.size;
         for (const checksum of page) {
@@ -150,25 +158,29 @@ export class VaultEmbeddingCache {
           if (diagnostics) diagnostics.attemptedShards++;
           try {
             const path = `${this.folder}/${checksum}.sqlite3`;
-            const bytes = diagnostics
-              ? await measure("shardReadMs", () =>
-                  this.readBoundedArtifact(path, signal, (size) => { diagnostics.bytesRead += size; })
-                )
-              : await this.readBoundedArtifact(path, signal);
+            const bytes = await measure("shardReadMs", () =>
+              this.readBoundedArtifact(
+                path,
+                signal,
+                diagnostics
+                  ? (size) => {
+                      diagnostics.bytesRead += size;
+                    }
+                  : undefined
+              )
+            );
             if (!bytes) {
               counts.invalid++;
               continue;
             }
-            const hash = diagnostics
-              ? await measure("checksumMs", () => sha256Bytes(bytes))
-              : await sha256Bytes(bytes);
+            const hash = await measure("checksumMs", () => sha256Bytes(bytes));
             if (hash !== checksum) {
               counts.checksumFailures++;
               continue;
             }
-            if (diagnostics)
-              await measure("shardImportMs", () => this.cache.importDocumentShard(checksum, bytes, signal));
-            else await this.cache.importDocumentShard(checksum, bytes, signal);
+            await measure("shardImportMs", () =>
+              this.cache.importDocumentShard(checksum, bytes, signal)
+            );
             counts.imported++;
           } catch (error) {
             if (isCancelled(error)) throw error;

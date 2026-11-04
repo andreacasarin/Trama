@@ -35,7 +35,6 @@ import { ObsidianIndexVault } from "@/vault/indexing/ObsidianIndexVault";
 import { ObsidianReadonlyVault } from "@/vault/readOnly/ObsidianReadonlyVault";
 import { normalizeStorageFolder } from "@/settings/StorageFolder";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
-import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 
 export class TramaPlugin extends Plugin {
   private readonly settingsStore = new SettingsStore();
@@ -51,6 +50,7 @@ export class TramaPlugin extends Plugin {
   private manualIndex?: ManualIndex;
   private retrieval?: VaultRetrieval;
   private session?: ChatSession;
+  private createSession?: () => ChatSession;
   private readonlyVault?: ObsidianReadonlyVault;
   private status?: IndexStatusController;
   private indexRun?: {
@@ -160,21 +160,24 @@ export class TramaPlugin extends Plugin {
     const worker = this.sqliteRuntime.createWorker();
     const candidate = new NoteStoreClient(worker, namespace, settings.consoleDebug);
     const workerStartedAt = this.startupTimer();
+    let timings: NoteStoreInitTimings | undefined;
     try {
-      const timings = await candidate.initialize();
-      this.logWorkerStartup(timings);
+      timings = await candidate.initialize();
     } catch (error) {
       await candidate.close();
       throw error;
     }
     this.logStartupElapsed("worker-ready", workerStartedAt);
+    this.logWorkerStartup(timings);
     if (this.disposed) {
       await candidate.close();
       return;
     }
     this.client = candidate;
     const indexStartedAt = this.startupTimer();
-    this.indexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
+    const indexedNotes = Boolean(await candidate.call("noteStoreHasNotes", {}));
+    if (this.disposed) return;
+    this.indexedNotes = indexedNotes;
     this.logStartupElapsed("index-presence", indexStartedAt);
     const compositionStartedAt = this.startupTimer();
     const profile = {
@@ -211,9 +214,6 @@ export class TramaPlugin extends Plugin {
       app.metadataCache,
       settings.storageFolder
     );
-    this.session?.reset();
-    this.session = undefined;
-    this.readonlyVault = readonlyVault;
     const noteVault = new ObsidianIndexVault(app.vault, (path) => this.isIndexableMarkdown(path));
     const store = new SqliteNoteVectorStore(
       embeddings,
@@ -231,7 +231,7 @@ export class TramaPlugin extends Plugin {
       sharedEmbeddingCache,
       this.consoleDebug
     );
-    this.retrieval = new VaultRetrieval(
+    const retrieval = new VaultRetrieval(
       candidate.call,
       settings.embedding.modelId ? embeddings : undefined,
       settings.embedding.modelId ? noteEmbeddingProfile(profile) : undefined,
@@ -246,6 +246,23 @@ export class TramaPlugin extends Plugin {
       this.consoleDebug,
       settings.storageFolder
     );
+    this.session?.reset();
+    this.session = undefined;
+    this.readonlyVault = readonlyVault;
+    this.retrieval = retrieval;
+    this.createSession = () =>
+      new ChatSession(
+        createLocalChatModel(settings.chat),
+        () => createVaultTools(readonlyVault, retrieval),
+        readonlyVault,
+        () => {
+          if (!settings.chat.modelId.trim())
+            throw new Error("Set a local chat model in Trama settings before sending a message.");
+        },
+        this.consoleDebug,
+        settings.chat.contextWindowTokens ?? DEFAULT_SETTINGS.chat.contextWindowTokens,
+        settings.chat.maxOutputTokens
+      );
     if (this.ui) {
       for (const leaf of app.workspace.getLeavesOfType("trama-voce")) {
         const view = leaf.view;
@@ -263,21 +280,7 @@ export class TramaPlugin extends Plugin {
   private getOrCreateSession(): ChatSession {
     if (this.session) return this.session;
     const startedAt = this.startupTimer();
-    const settings = this.getSettings();
-    const readonlyVault = this.readonlyVault!;
-    const chatModel: BaseChatModel = createLocalChatModel(settings.chat);
-    const session = new ChatSession(
-      chatModel,
-      () => createVaultTools(readonlyVault, this.retrieval!),
-      readonlyVault,
-      () => {
-        if (!settings.chat.modelId.trim())
-          throw new Error("Set a local chat model in Trama settings before sending a message.");
-      },
-      this.consoleDebug,
-      settings.chat.contextWindowTokens ?? DEFAULT_SETTINGS.chat.contextWindowTokens,
-      settings.chat.maxOutputTokens
-    );
+    const session = this.createSession!();
     this.session = session;
     this.logStartupElapsed("first-chat", startedAt);
     return session;
@@ -319,6 +322,7 @@ export class TramaPlugin extends Plugin {
     this.manualIndex = undefined;
     this.retrieval = undefined;
     this.session = undefined;
+    this.createSession = undefined;
     this.client = undefined;
   }
 

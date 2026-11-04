@@ -16,20 +16,6 @@ describe("V1 plugin composition", () => {
     (Notice as any).instances = [];
   });
 
-  it("checks the model settings captured by an existing chat session", async () => {
-    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    plugin.readonlyVault = {};
-    const session = plugin.getOrCreateSession();
-    const current = plugin.getSettings();
-    plugin.settingsStore.load({
-      ...current,
-      chat: { ...current.chat, modelId: "new-model" },
-    }, ".obsidian");
-    await expect(session.send({ content: "Hello", attachmentPaths: [] })).rejects.toThrow(
-      "Set a local chat model in Trama settings before sending a message."
-    );
-  });
-
   it("logs only numeric startup elapsed fields when console debug is enabled", () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -82,6 +68,42 @@ describe("V1 plugin composition", () => {
     } finally {
       info.mockRestore();
     }
+  });
+
+  it("does not publish services when index presence resolves after unload", async () => {
+    const listeners = new Set<(event: any) => void>();
+    let presenceId: number | undefined;
+    const worker = {
+      addEventListener: vi.fn((type: string, listener: (event: any) => void) => {
+        if (type === "message") listeners.add(listener);
+      }),
+      removeEventListener: vi.fn((type: string, listener: (event: any) => void) => {
+        if (type === "message") listeners.delete(listener);
+      }),
+      postMessage: vi.fn((request: any) => {
+        if (request.method === "noteStoreHasNotes") presenceId = request.id;
+        if (request.method === "init" || request.method === "close")
+          queueMicrotask(() => {
+            for (const listener of listeners) listener({ data: { id: request.id, ok: true } });
+          });
+      }),
+      terminate: vi.fn(),
+    };
+    const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
+    vi.spyOn(plugin.sqliteRuntime, "resolveNamespace").mockResolvedValue("a".repeat(64));
+    vi.spyOn(plugin.sqliteRuntime, "createWorker").mockReturnValue(worker);
+    const configuring = plugin.configureServices({});
+    await vi.waitFor(() => expect(presenceId).toBeDefined());
+    plugin.onunload();
+    for (const listener of listeners)
+      listener({ data: { id: presenceId, ok: true, result: true } });
+    await configuring;
+    expect(plugin.indexedNotes).toBe(false);
+    expect(plugin.createSession).toBeUndefined();
+    expect(plugin.readonlyVault).toBeUndefined();
+    expect(plugin.retrieval).toBeUndefined();
+    expect(plugin.manualIndex).toBeUndefined();
+    await vi.waitFor(() => expect(worker.terminate).toHaveBeenCalledOnce());
   });
 
   it("starts without provider requests, registers manual index controls, and closes the worker", async () => {
@@ -171,6 +193,17 @@ describe("V1 plugin composition", () => {
     try {
       await plugin.onload();
       expect(plugin.session).toBeUndefined();
+      const originalSettings = plugin.getSettings();
+      const sessionWithoutModel = plugin.getOrCreateSession();
+      plugin.settingsStore.load(
+        { ...originalSettings, chat: { ...originalSettings.chat, modelId: "new-model" } },
+        ".obsidian"
+      );
+      await expect(
+        sessionWithoutModel.send({ content: "Hello", attachmentPaths: [] })
+      ).rejects.toThrow("Set a local chat model in Trama settings before sending a message.");
+      plugin.settingsStore.load(originalSettings, ".obsidian");
+      plugin.session = undefined;
       expect(
         consoleInfo.mock.calls.filter(([label]) => String(label).startsWith("[Trama] Startup"))
       ).toHaveLength(0);
@@ -220,6 +253,8 @@ describe("V1 plugin composition", () => {
 
       const beforeIndexSwitch = plugin.client;
       const oldVault = plugin.readonlyVault;
+      const oldRetrieval = plugin.retrieval;
+      const oldEndpoint = plugin.getSettings().chat.endpoint;
       plugin.session = undefined;
       openVoce.isOpen = false;
       const indexing = plugin.manualIndex;
@@ -231,12 +266,15 @@ describe("V1 plugin composition", () => {
       expect(update).toHaveBeenCalledOnce();
       const indexSwitch = plugin.saveSettings((current: any) => ({
         ...current,
+        chat: { ...current.chat, endpoint: "http://127.0.0.1:4321/v1" },
         storageFolder: "Sync/Trama/next",
       }));
       await vi.waitFor(() => expect(cancelIndex).toHaveBeenCalledOnce());
       expect(lifecycle).not.toContain("close-3");
       const interimSession = plugin.getOrCreateSession();
       expect(interimSession.vault).toBe(oldVault);
+      expect(interimSession.model.clientConfig.baseURL).toBe(oldEndpoint);
+      expect(plugin.retrieval).toBe(oldRetrieval);
       const resetInterim = vi.spyOn(interimSession, "reset");
       openVoce.isOpen = true;
       finishPublication();
@@ -247,6 +285,8 @@ describe("V1 plugin composition", () => {
       expect(plugin.session).not.toBe(interimSession);
       expect(plugin.session.vault).toBe(plugin.readonlyVault);
       expect(plugin.session.vault).not.toBe(oldVault);
+      expect(plugin.session.model.clientConfig.baseURL).toBe("http://127.0.0.1:4321/v1");
+      expect(plugin.retrieval).not.toBe(oldRetrieval);
       expect(openVoce.setSession).toHaveBeenLastCalledWith(plugin.session);
       expect(files.has("Sync/Trama/next/identity.json")).toBe(true);
       expect(lifecycle.indexOf("close-3")).toBeGreaterThan(lifecycle.indexOf("create-3"));
