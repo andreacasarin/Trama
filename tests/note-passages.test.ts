@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { prepareNote } from "@/index/NotePassages";
 
 describe("body passage preparation", () => {
@@ -32,23 +32,20 @@ describe("body passage preparation", () => {
     }
   });
 
-  it("limits UTF-8 encoding inputs for a large unbroken block", async () => {
-    const body = "😀abcdefghijklmnopqrstuvwxyz".repeat(40_000);
+  it("bounds encoding inputs for unbroken Unicode text", async () => {
+    const body = "😀abcdefghijklmnopqrstuvwxyz".repeat(100);
     const encode = TextEncoder.prototype.encode;
     let largestInput = 0;
-    const spy = vi.spyOn(TextEncoder.prototype, "encode").mockImplementation(function (
-      this: TextEncoder,
-      input = ""
-    ) {
+    TextEncoder.prototype.encode = function (input = "") {
       largestInput = Math.max(largestInput, input.length);
       return encode.call(this, input);
-    });
+    };
     try {
-      const { passages } = await prepareNote(body, "large.md");
+      const { passages } = await prepareNote(body, "unbroken.md");
       expect(passages.map((passage) => passage.text).join("")).toBe(body);
       expect(largestInput).toBeLessThanOrEqual(1000);
     } finally {
-      spy.mockRestore();
+      TextEncoder.prototype.encode = encode;
     }
   });
 

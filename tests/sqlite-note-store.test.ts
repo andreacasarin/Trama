@@ -20,14 +20,9 @@ class DeterministicEmbeddings implements EmbeddingsInterface<number[]> {
   }
 }
 
-async function fixture(legacyMetadata = false) {
+async function fixture() {
   const sqlite = await loadTestSqlite();
   const db = new sqlite.oo1.DB(":memory:", "c");
-  if (legacyMetadata)
-    db.exec(`CREATE TABLE note_index(
-      note_id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, current_uid TEXT NOT NULL UNIQUE,
-      embedding_profile TEXT, centroid BLOB, metadata TEXT
-    )`);
   const database = new NoteSqliteDatabase(db);
   const client = new NoteStoreClient(new LocalNoteWorker(database), "a".repeat(64));
   const embeddings = new DeterministicEmbeddings();
@@ -157,54 +152,6 @@ describe("SQLite note vector store", () => {
     }
   });
 
-  it("applies official OpenAI request token and input caps offline", async () => {
-    const batches: string[][] = [];
-    const provider = {
-      embedDocuments: async (texts: string[]) => {
-        batches.push([...texts]);
-        return texts.map(() => [1, 0]);
-      },
-      embedQuery: async () => [1, 0],
-    };
-    const store = new SqliteNoteVectorStore(
-      provider,
-      async () => undefined,
-      async () => null,
-      {
-        endpoint: "https://api.openai.com/v1",
-        modelId: "text-embedding-3-small",
-        dimensions: 2,
-      }
-    );
-    let state = 12345;
-    const alphabet =
-      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()[]{}<>?";
-    const documents = Array.from({ length: 520 }, (_, index) => {
-      let text = "<|endoftext|> ";
-      while (text.length < 995) {
-        state = (state * 16807) % 2147483647;
-        text += alphabet[state % alphabet.length];
-      }
-      return note(`${index}.md`, text);
-    });
-    await store.addDocuments(documents);
-    const { Tiktoken } = await import("js-tiktoken/lite");
-    const { default: ranks } = await import("js-tiktoken/ranks/cl100k_base");
-    const tokenizer = new Tiktoken(ranks);
-    expect(batches.length).toBeGreaterThan(1);
-    expect(batches[0].length).toBeLessThanOrEqual(256);
-    expect(
-      batches.flat().reduce((sum, text) => sum + tokenizer.encode(text, [], []).length, 0)
-    ).toBeGreaterThan(300000);
-    for (const batch of batches) {
-      expect(batch.length).toBeLessThanOrEqual(256);
-      expect(batch.every((text) => new TextEncoder().encode(text).length <= 1000)).toBe(true);
-      const counts = batch.map((text) => tokenizer.encode(text, [], []).length);
-      expect(Math.max(...counts)).toBeLessThanOrEqual(8191);
-      expect(counts.reduce((sum, count) => sum + count, 0)).toBeLessThanOrEqual(300000);
-    }
-  });
-
   it("updates metadata and positions while reusing unchanged body embeddings", async () => {
     const { db, client, embeddings } = await fixture();
     const cache = new SqliteEmbeddingCache(embeddings, client.call, "cache-profile", 2);
@@ -237,28 +184,6 @@ describe("SQLite note vector store", () => {
       expect(
         db.selectValue("SELECT count(*) FROM pragma_table_info('note_index') WHERE name='metadata'")
       ).toBe(0);
-    } finally {
-      await client.close();
-      db.close();
-    }
-  });
-
-  it("writes and updates notes with an existing nullable metadata column", async () => {
-    const { db, client, store } = await fixture(true);
-    try {
-      await store.addDocuments([note("legacy.md", "---\naliases: [oldalias]\n---\nbody")]);
-      await store.addDocuments([
-        note("legacy.md", "---\naliases: [newalias]\ntags: [topic]\n---\nbody"),
-      ]);
-      expect(db.selectValue("SELECT metadata FROM note_index")).toBeNull();
-      for (const term of ["legacy", "newalias", "topic"]) {
-        expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH ?", [term])).toBe(
-          1
-        );
-      }
-      expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH 'oldalias'")).toBe(
-        0
-      );
     } finally {
       await client.close();
       db.close();

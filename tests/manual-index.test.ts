@@ -246,7 +246,8 @@ describe("native LangChain note indexing", () => {
       expect(chunksByPath.get("gamma.md")!.length).toBeGreaterThan(256);
 
       expect((await manual.update()).numAdded).toBe(3);
-      expect(embeddings.batches.every((batch) => batch.length <= 512)).toBe(true);
+      expect(embeddings.batches.every((batch) => batch.length <= 256)).toBe(true);
+      expect(embeddings.batches.flat()).toEqual([...chunksByPath.values()].flat());
       for (const [path, chunks] of chunksByPath) {
         const noteId = Number(
           db.selectValue("SELECT note_id FROM note_index WHERE path=?", [path])

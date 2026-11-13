@@ -162,7 +162,7 @@ describe("compact result presentation", () => {
   });
 });
 
-it("resolves Lente passage only on expansion and discards an aborted response", async () => {
+it("loads literal Lente passages on expansion and discards an aborted response", async () => {
   const { LenteView } = await import("@/ui/lente/LenteView");
   const rowModule = await import("@/ui/noteResultRow");
   let disclosure!: (expanded: boolean, metadata: HTMLElement) => void;
@@ -212,45 +212,7 @@ it("resolves Lente passage only on expansion and discards an aborted response", 
     await tick();
     expect(oldSlot.textContent).toBe("Loading passage…");
     expect(source.searchEvidence).toHaveBeenCalledTimes(2);
-  } finally {
-    row.mockRestore();
-  }
-});
-
-it("renders a semantic Lente passage as literal noninteractive text", async () => {
-  const { LenteView } = await import("@/ui/lente/LenteView");
-  const rowModule = await import("@/ui/noteResultRow");
-  let disclosure!: (expanded: boolean, metadata: HTMLElement) => void;
-  const row = vi.spyOn(rowModule, "appendNoteResultRow").mockImplementation((...args) => {
-    disclosure = args[6]!;
-    return {} as HTMLDivElement;
-  });
-  const source = {
-    searchEvidence: vi.fn(async () => ({
-      kind: "passage",
-      text: "# Literal [[link]]",
-      sectionPath: [],
-    })),
-  };
-  const app = { vault: { getFileByPath: () => ({}) }, workspace: {} };
-  const view: any = new LenteView({ app } as any, source as any);
-  view.status = element();
-  view.rows = element();
-  view.resultsCount = element();
-  view.output = {
-    hits: [
-      {
-        path: "a.md",
-        semanticScore: 1,
-        evidence: { uid: "u", profile: "p", startOffset: 0, endOffset: 18 },
-      },
-    ],
-    status: {},
-  };
-  try {
-    view.render();
-    const metadata = element();
-    disclosure(true, metadata);
+    releases[1]({ kind: "passage", text: "# Literal [[link]]" });
     await tick();
     const quote = metadata.children[0].children[1];
     expect(quote.tagName).toBe("blockquote");

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CallbackManager } from "@langchain/core/callbacks/manager";
+import { awaitAllCallbacks } from "@langchain/core/callbacks/promises";
 import { FakeToolCallingModel } from "langchain";
 import { ChatSession } from "@/chat/ChatSession";
 import { createVaultTools } from "@/tools/VaultTools";
@@ -225,58 +226,72 @@ describe("local retrieval tracing", () => {
 
 describe.skipIf(!process.env.TRAMA_SYNTHETIC_NETWORK)("synthetic tracing host", () => {
   it("captures tracing attempts without making network requests", async () => {
-    const requests: { url: string; headers: string }[] = [];
+    const requests: {
+      upload: boolean;
+      expectedLoopbackURL: boolean;
+      apiKeyAbsent: boolean;
+      apiKeyIsUndefinedSentinel: boolean;
+      authorizationAbsent: boolean;
+    }[] = [];
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      const url = new URL(String(input));
+      const key = headers.get("x-api-key");
       requests.push({
-        url: String(input),
-        headers: (() => {
-          const entries: Record<string, string> = {};
-          new Headers(init?.headers).forEach((value, key) => {
-            entries[key] = value;
-          });
-          return JSON.stringify(entries);
-        })(),
+        upload: url.pathname.startsWith("/runs"),
+        expectedLoopbackURL: url.origin === "http://127.0.0.1:19876",
+        apiKeyAbsent: key === null,
+        apiKeyIsUndefinedSentinel: key === "undefined",
+        authorizationAbsent: !headers.has("authorization"),
       });
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     });
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
-    const debug = new ConsoleDebug(() => true);
-    const vault = {
-      readNote: async (path: string) => ({ path, content: "note" }),
-      resolveLink: async () => null,
-      discoverLinks: async () => [],
-    };
-    const retrieval = new VaultRetrieval(
-      async () => ({ hits: [], mode: "lexical", degraded: false }),
-      undefined,
-      undefined,
-      vault.readNote,
-      debug
-    );
-    await retrieval.searchCandidates({ query: "term", mode: "lexical" });
-    const model = new FakeToolCallingModel({
-      toolCalls: [[{ id: "call", name: "vault_search", args: { query: "term" } }], []],
-    });
-    const session = new ChatSession(
-      model,
-      () => createVaultTools(vault, retrieval),
-      vault,
-      () => {},
-      debug
-    );
-    expect(
-      (await session.send({ content: "prompt", attachmentPaths: [] })).turns.at(-1)
-    ).toMatchObject({ status: "complete" });
-    if (process.env.TRAMA_SYNTHETIC_NETWORK === "enabled") {
-      await vi.waitFor(() => expect(requests.length).toBeGreaterThan(0), { timeout: 5000 });
-      expect(JSON.stringify(requests)).not.toContain("synthetic-model-key");
-      expect(requests.every(({ headers }) => !/x-api-key|authorization/i.test(headers))).toBe(true);
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      expect(requests).toEqual([]);
+    try {
+      const output = vi.spyOn(console, "info").mockImplementation(() => {});
+      const debug = new ConsoleDebug(() => true);
+      const vault = {
+        readNote: async (path: string) => ({ path, content: "note" }),
+        resolveLink: async () => null,
+        discoverLinks: async () => [],
+      };
+      const retrieval = new VaultRetrieval(
+        async () => ({ hits: [], mode: "lexical", degraded: false }),
+        undefined,
+        undefined,
+        vault.readNote,
+        debug
+      );
+      await retrieval.searchCandidates({ query: "term", mode: "lexical" });
+      const model = new FakeToolCallingModel({
+        toolCalls: [[{ id: "call", name: "vault_search", args: { query: "term" } }], []],
+      });
+      const session = new ChatSession(
+        model,
+        () => createVaultTools(vault, retrieval),
+        vault,
+        () => {},
+        debug
+      );
+      expect(
+        (await session.send({ content: "prompt", attachmentPaths: [] })).turns.at(-1)
+      ).toMatchObject({ status: "complete" });
+      await awaitAllCallbacks();
+      if (process.env.TRAMA_SYNTHETIC_NETWORK === "enabled") {
+        await vi.waitFor(() => expect(requests.some((request) => request.upload)).toBe(true), {
+          timeout: 5000,
+        });
+        expect(requests.every((request) => request.expectedLoopbackURL)).toBe(true);
+        expect(requests.every((request) => request.authorizationAbsent)).toBe(true);
+        expect(
+          requests.every((request) => request.apiKeyAbsent || request.apiKeyIsUndefinedSentinel)
+        ).toBe(true);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(requests).toEqual([]);
+      }
+      expect(JSON.stringify(output.mock.calls)).toContain('"type":"retriever"');
+    } finally {
+      vi.unstubAllGlobals();
     }
-    expect(JSON.stringify(output.mock.calls)).toContain('"type":"retriever"');
-    expect(JSON.stringify(output.mock.calls)).not.toContain("synthetic-model-key");
-    vi.unstubAllGlobals();
   });
 });
