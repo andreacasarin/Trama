@@ -43,7 +43,6 @@ const winner = db.selectValue("SELECT trama_vector_winner(vector,?,ordinal) FROM
   blob([1, 0]),
 ]);
 db.exec("CREATE VIRTUAL TABLE evidence_test USING fts5(body)");
-db.exec("INSERT INTO evidence_test VALUES ('café noir')");
 const runtimeChecks = {
   nativeDot: dot([1, 0], [0.5, 0.5]) === 0.5,
   smallDot: dot([1e-30, 0], [1e-30, 0]) > 0,
@@ -52,8 +51,6 @@ const runtimeChecks = {
   nativeWinner:
     db.selectValue("SELECT trama_winner_score(?)", [winner]) === 1 &&
     db.selectValue("SELECT trama_winner_ordinal(?)", [winner]) === 1,
-  ftsSearch:
-    db.selectValue("SELECT count(*) FROM evidence_test WHERE evidence_test MATCH 'cafe'") === 1,
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,

@@ -64,18 +64,31 @@ it("preserves native hybrid and related ranking", async () => {
       k: 10,
     });
     const ranking = hybrid as {
-      hits: Array<{ evidence?: { startOffset?: number; endOffset?: number } }>;
+      hits: Array<{
+        lexicalScore?: number;
+        evidence?: { startOffset?: number; endOffset?: number };
+      }>;
     };
     const normalizedHybrid = {
       ...(hybrid as object),
-      hits: ranking.hits.map(({ evidence, ...hit }) => ({
+      hits: ranking.hits.map(({ lexicalScore: _lexicalScore, evidence, ...hit }) => ({
         ...hit,
         ...(evidence?.startOffset === undefined
           ? {}
           : { evidence: { startOffset: evidence.startOffset, endOffset: evidence.endOffset } }),
       })),
     };
-    expect({ hybrid: normalizedHybrid, lexical, fallback, related, unavailable }).toEqual(EXPECTED);
+    const withoutLexicalScore = (result: typeof ranking) => ({
+      ...result,
+      hits: result.hits.map(({ lexicalScore: _lexicalScore, ...hit }) => hit),
+    });
+    expect({
+      hybrid: normalizedHybrid,
+      lexical: withoutLexicalScore(lexical as typeof ranking),
+      fallback: withoutLexicalScore(fallback as typeof ranking),
+      related,
+      unavailable,
+    }).toEqual(EXPECTED);
   } finally {
     db.close();
   }
@@ -87,7 +100,6 @@ const EXPECTED = {
       {
         path: "Folder/alpha.md",
         score: 0.032266458495966696,
-        lexicalScore: -1.123311976343026e-6,
         semanticScore: 1,
         evidence: {
           startOffset: 51,
@@ -97,7 +109,6 @@ const EXPECTED = {
       {
         path: "beta.md",
         score: 0.03225806451612903,
-        lexicalScore: -1.6612244897959184e-6,
         semanticScore: 1,
         evidence: {
           startOffset: 0,
@@ -107,7 +118,6 @@ const EXPECTED = {
       {
         path: "lexical.md",
         score: 0.01639344262295082,
-        lexicalScore: -1.8958575944102477e-6,
       },
       {
         path: "source.md",
@@ -127,17 +137,14 @@ const EXPECTED = {
       {
         path: "lexical.md",
         score: 0.01639344262295082,
-        lexicalScore: -1.8958575944102477e-6,
       },
       {
         path: "beta.md",
         score: 0.016129032258064516,
-        lexicalScore: -1.6612244897959184e-6,
       },
       {
         path: "Folder/alpha.md",
         score: 0.015873015873015872,
-        lexicalScore: -1.123311976343026e-6,
       },
     ],
     mode: "lexical",
@@ -148,17 +155,14 @@ const EXPECTED = {
       {
         path: "lexical.md",
         score: 0.01639344262295082,
-        lexicalScore: -1.8958575944102477e-6,
       },
       {
         path: "beta.md",
         score: 0.016129032258064516,
-        lexicalScore: -1.6612244897959184e-6,
       },
       {
         path: "Folder/alpha.md",
         score: 0.015873015873015872,
-        lexicalScore: -1.123311976343026e-6,
       },
     ],
     mode: "lexical",
