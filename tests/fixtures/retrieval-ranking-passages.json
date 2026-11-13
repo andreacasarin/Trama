@@ -1,0 +1,134 @@
+{
+  "source.md": {
+    "passages": [
+      {
+        "ordinal": 0,
+        "startOffset": 0,
+        "endOffset": 22,
+        "sectionStartOffset": 0,
+        "sectionPath": ["Source"],
+        "text": "# Source\n\nalpha source"
+      }
+    ],
+    "metadata": {
+      "title": "source",
+      "aliases": [],
+      "tags": []
+    }
+  },
+  "Folder/alpha.md": {
+    "passages": [
+      {
+        "ordinal": 0,
+        "startOffset": 51,
+        "endOffset": 72,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "# Alpha\n\nalpha body\n\n"
+      },
+      {
+        "ordinal": 1,
+        "startOffset": 72,
+        "endOffset": 1071,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 2,
+        "startOffset": 1071,
+        "endOffset": 2065,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 3,
+        "startOffset": 2065,
+        "endOffset": 3059,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 4,
+        "startOffset": 3059,
+        "endOffset": 4053,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 5,
+        "startOffset": 4053,
+        "endOffset": 5047,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 6,
+        "startOffset": 5047,
+        "endOffset": 6041,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 7,
+        "startOffset": 6041,
+        "endOffset": 7035,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long passage. Long "
+      },
+      {
+        "ordinal": 8,
+        "startOffset": 7035,
+        "endOffset": 7072,
+        "sectionStartOffset": 51,
+        "sectionPath": ["Alpha"],
+        "text": "passage. Long passage. Long passage. "
+      }
+    ],
+    "metadata": {
+      "title": "alpha",
+      "aliases": ["needle alias"],
+      "tags": ["#needle-tag"]
+    }
+  },
+  "beta.md": {
+    "passages": [
+      {
+        "ordinal": 0,
+        "startOffset": 0,
+        "endOffset": 26,
+        "sectionStartOffset": 0,
+        "sectionPath": ["needle title"],
+        "text": "# needle title\n\nalpha body"
+      }
+    ],
+    "metadata": {
+      "title": "beta",
+      "aliases": [],
+      "tags": []
+    }
+  },
+  "lexical.md": {
+    "passages": [
+      {
+        "ordinal": 0,
+        "startOffset": 0,
+        "endOffset": 22,
+        "sectionStartOffset": 0,
+        "sectionPath": ["Other"],
+        "text": "# Other\n\nneedle needle"
+      }
+    ],
+    "metadata": {
+      "title": "lexical",
+      "aliases": [],
+      "tags": []
+    }
+  }
+}

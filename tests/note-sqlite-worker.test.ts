@@ -1,5 +1,4 @@
-import { MarkdownTextSplitter } from "@langchain/textsplitters";
-import { Document } from "@langchain/core/documents";
+import { prepareNote } from "@/index/NotePassages";
 import { describe, expect, it, vi } from "vitest";
 import { NoteStoreClient, type NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
@@ -88,6 +87,8 @@ const entry = (path: string, markdown: string) => ({
   profile: null,
   markdown,
   vectors: [],
+  passages: [],
+  metadata: { title: "", aliases: [], tags: [] },
 });
 
 describe("SQLite note worker transport", () => {
@@ -267,9 +268,7 @@ describe("SQLite note worker transport", () => {
     await client.call("noteStoreReplace", entry("note.md", "# prior\n\nprior complete note"));
 
     const markdown = `# replacement\n\n${Array.from({ length: 1400 }, () => "transactional content for cancellation testing").join(" ")}`;
-    const chunks = await new MarkdownTextSplitter().splitDocuments([
-      new Document({ pageContent: markdown, metadata: { path: "note.md" } }),
-    ]);
+    const { passages: chunks } = await prepareNote(markdown, "note.md");
     expect(chunks.length).toBeGreaterThan(16);
     watchInsert = true;
     const controller = new AbortController();
@@ -281,6 +280,8 @@ describe("SQLite note worker transport", () => {
         profile: "local-model",
         markdown,
         vectors: chunks.map(() => [1, 0]),
+        metadata: { title: "", aliases: [], tags: [] },
+        passages: chunks,
       },
       controller.signal
     );
@@ -326,6 +327,16 @@ describe("SQLite note worker transport", () => {
           ...entry(path, `# ${path}\n\nshared searchable body`),
           profile: "worker-test",
           vectors: [[1, 0]],
+          passages: [
+            {
+              ordinal: 0,
+              startOffset: 0,
+              endOffset: `# ${path}\n\nshared searchable body`.length,
+              sectionStartOffset: null,
+              sectionPath: [],
+              text: `# ${path}\n\nshared searchable body`,
+            },
+          ],
         })
       )
     );

@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-09
-- Updated: 2026-10-28
+- Updated: 2026-11-12
 
 ## Context
 
@@ -24,13 +24,57 @@ Keep one native double precision dot product for scoring and raw shard validatio
 reuse the validated Float32 magnitude when normalizing bounded inputs. No parallel
 precision modes, SIMD specialization, or search-engine dependency is introduced.
 
-Use LangChain's vector-store interface, default Markdown splitter, native `index()` lifecycle, and a SQLite RecordManager. LangChain owns content/metadata hashing, record UIDs, unchanged-note skipping, record refresh, and stale cleanup. Do not retain a parallel custom source-hash, reread, or prune lifecycle, migration, or compatibility layer. Compatibility covers the Obsidian adapters only.
+Use LangChain's vector-store interface, native `index()` lifecycle, and a SQLite RecordManager. LangChain's `RecursiveCharacterTextSplitter` 1.0.2 prepares body passages using recursive paragraph, newline, and space separators, `keepSeparator: true`, a 1,000 UTF-8 byte target, and zero overlap. A small code-point-safe adapter supports the empty-separator fallback and maps passage positions to raw Markdown. LangChain owns content/metadata hashing, record UIDs, unchanged-note skipping, record refresh, and stale cleanup. Do not retain a parallel custom source-hash, reread, or prune lifecycle, migration, or compatibility layer. Compatibility covers the Obsidian adapters only. Keep SQL retrieval in SQLite; the proposed LangChain retriever path is deferred, and filtering, ranking, and vector arithmetic stay in SQLite.
 
-SQLite owns filtering, grouping, deduplication, ranking, and native vector scoring. Semantic scoring uses cosine similarity via dot products of normalized Float32 vectors, with double precision accumulation in Trama's small native SQL function. SQLite-Vector is no longer required. Validation uses the stored Float32 representation and the same arithmetic range; existing cache shards remain readable. Store note identity/path, embedding profile, chunk vectors, normalized note centroids, and contentless FTS data without raw Markdown bodies. Hydrate winning notes from the live vault. Hybrid search fuses body/path BM25 and maximum-chunk semantic ranking with reciprocal-rank fusion, using rank constant 60. Related-note lookup uses normalized centroids without provider access. LangChain defaults and these ranking values are approved V1 defaults; no separate tuning rationale was supplied. For the model-facing `vault_search` tool, retrieve ranked SQL candidates before hydrating live-vault notes. Iterate the full ranked SQL candidate pool, returning leading previews of up to 1,000 characters per hit, up to the requested result limit and within a 12,000-character serialized data cap. Stop before hydrating more candidates when the result limit is reached, or when the next preview would exceed the cap. Preserve ranking, canonical paths, and degradation status; report the full candidate-pool, hydrated, returned, and omitted counts. Missing notes are not hydrated. `hydratedCount` includes a successfully read candidate whose preview does not fit; `omittedCount` is candidate-pool count minus returned count; candidate count can exceed the requested result limit. Missing notes are skipped while counting successful live-vault hydration. This avoids hydrating lower-ranked candidates after the requested result count or serialized output cap is reached. Full reads remain available through `read_notes`.
+SQLite owns filtering, grouping, deduplication, ranking, and native vector scoring. Semantic scoring uses cosine similarity via dot products of normalized Float32 vectors, with double precision accumulation in Trama's small native SQL function. SQLite-Vector is no longer required. Validation uses the stored Float32 representation and the same arithmetic range; existing cache shards remain readable. Store note identity/path, embedding profile, chunk vectors, normalized note centroids, and contentless FTS data without raw Markdown bodies. Hydrate winning notes from the live vault. Hybrid search fuses body/path BM25 and maximum-passage semantic ranking with reciprocal-rank fusion, using rank constant 60. Related-note lookup uses normalized centroids without provider access. LangChain defaults and these ranking values are approved V1 defaults; no separate tuning rationale was supplied. For the model-facing `vault_search` tool, retrieve ranked SQL candidates before hydrating live-vault notes. Iterate the full ranked SQL candidate pool, returning leading previews of up to 1,000 characters per hit, up to the requested result limit and within a 12,000-character serialized data cap. Stop before hydrating more candidates when the result limit is reached, or when the next preview would exceed the cap. Preserve ranking, canonical paths, and degradation status; report the full candidate-pool, hydrated, returned, and omitted counts. Missing notes are not hydrated. `hydratedCount` includes a successfully read candidate whose preview does not fit; `omittedCount` is candidate-pool count minus returned count; candidate count can exceed the requested result limit. Missing notes are skipped while counting successful live-vault hydration. This avoids hydrating lower-ranked candidates after the requested result count or serialized output cap is reached. Full reads remain available through `read_notes`.
 
-The controller reserves a RecordManager run watermark, submits windows of up to 100 notes with cleanup disabled and `sourceIdKey: "path"`, then calls `index()` with an empty source and full cleanup after every input succeeds, including an empty vault. The adapter combines embeddings across notes into batches of up to 512 chunks; oversized notes use bounded batches too. Path and embedding profile are indexed metadata and affect the native hash.
+The controller reserves a RecordManager run watermark, submits windows of up to 100 notes with cleanup disabled and `sourceIdKey: "path"`, then calls `index()` with an empty source and full cleanup after every input succeeds, including an empty vault. The embedding adapter sends up to 256 chunks per request. Path and embedding profile are indexed metadata and affect the native hash.
 
-Register each prepared note's UID, path, and logical-clock tick in the same SQLite transaction as its FTS and vectors. Timestamps must be strictly later than the reserved watermark; cleanup selects older records in stable UID pages of up to 1,000. Existence checks match the current note UID, and UID-guarded deletion cannot delete a newer note at the same path. A failed run stops and skips cleanup, retaining earlier committed notes and existing lexical data. Do not rewrite a failed note as lexical-only. Note changes during a run are picked up by a later successful update. Query-time semantic failure can fall back to lexical search.
+### Body passages and note metadata
+
+Use Obsidian's frontmatter boundary to exclude the full YAML block from passage
+text, including recognized malformed frontmatter. Keep basename title, parsed
+aliases and tags as searchable metadata, and original Markdown in lexical search.
+Recursive splitting may trim or omit whitespace between passages, but every
+non-whitespace source character is covered exactly once. Preserve half-open
+UTF-16 offsets into original Markdown; use empty `sectionPath` and null
+`sectionStartOffset`, without promising heading parsing, breadcrumbs, or a
+Markdown tree. The 1,000-byte target bounds ordinary `cl100k_base` inputs by 1,000
+tokens each; batches of 256 therefore have a conservative 256,000-token bound.
+This is not native SDK token-budget enforcement and does not promise limits for
+arbitrary local tokenizers, provider prefixes, or server truncation. Smaller
+batches can increase calls and need not improve speed.
+
+Include `body-recursive-utf8-1000-codepoint-v1` in both note embedding profile
+and embedding-cache identity. Refresh and re-embedding under this identity are
+required; existing database fields remain compatible, with no destructive
+migration. The prior cache namespace is not reused, while normal shared-cache
+reuse under the new profile remains available.
+
+Keep passage vectors and compute the normalized note centroid during the note
+write, so Filo uses SQLite data on note open without a provider call. Lente and
+Voce retain the current BM25, maximum-passage semantic, and RRF-60 retrieval. Do
+not add reranking or UI settings.
+
+### Search-result presentation
+
+Keep Lente's BM25, maximum-passage semantic, and RRF-60 ranking. Keep Filo's
+centroid-based note ranking and finite similarity-label thresholds. Preserve
+metadata indexing and lexical retrieval. Lente may disclose the verified semantic
+winner passage as a plain block quote; show it in the picker only when a semantic
+reference is available. Keyword-only results retain their keyword label and
+ordinary title opening, with no excerpt. Do not add exact keyword highlighting,
+matched-field explanations, or an empty evidence disclosure. Filo presents the
+related-note title and similarity label without an excerpt or disclosure.
+
+Verify the semantic source UID and embedding profile against the current index,
+and verify live note content before presenting a stored quote. Keep ordinary
+Obsidian title hover preview, title opening, and modifier behavior. Quotes are
+noninteractive and do not navigate to exact source positions or force editor
+context. Retain semantic source identity and offsets needed to verify and slice
+quotes. The separate splitter identity change can change passage content and
+therefore embeddings, centroids, and search results; BM25, maximum-passage
+semantic, centroid, and RRF scoring formulas remain unchanged.
 
 ### Vault and worker isolation
 
@@ -64,6 +108,8 @@ Keep Voce drafting as ephemeral plain text in a `contenteditable="plaintext-only
 ## Rationale
 
 Native indexing removes owned lifecycle policy. The atomic note/record write closes the write-before-record-update orphan gap without adding a second lifecycle. SQLite adapters preserve bounded corpus computation and avoid moving vectors to JavaScript. Omitting raw note bodies limits stored corpus content, while live-vault hydration keeps Markdown authoritative. Stable vault identity isolates local indexes across reloads. Native summarization middleware bounds accumulated working history without a custom message-trimming policy. Current request context remains intact, and confirmed history compaction is disclosed in a separate accessible turn status without changing the transcript. The ephemeral retrieval ledger preserves which sources were retrieved across condensation without adding a persisted source store or changing native graph recursion behavior; batch reads update it after the completed result, and per-note failures do not become evidence. Its token cost remains subject to the configured context budget. This records retrieval only, not model assessment or task completion. Keeping selected skills as explicit current-turn instructions and linked notes as untrusted evidence gives the agent useful source-relative context without granting reference notes instruction authority or crawling unrelated vault branches.
+
+Lente retains verified semantic passages as compact evidence while avoiding a separate lexical-range extraction path and metadata-explanation UI. Keyword retrieval and ranking remain intact, and keyword-only results do not imply a quote. Ordinary note opening and Obsidian preview remain sufficient navigation for both result lists. Filo keeps its centroid-ranked related-note list without an additional passage query or excerpt state. Keeping semantic source identity and offsets supports fresh quote validation; the splitter identity separately versions the passage representation.
 
 ## Consequences
 

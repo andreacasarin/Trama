@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { sha256 } from "@langchain/core/utils/hash";
 import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
+import { NOTE_SPLITTER_ID } from "@/index/NotePassages";
 import { embeddingEndpointFingerprint } from "@/index/SqliteNoteVectorStore";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import type { NoteStoreCall, SqliteConnection } from "@/index/note-sqlite/protocol";
@@ -116,6 +117,34 @@ function queryRows(
 const profile = embeddingCacheIdentity("test", 2);
 
 describe("SQLite embedding cache", () => {
+  it("isolates old splitter cache entries and reuses the new namespace", async () => {
+    const f = await fixture();
+    const provider = new CountingEmbeddings();
+    const oldIdentity = embeddingCacheIdentity("test", 2);
+    const nextIdentity = embeddingCacheIdentity("test", 2, undefined, NOTE_SPLITTER_ID);
+    const oldCache = new SqliteEmbeddingCache(
+      provider,
+      f.database.call.bind(f.database),
+      oldIdentity,
+      2
+    );
+    const nextCache = new SqliteEmbeddingCache(
+      provider,
+      f.database.call.bind(f.database),
+      nextIdentity,
+      2
+    );
+    try {
+      await oldCache.embedDocuments(["same passage"]);
+      await nextCache.embedDocuments(["same passage"]);
+      await nextCache.embedDocuments(["same passage"]);
+      expect(provider.documentCalls).toEqual([["same passage"], ["same passage"]]);
+      expect(oldIdentity).not.toBe(nextIdentity);
+    } finally {
+      f.db.close();
+    }
+  });
+
   it.each(["resolve", "reject", "AbortError"] as const)(
     "propagates cancellation during query-cache writes that %s",
     async (outcome) => {

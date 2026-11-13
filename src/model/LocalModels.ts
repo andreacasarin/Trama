@@ -79,7 +79,7 @@ class GuardedOpenAIEmbeddings extends OpenAIEmbeddings {
       dimensions: options.dimensions,
       encodingFormat: "float",
       stripNewLines: false,
-      batchSize: 512,
+      batchSize: 256,
       maxRetries: 0,
       apiKey: "local-endpoint",
       configuration: {

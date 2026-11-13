@@ -10,12 +10,14 @@ import type { NoteStoreCall, SqliteEmbeddingShard } from "./note-sqlite/protocol
 export function embeddingCacheIdentity(
   modelId: string,
   dimensions: number,
-  endpointFingerprint?: string
+  endpointFingerprint?: string,
+  splitter?: string
 ): string {
   return JSON.stringify({
     modelId: modelId.trim(),
     dimensions,
     ...(endpointFingerprint ? { endpointFingerprint } : {}),
+    ...(splitter ? { splitter } : {}),
   });
 }
 

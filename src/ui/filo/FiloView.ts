@@ -1,27 +1,21 @@
-import { ItemView, Keymap, setTooltip, WorkspaceLeaf } from "obsidian";
-import type { Document } from "@langchain/core/documents";
+import { ItemView, Keymap, WorkspaceLeaf } from "obsidian";
 import type { IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { appendNoteResultRow } from "@/ui/noteResultRow";
 import type { IconName, EventRef } from "obsidian";
+import type { NoteStoreHit } from "@/index/note-sqlite/protocol";
+import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export const FILO_VIEW_TYPE = "trama-filo";
-interface RelatedSource {
-  related(
-    path: string,
-    signal: AbortSignal,
-    limit?: number
-  ): Promise<{ readonly documents: readonly Document[]; readonly available: boolean }>;
-}
+type RelatedSource = Pick<VaultRetrieval, "related">;
 
 export class FiloView extends ItemView {
   private status: IndexStatus;
   private unsubscribe?: () => void;
   private event?: EventRef;
   private controller?: AbortController;
-  private generation = 0;
   private activePath?: string;
-  private documents: readonly Document[] = [];
+  private hits: readonly NoteStoreHit[] = [];
   private available = false;
   private error = false;
   constructor(
@@ -44,7 +38,7 @@ export class FiloView extends ItemView {
   setRelated(source?: RelatedSource): void {
     this.cancel();
     this.related = source;
-    this.documents = [];
+    this.hits = [];
     this.refresh();
   }
   refreshActiveNote(path: string | undefined): void {
@@ -57,9 +51,11 @@ export class FiloView extends ItemView {
       const isBuilding = status.kind === "building";
       const finishedBuilding = wasBuilding && !isBuilding;
       if (isBuilding || finishedBuilding) this.refresh();
-      else this.render();
     });
-    this.event = this.app.workspace.on("active-leaf-change", () => this.refresh());
+    this.event = this.app.workspace.on("active-leaf-change", () => {
+      const path = this.app.workspace.getActiveFile()?.path;
+      if (path !== this.activePath) this.refresh();
+    });
     this.refresh();
     return Promise.resolve();
   }
@@ -71,7 +67,6 @@ export class FiloView extends ItemView {
     return Promise.resolve();
   }
   private cancel(): void {
-    this.generation++;
     this.controller?.abort();
     this.controller = undefined;
   }
@@ -82,27 +77,26 @@ export class FiloView extends ItemView {
         : (pathOverride ?? undefined);
     this.activePath = path && path.toLowerCase().endsWith(".md") ? path : undefined;
     this.cancel();
-    this.documents = [];
+    this.hits = [];
     this.available = false;
     this.error = false;
     if (!this.activePath || !this.related || this.status.kind === "building") {
       this.render();
       return;
     }
-    const generation = ++this.generation;
     const controller = new AbortController();
     this.controller = controller;
     void this.related
       .related(this.activePath, controller.signal, 20)
       .then((result) => {
-        if (generation !== this.generation || controller.signal.aborted) return;
-        this.documents = result.documents;
+        if (controller.signal.aborted) return;
+        this.hits = result.hits;
         this.available = result.available;
         this.controller = undefined;
         this.render();
       })
       .catch(() => {
-        if (generation !== this.generation || controller.signal.aborted) return;
+        if (controller.signal.aborted) return;
         this.error = true;
         this.controller = undefined;
         this.render();
@@ -136,15 +130,14 @@ export class FiloView extends ItemView {
       });
       return;
     }
-    if (!this.documents.length) {
+    if (!this.hits.length) {
       root.createDiv({ text: "No related notes found." });
       return;
     }
-    const documents = this.documents.filter((document) => {
-      const path = String(document.metadata.path ?? document.id ?? "");
-      return Boolean(path && path !== this.activePath && this.app.vault.getFileByPath(path));
-    });
-    if (!documents.length) {
+    const hits = this.hits.filter(
+      (hit) => hit.path && hit.path !== this.activePath && this.app.vault.getFileByPath(hit.path)
+    );
+    if (!hits.length) {
       root.createDiv({ text: "No related notes found." });
       return;
     }
@@ -152,14 +145,14 @@ export class FiloView extends ItemView {
     const resultsInfo = resultGroup.createDiv({ cls: "search-results-info" });
     resultsInfo.createDiv({
       cls: "search-results-result-count",
-      text: `${documents.length} related ${documents.length === 1 ? "note" : "notes"}`,
+      text: `${hits.length} related ${hits.length === 1 ? "note" : "notes"}`,
     });
     const rows = resultGroup.createDiv({
       cls: "search-result-container mod-global-search trama-filo__rows",
     });
-    for (const document of documents) {
-      const path = String(document.metadata.path ?? document.id ?? "");
-      const link = appendNoteResultRow(
+    for (const hit of hits) {
+      const path = hit.path;
+      appendNoteResultRow(
         rows,
         this.app,
         path,
@@ -171,9 +164,8 @@ export class FiloView extends ItemView {
             Keymap.isModEvent(event)
           );
         },
-        document.metadata.score
+        hit.score
       );
-      setTooltip(link, path);
     }
   }
 }

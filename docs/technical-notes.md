@@ -7,8 +7,10 @@ This reference covers storage, maintenance, and the details behind Voce's behavi
 
 ## Storage and retrieval
 
-Trama uses LangChain for embeddings, Markdown splitting, agents, and tools, with
-LangGraph owning the active conversation's in-memory checkpoints.
+Trama uses LangChain for embeddings, indexing lifecycle, agents, and tools, with
+LangGraph owning the active conversation's in-memory checkpoints. Note passage
+preparation uses LangChain's recursive character splitter, with a small adapter
+for UTF-8 byte sizing and source-position mapping.
 
 Each vault has a stable identity in
 `<storage-folder>/identity.json`; the storage folder defaults to `.trama` and
@@ -18,17 +20,79 @@ does not copy the database itself. Changing the storage folder selects its
 identity and OPFS namespace without moving or migrating files from the previous
 folder.
 
-SQLite stores note metadata, chunk vectors, lexical search data, and normalized
-note centroids. It performs filtering, ranking, and vector scoring. Vectors are
-normalized on ingestion, and the native dot product implements cosine similarity.
-Filo compares note centroids; its **Similarity** rating is approximate and
-model-dependent. Vector search is currently exact; approximate search is deferred.
+SQLite stores note metadata, passage vectors with source positions, lexical
+search data, and normalized note centroids. It performs filtering, ranking, and
+vector scoring. Vectors are normalized on ingestion, and the native dot product
+implements cosine similarity. Filo compares the stored note centroid, so opening
+a note does not trigger an embedding request. Its **Similarity** rating is
+approximate and model-dependent. Vector search is exact; approximate search is
+deferred.
 
-The index does not persist raw Markdown bodies. Lexical search data still derives
-from note content. Result lists use metadata without reading note bodies; tool
-excerpts and full-note reads load current content from the vault. Search falls
-back to lexical results when semantic retrieval cannot run and reports the
-degraded state.
+### Passage and metadata indexing
+
+Trama uses Obsidian's frontmatter boundary to exclude the entire YAML block from
+semantic passages, including recognized malformed frontmatter. The note basename
+is indexed as its title; Obsidian-parsed aliases and frontmatter tags remain
+searchable metadata. The original Markdown, including frontmatter text, remains
+in lexical search.
+
+Passages use LangChain's `RecursiveCharacterTextSplitter` 1.0.2 with recursive
+paragraph, newline, and space separators, `keepSeparator: true`, a 1,000-byte
+target, and no overlap. A code-point-safe adapter handles the empty-separator
+fallback, and a monotonic mapping preserves half-open UTF-16 offsets into the
+original Markdown. The splitter identity is
+`body-recursive-utf8-1000-codepoint-v1` and is part of both the note embedding
+profile and cache identity. Whitespace between passages may be trimmed or omitted; all
+non-whitespace source text is covered exactly once. Passage metadata does not
+include parsed Markdown structure: `sectionPath` is empty and
+`sectionStartOffset` is null. These fields do not promise heading-aware sections,
+breadcrumbs, or a Markdown syntax tree.
+
+The 1,000 UTF-8 byte limit is the conservative input bound used across compatible
+providers. With the standard `cl100k_base` encoding, it bounds ordinary passage
+inputs to at most 1,000 tokens. The configured OpenAI batch size is 256, so the
+combined conservative bound is 256,000 tokens per request, below 300,000 and the
+8,191-token per-input limit. These are byte-derived bounds, not automatic native
+SDK token-budget enforcement or guarantees for arbitrary local tokenizers,
+provider prefixes, or server-side truncation. Other compatible servers use the
+same byte limit without a context-window claim. Smaller batches can increase
+request count and do not necessarily improve indexing speed.
+
+The original Markdown body, including frontmatter text, remains in the lexical
+search field, together with path and structured metadata. Search keeps the
+existing BM25 body/path ranking, maximum
+passage semantic score, and reciprocal-rank fusion constant of 60. It does not
+add a reranking stage.
+
+The index does not persist raw Markdown bodies. Result lists use metadata without
+reading note bodies; tool excerpts and full-note reads load current content from
+the vault. Search falls back to lexical results when semantic retrieval cannot
+run and reports the degraded state.
+
+### Search and related-note evidence
+
+Lente keeps its existing lexical body/path BM25, maximum-passage semantic score,
+and reciprocal-rank fusion (RRF-60). Filo also keeps its existing ranking. Search
+results retain the existing semantic score labels and thresholds. Keyword-only
+Lente results retain the “Keyword match” label and title navigation, but do not
+show an excerpt. A semantic Lente result can be expanded to show its actual
+semantic winner passage as a plain block quote. The command-palette Lente picker
+shows that semantic passage in its existing two-line quote when one is available.
+Neither surface adds keyword highlighting or explanations of matched metadata
+fields. Filo shows its related-note title and similarity label without an excerpt
+or disclosure. Both views retain Obsidian title hover previews and ordinary title
+opening, including modifier-key behavior.
+
+Before showing a stored semantic quote, Trama verifies the source UID and profile
+against the current index and checks the live note content. If the source is no
+longer current, the quote is not shown. Quote text is noninteractive; title
+opening remains the route to the full note. No exact-position navigation or
+forced editor context is offered from excerpts.
+
+These displays use the existing index and profile without an embedding-provider
+call, schema or profile change, reindex, or embedding-cache rebuild. SQLite
+retains the semantic winner and tie order. Lente's lexical BM25 retrieval and
+metadata indexing remain unchanged.
 
 ## Index maintenance
 
@@ -49,10 +113,19 @@ Persisted file revisions include modification time, creation time, and size.
 Startup and file-event updates skip body reads for matching revisions. Manual
 Update and the five-minute backstop reread content to catch changes whose metadata
 did not change. Revisions are not remembered if the file changes during its read.
-Changed content still goes through LangChain hashing and cleanup.
+Changed content still goes through LangChain hashing and cleanup. The body-passage
+preprocessing and splitter identity are part of both the note embedding profile
+and embedding-cache identity. The new identity prevents stale passage cache
+entries from being reused; the index needs a refresh/re-embedding under the
+current profile. Matching passage embeddings can still be reused from
+the current shared cache, while changed passage text needs new embeddings.
+Metadata and source-position changes alone do not require new embeddings when
+passage text is unchanged. Existing database fields remain compatible; no
+destructive migration is needed. Until a note is refreshed, its existing lexical
+entry remains available.
 
-Notes enter LangChain in batches of up to 100. Embeddings are flushed in groups
-of up to 512 chunks. Each note commits atomically, and full cleanup runs only
+Notes enter LangChain in batches of up to 100. Embedding inputs are sent in
+groups of up to 256 chunks. Each note commits atomically, and full cleanup runs only
 after every input succeeds, including for an empty vault. Cancellation rolls back
 the active transaction while retaining earlier completed commits. Failures skip
 cleanup and leave previously indexed lexical data available. Changes during a run

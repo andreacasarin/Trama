@@ -39,6 +39,68 @@ async function shardFixture(hash = "b".repeat(64)) {
 }
 
 describe("Float32 storage and cosine scoring contract", () => {
+  it("scores each passage once when selecting semantic winners", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    let aggregateSteps = -1;
+    const connection: SqliteConnection = {
+      exec(statement) {
+        if (typeof statement !== "string" && statement.sql.includes("needle_input AS")) {
+          aggregateSteps = 0;
+          db.exec({
+            sql: `EXPLAIN ${statement.sql}`,
+            bind: statement.bind,
+            rowMode: "object",
+            callback: (row: Record<string, unknown>) => {
+              if (row.opcode === "AggStep" && row.p4 === "trama_vector_winner(3)") aggregateSteps++;
+            },
+          });
+        }
+        db.exec(statement);
+      },
+      close: () => db.close(),
+    };
+    const database = new NoteSqliteDatabase(connection);
+    try {
+      await database.call("noteStoreHybrid", {
+        query: "alpha",
+        vector: [1, 0],
+        profile: "p",
+        k: 10,
+      });
+      expect(aggregateSteps).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+  it("returns the same maximum dot score and lowest ordinal on a tie", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    try {
+      db.exec("CREATE TABLE candidates(ordinal INTEGER, vector BLOB)");
+      for (const [ordinal, vector] of [
+        [8, [-1, 0]],
+        [4, [-0.5, 0]],
+        [2, [-0.5, 0]],
+      ] as const) {
+        db.exec({
+          sql: "INSERT INTO candidates VALUES(?,?)",
+          bind: [ordinal, encodeVector([...vector], 2)],
+        });
+      }
+      const query = encodeVector([1, 0], 2);
+      const winner = db.selectValue(
+        "SELECT trama_vector_winner(vector,?,ordinal) FROM candidates",
+        [query]
+      );
+      expect(db.selectValue("SELECT trama_winner_ordinal(?)", [winner])).toBe(2);
+      expect(db.selectValue("SELECT trama_winner_score(?)", [winner])).toBe(
+        db.selectValue("SELECT MAX(trama_vector_dot(vector,?)) FROM candidates", [query])
+      );
+    } finally {
+      db.close();
+    }
+  });
   it.each([1e-30, 1e20, 2 ** -149, Math.fround(3.402823466e38)])(
     "accepts the same nonzero Float32 magnitudes in JS and native arithmetic: %s",
     async (value) => {
@@ -150,6 +212,17 @@ describe("Float32 storage and cosine scoring contract", () => {
           profile: "p",
           markdown: path,
           vectors: [vector],
+          metadata: { title: "", aliases: [], tags: [] },
+          passages: [
+            {
+              ordinal: 0,
+              startOffset: 0,
+              endOffset: path.length,
+              sectionStartOffset: null,
+              sectionPath: [],
+              text: path,
+            },
+          ],
         });
       for (const vector of [
         [1e-30, 0],

@@ -3,6 +3,7 @@ import { Notice, Plugin } from "obsidian";
 import { ChatSession } from "@/chat/ChatSession";
 import { skillCommandCatalog } from "@/chat/TemplateReferences";
 import { ManualIndex } from "@/index/ManualIndex";
+import { NOTE_SPLITTER_ID } from "@/index/NotePassages";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { embeddingCacheIdentity, SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import {
@@ -195,7 +196,8 @@ export class TramaPlugin extends Plugin {
           embeddingCacheIdentity(
             profile.modelId,
             profile.dimensions,
-            embeddingEndpointFingerprint(profile.endpoint)
+            embeddingEndpointFingerprint(profile.endpoint),
+            NOTE_SPLITTER_ID
           ),
           profile.dimensions
         )
@@ -237,9 +239,20 @@ export class TramaPlugin extends Plugin {
       settings.embedding.modelId ? noteEmbeddingProfile(profile) : undefined,
       async (path, signal) => {
         try {
+          const before = app.vault.getFileByPath(path);
+          if (!before) return null;
+          const revision = `${before.stat.mtime}:${before.stat.ctime}:${before.stat.size}`;
           const note = await readonlyVault.readNote(path, signal ?? new AbortController().signal);
+          const after = app.vault.getFileByPath(path);
+          if (
+            !after ||
+            after !== before ||
+            revision !== `${after.stat.mtime}:${after.stat.ctime}:${after.stat.size}`
+          )
+            return null;
           return { path: note.path, content: note.content };
         } catch {
+          if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
           return null;
         }
       },
@@ -270,8 +283,9 @@ export class TramaPlugin extends Plugin {
       }
       for (const leaf of app.workspace.getLeavesOfType("trama-filo"))
         leaf.view?.setRelated?.(this.retrieval);
-      for (const leaf of app.workspace.getLeavesOfType("trama-lente"))
-        leaf.view?.setSearch?.(this.retrieval.runnable);
+      for (const leaf of app.workspace.getLeavesOfType("trama-lente")) {
+        leaf.view?.setSearch?.(this.retrieval);
+      }
     }
     this.refreshVoceSuggestions();
     this.logStartupElapsed("service-compose", compositionStartedAt);

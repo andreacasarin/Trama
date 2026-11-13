@@ -42,10 +42,15 @@ Want a repeatable workflow? Write a skill as a Markdown note and invoke it with
 
 ### Filo and Lente: follow an idea
 
-Filo surfaces related notes as you move through your vault. Lente combines
-keyword and semantic search to help you find notes even when your wording has
-changed. Both link directly to the original notes. With Obsidian's **Page preview**
-enabled for Trama, hover over a result title to peek inside.
+Filo surfaces related notes as you move through your vault, and Lente combines
+keyword and semantic search to find notes even when your wording has changed.
+Both views show the title and a qualitative semantic label; keyword-only Lente
+results say **Keyword match**, and unavailable similarity is labeled
+**Similarity unavailable**. Lente can disclose the actual semantic passage behind a
+semantic result as a block quote. Keyword-only results have no excerpt. Filo keeps
+its related-note list compact, without an excerpt. Choose a result title to open
+the note. With Obsidian's **Page preview** enabled for Trama, hover over a result
+title to peek inside.
 
 ## Get started
 
@@ -87,6 +92,11 @@ After that first successful index, Trama keeps it up to date on startup and afte
 Markdown changes, with a periodic check for missed changes. New or changed content
 may be sent to your embedding model during these updates. You can update manually
 or stop an operation at any time.
+
+Semantic indexing excludes YAML frontmatter from passage embeddings. Titles, aliases,
+and frontmatter tags remain searchable as metadata; keyword search also indexes
+the original note text. See [technical notes](docs/technical-notes.md#storage-and-retrieval)
+for passage boundaries, embedding limits, and how existing indexes refresh.
 
 ## Your notes, your models
 
