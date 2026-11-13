@@ -116,6 +116,12 @@ for passage boundaries, embedding limits, and how existing indexes refresh.
   storage folder is excluded from both indexing and vault-reading tools.
 - **Session-only conversations.** Trama does not save chat history to disk. Use
   **New chat** to clear it; closing the last Voce pane also resets the conversation.
+- **Local tracing.** New structural trace events report fixed operation names and
+  types, run and parent IDs, outcomes, durations, counts, and status; these events
+  omit query text, paths, prompts, model configuration, tool arguments and results,
+  raw errors, and secrets. This describes those trace events, not every existing
+  console diagnostic. Trama supplies no tracing credentials or exporters; host
+  tracing configuration remains upstream-controlled and may attempt network access.
 
 [Read about storage, cache sharing, and provider requests →](docs/technical-notes.md)
 

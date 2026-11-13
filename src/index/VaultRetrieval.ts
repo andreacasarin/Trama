@@ -1,3 +1,6 @@
+import type { Callbacks } from "@langchain/core/callbacks/manager";
+import { LocalTraceHandler } from "@/plugin/LocalTracing";
+import { SqlCandidateRetriever } from "./SqlCandidateRetriever";
 import { Document } from "@langchain/core/documents";
 import { _HashedDocument } from "@langchain/core/indexing";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
@@ -100,11 +103,29 @@ export class VaultRetrieval {
   async searchCandidates(
     input: VaultRetrievalInput,
     signal?: AbortSignal,
-    evidence = false
+    evidence = false,
+    callbacks?: Callbacks
   ): Promise<VaultSearchCandidates> {
     signal = signal
       ? AbortSignal.any([signal, this.searchController.signal])
       : this.searchController.signal;
+    let batch: VaultSearchCandidates | undefined;
+    const retriever = new SqlCandidateRetriever(async () => {
+      batch = await this.searchCandidatesSql(input, signal, evidence);
+      return batch;
+    });
+    const documents = await retriever.invoke(input.query, {
+      callbacks: callbacks ?? [new LocalTraceHandler(this.consoleDebug, signal)],
+      runName: "SQL candidate retrieval",
+    });
+    return { ...batch!, hits: documents.map((document) => document.metadata.hit as NoteStoreHit) };
+  }
+
+  private async searchCandidatesSql(
+    input: VaultRetrievalInput,
+    signal: AbortSignal,
+    evidence = false
+  ): Promise<VaultSearchCandidates> {
     checkAbort(signal);
     const query = input.query.trim();
     if (

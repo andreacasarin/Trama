@@ -69,6 +69,27 @@ reading note bodies; tool excerpts and full-note reads load current content from
 the vault. Search falls back to lexical results when semantic retrieval cannot
 run and reports the degraded state.
 
+Voce model-facing note search is exposed through a thin native LangChain retriever
+that delegates once to the existing SQL retrieval path. SQL filtering, ranking,
+and scoring remain in SQLite; the retriever adds candidate document identity and
+metadata without changing the public candidate envelope. Zero-result status and
+cancellation signals are preserved. Live note hydration remains lazy, so evidence
+freshness checks and Filo’s cached related-note path are unchanged. Native local
+callback handling preserves tool-child parentage and agent stream summaries.
+
+The new local structural trace events record fixed operation names and types, run
+and parent IDs, operation outcome/status (success, failure, or cancellation),
+duration, and counts. Status here describes the operation result, not retrieval
+mode or degraded state. Those events omit query
+text, paths, prompts, model configuration, tool arguments or results, raw errors,
+and secrets. This describes the new trace events only; existing ConsoleDebug
+logging is separate and may retain its existing fields. Trama supplies no tracing
+credentials, clients, exporters, activation, or settings. With no externally
+supplied tracing configuration there are no trace network requests. Host-supplied
+LangSmith flags, exporters, or configuration remain effective and can cause
+unauthenticated network attempts; absence of a key does not guarantee that upstream
+tracing will not attempt a connection.
+
 ### Search and related-note evidence
 
 Lente keeps its existing lexical body/path BM25, maximum-passage semantic score,

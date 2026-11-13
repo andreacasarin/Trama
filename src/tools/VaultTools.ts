@@ -1,3 +1,4 @@
+import type { Callbacks } from "@langchain/core/callbacks/manager";
 import { tool } from "@langchain/core/tools";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
@@ -193,10 +194,18 @@ export function createVaultTools(
 ): StructuredToolInterface[] {
   const wrap =
     <Input extends Record<string, unknown>>(
-      operation: (input: Input, signal: AbortSignal) => Promise<VaultToolOutcome>
+      operation: (
+        input: Input,
+        signal: AbortSignal,
+        callbacks?: Callbacks
+      ) => Promise<VaultToolOutcome>
     ) =>
-    async (input: Input, runtime: { signal?: AbortSignal }) => {
-      const result = await operation(input, runtime.signal ?? new AbortController().signal);
+    async (input: Input, runtime: { signal?: AbortSignal; callbacks?: Callbacks }) => {
+      const result = await operation(
+        input,
+        runtime.signal ?? new AbortController().signal,
+        runtime.callbacks
+      );
       // Artifacts stay local; send an explicit success/error envelope to every provider.
       const serialized = JSON.stringify(
         result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error }
@@ -243,7 +252,7 @@ export function createVaultTools(
       }
     ),
     tool(
-      wrap<{ query: string; limit?: number }>(async ({ query, limit }, signal) => {
+      wrap<{ query: string; limit?: number }>(async ({ query, limit }, signal, callbacks) => {
         try {
           const resultLimit = limit ?? DEFAULT_SEARCH_LIMIT;
           const {
@@ -252,7 +261,9 @@ export function createVaultTools(
             signal: searchSignal,
           } = await retrieval.searchCandidates(
             { query, mode: "hybrid", limit: resultLimit },
-            signal
+            signal,
+            false,
+            callbacks
           );
           const results: { path: string; context: string; contextTruncated: boolean }[] = [];
           let hydratedCount = 0;

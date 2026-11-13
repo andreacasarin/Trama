@@ -1,3 +1,4 @@
+import { LocalTraceHandler } from "@/plugin/LocalTracing";
 import {
   countTokensApproximately,
   createAgent,
@@ -620,6 +621,7 @@ export class ChatSession {
           version: "v3",
           signal: controller.signal,
           callbacks: [
+            new LocalTraceHandler(this.consoleDebug, controller.signal),
             {
               handleChatModelStart: (
                 _llm,
