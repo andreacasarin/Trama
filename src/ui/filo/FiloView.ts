@@ -1,13 +1,13 @@
 import { ItemView, Keymap, WorkspaceLeaf } from "obsidian";
 import type { IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
-import { appendNoteResultRow } from "@/ui/noteResultRow";
+import { appendNoteResultRow, renderResultContext } from "@/ui/noteResultRow";
 import type { IconName, EventRef } from "obsidian";
 import type { NoteStoreHit } from "@/index/note-sqlite/protocol";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export const FILO_VIEW_TYPE = "trama-filo";
-type RelatedSource = Pick<VaultRetrieval, "related">;
+type RelatedSource = Pick<VaultRetrieval, "related" | "searchEvidence">;
 
 export class FiloView extends ItemView {
   private status: IndexStatus;
@@ -15,6 +15,7 @@ export class FiloView extends ItemView {
   private event?: EventRef;
   private controller?: AbortController;
   private activePath?: string;
+  private contextRequests = new Map<string, AbortController>();
   private hits: readonly NoteStoreHit[] = [];
   private available = false;
   private error = false;
@@ -68,6 +69,8 @@ export class FiloView extends ItemView {
   }
   private cancel(): void {
     this.controller?.abort();
+    for (const request of this.contextRequests.values()) request.abort();
+    this.contextRequests.clear();
     this.controller = undefined;
   }
   private refresh(pathOverride?: string | null): void {
@@ -164,7 +167,32 @@ export class FiloView extends ItemView {
             Keymap.isModEvent(event)
           );
         },
-        hit.score
+        hit.score,
+        (expanded, metadata) => {
+          this.contextRequests.get(path)?.abort();
+          this.contextRequests.delete(path);
+          metadata.empty();
+          if (!expanded || !this.related) return;
+          const controller = new AbortController();
+          this.contextRequests.set(path, controller);
+          const detail = metadata.createDiv({
+            cls: "trama-note-result__evidence",
+            attr: { "aria-live": "polite" },
+          });
+          detail.textContent = "Loading preview…";
+          void this.related
+            .searchEvidence({ ...hit, evidence: undefined }, controller.signal)
+            .then((result) => {
+              if (!controller.signal.aborted && detail.isConnected)
+                renderResultContext(detail, result);
+            })
+            .catch(() => {
+              if (!controller.signal.aborted && detail.isConnected)
+                detail.textContent = "Preview unavailable. Open note.";
+            });
+        },
+        undefined,
+        "note"
       );
     }
   }

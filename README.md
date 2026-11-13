@@ -44,13 +44,13 @@ Want a repeatable workflow? Write a skill as a Markdown note and invoke it with
 
 Filo surfaces related notes as you move through your vault, and Lente combines
 keyword and semantic search to find notes even when your wording has changed.
-Both views show the title and a qualitative semantic label; keyword-only Lente
+Both views show the title and a qualitative similarity label; keyword-only Lente
 results say **Keyword match**, and unavailable similarity is labeled
-**Similarity unavailable**. Lente can disclose the actual semantic passage behind a
-semantic result as a block quote. Keyword-only results have no excerpt. Filo keeps
-its related-note list compact, without an excerpt. Choose a result title to open
-the note. With Obsidian's **Page preview** enabled for Trama, hover over a result
-title to peek inside.
+**Similarity unavailable**. In the sidebars, expand a result for a short note
+preview. When a semantic passage matched, Trama labels it **Matched passage**;
+otherwise it labels the text **Preview**. The command-palette Lente picker shows a
+compact preview under each result. Choose a result title to open the note. With Obsidian's
+**Page preview** enabled for Trama, hover over a result title to peek inside.
 
 ## Get started
 

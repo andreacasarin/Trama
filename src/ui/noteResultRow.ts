@@ -20,12 +20,20 @@ export function similarityLabel(similarity: unknown, lexicalScore?: unknown): st
 export function appendSimilarityLabel(
   parent: HTMLElement,
   similarity: unknown,
-  lexicalScore?: unknown
+  lexicalScore?: unknown,
+  comparison: "query" | "note" = "query"
 ): void {
   const label = similarityLabel(similarity, lexicalScore);
   const span = parent.createSpan({ cls: "trama-note-result__similarity", text: label });
   if (label === "Keyword match")
     span.setAttribute("title", "Matched by keywords; semantic similarity is unavailable.");
+  else
+    span.setAttribute(
+      "title",
+      comparison === "query"
+        ? "Similarity between the query and a passage in this note."
+        : "Similarity between the current note and this note."
+    );
 }
 
 export function configureNoteResultHover(
@@ -53,7 +61,8 @@ export function appendNoteResultRow(
   onOpen: (event: MouseEvent) => void,
   similarity?: unknown,
   onDisclosure?: (expanded: boolean, metadata: HTMLElement) => void,
-  lexicalScore?: unknown
+  lexicalScore?: unknown,
+  comparison: "query" | "note" = "query"
 ): HTMLDivElement {
   const row = parent.createDiv({ cls: "tree-item search-result is-collapsed" });
   const heading = row.createDiv({ cls: "tree-item-self search-result-file-title is-clickable" });
@@ -67,7 +76,7 @@ export function appendNoteResultRow(
     onOpen(event);
   });
   configureNoteResultHover(title, app, path, hoverParent);
-  appendSimilarityLabel(heading, similarity, lexicalScore);
+  appendSimilarityLabel(heading, similarity, lexicalScore, comparison);
   if (onDisclosure) {
     const metadataId = `trama-note-result-meta-${++disclosureId}`;
     const toggleComponent = new ButtonComponent(heading)
@@ -96,4 +105,27 @@ export function appendNoteResultRow(
     });
   }
   return row;
+}
+
+export function renderResultContext(
+  parent: HTMLElement,
+  result: Awaited<ReturnType<import("@/index/VaultRetrieval").VaultRetrieval["searchEvidence"]>>
+): void {
+  parent.empty();
+  if (result.kind === "empty") {
+    const row = parent.closest(".tree-item");
+    row?.querySelector(".trama-note-result__toggle")?.remove();
+    parent.parentElement?.remove();
+  } else if (result.kind === "changed" || result.kind === "unavailable") {
+    parent.textContent =
+      result.kind === "changed"
+        ? "Note changed. Search again for an updated passage."
+        : "Preview unavailable. Open note.";
+  } else {
+    parent.createDiv({
+      text: result.kind === "passage" ? "Matched passage" : "Preview",
+      cls: "setting-item-description",
+    });
+    parent.createEl("blockquote", { cls: "trama-note-result__quote", text: result.text });
+  }
 }

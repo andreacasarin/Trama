@@ -122,7 +122,7 @@ describe("SQLite note retrieval", () => {
         true
       );
       const evidence = await retrieval.searchEvidence(result.hits[0]);
-      expect(evidence).toMatchObject({ kind: "passage", text: content });
+      expect(evidence).toMatchObject({ kind: "passage", text: "😀 café noir and cartography" });
       content += " edited";
       expect(await retrieval.searchEvidence(result.hits[0])).toEqual({ kind: "changed" });
       content = f.notes.get(path)!;
@@ -131,6 +131,43 @@ describe("SQLite note retrieval", () => {
     } finally {
       f.db.close();
     }
+  });
+  it("uses one live read for a heading-only passage fallback and excludes frontmatter", async () => {
+    const path = "note.md";
+    const content = "---\ntitle: Secret\n---\n# Today's dump\n\nActual [[body]]";
+    const profile = "p";
+    const uid = _HashedDocument.fromDocument(
+      new Document({ pageContent: content, metadata: { path, embeddingProfile: profile } })
+    ).uid;
+    const reader = vi.fn(async () => ({ path, content }));
+    const call = vi.fn(async () => [true]);
+    const retrieval = new VaultRetrieval(call as NoteStoreCall, undefined, profile, reader);
+    const startOffset = content.indexOf("# Today's");
+    expect(
+      await retrieval.searchEvidence({
+        path,
+        score: 1,
+        evidence: { uid, profile, startOffset, endOffset: content.indexOf("\n\nActual") },
+      })
+    ).toEqual({ kind: "preview", text: "Actual [[body]]" });
+    expect(reader).toHaveBeenCalledOnce();
+    reader.mockClear();
+    call.mockClear();
+    expect(await retrieval.searchEvidence({ path, score: 1, lexicalScore: 1 })).toEqual({
+      kind: "preview",
+      text: "Actual [[body]]",
+    });
+    expect(reader).toHaveBeenCalledOnce();
+    expect(call).not.toHaveBeenCalled();
+  });
+  it("omits empty previews", async () => {
+    const retrieval = new VaultRetrieval(vi.fn(), undefined, undefined, async (path) => ({
+      path,
+      content: "# Heading\n\n---\n",
+    }));
+    expect(await retrieval.searchEvidence({ path: "note.md", score: 1 })).toEqual({
+      kind: "empty",
+    });
   });
   it("returns hybrid results when a valid query embedding cannot be cached because SQLite is full", async () => {
     const f = await fixture();

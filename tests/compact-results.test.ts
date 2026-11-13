@@ -157,7 +157,7 @@ describe("compact result presentation", () => {
     await modal.getSuggestions("");
     release({ kind: "passage", text: "old" });
     await tick();
-    expect(second.children[1].textContent).toBe("Loading passage…");
+    expect(second.children[1].textContent).toBe("Loading preview…");
     modal.onClose();
   });
 });
@@ -210,7 +210,7 @@ it("loads literal Lente passages on expansion and discards an aborted response",
     disclosure(true, metadata);
     releases[0]({ kind: "passage", text: "old" });
     await tick();
-    expect(oldSlot.textContent).toBe("Loading passage…");
+    expect(oldSlot.textContent).toBe("Loading preview…");
     expect(source.searchEvidence).toHaveBeenCalledTimes(2);
     releases[1]({ kind: "passage", text: "# Literal [[link]]" });
     await tick();
@@ -224,7 +224,7 @@ it("loads literal Lente passages on expansion and discards an aborted response",
   }
 });
 
-it("shows no disclosure for keyword results or Filo rows", async () => {
+it("offers lazy disclosure for keyword results and Filo rows", async () => {
   const { LenteView } = await import("@/ui/lente/LenteView");
   const { FiloView } = await import("@/ui/filo/FiloView");
   const { IndexStatusController } = await import("@/ui/index/IndexStatus");
@@ -237,7 +237,11 @@ it("shows no disclosure for keyword results or Filo rows", async () => {
   lente.rows = element();
   lente.resultsCount = element();
   lente.output = { hits: [{ path: "a.md", lexicalScore: 1 }], status: {} };
-  const filo: any = new FiloView({ app } as any, new IndexStatusController(), {} as any);
+  const context = vi.fn(async () => ({ kind: "preview" as const, text: "literal [[body]]" }));
+  const filo: any = new FiloView({ app } as any, new IndexStatusController(), {
+    related: vi.fn(),
+    searchEvidence: context,
+  });
   filo.contentEl = element();
   filo.activePath = "source.md";
   filo.available = true;
@@ -245,7 +249,14 @@ it("shows no disclosure for keyword results or Filo rows", async () => {
   try {
     lente.render();
     filo.render();
-    expect(row.mock.calls.map((args) => args[6])).toEqual([undefined, undefined]);
+    expect(row.mock.calls.map((args) => typeof args[6])).toEqual(["function", "function"]);
+    expect(context).not.toHaveBeenCalled();
+    const metadata = element();
+    row.mock.calls[1][6]!(true, metadata);
+    await tick();
+    expect(context).toHaveBeenCalledOnce();
+    expect(metadata.children[0].children[0].textContent).toBe("Preview");
+    expect(metadata.children[0].children[1].textContent).toBe("literal [[body]]");
     row.mock.calls[0][4]({ ctrlKey: true } as MouseEvent);
     row.mock.calls[1][4]({ ctrlKey: true } as MouseEvent);
     expect(openLinkText).toHaveBeenNthCalledWith(1, "a.md", "", true);
@@ -360,6 +371,7 @@ it("ignores Filo completions from an earlier visit to the same source", async ()
   const pending: Array<(result: any) => void> = [];
   const source = {
     related: vi.fn(() => new Promise<any>((resolve) => pending.push(resolve))),
+    searchEvidence: vi.fn(),
   };
   const view: any = new FiloView(
     { app: { workspace: {} } } as any,

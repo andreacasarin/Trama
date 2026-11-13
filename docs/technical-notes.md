@@ -94,21 +94,27 @@ tracing will not attempt a connection.
 
 Lente keeps its existing lexical body/path BM25, maximum-passage semantic score,
 and reciprocal-rank fusion (RRF-60). Filo also keeps its existing ranking. Search
-results retain the existing semantic score labels and thresholds. Keyword-only
-Lente results retain the “Keyword match” label and title navigation, but do not
-show an excerpt. A semantic Lente result can be expanded to show its actual
-semantic winner passage as a plain block quote. The command-palette Lente picker
-shows that semantic passage in its existing two-line quote when one is available.
-Neither surface adds keyword highlighting or explanations of matched metadata
-fields. Filo shows its related-note title and similarity label without an excerpt
-or disclosure. Both views retain Obsidian title hover previews and ordinary title
-opening, including modifier-key behavior.
+results retain the existing semantic score labels and thresholds. Lente and Filo
+rows show the note title and a qualitative similarity label; the label tooltip
+explains whether similarity is query-to-passage or current-note-to-result. Keyword-
+only Lente results say “Keyword match,” with a tooltip explaining that semantic
+similarity is unavailable. Unavailable similarity is labeled “Similarity
+unavailable.”
 
-Before showing a stored semantic quote, Trama verifies the source UID and profile
+The command-palette Lente picker shows a compact two-line context preview for each
+result. In the Lente and Filo sidebars, expanding a row lazily reads a short context
+preview. A verified semantic winner passage is labeled “Matched passage.” When no
+semantic passage is available, the preview is labeled “Preview”; this applies to
+keyword-only Lente results and Filo results. YAML frontmatter is excluded from
+body previews. Context is plain text in a block quote, not rendered Markdown; an
+empty preview is omitted. These displays do not add keyword highlighting or
+explanations of matched metadata fields.
+
+Before showing a stored semantic passage, Trama verifies the source UID and profile
 against the current index and checks the live note content. If the source is no
-longer current, the quote is not shown. Quote text is noninteractive; title
-opening remains the route to the full note. No exact-position navigation or
-forced editor context is offered from excerpts.
+longer current, it does not present that text as a matched passage. Title opening
+remains the route to the full note. No exact-position navigation or forced editor
+context is offered from previews.
 
 These displays use the existing index and profile without an embedding-provider
 call, schema or profile change, reindex, or embedding-cache rebuild. SQLite

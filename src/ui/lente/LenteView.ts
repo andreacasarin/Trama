@@ -1,7 +1,7 @@
 import { ButtonComponent, ItemView, Keymap, SearchComponent, WorkspaceLeaf } from "obsidian";
 import type { VaultSearchCandidates } from "@/index/VaultRetrieval";
 import { TRAMA_ICONS } from "@/ui/icons";
-import { appendNoteResultRow } from "@/ui/noteResultRow";
+import { appendNoteResultRow, renderResultContext } from "@/ui/noteResultRow";
 import type { IconName } from "obsidian";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
@@ -173,47 +173,29 @@ export class LenteView extends ItemView {
           void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
         },
         hit.semanticScore,
-        hit.evidence?.startOffset !== undefined && hit.evidence.endOffset !== undefined
-          ? (expanded, metadata) => {
-              this.evidenceRequests.get(path)?.abort();
-              this.evidenceRequests.delete(path);
-              metadata.empty();
-              if (!expanded || !hit || !source) return;
-              const controller = new AbortController();
-              this.evidenceRequests.set(path, controller);
-              const evidence = metadata.createDiv({
-                cls: "trama-note-result__evidence",
-                attr: { "aria-live": "polite" },
-              });
-              evidence.textContent = "Loading passage…";
-              void source
-                .searchEvidence(hit, controller.signal)
-                .then((result) => {
-                  if (controller.signal.aborted || !evidence.isConnected) return;
-                  evidence.empty();
-                  if (result.kind === "changed") {
-                    evidence.textContent = "Note changed. Search again for an updated passage.";
-                    return;
-                  }
-                  if (result.kind === "unavailable") {
-                    evidence.textContent = "Passage unavailable. Open note.";
-                    return;
-                  }
-                  evidence.createDiv({
-                    text: ["Matched passage", ...(result.sectionPath ?? [])].join(" · "),
-                    cls: "setting-item-description",
-                  });
-                  evidence.createEl("blockquote", {
-                    cls: "trama-note-result__quote",
-                    text: result.text,
-                  });
-                })
-                .catch(() => {
-                  if (!controller.signal.aborted && evidence.isConnected)
-                    evidence.textContent = "Passage unavailable. Open note.";
-                });
-            }
-          : undefined,
+        (expanded, metadata) => {
+          this.evidenceRequests.get(path)?.abort();
+          this.evidenceRequests.delete(path);
+          metadata.empty();
+          if (!expanded) return;
+          const controller = new AbortController();
+          this.evidenceRequests.set(path, controller);
+          const detail = metadata.createDiv({
+            cls: "trama-note-result__evidence",
+            attr: { "aria-live": "polite" },
+          });
+          detail.textContent = "Loading preview…";
+          void source
+            .searchEvidence(hit, controller.signal)
+            .then((result) => {
+              if (!controller.signal.aborted && detail.isConnected)
+                renderResultContext(detail, result);
+            })
+            .catch(() => {
+              if (!controller.signal.aborted && detail.isConnected)
+                detail.textContent = "Preview unavailable. Open note.";
+            });
+        },
         hit.lexicalScore
       );
     }

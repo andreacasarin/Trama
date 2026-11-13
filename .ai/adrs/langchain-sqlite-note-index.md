@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-09
-- Updated: 2026-11-12
+- Updated: 2026-11-13
 
 ## Context
 
@@ -60,21 +60,25 @@ not add reranking or UI settings.
 
 Keep Lente's BM25, maximum-passage semantic, and RRF-60 ranking. Keep Filo's
 centroid-based note ranking and finite similarity-label thresholds. Preserve
-metadata indexing and lexical retrieval. Lente may disclose the verified semantic
-winner passage as a plain block quote; show it in the picker only when a semantic
-reference is available. Keyword-only results retain their keyword label and
-ordinary title opening, with no excerpt. Do not add exact keyword highlighting,
-matched-field explanations, or an empty evidence disclosure. Filo presents the
-related-note title and similarity label without an excerpt or disclosure.
+metadata indexing and lexical retrieval. Lente and Filo present the title and
+similarity category, with a tooltip explaining the comparison. Keyword-only Lente
+results retain “Keyword match” and explain that semantic similarity is unavailable.
+The command-palette Lente picker shows a compact context preview. Lente and Filo
+sidebars lazily disclose context when a row is expanded. Show a verified semantic
+winner passage as “Matched passage”; when none is available, show a same-read body
+preview labeled “Preview.” Keyword-only Lente results and Filo results therefore
+have useful context without implying a semantic match. Omit empty context. Do not
+add exact keyword highlighting or matched-field explanations.
 
 Verify the semantic source UID and embedding profile against the current index,
-and verify live note content before presenting a stored quote. Keep ordinary
-Obsidian title hover preview, title opening, and modifier behavior. Quotes are
-noninteractive and do not navigate to exact source positions or force editor
-context. Retain semantic source identity and offsets needed to verify and slice
-quotes. The separate splitter identity change can change passage content and
-therefore embeddings, centroids, and search results; BM25, maximum-passage
-semantic, centroid, and RRF scoring formulas remain unchanged.
+and verify live note content before presenting a stored passage as matched. Exclude
+YAML frontmatter from body previews and render preview text as plain text. Keep
+ordinary Obsidian title hover preview, title opening, and modifier behavior.
+Previews are noninteractive and do not navigate to exact source positions or force
+editor context. Retain semantic source identity and offsets needed to verify and
+slice matched passages. The separate splitter identity change can change passage
+content and therefore embeddings, centroids, and search results; BM25, maximum-
+passage semantic, centroid, and RRF scoring formulas remain unchanged.
 
 ### Vault and worker isolation
 
@@ -111,7 +115,7 @@ Keep Voce drafting as ephemeral plain text in a `contenteditable="plaintext-only
 
 Native indexing removes owned lifecycle policy. The atomic note/record write closes the write-before-record-update orphan gap without adding a second lifecycle. SQLite adapters preserve bounded corpus computation and avoid moving vectors to JavaScript. Omitting raw note bodies limits stored corpus content, while live-vault hydration keeps Markdown authoritative. Stable vault identity isolates local indexes across reloads. Native summarization middleware bounds accumulated working history without a custom message-trimming policy. Current request context remains intact, and confirmed history compaction is disclosed in a separate accessible turn status without changing the transcript. The ephemeral retrieval ledger preserves which sources were retrieved across condensation without adding a persisted source store or changing native graph recursion behavior; batch reads update it after the completed result, and per-note failures do not become evidence. Its token cost remains subject to the configured context budget. This records retrieval only, not model assessment or task completion. Keeping selected skills as explicit current-turn instructions and linked notes as untrusted evidence gives the agent useful source-relative context without granting reference notes instruction authority or crawling unrelated vault branches.
 
-Lente retains verified semantic passages as compact evidence while avoiding a separate lexical-range extraction path and metadata-explanation UI. Keyword retrieval and ranking remain intact, and keyword-only results do not imply a quote. Ordinary note opening and Obsidian preview remain sufficient navigation for both result lists. Filo keeps its centroid-ranked related-note list without an additional passage query or excerpt state. Keeping semantic source identity and offsets supports fresh quote validation; the splitter identity separately versions the passage representation.
+Lente and Filo share a consistent result shape while keeping their existing ranking: a visible title and similarity category, plus context on demand in sidebars and compactly in the picker. Verified semantic passages provide evidence when available; same-read body previews provide context when there is no semantic passage, without presenting it as a match. This avoids a separate lexical-range extraction path and matched-field UI while preserving ordinary Obsidian hover and title navigation. Keeping semantic source identity and offsets supports fresh passage validation; the splitter identity separately versions the passage representation.
 
 ## Consequences
 

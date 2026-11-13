@@ -1,3 +1,4 @@
+import { getFrontMatterInfo } from "obsidian";
 import type { Callbacks } from "@langchain/core/callbacks/manager";
 import { LocalTraceHandler } from "@/plugin/LocalTracing";
 import { SqlCandidateRetriever } from "./SqlCandidateRetriever";
@@ -185,7 +186,12 @@ export class VaultRetrieval {
     hit: NoteStoreHit,
     signal?: AbortSignal
   ): Promise<LiveMarkdown | null> {
-    if (!hit.evidence?.profile || this.isStoragePath(hit.path)) return null;
+    if (
+      !hit.evidence?.profile ||
+      hit.evidence.profile !== this.profile ||
+      this.isStoragePath(hit.path)
+    )
+      return null;
     const note = await this.readNote(hit.path, signal);
     checkAbort(signal);
     if (!note || note.path !== hit.path) return null;
@@ -202,22 +208,40 @@ export class VaultRetrieval {
   }
 
   async searchEvidence(hit: NoteStoreHit, signal?: AbortSignal) {
-    const note = await this.verifiedEvidenceSource(hit, signal);
-    if (!note || !hit.evidence) return { kind: "changed" as const };
-    const { startOffset, endOffset, sectionPath } = hit.evidence;
-    if (
-      startOffset === undefined ||
-      endOffset === undefined ||
-      startOffset < 0 ||
-      endOffset > note.content.length ||
-      endOffset <= startOffset
-    )
-      return { kind: "unavailable" as const };
-    return {
-      kind: "passage" as const,
-      text: note.content.slice(startOffset, endOffset),
-      sectionPath,
+    checkAbort(signal);
+    if (this.isStoragePath(hit.path)) return { kind: "unavailable" as const };
+    const hasPassage =
+      hit.evidence?.startOffset !== undefined && hit.evidence.endOffset !== undefined;
+    const note = hasPassage
+      ? await this.verifiedEvidenceSource(hit, signal)
+      : await this.readNote(hit.path, signal);
+    checkAbort(signal);
+    if (!note || note.path !== hit.path)
+      return { kind: hasPassage ? ("changed" as const) : ("unavailable" as const) };
+    const bodyStart = getFrontMatterInfo(note.content).contentStart;
+    const useful = (text: string) => {
+      const lines = text.split(/(?<=\n)/);
+      let start = 0;
+      while (
+        start < lines.length &&
+        /^(?:\s*|\s*#{1,6}(?:\s+.*)?|\s*[-*_]{3,}\s*)$/.test(lines[start].trimEnd())
+      )
+        start++;
+      return lines.slice(start).join("").trim().slice(0, 1000);
     };
+    if (hasPassage && hit.evidence) {
+      const { startOffset, endOffset, sectionPath } = hit.evidence;
+      if (
+        startOffset! < bodyStart ||
+        endOffset! > note.content.length ||
+        endOffset! <= startOffset!
+      )
+        return { kind: "unavailable" as const };
+      const text = useful(note.content.slice(startOffset, endOffset));
+      if (text) return { kind: "passage" as const, text, sectionPath };
+    }
+    const text = useful(note.content.slice(bodyStart));
+    return text ? { kind: "preview" as const, text } : { kind: "empty" as const };
   }
 
   async readSearchCandidate(

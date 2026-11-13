@@ -4,7 +4,7 @@ import type { NoteStoreHit } from "@/index/note-sqlite/protocol";
 import { configureNoteResultHover, appendSimilarityLabel } from "@/ui/noteResultRow";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
-type EvidenceDisplay = { kind: "passage" | "other"; text: string };
+type EvidenceDisplay = Awaited<ReturnType<VaultRetrieval["searchEvidence"]>>;
 
 interface NoteResult {
   readonly path: string;
@@ -87,14 +87,9 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     });
     configureNoteResultHover(title, this.app, result.path, this);
     appendSimilarityLabel(heading, result.semanticScore, result.hit.lexicalScore);
-    if (
-      result.hit.evidence?.startOffset === undefined ||
-      result.hit.evidence.endOffset === undefined
-    )
-      return;
     const slot = el.createDiv({
       cls: "trama-lente-search-modal__excerpt",
-      text: "Loading passage…",
+      text: "Loading preview…",
     });
     const controller = this.controller;
     const query = this.inputEl.value.trim();
@@ -102,19 +97,11 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     let promise = this.evidence.get(result);
     if (!promise) {
       promise = this.queue.then(async () => {
-        if (!this.isCurrent(controller, query)) return { kind: "other" as const, text: "" };
+        if (!this.isCurrent(controller, query)) return { kind: "empty" as const };
         try {
-          const evidence = await this.source.searchEvidence(result.hit, controller.signal);
-          if (evidence.kind === "changed")
-            return {
-              kind: "other" as const,
-              text: "Note changed. Search again for an updated passage.",
-            };
-          if (evidence.kind === "unavailable")
-            return { kind: "other" as const, text: "Passage unavailable. Open note." };
-          return { kind: "passage" as const, text: evidence.text };
+          return await this.source.searchEvidence(result.hit, controller.signal);
         } catch {
-          return { kind: "other" as const, text: "Passage unavailable. Open note." };
+          return { kind: "unavailable" as const };
         }
       });
       this.evidence.set(result, promise);
@@ -123,9 +110,14 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     void promise.then((display) => {
       if (this.isCurrent(controller, query) && el.isConnected && slot.parentElement === el) {
         slot.empty();
-        if (display.kind === "passage")
+        if (display.kind === "passage" || display.kind === "preview") {
           slot.createEl("blockquote", { cls: "trama-note-result__quote", text: display.text });
-        else slot.textContent = display.text;
+        } else if (display.kind === "empty") slot.remove();
+        else
+          slot.textContent =
+            display.kind === "changed"
+              ? "Note changed. Search again for an updated passage."
+              : "Preview unavailable. Open note.";
       }
     });
   }
