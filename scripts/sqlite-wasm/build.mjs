@@ -13,6 +13,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { getInputFingerprint, updateVendoredAssets } from "./artifacts.mjs";
+
 export const DOCKER_BUILD_TIMEOUT_MS = 20 * 60 * 1000;
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -29,9 +31,7 @@ function dockerPlatform() {
 
 export function getBuildContext({ rootDir = root, platform = dockerPlatform() } = {}) {
   const lockPath = join(rootDir, "vendor/sqlite-wasm/supply-chain.json");
-  const builderPath = join(rootDir, "scripts/sqlite-wasm/build.mjs");
   const dockerfilePath = join(rootDir, "scripts/sqlite-wasm/Dockerfile");
-  const extraInitPath = join(rootDir, "scripts/sqlite-wasm/sqlite3_wasm_extra_init.c");
   const lockBytes = readFileSync(lockPath);
   const lock = JSON.parse(lockBytes);
   const imageDigest = lock.emscripten?.images?.[platform];
@@ -39,10 +39,7 @@ export function getBuildContext({ rootDir = root, platform = dockerPlatform() } 
   const dockerImage = `${lock.emscripten.image}@${imageDigest}`;
   const fingerprint = sha256(
     JSON.stringify({
-      lock: sha256(lockBytes),
-      dockerfile: digest(dockerfilePath),
-      extraInit: digest(extraInitPath),
-      builder: digest(builderPath),
+      inputs: getInputFingerprint(rootDir),
       platform,
       dockerImage,
     })
@@ -164,5 +161,8 @@ export function ensureProductionAssets({ rootDir = root, forceClean = false } = 
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
-if (invokedPath === resolve(scriptPath))
-  ensureProductionAssets({ forceClean: process.argv.includes("--clean") });
+if (invokedPath === resolve(scriptPath)) {
+  const update = process.argv.includes("--update-vendored");
+  ensureProductionAssets({ forceClean: update || process.argv.includes("--clean") });
+  if (update) updateVendoredAssets();
+}

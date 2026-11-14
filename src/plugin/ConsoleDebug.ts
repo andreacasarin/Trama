@@ -47,12 +47,11 @@ export class ConsoleDebug {
     fields?: Record<string, string | number | boolean>
   ): void {
     if (!this.enabled()) return;
-    // eslint-disable-next-line no-console
-    const output = console[level];
+    const output = console[level].bind(console);
     if (error === undefined) {
-      if (fields) output.call(console, `[Trama] ${label}`, fields);
-      else output.call(console, `[Trama] ${label}`);
-    } else if (fields) output.call(console, `[Trama] ${label}`, error, fields);
-    else output.call(console, `[Trama] ${label}`, error);
+      if (fields) output(`[Trama] ${label}`, fields);
+      else output(`[Trama] ${label}`);
+    } else if (fields) output(`[Trama] ${label}`, error, fields);
+    else output(`[Trama] ${label}`, error);
   }
 }

@@ -5,7 +5,7 @@ daily journal entries and linked topic notes in `zettelkasten`, covering retriev
 embeddings, SQLite, and Trama workflows.
 The source notes live in `test-vaults/demo/`; the runnable copy is ignored by Git.
 
-From a fresh clone, use Node.js 24 and install dependencies once with `npm ci`.
+From a fresh clone, use Node.js 22.23.3 and install dependencies once with `npm ci`.
 
 Run this one-time setup to create the generated demo vault and install or update
 Trama in it:

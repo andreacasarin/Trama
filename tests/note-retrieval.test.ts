@@ -160,6 +160,20 @@ describe("SQLite note retrieval", () => {
     expect(reader).toHaveBeenCalledOnce();
     expect(call).not.toHaveBeenCalled();
   });
+  it.each(["\n", "\r\n"])(
+    "preserves multiline preview content with %j line endings",
+    async (newline) => {
+      const text = ["First line", "Second line", "", "Last paragraph"].join(newline);
+      const retrieval = new VaultRetrieval(vi.fn(), undefined, undefined, async (path) => ({
+        path,
+        content: ["# Heading", "", "---", text, ""].join(newline),
+      }));
+      expect(await retrieval.searchEvidence({ path: "note.md", score: 1 })).toEqual({
+        kind: "preview",
+        text,
+      });
+    }
+  );
   it("omits empty previews", async () => {
     const retrieval = new VaultRetrieval(vi.fn(), undefined, undefined, async (path) => ({
       path,

@@ -445,8 +445,12 @@ model fully assessed the material.
 
 ## Build, packaging, and architecture
 
-Development uses Node.js 24 and Docker for the pinned SQLite/WASM build. `npm test`
-builds the production assets, verifies SQLite, type-checks, and runs the tests.
+Development uses Node.js 22.23.3, matching the observed Community verifier.
+`npm test` checks committed SQLite/WASM input checksums and their native-source
+fingerprint, verifies SQLite, builds the production assets, type-checks, and runs
+the tests without Docker or generated inputs from an earlier checkout. Docker is
+required only for explicit maintainer native rebuilds; CI independently rebuilds
+and byte-compares these inputs and tests a clean Node 22 install without Docker.
 CI also checks formatting, lint, versions, license metadata, and production and
 development dependency advisories. Build identities hash source and locked inputs
 deterministically.

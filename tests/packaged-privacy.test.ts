@@ -7,7 +7,7 @@ import * as obsidian from "./obsidian";
 describe("packaged privacy boundary", () => {
   it("ignores host tracing flags while retaining retrieval and configured model requests", async () => {
     const hostProcess = {
-      versions: { node: "24.13.0" },
+      versions: { node: "22.23.3" },
       env: {
         LANGSMITH_TRACING: "true",
         LANGSMITH_TRACING_V2: "true",

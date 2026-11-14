@@ -24,10 +24,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Node.js 24.13.0
+      - name: Set up Node.js 22.23.3
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.13.0
+          node-version: 22.23.3
           cache: npm
 
       - name: Validate tag and package versions
@@ -86,7 +86,7 @@ jobs:
           npm run lint
 
       - name: Build the clean pinned SQLite assets
-        run: node scripts/sqlite-wasm/build.mjs --clean
+        run: npm run verify:sqlite:rebuild
 
       - name: Run the full test suite
         run: npm test

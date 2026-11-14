@@ -2,10 +2,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getBuildContext } from "./build.mjs";
+import { verifyVendoredAssets } from "./artifacts.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const directoryIndex = process.argv.indexOf("--directory");
-const directory = directoryIndex >= 0 ? resolve(process.argv[directoryIndex + 1] ?? "") : root;
+const directory =
+  directoryIndex >= 0
+    ? resolve(process.argv[directoryIndex + 1] ?? "")
+    : join(root, "vendor/sqlite-wasm");
+if (directoryIndex < 0) verifyVendoredAssets(root);
 const context = getBuildContext({ rootDir: root });
 const modulePath = join(directory, "sqlite3.mjs");
 const wasmPath = join(directory, "sqlite3.wasm");

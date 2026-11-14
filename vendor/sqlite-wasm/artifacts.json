@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "inputs": "c081d4a9c0c6bbfe7b617cc496db9c7a69ae9b58bd720d43ac387a0a72865ebf",
+  "outputs": {
+    "sqlite3.mjs": "64fd02a8bbee30e1c16b38ca23fbc86d37d51dee4f3b23b572213f342be1585d",
+    "sqlite3.wasm": "ddb20dc3d0cc2e10b51c3b61accb30d186074ac1462a7c980e356c9486a90310"
+  }
+}

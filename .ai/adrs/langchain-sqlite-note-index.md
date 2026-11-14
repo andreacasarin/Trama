@@ -12,6 +12,13 @@ The proof of concept prioritizes reducing owned code through LangChain primitive
 
 ### Native indexing and SQL retrieval
 
+Normal builds use the committed SQLite module and WASM, pinned by SHA-256 and a
+native-input fingerprint. They require Node.js 22.23.3 without Docker, matching
+the Community verifier. Explicit maintainer rebuilds still use the pinned Docker
+toolchain; CI and releases rebuild and compare the native bytes, while a separate
+clean CI container has no Docker executable. No native compiler, cache, network
+asset fetch, or generated root sidecar is needed for a normal plugin build.
+
 The build embeds the SQLite module and WASM in the worker, then embeds that worker
 in `main.js` using esbuild's binary and text loaders. A Blob-backed module worker
 retains the existing RPC queue, cancellation, and OPFS storage identity. No runtime

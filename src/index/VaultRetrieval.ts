@@ -220,14 +220,14 @@ export class VaultRetrieval {
       return { kind: hasPassage ? ("changed" as const) : ("unavailable" as const) };
     const bodyStart = getFrontMatterInfo(note.content).contentStart;
     const useful = (text: string) => {
-      const lines = text.split(/(?<=\n)/);
+      const lines = text.split("\n");
       let start = 0;
       while (
         start < lines.length &&
         /^(?:\s*|\s*#{1,6}(?:\s+.*)?|\s*[-*_]{3,}\s*)$/.test(lines[start].trimEnd())
       )
         start++;
-      return lines.slice(start).join("").trim().slice(0, 1000);
+      return lines.slice(start).join("\n").trim().slice(0, 1000);
     };
     if (hasPassage && hit.evidence) {
       const { startOffset, endOffset, sectionPath } = hit.evidence;
