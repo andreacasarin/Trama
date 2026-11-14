@@ -59,6 +59,12 @@ to OpenAI-compatible endpoints; chat requires the **Responses API** and tool
 calling, and semantic search requires an **embedding model**. You can configure
 chat and embeddings separately.
 
+Trama supports desktop and mobile. Mobile use has been validated by the maintainer;
+a model server running on another device needs a reachable network address, because
+`127.0.0.1` always means the device running Obsidian. The SQLite index uses the
+app's browser storage (OPFS), outside the vault folder; it is device-local and
+is not included in ordinary vault backups or sync.
+
 ### 1. Install Trama
 
 1. Download the plugin ZIP from [Releases](https://github.com/andreacasarin/trama/releases).
@@ -82,6 +88,16 @@ Open **Settings → Trama**:
 
 The default base URL is `http://127.0.0.1:1234/v1`. Use your server's base URL,
 including any required prefix such as `/v1`.
+
+Trama itself is free and needs no Trama account. Local servers such as LM Studio
+can provide chat and embeddings without a paid API. A remote OpenAI-compatible
+server or gateway may require an account and charge for inference, indexing, and
+search; eligible automatic index updates can also incur provider charges.
+Trama currently sends a fixed placeholder bearer token, not a configurable API
+key. Paid APIs such as OpenAI therefore require a compatible gateway that handles
+authentication; a direct API-key connection is not supported. Your server must
+allow requests from Obsidian (including CORS where applicable). Check your
+provider's prices, retention, and privacy terms before connecting it.
 
 ### 3. Index and explore
 
@@ -114,14 +130,19 @@ for passage boundaries, embedding limits, and how existing indexes refresh.
 - **Read-only note tools.** Voce can search and read notes. Its vault tools cannot
   edit or delete them. Folder exclusions apply to indexing only. The configured
   storage folder is excluded from both indexing and vault-reading tools.
+- **Diagnostics.** Trama has no analytics or remote telemetry service. Its bundled
+  SDKs cannot read host environment variables to enable LangSmith tracing. Optional
+  Console Debug output stays in the local developer console and can include note
+  paths or errors; remove private information before sharing it. Configured AI
+  servers still receive the content described above and apply their own data policies.
 - **Session-only conversations.** Trama does not save chat history to disk. Use
   **New chat** to clear it; closing the last Voce pane also resets the conversation.
 - **Local tracing.** New structural trace events report fixed operation names and
   types, run and parent IDs, outcomes, durations, counts, and status; these events
   omit query text, paths, prompts, model configuration, tool arguments and results,
   raw errors, and secrets. This describes those trace events, not every existing
-  console diagnostic. Trama supplies no tracing credentials or exporters; host
-  tracing configuration remains upstream-controlled and may attempt network access.
+  console diagnostic. Trama supplies no tracing credentials or exporters; bundled
+  SDKs do not inherit host environment settings that activate LangSmith.
 
 [Read about storage, cache sharing, and provider requests →](docs/technical-notes.md)
 

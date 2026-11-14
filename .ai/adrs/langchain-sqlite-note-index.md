@@ -90,7 +90,13 @@ Serialize plugin loading, settings persistence, and reconfiguration through one 
 
 ### Agent and privacy boundaries
 
-Use local structural callbacks with the native agent and retriever. Preserve tool-child parentage, agent streams, and retained summaries. New structural trace events contain only fixed operation names/types, run and parent IDs, outcome, duration, counts, and status; they omit queries, paths, prompts, model configuration, tool arguments/results, raw errors, and secrets. This guarantee applies to these trace events, not all existing ConsoleDebug logging. Trama supplies no tracing credentials, clients, exporters, activation, or settings. With no externally supplied tracing configuration, tracing makes no network requests. Host-supplied LangSmith flags, exporters, or configuration remain effective and may attempt unauthenticated network requests; a missing key is not a universal network prohibition. Do not add a patch, AsyncLocalStorage, dependency, setting, or platform restriction.
+Use local structural callbacks with the native agent and retriever. Preserve tool-child parentage, agent streams, and retained summaries. New structural trace events contain only fixed operation names/types, run and parent IDs, outcome, duration, counts, and status; they omit queries, paths, prompts, model configuration, tool arguments/results, raw errors, and secrets. This guarantee applies to these trace events, not all existing ConsoleDebug logging. Trama supplies no tracing credentials, clients, exporters, activation, or settings.
+For Community directory compliance, the production browser bundle now injects a
+bundle-local undefined `process`. This supersedes the earlier decision to leave
+host environment tracing effective: SDKs must not inherit host tracing flags,
+endpoints, or credentials. The host process and other plugins remain unchanged.
+Keep local structural callbacks and provider requests. Validate this at Trama's
+packaged retrieval and model boundaries with hostile host tracing variables.
 
 Selecting Edit only prepares a composer draft; it leaves native history and the
 visible conversation intact. Sending the revised prompt, after preflight and

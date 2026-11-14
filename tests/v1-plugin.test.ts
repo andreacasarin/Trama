@@ -217,12 +217,7 @@ describe("V1 plugin composition", () => {
         type: "module",
       });
       expect(commands.mock.calls.map(([command]) => (command as any).id)).toEqual(
-        expect.arrayContaining([
-          "trama-update-index",
-          "trama-rebuild-index",
-          "trama-stop-indexing",
-          "trama-clear-index",
-        ])
+        expect.arrayContaining(["update-index", "rebuild-index", "stop-indexing", "clear-index"])
       );
       const openCommand = commands.mock.calls
         .map(([command]) => command as any)

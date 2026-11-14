@@ -84,11 +84,11 @@ mode or degraded state. Those events omit query
 text, paths, prompts, model configuration, tool arguments or results, raw errors,
 and secrets. This describes the new trace events only; existing ConsoleDebug
 logging is separate and may retain its existing fields. Trama supplies no tracing
-credentials, clients, exporters, activation, or settings. With no externally
-supplied tracing configuration there are no trace network requests. Host-supplied
-LangSmith flags, exporters, or configuration remain effective and can cause
-unauthenticated network attempts; absence of a key does not guarantee that upstream
-tracing will not attempt a connection.
+credentials, clients, exporters, activation, or settings. The production browser
+bundle uses a bundle-local undefined `process`, so bundled SDKs cannot inherit
+host environment variables, tracing flags, endpoints, or credentials. This does
+not modify Obsidian's process or other plugins. Console Debug stays local;
+configured model requests are separate from diagnostics.
 
 ### Search and related-note evidence
 

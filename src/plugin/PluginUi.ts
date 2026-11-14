@@ -89,22 +89,22 @@ export function registerPluginUi(
       new LenteSearchModal(app, dependencies.retrieval(), dependencies.consoleDebug).open(),
   });
   plugin.addCommand({
-    id: "trama-update-index",
+    id: "update-index",
     name: "Update note index",
     callback: () => void plugin.updateIndex(),
   });
   plugin.addCommand({
-    id: "trama-rebuild-index",
+    id: "rebuild-index",
     name: "Rebuild note index",
     callback: () => void plugin.rebuildIndex(),
   });
   plugin.addCommand({
-    id: "trama-stop-indexing",
+    id: "stop-indexing",
     name: "Stop index operation",
     callback: () => plugin.stopIndex(),
   });
   plugin.addCommand({
-    id: "trama-clear-index",
+    id: "clear-index",
     name: "Clear index and embedding cache",
     callback: () => void plugin.clearIndex(),
   });

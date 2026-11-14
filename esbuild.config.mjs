@@ -7,6 +7,8 @@ const runtimeBuildId = JSON.parse(readFileSync(".cache/runtime-build.json", "utf
 const common = {
   bundle: true,
   platform: "browser",
+  // SDKs must not inherit Obsidian's Node environment or tracing credentials.
+  inject: ["scripts/browser-process.mjs"],
   target: "es2020",
   minify: production,
   logLevel: "info",
