@@ -53,7 +53,7 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
   const timings: NoteStoreInitTimings = {};
   let startedAt = diagnostics ? performance.now() : undefined;
   // esbuild lowers this literal require to a lazy bundled initializer without a namespace wrapper.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- esbuild embeds this literal WASM require as a lazy binary initializer.
   const bytes = require("../../../sqlite3.wasm") as Uint8Array<ArrayBuffer>;
   const loadedAt = startedAt !== undefined ? performance.now() : undefined;
   (globalThis as any).sqlite3ApiConfig = {

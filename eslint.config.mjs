@@ -30,6 +30,11 @@ export default tseslint.config(
     rules: { "no-console": "error" },
   },
   {
+    // The user-enabled diagnostic sink is the sole runtime console writer.
+    files: ["src/plugin/ConsoleDebug.ts"],
+    rules: { "no-console": "off" },
+  },
+  {
     files: ["scripts/sqlite-wasm/**/*.{js,mjs}"],
     languageOptions: { globals: { console: "readonly", URL: "readonly", WebAssembly: "readonly" } },
   }
