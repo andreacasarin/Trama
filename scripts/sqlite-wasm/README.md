@@ -1,19 +1,31 @@
 # Direct SQLite WASM supply chain
 
-Run from the repository root:
+Normal plugin builds use Node.js 22.23.3 and the committed `sqlite3.mjs` and
+`sqlite3.wasm` in `vendor/sqlite-wasm/`. `artifacts.json` pins their SHA-256 hashes
+and the fingerprint of the native source, Dockerfile, supply-chain lock, and
+builder. `npm run build` rejects modified or stale inputs and verifies their
+native capabilities before bundling. It needs no Docker, compiler, build cache,
+or downloads beyond `npm ci`.
+
+For maintainers, from the repository root with Docker available:
 
 ```sh
-node scripts/sqlite-wasm/build.mjs --clean
-node scripts/sqlite-wasm/verify.mjs
+npm run rebuild:sqlite
+npm run verify:sqlite:rebuild
 ```
 
-The Dockerfile downloads and verifies the pinned official SQLite source and
+`rebuild:sqlite` downloads and verifies the pinned official SQLite source and
 amalgamation archives, then compiles them with the digest-pinned Emscripten image
-recorded in `vendor/sqlite-wasm/supply-chain.json`. The Node wrapper records one
-local input fingerprint, rebuilds only when it changes, verifies the Docker
-outputs, and atomically copies `sqlite3.mjs` and `sqlite3.wasm` to the ignored
-repository root. The build uses SQLite's canonical ES module without
-post-processing generated code.
+recorded in `vendor/sqlite-wasm/supply-chain.json`. It verifies the native outputs
+before updating the committed artifacts and integrity record. Commit those files
+together with any native input change. Generated code is not post-processed.
+
+`verify:sqlite:rebuild` independently recompiles without a build-cache shortcut
+and requires byte equality with the committed artifacts. CI and the release
+workflow run this check. Native rebuild staging files at the ignored repository
+root are never used by the normal plugin build. A separate CI test starts from a
+clean Node 22 container without Docker and runs the same install, build, and tests
+as a fresh contributor or the Community verifier.
 
 The static initializer registers only Trama's native dot product and centroid
 aggregate. Lexical retrieval uses SQLite's built-in FTS5 tokenizer and BM25;

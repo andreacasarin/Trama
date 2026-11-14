@@ -1,8 +1,8 @@
 # SQLite candidate supply-chain licenses
 
-This directory is generated from pinned upstream sources by
-`node scripts/sqlite-wasm/build.mjs`. The direct-production WASM assets contain the following
-third-party components:
+The committed SQLite/WASM build inputs are generated from pinned upstream sources
+by `npm run rebuild:sqlite`. Normal builds verify their integrity without a native
+compiler. The direct-production WASM assets contain the following third-party components:
 
 | Component | Version | License | Official evidence |
 | --- | --- | --- | --- |

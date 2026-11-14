@@ -4,10 +4,10 @@
   "description": "Local-first AI for conversing with your vault through Voce, discovering related notes through Filo, and searching indexed notes through Lente.",
   "main": "main.js",
   "engines": {
-    "node": "24.x"
+    "node": "22.x"
   },
   "scripts": {
-    "build": "npm run verify:licenses && node scripts/generate-build-identity.mjs && node scripts/sqlite-wasm/build.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
+    "build": "npm run verify:licenses && node scripts/generate-build-identity.mjs && node scripts/sqlite-wasm/verify.mjs && tsc --noEmit && node esbuild.config.mjs production",
     "version": "node scripts/sync-version.mjs",
     "version:sync": "node scripts/sync-version.mjs",
     "version:check": "node scripts/sync-version.mjs --check",
@@ -20,7 +20,9 @@
     "lint": "eslint .",
     "test": "npm run build && vitest run",
     "benchmark:compare": "node scripts/benchmark/compare.mjs",
-    "verify:licenses": "node scripts/verify-licenses.mjs"
+    "verify:licenses": "node scripts/verify-licenses.mjs",
+    "rebuild:sqlite": "node scripts/sqlite-wasm/build.mjs --update-vendored",
+    "verify:sqlite:rebuild": "node scripts/sqlite-wasm/build.mjs --clean && node scripts/sqlite-wasm/artifacts.mjs --check-rebuilt"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

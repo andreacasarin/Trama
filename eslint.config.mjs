@@ -8,6 +8,7 @@ export default tseslint.config(
       "main.js",
       "sqlite-worker.mjs",
       "sqlite3.mjs",
+      "vendor/sqlite-wasm/sqlite3.mjs",
       "sqlite3.wasm",
       "coverage/**",
       ".artifacts/**",

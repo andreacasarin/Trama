@@ -54,7 +54,7 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
   let startedAt = diagnostics ? performance.now() : undefined;
   // esbuild lowers this literal require to a lazy bundled initializer without a namespace wrapper.
   // eslint-disable-next-line @typescript-eslint/no-require-imports -- esbuild embeds this literal WASM require as a lazy binary initializer.
-  const bytes = require("../../../sqlite3.wasm") as Uint8Array<ArrayBuffer>;
+  const bytes = require("../../../vendor/sqlite-wasm/sqlite3.wasm") as Uint8Array<ArrayBuffer>;
   const loadedAt = startedAt !== undefined ? performance.now() : undefined;
   (globalThis as any).sqlite3ApiConfig = {
     disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
@@ -70,13 +70,12 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
     return module;
   });
   const glueStarted = diagnostics ? performance.now() : undefined;
-  // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
-  const loadingGlue: Promise<{ default: unknown }> = import("../../../sqlite3.mjs").then(
-    (module) => {
+  const loadingGlue: Promise<{ default: unknown }> =
+    // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
+    import("../../../vendor/sqlite-wasm/sqlite3.mjs").then((module) => {
       if (glueStarted !== undefined) timings["sqlite-bootstrap"] = performance.now() - glueStarted;
       return module;
-    }
-  );
+    });
   const [wasm, { default: sqliteInit }] = await Promise.all([compiling, loadingGlue]);
   const init = sqliteInit as Init;
   const initStarted = diagnostics ? performance.now() : undefined;

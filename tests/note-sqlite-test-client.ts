@@ -12,8 +12,10 @@ export function loadTestSqlite(): Promise<any> {
       disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
     };
     // @ts-expect-error generated production asset has no application declarations.
-    const init = (await import("../sqlite3.mjs")).default;
-    const wasmBinary = readFileSync(fileURLToPath(new URL("../sqlite3.wasm", import.meta.url)));
+    const init = (await import("../vendor/sqlite-wasm/sqlite3.mjs")).default;
+    const wasmBinary = readFileSync(
+      fileURLToPath(new URL("../vendor/sqlite-wasm/sqlite3.wasm", import.meta.url))
+    );
     return init({
       instantiateWasm(
         imports: WebAssembly.Imports,

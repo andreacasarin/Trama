@@ -182,12 +182,26 @@ context window.
 
 ## Build and contribute
 
-Development requires **Node.js 24** and **Docker** for the pinned SQLite/WASM build.
+Development uses **Node.js 22.23.3**, matching the Community verifier. The project
+version is pinned in `.tool-versions`; dependency installation enforces Node 22.
+Normal builds use committed, checksum-verified SQLite/WASM inputs and need no
+Docker or native compiler. CI also tests a clean install in a Node 22 container without Docker.
 
 ```sh
 npm ci
 npm test
 ```
+
+Only maintainers rebuilding the pinned native SQLite inputs need Docker:
+
+```sh
+npm run rebuild:sqlite
+npm run verify:sqlite:rebuild
+```
+
+The first command updates the committed native inputs and their integrity record;
+the second independently rebuilds and compares them. See the
+[SQLite build guide](scripts/sqlite-wasm/README.md).
 
 To build and install into the generated demo vault:
 

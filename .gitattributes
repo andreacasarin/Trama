@@ -1,0 +1,6 @@
+# Keep checksum-pinned native inputs and generated outputs identical on every OS.
+scripts/sqlite-wasm/* text eol=lf
+vendor/sqlite-wasm/supply-chain.json text eol=lf
+vendor/sqlite-wasm/artifacts.json text eol=lf
+vendor/sqlite-wasm/sqlite3.mjs -text linguist-generated=true
+vendor/sqlite-wasm/sqlite3.wasm binary

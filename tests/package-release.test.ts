@@ -73,8 +73,6 @@ describe("release package", () => {
       "styles.css",
       "esbuild.config.mjs",
       "tsconfig.json",
-      "sqlite3.mjs",
-      "sqlite3.wasm",
       ".cache/runtime-build.json",
     ])
       cpSync(join(root, name), join(rebuildRoot, name), { recursive: true });
