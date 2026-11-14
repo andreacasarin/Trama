@@ -17,6 +17,8 @@ tools for exploring your notes.
 
 [Get started](#get-started) · [Explore Trama](#three-ways-into-your-vault) · [Privacy](#your-notes-your-models) · [Technical notes](docs/technical-notes.md)
 
+![Trama on desktop and mobile: search, related notes, and AI chat](assets/branding/trama-preview.gif)
+
 ## Three ways into your vault
 
 | View              | What it does                                                                 | Try it when…                                          |
