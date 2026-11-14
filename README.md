@@ -1,5 +1,7 @@
 # Trama
 
+![Trama logo](assets/branding/trama-wordmark.png)
+
 **Talk with your notes. Find the thread between them.**
 
 [![CI](https://github.com/andreacasarin/trama/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/andreacasarin/trama/actions/workflows/ci.yml)

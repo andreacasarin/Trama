@@ -1,0 +1,43 @@
+{
+  "design": "D — Tailored weave",
+  "created": "2026-11-14",
+  "generation": "OpenAI built-in image generation; raster PNG originals",
+  "palette": {
+    "aubergine": "#4B174D",
+    "lavender": "#B591D0",
+    "blog_background": "#FAF6EE"
+  },
+  "assets": [
+    {
+      "file": "trama-blog-landscape.png",
+      "width": 1672,
+      "height": 941,
+      "mode": "RGB",
+      "transparent": false
+    },
+    {
+      "file": "trama-icon.png",
+      "width": 1254,
+      "height": 1254,
+      "mode": "RGBA",
+      "transparent": true
+    },
+    {
+      "file": "trama-wordmark.png",
+      "width": 2172,
+      "height": 724,
+      "mode": "RGBA",
+      "transparent": true
+    }
+  ],
+  "prompt_set": {
+    "icon": "Refine selected D: preserve the four interwoven strips, two vertical and two horizontal, staggered rounded ends, central square opening and over-under arrangement. Aubergine and lavender. Icon only, generous balanced padding, genuine transparent background. Remove stray pixels without changing the design.",
+    "wordmark": "Use the final master icon unchanged on the left with lowercase trama on the right. Rounded geometric sans lettering in aubergine, optically aligned. Wide horizontal composition, transparent background, no tagline.",
+    "blog": "Use the same four-strip icon and lowercase trama wordmark, centered in a spacious 16:9 landscape composition. Warm ivory background with subtle lavender woven corner outlines. Add the established tagline: Talk with your notes. Find the thread between them."
+  },
+  "usage": {
+    "trama-icon.png": "Standalone icon; transparent PNG. Community editor currently permits only stock Lucide icons, not custom uploads.",
+    "trama-wordmark.png": "Transparent horizontal lockup for README and other brand placement.",
+    "trama-blog-landscape.png": "Opaque ivory blog header; safe margins and established tagline."
+  }
+}
