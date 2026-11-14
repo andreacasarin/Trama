@@ -1,67 +1,125 @@
-import { Keymap, SuggestModal, type App } from "obsidian";
-import type { VaultRetrievalOutput } from "@/index/VaultRetrieval";
-import { appendNoteEditDate } from "@/ui/noteEditDate";
-import type { SearchRunnable } from "./LenteView";
+import { Keymap, SuggestModal, type App, type HoverPopover } from "obsidian";
+import type { VaultRetrieval } from "@/index/VaultRetrieval";
+import type { NoteStoreHit } from "@/index/note-sqlite/protocol";
+import { configureNoteResultHover, appendSimilarityLabel } from "@/ui/noteResultRow";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+
+type EvidenceDisplay = Awaited<ReturnType<VaultRetrieval["searchEvidence"]>>;
 
 interface NoteResult {
   readonly path: string;
   readonly title: string;
+  readonly semanticScore?: number;
+  readonly hit: NoteStoreHit;
 }
 export class LenteSearchModal extends SuggestModal<NoteResult> {
+  hoverPopover: HoverPopover | null = null;
   private controller?: AbortController;
-  private revision = 0;
   private opened = false;
+  private cachedQuery?: string;
+  private cachedResults: NoteResult[] = [];
+  private queue: Promise<void> = Promise.resolve();
+  private evidence = new Map<NoteResult, Promise<EvidenceDisplay>>();
   constructor(
     app: App,
-    private readonly search: SearchRunnable,
+    private readonly source: Pick<VaultRetrieval, "searchCandidates" | "searchEvidence">,
     private readonly consoleDebug?: ConsoleDebug
   ) {
     super(app);
     this.setPlaceholder("Search your vault");
   }
-  override async getSuggestions(query: string): Promise<NoteResult[]> {
-    const revision = ++this.revision;
-    this.controller?.abort();
-    this.controller = undefined;
+  override getSuggestions(query: string): NoteResult[] {
     const trimmed = query.trim();
+    if (trimmed === this.cachedQuery) return this.cachedResults;
+    this.cancel();
     if (!trimmed) {
       this.emptyStateText = "";
       return [];
     }
-
     const controller = new AbortController();
     this.controller = controller;
+    this.cachedQuery = trimmed;
     this.emptyStateText = "Searching…";
+    void this.loadSuggestions(trimmed, controller);
+    return [];
+  }
+  private async loadSuggestions(query: string, controller: AbortController): Promise<void> {
     try {
-      const result = await this.search.invoke(
-        { query: trimmed, mode: "hybrid", content: "metadata" },
-        { signal: controller.signal }
+      const result = await this.source.searchCandidates(
+        { query, mode: "hybrid" },
+        controller.signal,
+        true
       );
-      if (!this.isCurrent(revision, controller, trimmed)) return [];
-      const suggestions = result.documents.flatMap((document) => {
-        const path = String(document.metadata.path ?? document.id ?? "");
+      if (!this.isCurrent(controller, query)) return;
+      this.cachedResults = result.hits.flatMap((hit) => {
+        const path = hit.path;
         return path && this.app.vault.getFileByPath(path)
-          ? [{ path, title: path.split("/").pop()?.replace(/\.md$/i, "") ?? path }]
+          ? [
+              {
+                path,
+                title: path.split("/").pop()?.replace(/\.md$/i, "") ?? path,
+                semanticScore: hit.semanticScore,
+                hit,
+              },
+            ]
           : [];
       });
-      this.emptyStateText = this.describe(result);
-      this.controller = undefined;
-      return suggestions;
+      this.emptyStateText = !this.cachedResults.length
+        ? "No matching notes found."
+        : result.status.degraded
+          ? "Results use lexical search because semantic search degraded."
+          : `${this.cachedResults.length} notes`;
     } catch (error) {
-      if (!this.isCurrent(revision, controller, trimmed)) return [];
+      if (!this.isCurrent(controller, query)) return;
       this.consoleDebug?.error("Lente modal search failed", error);
       this.emptyStateText = "Search failed.";
-      this.controller = undefined;
-      return [];
+      this.cachedResults = [];
     }
+    this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
   }
   override renderSuggestion(result: NoteResult, el: HTMLElement): void {
     el.empty();
     el.classList.add("trama-lente-search-modal__result");
-    el.createDiv({ cls: "suggestion-title trama-lente-search-modal__title", text: result.title });
-    el.createDiv({ cls: "suggestion-note trama-lente-search-modal__path", text: result.path });
-    appendNoteEditDate(el, this.app, result.path);
+    const heading = el.createDiv({ cls: "trama-lente-search-modal__heading" });
+    const title = heading.createDiv({
+      cls: "suggestion-title trama-lente-search-modal__title",
+      text: result.title,
+    });
+    configureNoteResultHover(title, this.app, result.path, this);
+    appendSimilarityLabel(heading, result.semanticScore, result.hit.lexicalScore);
+    const slot = el.createDiv({
+      cls: "trama-lente-search-modal__excerpt",
+      text: "Loading preview…",
+    });
+    const controller = this.controller;
+    const query = this.inputEl.value.trim();
+    if (!controller) return;
+    let promise = this.evidence.get(result);
+    if (!promise) {
+      promise = this.queue.then(async () => {
+        if (!this.isCurrent(controller, query)) return { kind: "empty" as const };
+        try {
+          return await this.source.searchEvidence(result.hit, controller.signal);
+        } catch {
+          return { kind: "unavailable" as const };
+        }
+      });
+      this.evidence.set(result, promise);
+      this.queue = promise.then(() => {});
+    }
+    void promise.then((display) => {
+      if (this.isCurrent(controller, query) && el.isConnected && slot.parentElement === el) {
+        slot.empty();
+        if (display.kind === "passage" || display.kind === "preview") {
+          slot.createEl("blockquote", { cls: "trama-note-result__quote", text: display.text });
+        } else if (display.kind === "empty") slot.remove();
+        else
+          slot.textContent =
+            display.kind === "changed"
+              ? "Note changed. Search again for an updated passage."
+              : "Preview unavailable. Open note.";
+      }
+    });
   }
   override onChooseSuggestion(result: NoteResult, event: MouseEvent | KeyboardEvent): void {
     void (this.app as App).workspace.openLinkText(result.path, "", Keymap.isModEvent(event));
@@ -77,22 +135,16 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     super.onClose();
   }
   private cancel(): void {
-    this.revision++;
+    this.hoverPopover?.unload();
+    this.hoverPopover = null;
     this.controller?.abort();
     this.controller = undefined;
+    this.cachedQuery = undefined;
+    this.cachedResults = [];
+    this.queue = Promise.resolve();
+    this.evidence.clear();
   }
-  private isCurrent(revision: number, controller: AbortController, query: string): boolean {
-    return (
-      this.opened &&
-      revision === this.revision &&
-      !controller.signal.aborted &&
-      this.inputEl.value.trim() === query
-    );
-  }
-  private describe(output: VaultRetrievalOutput): string {
-    if (!output.documents.length) return "No matching notes found.";
-    return output.status.degraded
-      ? "Results use lexical search because semantic search degraded."
-      : `${output.documents.length} notes`;
+  private isCurrent(controller: AbortController, query: string): boolean {
+    return this.opened && !controller.signal.aborted && this.inputEl.value.trim() === query;
   }
 }

@@ -42,10 +42,15 @@ Want a repeatable workflow? Write a skill as a Markdown note and invoke it with
 
 ### Filo and Lente: follow an idea
 
-Filo surfaces related notes as you move through your vault. Lente combines
-keyword and semantic search to help you find notes even when your wording has
-changed. Both link directly to the original notes. With Obsidian's **Page preview**
-enabled for Trama, hover over a result title to peek inside.
+Filo surfaces related notes as you move through your vault, and Lente combines
+keyword and semantic search to find notes even when your wording has changed.
+Both views show the title and a qualitative similarity label; keyword-only Lente
+results say **Keyword match**, and unavailable similarity is labeled
+**Similarity unavailable**. In the sidebars, expand a result for a short note
+preview. When a semantic passage matched, Trama labels it **Matched passage**;
+otherwise it labels the text **Preview**. The command-palette Lente picker shows a
+compact preview under each result. Choose a result title to open the note. With Obsidian's
+**Page preview** enabled for Trama, hover over a result title to peek inside.
 
 ## Get started
 
@@ -88,6 +93,11 @@ Markdown changes, with a periodic check for missed changes. New or changed conte
 may be sent to your embedding model during these updates. You can update manually
 or stop an operation at any time.
 
+Semantic indexing excludes YAML frontmatter from passage embeddings. Titles, aliases,
+and frontmatter tags remain searchable as metadata; keyword search also indexes
+the original note text. See [technical notes](docs/technical-notes.md#storage-and-retrieval)
+for passage boundaries, embedding limits, and how existing indexes refresh.
+
 ## Your notes, your models
 
 - **Local storage.** The search index lives on your device. Trama stores a vault
@@ -106,6 +116,12 @@ or stop an operation at any time.
   storage folder is excluded from both indexing and vault-reading tools.
 - **Session-only conversations.** Trama does not save chat history to disk. Use
   **New chat** to clear it; closing the last Voce pane also resets the conversation.
+- **Local tracing.** New structural trace events report fixed operation names and
+  types, run and parent IDs, outcomes, durations, counts, and status; these events
+  omit query text, paths, prompts, model configuration, tool arguments and results,
+  raw errors, and secrets. This describes those trace events, not every existing
+  console diagnostic. Trama supplies no tracing credentials or exporters; host
+  tracing configuration remains upstream-controlled and may attempt network access.
 
 [Read about storage, cache sharing, and provider requests →](docs/technical-notes.md)
 

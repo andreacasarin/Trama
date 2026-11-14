@@ -1,6 +1,10 @@
+import { getFrontMatterInfo } from "obsidian";
+import type { Callbacks } from "@langchain/core/callbacks/manager";
+import { LocalTraceHandler } from "@/plugin/LocalTracing";
+import { SqlCandidateRetriever } from "./SqlCandidateRetriever";
 import { Document } from "@langchain/core/documents";
+import { _HashedDocument } from "@langchain/core/indexing";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
-import { RunnableLambda, type RunnableConfig } from "@langchain/core/runnables";
 import { StructuredError, checkAbort, isCancelled } from "@/domain/errors";
 import { EmbeddingProviderError } from "@/model/LocalModels";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -16,18 +20,12 @@ export interface VaultRetrievalInput {
   readonly query: string;
   readonly mode: "hybrid" | "lexical";
   readonly limit?: number;
-  readonly content?: "full" | "metadata";
 }
 
 export interface VaultRetrievalStatus {
   readonly mode: "hybrid" | "lexical";
   readonly degraded: boolean;
   readonly degradationReason?: "semantic-unavailable" | "query-embedding-failed";
-}
-
-export interface VaultRetrievalOutput {
-  readonly documents: readonly Document[];
-  readonly status: VaultRetrievalStatus;
 }
 
 export interface VaultSearchCandidates {
@@ -47,7 +45,6 @@ export type LiveMarkdownReader = (
 ) => Promise<LiveMarkdown | null>;
 
 export class VaultRetrieval {
-  readonly runnable: RunnableLambda<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>;
   private searchController = new AbortController();
   private relatedGeneration = 0;
   private relatedRequest?: {
@@ -70,24 +67,19 @@ export class VaultRetrieval {
     private readonly readNote: LiveMarkdownReader,
     private readonly consoleDebug?: ConsoleDebug,
     private readonly storageFolder = DEFAULT_STORAGE_FOLDER
-  ) {
-    this.runnable = RunnableLambda.from<VaultRetrievalInput, VaultRetrievalOutput, RunnableConfig>(
-      (input, config) => this.search(input, config.signal)
-    );
-  }
+  ) {}
 
   async related(
     sourcePath: string,
     signal: AbortSignal,
     limit = 20
-  ): Promise<{ readonly documents: readonly Document[]; readonly available: boolean }> {
+  ): Promise<NoteStoreRelatedResult> {
     checkAbort(signal);
     const finish = this.consoleDebug?.start("Filo related-note lookup");
     try {
       const result = await this.relatedHits(sourcePath, signal, limit);
-      const documents = result.hits.map(metadataDocument);
-      finish?.("completed", { resultCount: documents.length, available: result.available });
-      return { documents, available: result.available };
+      finish?.("completed", { resultCount: result.hits.length, available: result.available });
+      return result;
     } catch (error) {
       finish?.(signal.aborted || isCancelled(error) ? "cancelled" : "failed");
       throw error;
@@ -111,11 +103,30 @@ export class VaultRetrieval {
 
   async searchCandidates(
     input: VaultRetrievalInput,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    evidence = false,
+    callbacks?: Callbacks
   ): Promise<VaultSearchCandidates> {
     signal = signal
       ? AbortSignal.any([signal, this.searchController.signal])
       : this.searchController.signal;
+    let batch: VaultSearchCandidates | undefined;
+    const retriever = new SqlCandidateRetriever(async () => {
+      batch = await this.searchCandidatesSql(input, signal, evidence);
+      return batch;
+    });
+    const documents = await retriever.invoke(input.query, {
+      callbacks: callbacks ?? [new LocalTraceHandler(this.consoleDebug, signal)],
+      runName: "SQL candidate retrieval",
+    });
+    return { ...batch!, hits: documents.map((document) => document.metadata.hit as NoteStoreHit) };
+  }
+
+  private async searchCandidatesSql(
+    input: VaultRetrievalInput,
+    signal: AbortSignal,
+    evidence = false
+  ): Promise<VaultSearchCandidates> {
     checkAbort(signal);
     const query = input.query.trim();
     if (
@@ -153,6 +164,7 @@ export class VaultRetrieval {
         query,
         ...(vector && this.profile ? { vector, profile: this.profile } : {}),
         k: Math.max(20, input.limit ?? 10),
+        ...(evidence ? { evidence: true } : {}),
       },
       signal
     )) as NoteStoreHybridResult;
@@ -168,6 +180,68 @@ export class VaultRetrieval {
       },
       signal,
     };
+  }
+
+  private async verifiedEvidenceSource(
+    hit: NoteStoreHit,
+    signal?: AbortSignal
+  ): Promise<LiveMarkdown | null> {
+    if (
+      !hit.evidence?.profile ||
+      hit.evidence.profile !== this.profile ||
+      this.isStoragePath(hit.path)
+    )
+      return null;
+    const note = await this.readNote(hit.path, signal);
+    checkAbort(signal);
+    if (!note || note.path !== hit.path) return null;
+    const uid = _HashedDocument.fromDocument(
+      new Document({
+        pageContent: note.content,
+        metadata: { path: hit.path, embeddingProfile: hit.evidence.profile },
+      })
+    ).uid;
+    if (uid !== hit.evidence.uid) return null;
+    const exists = (await this.call("recordManagerExists", { keys: [uid] }, signal)) as boolean[];
+    checkAbort(signal);
+    return exists[0] ? note : null;
+  }
+
+  async searchEvidence(hit: NoteStoreHit, signal?: AbortSignal) {
+    checkAbort(signal);
+    if (this.isStoragePath(hit.path)) return { kind: "unavailable" as const };
+    const hasPassage =
+      hit.evidence?.startOffset !== undefined && hit.evidence.endOffset !== undefined;
+    const note = hasPassage
+      ? await this.verifiedEvidenceSource(hit, signal)
+      : await this.readNote(hit.path, signal);
+    checkAbort(signal);
+    if (!note || note.path !== hit.path)
+      return { kind: hasPassage ? ("changed" as const) : ("unavailable" as const) };
+    const bodyStart = getFrontMatterInfo(note.content).contentStart;
+    const useful = (text: string) => {
+      const lines = text.split(/(?<=\n)/);
+      let start = 0;
+      while (
+        start < lines.length &&
+        /^(?:\s*|\s*#{1,6}(?:\s+.*)?|\s*[-*_]{3,}\s*)$/.test(lines[start].trimEnd())
+      )
+        start++;
+      return lines.slice(start).join("").trim().slice(0, 1000);
+    };
+    if (hasPassage && hit.evidence) {
+      const { startOffset, endOffset, sectionPath } = hit.evidence;
+      if (
+        startOffset! < bodyStart ||
+        endOffset! > note.content.length ||
+        endOffset! <= startOffset!
+      )
+        return { kind: "unavailable" as const };
+      const text = useful(note.content.slice(startOffset, endOffset));
+      if (text) return { kind: "passage" as const, text, sectionPath };
+    }
+    const text = useful(note.content.slice(bodyStart));
+    return text ? { kind: "preview" as const, text } : { kind: "empty" as const };
   }
 
   async readSearchCandidate(
@@ -258,53 +332,6 @@ export class VaultRetrieval {
   private isStoragePath(path: string): boolean {
     return path === this.storageFolder || path.startsWith(`${this.storageFolder}/`);
   }
-
-  private async search(
-    input: VaultRetrievalInput,
-    signal?: AbortSignal
-  ): Promise<VaultRetrievalOutput> {
-    const finish = this.consoleDebug?.start("Vault search", { mode: input.mode });
-
-    try {
-      const candidates = await this.searchCandidates(input, signal);
-      const documents =
-        input.content === "metadata"
-          ? candidates.hits.slice(0, input.limit).map(metadataDocument)
-          : await this.hydrate(candidates.hits, candidates.signal, input.limit);
-      checkAbort(candidates.signal);
-      finish?.("completed", {
-        resultCount: documents.length,
-        degraded: candidates.status.degraded,
-      });
-      return {
-        documents,
-        status: candidates.status,
-      };
-    } catch (error) {
-      finish?.(isCancelled(error) ? "cancelled" : "failed");
-      throw error;
-    }
-  }
-
-  private async hydrate(
-    hits: readonly {
-      readonly path: string;
-      readonly score: number;
-      readonly lexicalScore?: number;
-      readonly semanticScore?: number;
-    }[],
-    signal?: AbortSignal,
-    limit?: number
-  ): Promise<Document[]> {
-    const documents: Document[] = [];
-    for (const hit of hits) {
-      if (limit !== undefined && documents.length >= limit) break;
-      checkAbort(signal);
-      const document = await this.readSearchCandidate(hit, signal);
-      if (document) documents.push(document);
-    }
-    return documents;
-  }
 }
 
 function waitForConsumer<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -324,8 +351,4 @@ function waitForConsumer<T>(promise: Promise<T>, signal: AbortSignal): Promise<T
       }
     );
   });
-}
-
-function metadataDocument(hit: NoteStoreHit): Document {
-  return new Document({ id: hit.path, pageContent: "", metadata: { ...hit } });
 }

@@ -31,6 +31,8 @@ describe("SQLite LangChain record manager", () => {
         profile: null,
         markdown: "# current note",
         vectors: [],
+        passages: [],
+        metadata: { title: "", aliases: [], tags: [] },
       });
       expect(await records.exists(["uid-a", "uid-b"])).toEqual([true, false]);
       await database.call("noteStoreReplace", {
@@ -39,6 +41,8 @@ describe("SQLite LangChain record manager", () => {
         profile: null,
         markdown: "# replacement note",
         vectors: [],
+        passages: [],
+        metadata: { title: "", aliases: [], tags: [] },
       });
       expect(await records.exists(["uid-a", "uid-new"])).toEqual([false, true]);
     } finally {

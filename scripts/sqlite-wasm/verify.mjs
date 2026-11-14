@@ -31,11 +31,26 @@ const sqlite = await initModule({
 const db = new sqlite.oo1.DB(":memory:", "c");
 const blob = (values) => new Uint8Array(new Float32Array(values).buffer);
 const dot = (a, b) => db.selectValue("SELECT trama_vector_dot(?,?)", [blob(a), blob(b)]);
+db.exec("CREATE TABLE winner_test(ordinal INTEGER, vector BLOB)");
+for (const [ordinal, vector] of [
+  [3, [-1, 0]],
+  [2, [1, 0]],
+  [1, [1, 0]],
+]) {
+  db.exec({ sql: "INSERT INTO winner_test VALUES (?,?)", bind: [ordinal, blob(vector)] });
+}
+const winner = db.selectValue("SELECT trama_vector_winner(vector,?,ordinal) FROM winner_test", [
+  blob([1, 0]),
+]);
+db.exec("CREATE VIRTUAL TABLE evidence_test USING fts5(body)");
 const runtimeChecks = {
   nativeDot: dot([1, 0], [0.5, 0.5]) === 0.5,
   smallDot: dot([1e-30, 0], [1e-30, 0]) > 0,
   largeDot: Number.isFinite(dot([1e20, 0], [1e20, 0])),
   nativeCentroid: db.selectValue("SELECT length(trama_vector_centroid(?))", [blob([1, 0])]) === 8,
+  nativeWinner:
+    db.selectValue("SELECT trama_winner_score(?)", [winner]) === 1 &&
+    db.selectValue("SELECT trama_winner_ordinal(?)", [winner]) === 1,
   fts5: db.selectValue("SELECT sqlite_compileoption_used('ENABLE_FTS5')") === 1,
   loadExtensionOmitted:
     db.selectValue("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION')") === 1,

@@ -64,7 +64,7 @@ export function registerPluginUi(
   );
   plugin.registerView(
     ui.LENTE_VIEW_TYPE,
-    (leaf) => new ui.LenteView(leaf, dependencies.retrieval().runnable, dependencies.consoleDebug)
+    (leaf) => new ui.LenteView(leaf, dependencies.retrieval(), dependencies.consoleDebug)
   );
   for (const [id, name, icon, type] of [
     ["open-voce", "Open Voce", TRAMA_ICONS.voce, ui.VOCE_VIEW_TYPE],
@@ -86,11 +86,7 @@ export function registerPluginUi(
     name: "Search with Lente",
     icon: TRAMA_ICONS.lente,
     callback: () =>
-      new LenteSearchModal(
-        app,
-        dependencies.retrieval().runnable,
-        dependencies.consoleDebug
-      ).open(),
+      new LenteSearchModal(app, dependencies.retrieval(), dependencies.consoleDebug).open(),
   });
   plugin.addCommand({
     id: "trama-update-index",

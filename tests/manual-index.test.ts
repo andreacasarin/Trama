@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
-import { MarkdownTextSplitter } from "@langchain/textsplitters";
+import { prepareNote } from "@/index/NotePassages";
 import { ManualIndex, type ManualIndexNote, type ManualIndexVault } from "@/index/ManualIndex";
 import { SqliteNoteRecordManager } from "@/index/SqliteNoteRecordManager";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
@@ -177,10 +177,11 @@ describe("native LangChain note indexing", () => {
     const { db, client, embeddings, manual } = await setup(notes);
     try {
       expect((await manual.update()).numAdded).toBe(3);
-      const splitter = new MarkdownTextSplitter();
       const expected: string[] = [];
       for (const [, markdown] of [...notes].sort(([left], [right]) => left.localeCompare(right)))
-        expected.push(...(await splitter.splitText(markdown)));
+        expected.push(
+          ...(await prepareNote(markdown, "note.md")).passages.map((passage) => passage.text)
+        );
       expect(embeddings.batches).toEqual([expected]);
 
       for (const [path, markdown] of notes) {
@@ -191,7 +192,9 @@ describe("native LangChain note indexing", () => {
           db.selectValue("SELECT current_uid FROM note_index WHERE path=?", [path])
         );
         expect(db.selectValue("SELECT group_path FROM note_records WHERE uid=?", [uid])).toBe(path);
-        const chunks = await splitter.splitText(markdown);
+        const chunks = (await prepareNote(markdown, "note.md")).passages.map(
+          (passage) => passage.text
+        );
         expect(db.selectValue("SELECT count(*) FROM note_vectors WHERE note_id=?", [noteId])).toBe(
           chunks.length
         );
@@ -220,26 +223,31 @@ describe("native LangChain note indexing", () => {
     }
   });
 
-  it("flushes near the 512-chunk cap and slices an oversized note across provider calls", async () => {
+  it("flushes near the 256-chunk cap and slices an oversized note across provider calls", async () => {
     const notes = new Map([
       ["alpha.md", `# alphamarker\n\n${"w ".repeat(204_000)}`],
       ["beta.md", `# betamarker\n\n${"x ".repeat(500)}`],
-      ["gamma.md", `# gammamarker\n\n${"y ".repeat(204_800)}`],
+      ["gamma.md", `# gammamarker\n\n${"y ".repeat(260_000)}`],
     ]);
     const { db, client, embeddings, manual } = await setup(notes);
     try {
-      const splitter = new MarkdownTextSplitter();
       const chunksByPath = new Map(
         await Promise.all(
           [...notes].map(
-            async ([path, markdown]) => [path, await splitter.splitText(markdown)] as const
+            async ([path, markdown]) =>
+              [
+                path,
+                (await prepareNote(markdown, "note.md")).passages.map((passage) => passage.text),
+              ] as const
           )
         )
       );
-      expect([...chunksByPath.values()].map((chunks) => chunks.length)).toEqual([511, 3, 513]);
+      expect([...chunksByPath.values()].every((chunks) => chunks.length > 0)).toBe(true);
+      expect(chunksByPath.get("gamma.md")!.length).toBeGreaterThan(256);
 
       expect((await manual.update()).numAdded).toBe(3);
-      expect(embeddings.batches.map((batch) => batch.length)).toEqual([511, 3, 512, 1]);
+      expect(embeddings.batches.every((batch) => batch.length <= 256)).toBe(true);
+      expect(embeddings.batches.flat()).toEqual([...chunksByPath.values()].flat());
       for (const [path, chunks] of chunksByPath) {
         const noteId = Number(
           db.selectValue("SELECT note_id FROM note_index WHERE path=?", [path])
@@ -412,13 +420,25 @@ describe("native LangChain note indexing", () => {
 
   it("reindexes a note when its embedding profile changes", async () => {
     const notes = new Map([["profile.md", "# profile\n\nkeep this note"]]);
-    const { db, client, records, embeddings, vault, manual } = await setup(notes);
+    const { db, client, records, embeddings, vault, store } = await setup(notes);
     try {
-      await manual.update();
+      const oldProfile = store.embeddingProfile.replace(
+        "body-recursive-utf8-1000-codepoint-v1",
+        "body-structure-utf8-1000-v1"
+      );
+      const oldStore = new SqliteNoteVectorStore(
+        embeddings,
+        client.call,
+        async (path) => notes.get(path) ?? null,
+        oldProfile,
+        undefined,
+        2
+      );
+      await new ManualIndex(vault, oldStore, records).update();
       const priorUid = String(await db.selectValue("SELECT current_uid FROM note_index"));
       const nextProfile = {
         endpoint: "http://127.0.0.1:1234/v1",
-        modelId: "changed-profile",
+        modelId: "manual-test",
         dimensions: 2,
       };
       const nextStore = new SqliteNoteVectorStore(
@@ -434,6 +454,8 @@ describe("native LangChain note indexing", () => {
       expect(await db.selectValue("SELECT embedding_profile FROM note_index")).toBe(
         nextStore.embeddingProfile
       );
+      expect(embeddings.calls).toBe(2);
+      expect((await new ManualIndex(vault, nextStore, records).update()).numSkipped).toBe(1);
       expect(embeddings.calls).toBe(2);
     } finally {
       await client.close();

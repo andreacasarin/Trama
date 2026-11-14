@@ -1,13 +1,13 @@
 import { ButtonComponent, ItemView, Keymap, SearchComponent, WorkspaceLeaf } from "obsidian";
-import type { Runnable } from "@langchain/core/runnables";
-import type { VaultRetrievalInput, VaultRetrievalOutput } from "@/index/VaultRetrieval";
+import type { VaultSearchCandidates } from "@/index/VaultRetrieval";
 import { TRAMA_ICONS } from "@/ui/icons";
-import { appendNoteResultRow } from "@/ui/noteResultRow";
+import { appendNoteResultRow, renderResultContext } from "@/ui/noteResultRow";
 import type { IconName } from "obsidian";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
+import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
-export type SearchRunnable = Pick<Runnable<VaultRetrievalInput, VaultRetrievalOutput>, "invoke">;
+type SearchSource = Pick<VaultRetrieval, "searchCandidates" | "searchEvidence">;
 
 export class LenteView extends ItemView {
   private input!: HTMLInputElement;
@@ -15,13 +15,13 @@ export class LenteView extends ItemView {
   private rows!: HTMLDivElement;
   private resultsCount!: HTMLDivElement;
   private controller?: AbortController;
-  private revision = 0;
   private submitted = "";
-  private output?: VaultRetrievalOutput;
+  private output?: VaultSearchCandidates;
   private opened = false;
+  private evidenceRequests = new Map<string, AbortController>();
   constructor(
     leaf: WorkspaceLeaf,
-    private search: SearchRunnable,
+    private search: SearchSource,
     private readonly consoleDebug?: ConsoleDebug
   ) {
     super(leaf);
@@ -35,7 +35,7 @@ export class LenteView extends ItemView {
   getIcon(): IconName {
     return TRAMA_ICONS.lente;
   }
-  setSearch(search: SearchRunnable): void {
+  setSearch(search: SearchSource): void {
     this.cancel();
     this.search = search;
     this.output = undefined;
@@ -102,8 +102,9 @@ export class LenteView extends ItemView {
     return Promise.resolve();
   }
   private cancel(): void {
-    this.revision++;
     this.controller?.abort();
+    for (const request of this.evidenceRequests.values()) request.abort();
+    this.evidenceRequests.clear();
     this.controller = undefined;
   }
   private async run(query: string): Promise<void> {
@@ -114,20 +115,20 @@ export class LenteView extends ItemView {
       return;
     }
     this.cancel();
-    const revision = ++this.revision;
     const controller = new AbortController();
     this.controller = controller;
     this.render();
     try {
-      const output = await this.search.invoke(
-        { query, mode: "hybrid", content: "metadata" },
-        { signal: controller.signal }
+      const output = await this.search.searchCandidates(
+        { query, mode: "hybrid" },
+        controller.signal,
+        true
       );
-      if (revision !== this.revision || controller.signal.aborted) return;
+      if (controller.signal.aborted) return;
       this.output = output;
       this.controller = undefined;
     } catch (error) {
-      if (revision !== this.revision || controller.signal.aborted) return;
+      if (controller.signal.aborted) return;
       this.consoleDebug?.error("Lente search failed", error);
       this.output = undefined;
       this.controller = undefined;
@@ -149,24 +150,54 @@ export class LenteView extends ItemView {
         this.status.textContent = "Submit a query to search your vault.";
       return;
     }
-    const documents = output.documents.filter((document) =>
-      Boolean(this.app.vault.getFileByPath(String(document.metadata.path ?? document.id ?? "")))
-    );
-    this.resultsCount.textContent = documents.length
-      ? `${documents.length} ${documents.length === 1 ? "result" : "results"}`
+    const hits = output.hits.filter((hit) => this.app.vault.getFileByPath(hit.path));
+    this.resultsCount.textContent = hits.length
+      ? `${hits.length} ${hits.length === 1 ? "result" : "results"}`
       : "";
     this.status.textContent = output.status.degraded
       ? output.status.degradationReason === "query-embedding-failed"
         ? "Lexical results (query embedding failed)."
         : "Lexical results (semantic search unavailable)."
-      : documents.length
+      : hits.length
         ? ""
         : "No matching notes found.";
-    for (const document of documents) {
-      const path = String(document.metadata.path ?? document.id ?? "");
-      appendNoteResultRow(this.rows, this.app, path, this.leaf, (event) => {
-        void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
-      });
+    for (const hit of hits) {
+      const path = hit.path;
+      const source = this.search;
+      appendNoteResultRow(
+        this.rows,
+        this.app,
+        path,
+        this.leaf,
+        (event) => {
+          void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
+        },
+        hit.semanticScore,
+        (expanded, metadata) => {
+          this.evidenceRequests.get(path)?.abort();
+          this.evidenceRequests.delete(path);
+          metadata.empty();
+          if (!expanded) return;
+          const controller = new AbortController();
+          this.evidenceRequests.set(path, controller);
+          const detail = metadata.createDiv({
+            cls: "trama-note-result__evidence",
+            attr: { "aria-live": "polite" },
+          });
+          detail.textContent = "Loading preview…";
+          void source
+            .searchEvidence(hit, controller.signal)
+            .then((result) => {
+              if (!controller.signal.aborted && detail.isConnected)
+                renderResultContext(detail, result);
+            })
+            .catch(() => {
+              if (!controller.signal.aborted && detail.isConnected)
+                detail.textContent = "Preview unavailable. Open note.";
+            });
+        },
+        hit.lexicalScore
+      );
     }
   }
 }

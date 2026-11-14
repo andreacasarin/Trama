@@ -126,6 +126,21 @@ export class NoteSqliteDatabase {
       vector BLOB NOT NULL,
       PRIMARY KEY(note_id,ordinal)
     )`);
+    const ensureColumn = (table: string, column: string, type: string) => {
+      if (!rows(db, `PRAGMA table_info(${table})`).some((row) => row.name === column))
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    };
+    ensureColumn("note_vectors", "start_offset", "INTEGER");
+    ensureColumn("note_vectors", "end_offset", "INTEGER");
+    ensureColumn("note_vectors", "section_start_offset", "INTEGER");
+    ensureColumn("note_vectors", "section_path", "TEXT");
+    for (const table of [
+      "note_line_membership",
+      "note_line_counts",
+      "note_related_state",
+      "note_related_clock",
+    ])
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
       body,path_text,content='',contentless_delete=1,
       tokenize='unicode61 remove_diacritics 2'
@@ -866,12 +881,13 @@ export class NoteSqliteDatabase {
     const found = rows(
       this.db,
       `WITH ${lexicalCte}
-      semantic_base AS (
-        SELECT n.note_id,n.path,MAX(trama_vector_dot(v.vector,?)) AS semanticScore
-        FROM note_index n JOIN note_vectors v USING(note_id)
+      needle_input AS (SELECT ? AS vector), semantic_base AS (
+        SELECT n.note_id,n.path,trama_vector_winner(v.vector,needle_input.vector,v.ordinal) AS winner,
+          trama_winner_score(trama_vector_winner(v.vector,needle_input.vector,v.ordinal)) AS semanticScore
+        FROM note_index n JOIN note_vectors v USING(note_id) CROSS JOIN needle_input
         WHERE n.embedding_profile=? AND ?=1
         GROUP BY n.note_id
-        ORDER BY semanticScore DESC,n.path COLLATE BINARY ASC LIMIT ?
+        ORDER BY semanticScore DESC,path COLLATE BINARY ASC LIMIT ?
       ), semantic AS (
         SELECT *,ROW_NUMBER() OVER(ORDER BY semanticScore DESC,path COLLATE BINARY ASC) AS semanticRank FROM semantic_base
       ), combined AS (
@@ -881,9 +897,16 @@ export class NoteSqliteDatabase {
         UNION ALL
         SELECT s.note_id,s.path,NULL,s.semanticScore,1.0/(60+s.semanticRank)
         FROM semantic s LEFT JOIN lexical l ON l.note_id=s.note_id WHERE l.note_id IS NULL
+      ), selected AS MATERIALIZED (
+        SELECT * FROM combined ORDER BY fusedScore DESC,path COLLATE BINARY ASC LIMIT ?
       )
-      SELECT path,fusedScore,lexicalScore,semanticScore FROM combined
-      ORDER BY fusedScore DESC,path COLLATE BINARY ASC LIMIT ?`,
+      SELECT selected.path,selected.fusedScore,selected.lexicalScore,selected.semanticScore,
+        n.current_uid,n.embedding_profile,
+        v.start_offset,v.end_offset,v.section_path
+      FROM selected JOIN note_index n ON n.note_id=selected.note_id
+      LEFT JOIN semantic s ON s.note_id=selected.note_id
+      LEFT JOIN note_vectors v ON v.note_id=n.note_id AND v.ordinal=trama_winner_ordinal(s.winner)
+      ORDER BY selected.fusedScore DESC,selected.path COLLATE BINARY ASC`,
       [
         ...(expression ? [expression, candidateLimit] : []),
         needle,
@@ -903,6 +926,19 @@ export class NoteSqliteDatabase {
         score,
         ...(lexicalScore === undefined ? {} : { lexicalScore }),
         ...(semanticScore === undefined ? {} : { semanticScore }),
+        ...(input.evidence
+          ? {
+              evidence: {
+                uid: String(row.current_uid),
+                profile: row.embedding_profile === null ? null : String(row.embedding_profile),
+                ...(row.start_offset === null ? {} : { startOffset: Number(row.start_offset) }),
+                ...(row.end_offset === null ? {} : { endOffset: Number(row.end_offset) }),
+                ...(row.section_path === null
+                  ? {}
+                  : { sectionPath: JSON.parse(String(row.section_path)) as string[] }),
+              },
+            }
+          : {}),
       } satisfies NoteStoreHit;
     });
     const degraded = vector !== undefined && !semanticAvailable;
@@ -941,7 +977,10 @@ export class NoteSqliteDatabase {
         AND other.centroid IS NOT NULL AND other.note_id<>source.note_id
       ORDER BY score DESC,other.path COLLATE BINARY ASC LIMIT ?`,
       [sourcePath, profile, k]
-    ).map((row) => ({ path: String(row.path), score: Number(row.score) }));
+    ).map((row) => ({
+      path: String(row.path),
+      score: Number(row.score),
+    }));
     checkAbort(signal);
     return { hits, available: true };
   }
@@ -950,14 +989,37 @@ export class NoteSqliteDatabase {
     input: NoteStoreRpc["noteStoreReplace"],
     signal?: AbortSignal
   ): Promise<{ path: string }> {
-    const { uid, path, profile, markdown, vectors } = input;
+    const { uid, path, profile, markdown, vectors, passages, metadata } = input;
     validPath(path);
     if (
       typeof uid !== "string" ||
       !uid ||
       (profile !== null && typeof profile !== "string") ||
       typeof markdown !== "string" ||
-      !Array.isArray(vectors)
+      !Array.isArray(vectors) ||
+      !Array.isArray(passages) ||
+      passages.length !== vectors.length ||
+      !metadata ||
+      typeof metadata.title !== "string" ||
+      !Array.isArray(metadata.aliases) ||
+      !Array.isArray(metadata.tags) ||
+      [...metadata.aliases, ...metadata.tags].some((value) => typeof value !== "string") ||
+      passages.some(
+        (passage, index) =>
+          passage.ordinal !== index ||
+          !Number.isSafeInteger(passage.startOffset) ||
+          !Number.isSafeInteger(passage.endOffset) ||
+          passage.startOffset < 0 ||
+          passage.endOffset < passage.startOffset ||
+          passage.endOffset > markdown.length ||
+          markdown.slice(passage.startOffset, passage.endOffset) !== passage.text ||
+          (passage.sectionStartOffset !== null &&
+            (!Number.isSafeInteger(passage.sectionStartOffset) ||
+              passage.sectionStartOffset < 0 ||
+              passage.sectionStartOffset > passage.startOffset)) ||
+          !Array.isArray(passage.sectionPath) ||
+          passage.sectionPath.some((value: unknown) => typeof value !== "string")
+      )
     )
       throw new TypeError("Invalid note replacement");
     const dimensions = vectors[0]?.length;
@@ -986,8 +1048,16 @@ export class NoteSqliteDatabase {
       for (let i = 0; i < normalized.length; i++) {
         checkAbort(signal);
         this.db.exec({
-          sql: "INSERT INTO note_vectors(note_id,ordinal,vector) VALUES(?,?,?)",
-          bind: [id, i, normalized[i]],
+          sql: "INSERT INTO note_vectors(note_id,ordinal,vector,start_offset,end_offset,section_start_offset,section_path) VALUES(?,?,?,?,?,?,?)",
+          bind: [
+            id,
+            i,
+            normalized[i],
+            passages[i].startOffset,
+            passages[i].endOffset,
+            passages[i].sectionStartOffset,
+            JSON.stringify(passages[i].sectionPath),
+          ],
         });
         if ((i + 1) % 16 === 0 && i + 1 < normalized.length) {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -1004,7 +1074,11 @@ export class NoteSqliteDatabase {
       }
       this.db.exec({
         sql: "INSERT INTO note_fts(rowid,body,path_text) VALUES(?,?,?)",
-        bind: [id, markdown, path],
+        bind: [
+          id,
+          markdown,
+          [path, metadata.title, ...metadata.aliases, ...metadata.tags].join(" "),
+        ],
       });
       const updatedAt = this.tickRecordClock();
       this.db.exec({

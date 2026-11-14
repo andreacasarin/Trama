@@ -3,7 +3,7 @@ import { checkAbort } from "@/domain/errors";
 import { Document, type DocumentInterface } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { VectorStore } from "@langchain/core/vectorstores";
-import { MarkdownTextSplitter } from "@langchain/textsplitters";
+import { NOTE_SPLITTER_ID, prepareNote, type NotePassage, type NoteMetadata } from "./NotePassages";
 import { sha256 } from "@langchain/core/utils/hash";
 import type { NoteStoreCall, NoteSourceRevision } from "./note-sqlite/protocol";
 
@@ -35,8 +35,8 @@ export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
     endpoint: endpoint.href.replace(/\/$/, ""),
     modelId: profile.modelId.trim(),
     dimensions: profile.dimensions,
-    splitter: "langchain-markdown-default-v1",
-    preprocessing: "raw-markdown-v1",
+    splitter: NOTE_SPLITTER_ID,
+    preprocessing: "body-only-v1",
     ...(endpointFingerprint ? { endpointFingerprint } : {}),
   });
 }
@@ -48,15 +48,15 @@ interface PendingNote {
   readonly path: string;
   readonly profile: string;
   readonly markdown: string;
-  readonly chunks: DocumentInterface[];
+  readonly chunks: NotePassage[];
+  readonly metadata: NoteMetadata;
 }
 
-const MAX_BATCH_CHUNKS = 512;
+const MAX_BATCH_CHUNKS = 256;
 
 export class SqliteNoteVectorStore extends VectorStore {
   private readonly profile: string;
   private readonly dimensions: number;
-  private readonly splitter = new MarkdownTextSplitter();
   private readonly runSignal?: AbortSignal;
 
   constructor(
@@ -133,11 +133,7 @@ export class SqliteNoteVectorStore extends VectorStore {
       if (pending.length === 0) return;
       checkAbort(signal);
       const chunks = pending.flatMap((note) => note.chunks);
-      const vectors = await this.embeddings.embedDocuments(
-        chunks.map(({ pageContent }) => pageContent)
-      );
-      if (vectors.length !== chunks.length)
-        throw new TypeError("Embedding count did not match chunk count");
+      const vectors = await this.embedChunks(chunks, signal);
       checkAbort(signal);
       let vectorOffset = 0;
       for (const note of pending) {
@@ -150,6 +146,7 @@ export class SqliteNoteVectorStore extends VectorStore {
           note.markdown,
           noteVectors,
           note.chunks,
+          note.metadata,
           signal
         );
       }
@@ -167,42 +164,53 @@ export class SqliteNoteVectorStore extends VectorStore {
           ? note.metadata.embeddingProfile
           : this.profile;
       if (!uid) throw new TypeError("A native document UID is required");
-      const split = await this.splitter.splitDocuments([
-        new Document({ pageContent: note.pageContent, metadata: { path } }),
-      ]);
-      const chunks = split.map(
-        (chunk, ordinal) =>
-          new Document({ pageContent: chunk.pageContent, metadata: { path, ordinal } })
-      );
+      const { passages: chunks, metadata } = await prepareNote(note.pageContent, path);
       uids.push(uid);
 
       if (chunks.length === 0) {
         await flush();
         checkAbort(signal);
-        await this.writeNote(uid, path, profile, note.pageContent, [], [], signal);
+        await this.writeNote(uid, path, profile, note.pageContent, [], [], metadata, signal);
       } else if (chunks.length > MAX_BATCH_CHUNKS) {
         await flush();
         const vectors: number[][] = [];
         for (let offset = 0; offset < chunks.length; offset += MAX_BATCH_CHUNKS) {
           checkAbort(signal);
           const batchChunks = chunks.slice(offset, offset + MAX_BATCH_CHUNKS);
-          const batch = await this.embeddings.embedDocuments(
-            batchChunks.map(({ pageContent }) => pageContent)
-          );
-          if (batch.length !== batchChunks.length)
-            throw new TypeError("Embedding count did not match chunk count");
+          const batch = await this.embedChunks(batchChunks, signal);
           vectors.push(...batch);
         }
         checkAbort(signal);
-        await this.writeNote(uid, path, profile, note.pageContent, vectors, chunks, signal);
+        await this.writeNote(
+          uid,
+          path,
+          profile,
+          note.pageContent,
+          vectors,
+          chunks,
+          metadata,
+          signal
+        );
       } else {
         if (pendingChunkCount + chunks.length > MAX_BATCH_CHUNKS) await flush();
-        pending.push({ uid, path, profile, markdown: note.pageContent, chunks });
+        pending.push({ uid, path, profile, markdown: note.pageContent, chunks, metadata });
         pendingChunkCount += chunks.length;
       }
     }
     await flush();
     return uids;
+  }
+
+  private async embedChunks(
+    chunks: readonly NotePassage[],
+    signal?: AbortSignal
+  ): Promise<number[][]> {
+    if (!chunks.length) return [];
+    checkAbort(signal);
+    const vectors = await this.embeddings.embedDocuments(chunks.map((chunk) => chunk.text));
+    if (vectors.length !== chunks.length)
+      throw new TypeError("Embedding count did not match chunk count");
+    return vectors;
   }
 
   async addVectors(
@@ -213,10 +221,12 @@ export class SqliteNoteVectorStore extends VectorStore {
     const note = options.note;
     if (!note) throw new TypeError("The source note is required");
     const path = this.notePath(note);
-    const split = await this.splitter.splitDocuments([
-      new Document({ pageContent: note.pageContent, metadata: { path } }),
-    ]);
-    if (split.length !== documents.length) throw new TypeError("Chunk and vector counts differ");
+    const { passages, metadata } = await prepareNote(note.pageContent, path);
+    if (
+      passages.length !== documents.length ||
+      passages.some((passage, index) => passage.text !== documents[index].pageContent)
+    )
+      throw new TypeError("Chunks must match prepared passages");
     const uid = options.ids?.[0] ?? note.id ?? path;
     if (!uid) throw new TypeError("A native document UID is required");
     await this.writeNote(
@@ -227,7 +237,8 @@ export class SqliteNoteVectorStore extends VectorStore {
         : this.profile,
       note.pageContent,
       vectors,
-      documents,
+      passages,
+      metadata,
       options.signal ?? this.runSignal
     );
   }
@@ -238,16 +249,13 @@ export class SqliteNoteVectorStore extends VectorStore {
     profile: string,
     markdown: string,
     vectors: number[][],
-    documents: DocumentInterface[],
+    documents: NotePassage[],
+    metadata: NoteMetadata,
     signal?: AbortSignal
   ): Promise<void> {
     if (!path || !uid || vectors.length !== documents.length)
       throw new TypeError("Note path and vector count are invalid");
-    for (let index = 0; index < documents.length; index++) {
-      if (documents[index].metadata.path !== path || documents[index].metadata.ordinal !== index)
-        throw new TypeError("Chunks must have one path and consecutive ordinals");
-      validateVector(vectors[index], this.dimensions || undefined);
-    }
+    for (const vector of vectors) validateVector(vector, this.dimensions || undefined);
     await this.call(
       "noteStoreReplace",
       {
@@ -256,6 +264,8 @@ export class SqliteNoteVectorStore extends VectorStore {
         profile,
         markdown,
         vectors,
+        passages: documents,
+        metadata,
       },
       signal
     );

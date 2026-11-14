@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { Document } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
-import { MarkdownTextSplitter } from "@langchain/textsplitters";
+import { prepareNote } from "@/index/NotePassages";
 import { noteEmbeddingProfile, SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
+import { SqliteEmbeddingCache } from "@/index/SqliteEmbeddingCache";
 import { NoteSqliteDatabase } from "@/index/note-sqlite/database";
 import { NoteStoreClient } from "@/index/note-sqlite/client";
 import type {} from "@/index/note-sqlite/protocol";
@@ -79,20 +80,18 @@ describe("SQLite note vector store", () => {
         endpoint: "http://127.0.0.1:1234/v1",
         modelId: "test-model",
         dimensions: 2,
-        splitter: "langchain-markdown-default-v1",
-        preprocessing: "raw-markdown-v1",
+        splitter: "body-recursive-utf8-1000-codepoint-v1",
+        preprocessing: "body-only-v1",
       })
     );
   });
 
-  it("uses the default Markdown split once, stores vectors in SQLite, and hydrates live notes", async () => {
+  it("stores prepared passages in SQLite and hydrates live notes", async () => {
     const { db, client, store, embeddings, notes } = await fixture();
-    const split = vi.spyOn(MarkdownTextSplitter.prototype, "splitDocuments");
     try {
       const markdown = "# alpha\n\nalpha note body with searchable details.";
       notes.set("alpha.md", markdown);
       expect(await store.addDocuments([note("alpha.md", markdown)])).toEqual(["alpha.md"]);
-      expect(split).toHaveBeenCalledOnce();
       expect(embeddings.calls).toHaveLength(1);
       expect(db.selectValue("SELECT body IS NULL FROM note_fts WHERE rowid=1")).toBe(1);
       expect(
@@ -104,7 +103,88 @@ describe("SQLite note vector store", () => {
       expect(hit[0].pageContent).toBe(markdown);
       expect(hit[1]).toBeCloseTo(1);
     } finally {
-      split.mockRestore();
+      await client.close();
+      db.close();
+    }
+  });
+
+  it("upgrades release-shaped storage without discarding lexical data or cache", async () => {
+    const sqlite = await loadTestSqlite();
+    const db = new sqlite.oo1.DB(":memory:", "c");
+    db.exec(
+      "CREATE TABLE note_index(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,current_uid TEXT NOT NULL UNIQUE,embedding_profile TEXT,centroid BLOB)"
+    );
+    db.exec(
+      "CREATE TABLE note_vectors(note_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(note_id,ordinal))"
+    );
+    db.exec(
+      "CREATE VIRTUAL TABLE note_fts USING fts5(body,path_text,content='',contentless_delete=1,tokenize='unicode61 remove_diacritics 2')"
+    );
+    db.exec("INSERT INTO note_index VALUES(1,'old.md','old','release',NULL)");
+    db.exec("INSERT INTO note_fts(rowid,body,path_text) VALUES(1,'old lexical sentinel','old.md')");
+    db.exec(
+      "CREATE TABLE embedding_cache(cache_id INTEGER PRIMARY KEY,profile TEXT NOT NULL,task TEXT NOT NULL,hash TEXT NOT NULL,vector BLOB NOT NULL,created_at INTEGER NOT NULL,UNIQUE(profile,task,hash))"
+    );
+    db.exec(
+      "INSERT INTO embedding_cache(profile,task,hash,vector,created_at) VALUES('p','document','h',x'00000000',1)"
+    );
+    try {
+      const database = new NoteSqliteDatabase(db);
+      expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH 'sentinel'")).toBe(
+        1
+      );
+      expect(db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
+      const store = new SqliteNoteVectorStore(
+        new DeterministicEmbeddings(),
+        database.call.bind(database),
+        async () => null,
+        { endpoint: "http://localhost/v1", modelId: "test", dimensions: 2 }
+      );
+      expect(store.embeddingProfile).not.toBe("release");
+      await store.addDocuments([note("old.md", "# refreshed\n\nbody")]);
+      expect(db.selectValue("SELECT start_offset FROM note_vectors")).toBe(0);
+      expect(db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
+      expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH 'refreshed'")).toBe(
+        1
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("updates metadata and positions while reusing unchanged body embeddings", async () => {
+    const { db, client, embeddings } = await fixture();
+    const cache = new SqliteEmbeddingCache(embeddings, client.call, "cache-profile", 2);
+    const store = new SqliteNoteVectorStore(cache, client.call, async () => null, {
+      endpoint: "http://localhost/v1",
+      modelId: "test",
+      dimensions: 2,
+    });
+    try {
+      const first = "---\naliases: [oldalias]\n---\n# Heading\n\nbody";
+      const second = "---\naliases: [newalias]\ntags: [topic]\n---\n# Heading\n\nbody";
+      await store.addDocuments([note("title.md", first)]);
+      const start = Number(db.selectValue("SELECT start_offset FROM note_vectors LIMIT 1"));
+      await store.addDocuments([note("title.md", second)]);
+      expect(embeddings.calls).toHaveLength(1);
+      expect(
+        Number(db.selectValue("SELECT start_offset FROM note_vectors LIMIT 1"))
+      ).toBeGreaterThan(start);
+      expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH 'newalias'")).toBe(
+        1
+      );
+      expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH 'oldalias'")).toBe(
+        0
+      );
+      for (const term of ["title", "newalias", "topic"]) {
+        expect(db.selectValue("SELECT count(*) FROM note_fts WHERE note_fts MATCH ?", [term])).toBe(
+          1
+        );
+      }
+      expect(
+        db.selectValue("SELECT count(*) FROM pragma_table_info('note_index') WHERE name='metadata'")
+      ).toBe(0);
+    } finally {
       await client.close();
       db.close();
     }
@@ -172,24 +252,24 @@ describe("SQLite note vector store", () => {
     }
   });
 
-  it("rejects invalid vectors and addVectors whose count differs from the default split", async () => {
+  it("rejects invalid vectors and addVectors whose passages differ", async () => {
     const { db, client, store, notes } = await fixture();
     try {
       const markdown = `# long note\n\n${"counted note content ".repeat(900)}`;
       notes.set("long.md", markdown);
       const source = note("long.md", markdown);
-      const split = await new MarkdownTextSplitter().splitDocuments([source]);
+      const split = (await prepareNote(markdown, "long.md")).passages;
       expect(split.length).toBeGreaterThan(1);
       const chunks = split.map(
         (part, ordinal) =>
           new Document({
-            pageContent: part.pageContent,
+            pageContent: part.text,
             metadata: { path: "long.md", ordinal },
           })
       );
       await expect(
         store.addVectors([[1, 0]], [chunks[0]], { note: source, ids: ["long"] })
-      ).rejects.toThrow("Chunk and vector counts differ");
+      ).rejects.toThrow("Chunks must match prepared passages");
       await expect(
         store.addVectors(
           chunks.map(() => [1, Number.NaN]),

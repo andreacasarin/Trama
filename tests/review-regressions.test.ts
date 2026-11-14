@@ -21,7 +21,7 @@ describe("release review regressions", () => {
     "Escape forgets the submitted Lente query (pending: %s)",
     async (pending) => {
       let release!: (output: any) => void;
-      const output = { documents: [], status: {} };
+      const output = { hits: [], status: {} };
       const invoke = vi.fn(() =>
         pending
           ? new Promise<any>((resolve) => {
@@ -29,7 +29,7 @@ describe("release review regressions", () => {
             })
           : Promise.resolve(output)
       );
-      const view = new LenteView({} as any, { invoke }) as any;
+      const view = new LenteView({} as any, { searchCandidates: invoke } as any) as any;
       const listeners = new Map<string, (event: any) => void>();
       const element = (): any => ({
         value: "",
@@ -100,17 +100,22 @@ describe("release review regressions", () => {
         getActiveFile: () => (active ? { path: active } : null),
       },
     };
-    const related = vi.fn(async () => ({ documents: [], available: true }));
-    const view = new FiloView({ app } as any, new IndexStatusController(), { related });
+    const related = vi.fn(async () => ({ hits: [], available: true }));
+    const view = new FiloView({ app } as any, new IndexStatusController(), { related } as any);
     vi.spyOn(view as any, "render").mockImplementation(() => {});
     await view.onOpen();
     active = "note.md";
     for (const callback of listeners.values()) callback();
     expect(related).toHaveBeenCalledOnce();
+    for (const callback of listeners.values()) callback();
+    expect(related).toHaveBeenCalledOnce();
+    active = "other.md";
+    for (const callback of listeners.values()) callback();
+    expect(related).toHaveBeenCalledTimes(2);
     await view.onClose();
     expect(listeners.size).toBe(0);
     for (const callback of listeners.values()) callback();
-    expect(related).toHaveBeenCalledOnce();
+    expect(related).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the shared conversation until its last Voce pane closes", async () => {
@@ -238,6 +243,25 @@ describe("release review regressions", () => {
           [1, 0],
           [-1, 0],
         ],
+        metadata: { title: "", aliases: [], tags: [] },
+        passages: [
+          {
+            ordinal: 0,
+            startOffset: 0,
+            endOffset: "text".length,
+            sectionStartOffset: null,
+            sectionPath: [],
+            text: "text",
+          },
+          {
+            ordinal: 1,
+            startOffset: 0,
+            endOffset: "text".length,
+            sectionStartOffset: null,
+            sectionPath: [],
+            text: "text",
+          },
+        ],
       });
       expect(connection.selectValue("SELECT centroid FROM note_index")).toBeNull();
       expect(
@@ -257,17 +281,16 @@ describe("release review regressions", () => {
     }));
     const readNote = vi.fn(async (path: string) => ({ path, content: "large private note" }));
     const retrieval = new VaultRetrieval(call as any, undefined, "p", readNote);
-    const metadata = await retrieval.runnable.invoke({
+    const metadata = await retrieval.searchCandidates({
       query: "note",
       mode: "lexical",
-      content: "metadata",
     });
     const related = await retrieval.related("source.md", new AbortController().signal);
-    expect(metadata.documents[0].metadata).toEqual({ path: "note.md", score: 1 });
-    expect(related.documents[0].pageContent).toBe("");
+    expect(metadata.hits[0]).toEqual({ path: "note.md", score: 1 });
+    expect(related.hits[0].path).toBe("note.md");
     expect(readNote).not.toHaveBeenCalled();
-    const full = await retrieval.runnable.invoke({ query: "note", mode: "lexical" });
-    expect(full.documents[0].pageContent).toBe("large private note");
+    const full = await retrieval.readSearchCandidate(metadata.hits[0]);
+    expect(full?.pageContent).toBe("large private note");
     expect(readNote).toHaveBeenCalledOnce();
   });
 });

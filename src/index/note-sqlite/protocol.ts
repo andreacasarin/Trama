@@ -1,3 +1,4 @@
+import type { NotePassage, NoteMetadata } from "../NotePassages";
 export type NoteVector = readonly number[];
 
 export const EMBEDDING_ARTIFACT_MAX_ENTRIES = 128;
@@ -28,6 +29,13 @@ export interface NoteStoreHit {
   readonly score: number;
   readonly lexicalScore?: number;
   readonly semanticScore?: number;
+  readonly evidence?: {
+    readonly uid: string;
+    readonly profile: string | null;
+    readonly startOffset?: number;
+    readonly endOffset?: number;
+    readonly sectionPath?: readonly string[];
+  };
 }
 
 export interface NoteStoreHybridResult {
@@ -112,6 +120,8 @@ export interface NoteStoreRpc {
     readonly profile: string | null;
     readonly markdown: string;
     readonly vectors: readonly NoteVector[];
+    readonly passages: readonly NotePassage[];
+    readonly metadata: NoteMetadata;
   };
   noteStoreDelete: { readonly uids: readonly string[] };
   noteStoreReset: Record<string, never>;
@@ -141,6 +151,7 @@ export interface NoteStoreRpc {
     readonly vector?: NoteVector;
     readonly profile?: string;
     readonly k: number;
+    readonly evidence?: boolean;
   };
   noteStoreRelated: {
     readonly sourcePath: string;

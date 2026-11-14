@@ -76,13 +76,13 @@ describe("V1 same-corpus indexing and retrieval workload", () => {
         }
       );
       const queryStarted = performance.now();
-      const result = await retrieval.runnable.invoke({ query: "anchor alpha", mode: "hybrid" });
+      const result = await retrieval.searchCandidates({ query: "anchor alpha", mode: "hybrid" });
       const queryMs = performance.now() - queryStarted;
       expect(result.status).toEqual({ mode: "hybrid", degraded: false });
-      expect(result.documents.length).toBeGreaterThan(0);
+      expect(result.hits.length).toBeGreaterThan(0);
       expect(JSON.stringify(result)).not.toContain("vector");
       console.info(
-        `V1 workload: ${notes.size} notes, ${Number(db.selectValue("SELECT count(*) FROM note_vectors"))} vectors, ${databaseBytes} SQLite bytes, index ${indexMs.toFixed(1)} ms, query ${queryMs.toFixed(1)} ms, ${result.documents.length} hydrated results`
+        `V1 workload: ${notes.size} notes, ${Number(db.selectValue("SELECT count(*) FROM note_vectors"))} vectors, ${databaseBytes} SQLite bytes, index ${indexMs.toFixed(1)} ms, query ${queryMs.toFixed(1)} ms, ${result.hits.length} candidates`
       );
     } finally {
       db.close();

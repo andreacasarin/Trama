@@ -80,7 +80,11 @@ export class ItemView extends Component {
 
 export class SuggestModal<T> {
   readonly contentEl = {} as HTMLElement;
-  readonly inputEl = { value: "", focus: () => {} } as unknown as HTMLInputElement;
+  readonly inputEl = {
+    value: "",
+    focus: () => {},
+    dispatchEvent: () => true,
+  } as unknown as HTMLInputElement;
   emptyStateText = "";
   instructions?: unknown;
   constructor(public app: unknown) {}
@@ -349,4 +353,38 @@ export class Notice {
     return this;
   }
   hide(): void {}
+}
+
+export function getFrontMatterInfo(content: string) {
+  const match = /^(?:\uFEFF)?---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m.exec(content);
+  if (!match || match.index !== 0)
+    return { exists: false, frontmatter: "", from: 0, to: 0, contentStart: 0 };
+  const from = content.indexOf("\n") + 1;
+  return {
+    exists: true,
+    frontmatter: match[1],
+    from,
+    to: from + match[1].length,
+    contentStart: match[0].length,
+  };
+}
+
+export { parse as parseYaml } from "yaml";
+export function parseFrontMatterAliases(value: unknown): string[] | null {
+  const aliases = (value as { aliases?: unknown } | null)?.aliases;
+  return typeof aliases === "string"
+    ? [aliases]
+    : Array.isArray(aliases)
+      ? aliases.filter((item): item is string => typeof item === "string")
+      : null;
+}
+export function parseFrontMatterTags(value: unknown): string[] | null {
+  const tags = (value as { tags?: unknown } | null)?.tags;
+  const list =
+    typeof tags === "string"
+      ? tags.split(/[,\s]+/)
+      : Array.isArray(tags)
+        ? tags.filter((item): item is string => typeof item === "string")
+        : [];
+  return list.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`));
 }

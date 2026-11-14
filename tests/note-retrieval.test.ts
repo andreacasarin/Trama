@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Document } from "@langchain/core/documents";
+import { _HashedDocument } from "@langchain/core/indexing";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { SqliteNoteVectorStore } from "@/index/SqliteNoteVectorStore";
 import { SqliteEmbeddingCache, embeddingCacheIdentity } from "@/index/SqliteEmbeddingCache";
@@ -38,6 +39,136 @@ async function fixture() {
 }
 
 describe("SQLite note retrieval", () => {
+  it("does not query evidence after its source read is cancelled", async () => {
+    let release!: (value: { path: string; content: string }) => void;
+    const reader = vi.fn(
+      () =>
+        new Promise<{ path: string; content: string }>((resolve) => {
+          release = resolve;
+        })
+    );
+    const call = vi.fn();
+    const retrieval = new VaultRetrieval(call, undefined, "p", reader);
+    const controller = new AbortController();
+    const pending = retrieval.searchEvidence(
+      {
+        path: "note.md",
+        score: 1,
+        evidence: { uid: "uid", profile: "p", startOffset: 0, endOffset: 4 },
+      },
+      controller.signal
+    );
+    controller.abort();
+    release({ path: "note.md", content: "term" });
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(call).not.toHaveBeenCalled();
+  });
+  it("rejects cancellation after the index freshness check completes", async () => {
+    const path = "note.md";
+    const content = "passage";
+    const profile = "p";
+    const uid = _HashedDocument.fromDocument(
+      new Document({ pageContent: content, metadata: { path, embeddingProfile: profile } })
+    ).uid;
+    let release!: (value: boolean[]) => void;
+    const call = vi.fn(
+      () =>
+        new Promise<boolean[]>((resolve) => {
+          release = resolve;
+        })
+    );
+    const retrieval = new VaultRetrieval(call as NoteStoreCall, undefined, profile, async () => ({
+      path,
+      content,
+    }));
+    const controller = new AbortController();
+    const pending = retrieval.searchEvidence(
+      { path, score: 1, evidence: { uid, profile, startOffset: 0, endOffset: content.length } },
+      controller.signal
+    );
+    await vi.waitFor(() =>
+      expect(call).toHaveBeenCalledWith("recordManagerExists", { keys: [uid] }, controller.signal)
+    );
+    controller.abort();
+    release([true]);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+  it("returns the semantic passage literally and rejects an edited source", async () => {
+    const f = await fixture();
+    const path = "Folder/Note.md";
+    let content = "# Heading\n\n😀 café noir and cartography";
+    f.notes.set(path, content);
+    const uid = _HashedDocument.fromDocument(
+      new Document({
+        pageContent: content,
+        metadata: { path, embeddingProfile: f.store.embeddingProfile },
+      })
+    ).uid;
+    await f.store.addDocuments(
+      [new Document({ id: path, pageContent: content, metadata: { path } })],
+      { ids: [uid] }
+    );
+    await f.client.call("recordManagerUpdate", { keys: [uid] });
+    const retrieval = new VaultRetrieval(
+      f.client.call,
+      f.embeddings,
+      f.store.embeddingProfile,
+      async () => ({ path, content })
+    );
+    try {
+      const result = await retrieval.searchCandidates(
+        { query: "alpha", mode: "hybrid" },
+        undefined,
+        true
+      );
+      const evidence = await retrieval.searchEvidence(result.hits[0]);
+      expect(evidence).toMatchObject({ kind: "passage", text: "😀 café noir and cartography" });
+      content += " edited";
+      expect(await retrieval.searchEvidence(result.hits[0])).toEqual({ kind: "changed" });
+      content = f.notes.get(path)!;
+      await f.client.call("noteStoreReset", {});
+      expect(await retrieval.searchEvidence(result.hits[0])).toEqual({ kind: "changed" });
+    } finally {
+      f.db.close();
+    }
+  });
+  it("uses one live read for a heading-only passage fallback and excludes frontmatter", async () => {
+    const path = "note.md";
+    const content = "---\ntitle: Secret\n---\n# Today's dump\n\nActual [[body]]";
+    const profile = "p";
+    const uid = _HashedDocument.fromDocument(
+      new Document({ pageContent: content, metadata: { path, embeddingProfile: profile } })
+    ).uid;
+    const reader = vi.fn(async () => ({ path, content }));
+    const call = vi.fn(async () => [true]);
+    const retrieval = new VaultRetrieval(call as NoteStoreCall, undefined, profile, reader);
+    const startOffset = content.indexOf("# Today's");
+    expect(
+      await retrieval.searchEvidence({
+        path,
+        score: 1,
+        evidence: { uid, profile, startOffset, endOffset: content.indexOf("\n\nActual") },
+      })
+    ).toEqual({ kind: "preview", text: "Actual [[body]]" });
+    expect(reader).toHaveBeenCalledOnce();
+    reader.mockClear();
+    call.mockClear();
+    expect(await retrieval.searchEvidence({ path, score: 1, lexicalScore: 1 })).toEqual({
+      kind: "preview",
+      text: "Actual [[body]]",
+    });
+    expect(reader).toHaveBeenCalledOnce();
+    expect(call).not.toHaveBeenCalled();
+  });
+  it("omits empty previews", async () => {
+    const retrieval = new VaultRetrieval(vi.fn(), undefined, undefined, async (path) => ({
+      path,
+      content: "# Heading\n\n---\n",
+    }));
+    expect(await retrieval.searchEvidence({ path: "note.md", score: 1 })).toEqual({
+      kind: "empty",
+    });
+  });
   it("returns hybrid results when a valid query embedding cannot be cached because SQLite is full", async () => {
     const f = await fixture();
     const vector = [1, ...new Array<number>(1535).fill(0)];
@@ -65,6 +196,17 @@ describe("SQLite note retrieval", () => {
         profile: "p",
         markdown: "alpha sentinel",
         vectors: [vector],
+        metadata: { title: "", aliases: [], tags: [] },
+        passages: [
+          {
+            ordinal: 0,
+            startOffset: 0,
+            endOffset: "alpha sentinel".length,
+            sectionStartOffset: null,
+            sectionPath: [],
+            text: "alpha sentinel",
+          },
+        ],
       });
       f.db.exec(`PRAGMA max_page_count=${Number(f.db.selectValue("PRAGMA page_count")) + 1}`);
       let full = false;
@@ -88,11 +230,11 @@ describe("SQLite note retrieval", () => {
         path,
         content: "alpha sentinel",
       }));
-      const output = await retrieval.runnable.invoke({ query: "alpha", mode: "hybrid" });
+      const output = await retrieval.searchCandidates({ query: "alpha", mode: "hybrid" });
       expect(writeErrors).toHaveLength(1);
       expect(writeErrors[0]).toContain("SQLITE_FULL");
       expect(embedQuery).toHaveBeenCalledOnce();
-      expect(output.documents.map((document) => document.metadata.path)).toEqual(["a.md"]);
+      expect(output.hits.map((hit) => hit.path)).toEqual(["a.md"]);
       expect(output.status).toMatchObject({ mode: "hybrid", degraded: false });
     } finally {
       await f.client.close();
@@ -117,7 +259,7 @@ describe("SQLite note retrieval", () => {
     );
     const retrieval = new VaultRetrieval(f.client.call, cache, "profile", async () => null);
     try {
-      const pending = retrieval.runnable.invoke({ query: "needle", mode: "hybrid" });
+      const pending = retrieval.searchCandidates({ query: "needle", mode: "hybrid" });
       await vi.waitFor(() => expect(embedQuery).toHaveBeenCalledOnce());
       retrieval.cancelSearches();
       await f.client.call("noteStoreClear", {});
@@ -125,7 +267,7 @@ describe("SQLite note retrieval", () => {
       await expect(pending).rejects.toMatchObject({ name: "AbortError" });
       expect(f.db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(0);
       embedQuery.mockResolvedValue([1, 0]);
-      await retrieval.runnable.invoke({ query: "needle", mode: "hybrid" });
+      await retrieval.searchCandidates({ query: "needle", mode: "hybrid" });
       expect(f.db.selectValue("SELECT count(*) FROM embedding_cache")).toBe(1);
     } finally {
       f.db.close();
@@ -153,9 +295,9 @@ describe("SQLite note retrieval", () => {
         path,
         content: f.notes.get(path)!,
       }));
-      const result = await retrieval.runnable.invoke({ query: "alpha", mode: "hybrid" });
+      const result = await retrieval.searchCandidates({ query: "alpha", mode: "hybrid" });
       expect(result.status.degradationReason).toBe("query-embedding-failed");
-      expect(result.documents.map((document) => document.metadata.path)).toEqual(["alpha.md"]);
+      expect(result.hits.map((hit) => hit.path)).toEqual(["alpha.md"]);
     } finally {
       await f.client.close();
       f.db.close();
@@ -178,7 +320,7 @@ describe("SQLite note retrieval", () => {
       async () => null,
       new ConsoleDebug(() => true)
     );
-    const result = await retrieval.runnable.invoke({
+    const result = await retrieval.searchCandidates({
       query: "private search text",
       mode: "hybrid",
     });
@@ -190,7 +332,7 @@ describe("SQLite note retrieval", () => {
     debugWarn.mockRestore();
   });
 
-  it("terminalizes failed and cancelled searches while preserving failures for the view", async () => {
+  it("propagates failed and cancelled candidate searches", async () => {
     const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const original = new Error("search transport failed");
@@ -203,11 +345,9 @@ describe("SQLite note retrieval", () => {
       async () => null,
       new ConsoleDebug(() => true)
     );
-    await expect(failed.runnable.invoke({ query: "private text", mode: "lexical" })).rejects.toBe(
+    await expect(failed.searchCandidates({ query: "private text", mode: "lexical" })).rejects.toBe(
       original
     );
-    expect(debugInfo.mock.calls.map(([label]) => label)).toContain("[Trama] Vault search failed");
-    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
     expect(debugError).not.toHaveBeenCalled();
 
     debugInfo.mockClear();
@@ -225,17 +365,13 @@ describe("SQLite note retrieval", () => {
       new ConsoleDebug(() => true)
     );
     const controller = new AbortController();
-    const pending = cancelled.runnable.invoke(
+    const pending = cancelled.searchCandidates(
       { query: "private text", mode: "lexical" },
-      { signal: controller.signal }
+      controller.signal
     );
     await vi.waitFor(() => expect(call).toHaveBeenCalledOnce());
     controller.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
-    expect(debugInfo.mock.calls.map(([label]) => label)).toContain(
-      "[Trama] Vault search cancelled"
-    );
-    expect(debugInfo.mock.calls.at(-1)?.[1]).toMatchObject({ elapsedMs: expect.any(Number) });
     expect(debugError).not.toHaveBeenCalled();
     debugInfo.mockRestore();
     debugError.mockRestore();
@@ -312,7 +448,7 @@ describe("SQLite note retrieval", () => {
     resolveHits({ hits: [{ path: "related.md", score: 0.8 }], available: true });
     await expect(hydrated).resolves.toMatchObject({
       available: true,
-      documents: [{ id: "related.md", pageContent: "" }],
+      hits: [{ path: "related.md", score: 0.8 }],
     });
     expect(call).toHaveBeenCalledTimes(1);
     expect(readNote).not.toHaveBeenCalled();
@@ -357,9 +493,11 @@ describe("SQLite note retrieval", () => {
           return content === undefined ? null : { path, content };
         }
       );
-      const result = await retrieval.runnable.invoke({ query: "alpha (c++)", mode: "hybrid" });
-      expect(result.documents[0].metadata.path).toBe("a.md");
-      expect(result.documents[0].pageContent).toContain("alpha apple");
+      const result = await retrieval.searchCandidates({ query: "alpha (c++)", mode: "hybrid" });
+      expect(result.hits[0].path).toBe("a.md");
+      expect((await retrieval.readSearchCandidate(result.hits[0]))?.pageContent).toContain(
+        "alpha apple"
+      );
       expect(result.status).toEqual({ mode: "hybrid", degraded: false });
       await expect(
         f.database.call("noteStoreHybrid", {
@@ -388,7 +526,7 @@ describe("SQLite note retrieval", () => {
     }
   });
 
-  it("keeps the SQL candidate pool while hydrating only enough existing documents for the limit", async () => {
+  it("keeps the SQL candidate pool and reads candidates on demand", async () => {
     const call = vi.fn(async (_method: string, _payload: unknown) => ({
       mode: "lexical" as const,
       degraded: false,
@@ -403,14 +541,16 @@ describe("SQLite note retrieval", () => {
     );
     const retrieval = new VaultRetrieval(call as any, undefined, "profile", readNote);
 
-    const result = await retrieval.runnable.invoke({ query: "needle", mode: "lexical", limit: 1 });
+    const result = await retrieval.searchCandidates({ query: "needle", mode: "lexical", limit: 1 });
 
     expect(call).toHaveBeenCalledWith(
       "noteStoreHybrid",
       expect.objectContaining({ k: 20 }),
       expect.any(AbortSignal)
     );
-    expect(result.documents.map((document) => document.id)).toEqual(["first.md"]);
+    expect(result.hits.map((hit) => hit.path)).toEqual(["missing.md", "first.md", "second.md"]);
+    expect(await retrieval.readSearchCandidate(result.hits[0])).toBeUndefined();
+    expect((await retrieval.readSearchCandidate(result.hits[1]))?.id).toBe("first.md");
     expect(readNote.mock.calls.map(([path]) => path)).toEqual(["missing.md", "first.md"]);
   });
 
@@ -429,23 +569,21 @@ describe("SQLite note retrieval", () => {
         return content === undefined ? null : { path, content };
       });
 
-      const result = await retrieval.runnable.invoke({
+      const result = await retrieval.searchCandidates({
         query: "needle",
         mode: "lexical",
         limit: 210,
       });
 
-      expect(result.documents).toHaveLength(210);
-      expect(result.documents[0].metadata.path).toBe("notes/result-000.md");
-      expect(result.documents.some(({ metadata }) => metadata.path === "notes/result-209.md")).toBe(
-        true
-      );
+      expect(result.hits).toHaveLength(210);
+      expect(result.hits[0].path).toBe("notes/result-000.md");
+      expect(result.hits.some(({ path }) => path === "notes/result-209.md")).toBe(true);
     } finally {
       f.db.close();
     }
   });
 
-  it("filters stale selected-storage hits from metadata, related, and direct retrieval", async () => {
+  it("filters stale selected-storage hits from candidates, related, and direct retrieval", async () => {
     const storageHit = { path: "Sync/Trama/old.md", score: 10 };
     const visibleHit = { path: "Notes/visible.md", score: 8 };
     const call = vi.fn(async (method: string) =>
@@ -463,19 +601,18 @@ describe("SQLite note retrieval", () => {
       "Sync/Trama"
     );
 
-    const metadata = await retrieval.runnable.invoke({
+    const metadata = await retrieval.searchCandidates({
       query: "needle",
       mode: "lexical",
-      content: "metadata",
       limit: 2,
     });
-    expect(metadata.documents.map((document) => document.id)).toEqual([visibleHit.path]);
+    expect(metadata.hits.map((hit) => hit.path)).toEqual([visibleHit.path]);
     expect((await retrieval.relatedPaths("source.md", new AbortController().signal)).paths).toEqual(
       [visibleHit.path]
     );
     expect(
-      (await retrieval.related("source.md", new AbortController().signal)).documents.map(
-        (document) => document.id
+      (await retrieval.related("source.md", new AbortController().signal)).hits.map(
+        (hit) => hit.path
       )
     ).toEqual([visibleHit.path]);
     expect(await retrieval.readSearchCandidate(storageHit)).toBeUndefined();
@@ -506,13 +643,12 @@ describe("SQLite note retrieval", () => {
         "Sync/Trama"
       );
 
-      const metadata = await retrieval.runnable.invoke({
+      const metadata = await retrieval.searchCandidates({
         query: "needle",
         mode: "lexical",
-        content: "metadata",
         limit: 10,
       });
-      expect(metadata.documents.map((document) => document.id)).toEqual(["Notes/visible.md"]);
+      expect(metadata.hits.map((hit) => hit.path)).toEqual(["Notes/visible.md"]);
       const related = await retrieval.relatedPaths(
         "Notes/visible.md",
         new AbortController().signal

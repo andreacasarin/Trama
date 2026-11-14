@@ -238,7 +238,7 @@ describe("V1 plugin composition", () => {
       await plugin.configureServices(app);
       expect(openVoce.setSession).toHaveBeenCalledWith(plugin.session);
       expect(openFilo.setRelated).toHaveBeenCalledWith(plugin.retrieval);
-      expect(openLente.setSearch).toHaveBeenCalledWith(plugin.retrieval.runnable);
+      expect(openLente.setSearch).toHaveBeenCalledWith(plugin.retrieval);
       const oldClient = plugin.client;
       plugin.loadData = vi.fn(async () => ({
         ...plugin.getSettings(),
@@ -1053,7 +1053,7 @@ describe("V1 plugin composition", () => {
       );
       const retrieval = new VaultRetrieval(call, cache, "profile", async () => null);
       const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-      const view = new LenteView({} as any, retrieval.runnable) as any;
+      const view = new LenteView({} as any, retrieval) as any;
       view.opened = true;
       view.submitted = "needle";
       plugin.retrieval = retrieval;

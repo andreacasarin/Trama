@@ -40,6 +40,10 @@ you have performed it in Obsidian.
 - Change a harmless setting, close and reopen Settings, and confirm the value persists.
 - In Lente, search for `embedding cache` and open a result. Keyword search works
   without a provider; semantic or hybrid search requires a configured embedding model.
+- Expand a Lente result and a Filo result to check their context labels and previews.
+  With semantic search available, confirm a matched passage is labeled as such;
+  keyword-only and Filo context is labeled as a preview. The Lente command picker
+  also shows a compact context preview.
 - Open a note and check that Filo shows related notes. After editing a demo note,
   run Update and confirm the refreshed results reflect the index update. This check
   requires a configured embedding model.
