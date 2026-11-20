@@ -347,7 +347,7 @@ describe("SQLite note retrieval", () => {
   });
 
   it("propagates failed and cancelled candidate searches", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const original = new Error("search transport failed");
     const failed = new VaultRetrieval(
@@ -392,7 +392,7 @@ describe("SQLite note retrieval", () => {
   });
 
   it("terminalizes related lookup failures and consumer cancellation without duplicate errors", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const original = new Error("related query failed");
     const failed = new VaultRetrieval(

@@ -47,7 +47,9 @@ export class ConsoleDebug {
     fields?: Record<string, string | number | boolean>
   ): void {
     if (!this.enabled()) return;
-    const output = console[level].bind(console);
+    // Informational diagnostics belong to the debug console level.
+    const outputs = { info: console.debug, warn: console.warn, error: console.error };
+    const output = outputs[level].bind(console);
     if (error === undefined) {
       if (fields) output(`[Trama] ${label}`, fields);
       else output(`[Trama] ${label}`);

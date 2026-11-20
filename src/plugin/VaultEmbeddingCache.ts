@@ -277,7 +277,7 @@ export class VaultEmbeddingCache {
 }
 
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
-  const input = bytes.slice().buffer as ArrayBuffer;
+  const input = bytes.slice().buffer;
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

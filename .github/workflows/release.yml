@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -84,6 +86,7 @@ jobs:
         run: |
           npm run format:check
           npm run lint
+          npm run lint:community
 
       - name: Build the clean pinned SQLite assets
         run: npm run verify:sqlite:rebuild
@@ -94,13 +97,20 @@ jobs:
       - name: Create and validate the release archive
         run: node scripts/package-release.mjs --version "$RELEASE_VERSION" --archive "dist/trama-$RELEASE_VERSION.zip"
 
+      - name: Attest the Community installation assets
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
       - name: Create or reconcile the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          archive="dist/trama-${RELEASE_VERSION}.zip"
           release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,assets 2>/dev/null || true)"
           if [[ -z "$release_json" ]]; then
             create_args=("$RELEASE_TAG" --draft --title "$RELEASE_TITLE" --generate-notes)
@@ -123,16 +133,12 @@ jobs:
           draft="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).isDraft))' "$release_json")"
           existing_dir="$(mktemp -d)"
           trap 'rm -rf "$existing_dir"' EXIT
-          for asset in "$archive" main.js manifest.json styles.css; do
+          for asset in main.js manifest.json styles.css; do
             name="${asset##*/}"
             has_asset="$(node -e 'const x=JSON.parse(process.argv[1]); process.stdout.write(String(x.assets.some((asset) => asset.name === process.argv[2])))' "$release_json" "$name")"
             if [[ "$has_asset" == "true" ]]; then
               gh release download "$RELEASE_TAG" --pattern "$name" --dir "$existing_dir"
-              if [[ "$asset" == "$archive" ]]; then
-                node scripts/package-release.mjs --verify --version "$RELEASE_VERSION" --archive "$existing_dir/$name"
-              else
-                cmp "$existing_dir/$name" "$asset"
-              fi
+              cmp "$existing_dir/$name" "$asset"
             elif [[ "$draft" == "true" ]]; then
               gh release upload "$RELEASE_TAG" "$asset"
             else

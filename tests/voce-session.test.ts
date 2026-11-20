@@ -630,7 +630,7 @@ describe("Voce native agent session", () => {
   });
 
   it("projects only read evidence as Sources while retaining full tool provenance", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const retrieval = new VaultRetrieval(
@@ -772,7 +772,7 @@ describe("Voce native agent session", () => {
       }
     }
     const model = new PendingModel({ toolCalls: [[], []] });
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const session = new ChatSession(
@@ -807,7 +807,7 @@ describe("Voce native agent session", () => {
   });
 
   it("branches a new turn from completed history while cancelled tool work is pending", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const inputs: BaseMessage[][] = [];
@@ -985,7 +985,7 @@ describe("Voce native agent session", () => {
   });
 
   it("executes a real native tool call and projects its source into the answer", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const vault = {
@@ -1043,7 +1043,7 @@ describe("Voce native agent session", () => {
   });
 
   it("logs validation and failed native tool outcomes without projecting sources", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const readNote = vi.fn(async (path: string) => ({ path, content: "unread" }));
     const vault = {
@@ -1098,7 +1098,7 @@ describe("Voce native agent session", () => {
   });
 
   it("logs a failed native tool outcome with a safe code only", async () => {
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const vault = {
       readNote: async () => {

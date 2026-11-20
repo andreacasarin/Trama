@@ -18,7 +18,7 @@ describe("V1 plugin composition", () => {
 
   it("logs only numeric startup elapsed fields when console debug is enabled", () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const info = vi.spyOn(console, "debug").mockImplementation(() => undefined);
     try {
       plugin.settingsStore.load({ consoleDebug: true }, ".obsidian");
       const startedAt = plugin.startupTimer();
@@ -40,7 +40,7 @@ describe("V1 plugin composition", () => {
 
   it("logs worker initialization phases only through enabled console debug", () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const info = vi.spyOn(console, "debug").mockImplementation(() => undefined);
     const timings = {
       "wasm-load-compile": 1,
       "wasm-load": 1,
@@ -189,7 +189,7 @@ describe("V1 plugin composition", () => {
     const commands = vi.spyOn(plugin, "addCommand");
     const hoverSource = vi.spyOn(plugin, "registerHoverLinkSource");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
-    const consoleInfo = vi.spyOn(console, "info");
+    const consoleInfo = vi.spyOn(console, "debug");
     try {
       await plugin.onload();
       expect(plugin.session).toBeUndefined();
@@ -426,7 +426,7 @@ describe("V1 plugin composition", () => {
 
   it("applies an externally synchronized debug toggle without rebuilding services", async () => {
     const plugin = new TramaPlugin(undefined as never, undefined as never) as any;
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     plugin.loadData = vi.fn(async () => ({ ...plugin.getSettings(), consoleDebug: true }));
     plugin.configureServices = vi.fn();
     await plugin.onExternalSettingsChange();
@@ -508,7 +508,7 @@ describe("V1 plugin composition", () => {
       cancel: vi.fn(),
     };
     plugin.retrieval = { invalidateRelated: vi.fn() };
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     await plugin.updateIndex();
     expect(plugin.manualIndex.update).toHaveBeenCalledWith(true);
     expect(debugInfo).toHaveBeenCalledTimes(2);

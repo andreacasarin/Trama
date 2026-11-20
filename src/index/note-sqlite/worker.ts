@@ -229,4 +229,4 @@ export function attachNoteStoreWorker(scope: WorkerScope, openDatabase: OpenData
   };
 }
 
-if (typeof self !== "undefined") attachNoteStoreWorker(self as unknown as WorkerScope, open);
+if (typeof self !== "undefined") attachNoteStoreWorker(self, open);

@@ -1,4 +1,4 @@
-import { Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -56,7 +56,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     },
     private readonly consoleDebug?: ConsoleDebug
   ) {
-    super(app, plugin as unknown as Plugin);
+    super(app, plugin);
   }
 
   display(): void {

@@ -122,10 +122,10 @@ export class LenteSearchModal extends SuggestModal<NoteResult> {
     });
   }
   override onChooseSuggestion(result: NoteResult, event: MouseEvent | KeyboardEvent): void {
-    void (this.app as App).workspace.openLinkText(result.path, "", Keymap.isModEvent(event));
+    void this.app.workspace.openLinkText(result.path, "", Keymap.isModEvent(event));
   }
   override onOpen(): void {
-    super.onOpen();
+    void super.onOpen();
     this.opened = true;
     this.inputEl.focus();
   }

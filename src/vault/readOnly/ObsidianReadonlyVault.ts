@@ -96,7 +96,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     const sourcePath = this.normalizePath(path);
     const file = this.vault.getFileByPath(sourcePath);
     if (!file) throw new Error("Note not found");
-    const cache = this.metadataCache.getFileCache(file as TFile);
+    const cache = this.metadataCache.getFileCache(file);
     const links = this.cachedLinks(cache);
     const output: VaultLink[] = [];
     for (const link of links.slice(0, Math.max(0, Math.floor(maxLinks)))) {

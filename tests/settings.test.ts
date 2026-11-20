@@ -8,7 +8,7 @@ describe("settings", () => {
     const store = new SettingsStore();
     expect(store.load({ consoleDebug: "true" }).consoleDebug).toBe(false);
     expect(store.load({ consoleDebug: true }).consoleDebug).toBe(true);
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const info = vi.spyOn(console, "debug").mockImplementation(() => {});
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     let enabled = false;
@@ -20,6 +20,8 @@ describe("settings", () => {
     expect(warn).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
     enabled = true;
+    debug.info("diagnostic");
+    expect(info).toHaveBeenCalledWith("[Trama] diagnostic");
     debug.error("visible", new Error("detail"));
     expect(error).toHaveBeenCalledOnce();
     info.mockRestore();

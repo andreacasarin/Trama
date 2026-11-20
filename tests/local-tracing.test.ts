@@ -28,7 +28,7 @@ describe("local retrieval tracing", () => {
       degradationReason: "semantic-unavailable",
     })) as unknown as NoteStoreCall;
     const read = vi.fn();
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const retrieval = new VaultRetrieval(
       call,
       undefined,
@@ -65,7 +65,7 @@ describe("local retrieval tracing", () => {
       mode: "lexical",
       degraded: false,
     })) as unknown as NoteStoreCall;
-    vi.spyOn(console, "info").mockImplementation(() => {
+    vi.spyOn(console, "debug").mockImplementation(() => {
       throw new Error("sink failed");
     });
     const retrieval = new VaultRetrieval(
@@ -83,7 +83,7 @@ describe("local retrieval tracing", () => {
   });
 
   it("reports fixed structural fields and cancellation without inputs or error text", () => {
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const controller = new AbortController();
     const handler = new LocalTraceHandler(new ConsoleDebug(() => true), controller.signal);
     handler.handleToolStart({ secret: "serialized" }, "private arguments", "child", "parent");
@@ -100,7 +100,7 @@ describe("local retrieval tracing", () => {
     expect(output).toHaveBeenCalledOnce();
   });
   it("uses the native chain parent ID and ignores the dynamic run name", async () => {
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const manager = new CallbackManager("parent-id");
     manager.addHandler(new LocalTraceHandler(new ConsoleDebug(() => true)), true);
     const run = await manager.handleChainStart(
@@ -123,7 +123,7 @@ describe("local retrieval tracing", () => {
   });
 
   it("classifies a cancelled search even when the parent turn signal remains active", async () => {
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const parent = new AbortController();
     const call = vi.fn(
       (_method: string, _payload: unknown, signal?: AbortSignal) =>
@@ -152,7 +152,7 @@ describe("local retrieval tracing", () => {
   });
 
   it("carries native tool parentage through a streamed Voce turn", async () => {
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debug = new ConsoleDebug(() => true);
     const vault = {
       readNote: async (path: string) => ({ path, content: "private note" }),
@@ -189,7 +189,7 @@ describe("local retrieval tracing", () => {
     expect(JSON.stringify(events)).not.toMatch(/private|call-1/);
   });
   it("keeps interleaved queries, results, and run IDs independent", async () => {
-    const output = vi.spyOn(console, "info").mockImplementation(() => {});
+    const output = vi.spyOn(console, "debug").mockImplementation(() => {});
     const pending = new Map<string, (result: unknown) => void>();
     const call = vi.fn(
       (_method: string, payload: { query: string }) =>

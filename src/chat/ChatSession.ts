@@ -560,7 +560,7 @@ export class ChatSession {
               tokenCounter: messageTokens,
               trimTokensToSummarize: summaryInputBudget,
             };
-            return nativeHook(state, { ...runtime, context } as typeof runtime);
+            return nativeHook(state, { ...runtime, context });
           };
         }
         middleware.unshift(summarizer);

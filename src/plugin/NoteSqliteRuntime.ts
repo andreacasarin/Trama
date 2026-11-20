@@ -47,7 +47,7 @@ export class NoteSqliteRuntime {
         URL.revokeObjectURL(url);
         terminate();
       };
-      return worker as unknown as NoteStoreWorkerLike;
+      return worker;
     } catch (error) {
       URL.revokeObjectURL(url);
       throw error;

@@ -3,7 +3,7 @@ import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig({
   test: {
-    exclude: [...configDefaults.exclude, ".ai/bench/**"],
+    exclude: [...configDefaults.exclude, ".ai/bench/**", ".artifacts/**", ".cache/**"],
   },
   resolve: {
     alias: {
