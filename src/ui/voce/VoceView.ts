@@ -211,7 +211,7 @@ export class VoceView extends ItemView {
     const composer = this.root.createDiv({ cls: "trama-voce__composer" });
     this.attachments = composer.createDiv({ cls: "trama-voce__context" });
     const composeRow = composer.createDiv({ cls: "trama-voce__compose-row" });
-    const input = composeRow.createDiv({ cls: "trama-voce__input" }) as unknown as HTMLDivElement;
+    const input = composeRow.createDiv({ cls: "trama-voce__input" });
     input.contentEditable = "plaintext-only";
     input.setAttribute("role", "textbox");
     input.setAttribute("aria-multiline", "true");
@@ -666,8 +666,7 @@ export class VoceView extends ItemView {
       }
     );
     if (isCollapsible) this.renderExpandAction(bubble, turn.id, isExpanded, message);
-    if (turn.role === "assistant" && turn.sources.length)
-      this.renderSources(bubble, turn as AssistantConversationTurn);
+    if (turn.role === "assistant" && turn.sources.length) this.renderSources(bubble, turn);
     if (turn.role === "user" && turn.skill) {
       const sources = bubble.createDiv({ cls: "trama-voce__sources" });
       sources.createDiv({
@@ -686,7 +685,7 @@ export class VoceView extends ItemView {
       turn.role === "assistant" &&
       (turn.status === "complete" || (turn.status === "stopped" && turn.content.length > 0))
     )
-      this.renderAssistantActions(bubble, turn as AssistantConversationTurn);
+      this.renderAssistantActions(bubble, turn);
     if (turn.role === "user") this.renderUserActions(bubble, turn);
     if (turn.role === "assistant" && turn.status === "working")
       rendered.activity = this.renderActivity(bubble);

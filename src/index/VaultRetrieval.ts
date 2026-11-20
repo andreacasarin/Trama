@@ -347,7 +347,7 @@ function waitForConsumer<T>(promise: Promise<T>, signal: AbortSignal): Promise<T
       },
       (error) => {
         signal.removeEventListener("abort", onAbort);
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
       }
     );
   });

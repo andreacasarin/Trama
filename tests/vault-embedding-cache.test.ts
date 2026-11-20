@@ -914,7 +914,7 @@ describe("vault-shared document embedding artifacts", () => {
       exportNextDocumentShard: vi.fn(),
       markDocumentShardPublished: vi.fn(),
     };
-    const debugInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debugInfo = vi.spyOn(console, "debug").mockImplementation(() => {});
     const debugWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const debugError = vi.spyOn(console, "error").mockImplementation(() => {});
     const shared = new VaultEmbeddingCache(
@@ -958,7 +958,7 @@ describe("vault-shared document embedding artifacts", () => {
       exportNextDocumentShard: vi.fn(),
       markDocumentShardPublished: vi.fn(),
     };
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const info = vi.spyOn(console, "debug").mockImplementation(() => {});
     try {
       const shared = new VaultEmbeddingCache(
         adapter as any,
@@ -1003,7 +1003,7 @@ describe("vault-shared document embedding artifacts", () => {
     const list = vi.spyOn(adapter, "list");
     const stat = vi.spyOn(adapter, "stat");
     const read = vi.spyOn(adapter, "readBinary");
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const info = vi.spyOn(console, "debug").mockImplementation(() => {});
     const shared = new VaultEmbeddingCache(
       adapter as any,
       cache as any,
@@ -1094,7 +1094,7 @@ describe("vault-shared document embedding artifacts", () => {
       markDocumentShardPublished: vi.fn(),
     };
     const now = vi.spyOn(performance, "now");
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const info = vi.spyOn(console, "debug").mockImplementation(() => {});
     try {
       await new VaultEmbeddingCache(
         adapter as any,

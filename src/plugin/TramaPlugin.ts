@@ -111,7 +111,7 @@ export class TramaPlugin extends Plugin {
         this.ui = ui;
         this.settingsTab = registerPluginUi(this, app, ui, {
           session: () => this.getOrCreateSession(),
-          status: this.status!,
+          status: this.status,
           retrieval: () => this.retrieval!,
           noteCatalog: this.catalog,
           currentNote: () => (this.activeNote ? [this.activeNote] : []),
@@ -606,7 +606,7 @@ export class TramaPlugin extends Plugin {
     try {
       operation = rebuild ? manualIndex.rebuild() : manualIndex.update(verifyContent);
     } catch (error) {
-      operation = Promise.reject(error);
+      operation = Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
     const completion = operation
       .then(async (result) => {

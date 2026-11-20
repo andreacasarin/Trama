@@ -152,37 +152,40 @@ describe("SQLite note worker transport", () => {
     }
   });
 
-  it("rejects initialization on a worker module error and closes the failed candidate", async () => {
-    const listeners = new Map<string, Set<(event: any) => void>>();
-    let terminated = false;
-    const worker: NoteStoreWorkerLike = {
-      postMessage: (message: any) => {
-        if (message.method === "init")
-          queueMicrotask(() => {
-            for (const listener of listeners.get("error") ?? [])
-              listener({
-                message: "worker module failed",
-                error: new Error("worker module failed"),
-              });
-          });
-      },
-      addEventListener(type, listener) {
-        const group = listeners.get(type) ?? new Set();
-        group.add(listener);
-        listeners.set(type, group);
-      },
-      removeEventListener(type, listener) {
-        listeners.get(type)?.delete(listener);
-      },
-      terminate() {
-        terminated = true;
-      },
-    };
-    const client = new NoteStoreClient(worker, namespaceA);
-    await expect(client.initialize()).rejects.toThrow("worker module failed");
-    await client.close();
-    expect(terminated).toBe(true);
-  });
+  it.each([new Error("worker module failed"), "worker module failed"])(
+    "rejects initialization on a worker module error (%s) and closes the failed candidate",
+    async (workerError) => {
+      const listeners = new Map<string, Set<(event: any) => void>>();
+      let terminated = false;
+      const worker: NoteStoreWorkerLike = {
+        postMessage: (message: any) => {
+          if (message.method === "init")
+            queueMicrotask(() => {
+              for (const listener of listeners.get("error") ?? [])
+                listener({
+                  message: "worker module failed",
+                  error: workerError,
+                });
+            });
+        },
+        addEventListener(type, listener) {
+          const group = listeners.get(type) ?? new Set();
+          group.add(listener);
+          listeners.set(type, group);
+        },
+        removeEventListener(type, listener) {
+          listeners.get(type)?.delete(listener);
+        },
+        terminate() {
+          terminated = true;
+        },
+      };
+      const client = new NoteStoreClient(worker, namespaceA);
+      await expect(client.initialize()).rejects.toThrow("worker module failed");
+      await client.close();
+      expect(terminated).toBe(true);
+    }
+  );
 
   it("isolates initialized vault namespaces and rejects requests before initialization", async () => {
     const sqlite = await loadTestSqlite();

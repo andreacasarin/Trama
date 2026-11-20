@@ -71,10 +71,11 @@ is not included in ordinary vault backups or sync.
 
 ### 1. Install Trama
 
-1. Download the plugin ZIP from [Releases](https://github.com/andreacasarin/trama/releases).
-2. Extract all files into `<your-vault>/.obsidian/plugins/trama/`, so
-   `manifest.json` sits directly inside that folder. If your vault uses a custom
-   configuration folder, use it in place of `.obsidian`.
+1. Download `main.js`, `manifest.json`, and `styles.css` from
+   [Releases](https://github.com/andreacasarin/trama/releases).
+2. Create `<your-vault>/.obsidian/plugins/trama/` and place all three files directly
+   inside it. If your vault uses a custom configuration folder, use it in place
+   of `.obsidian`.
 3. Reload Obsidian, allow community plugins, and enable **Trama** in Settings.
 
 The search engine and its worker are bundled into `main.js`; no extra runtime
@@ -193,8 +194,16 @@ Docker or native compiler. CI also tests a clean install in a Node 22 container 
 
 ```sh
 npm ci
+npm run lint
+npm run lint:community
 npm test
 ```
+
+`lint:community` uses the pinned official Obsidian ESLint plugin and its documented
+scanner-equivalent configuration. CI rejects errors; warnings remain visible for
+review. A successful local check does not establish that the hosted scanner passed.
+Release builds attest `main.js`, `manifest.json`, and `styles.css` through GitHub
+Actions; the ZIP is retained for local installation tooling.
 
 Only maintainers rebuilding the pinned native SQLite inputs need Docker:
 

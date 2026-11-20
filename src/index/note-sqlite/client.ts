@@ -46,7 +46,7 @@ function rpcError(error?: RpcError | string): Error {
 export class NoteStoreClient {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
-  private failure?: unknown;
+  private failure?: Error;
   private closing = false;
   private closed = false;
   private closePromise?: Promise<void>;
@@ -70,7 +70,9 @@ export class NoteStoreClient {
     const detail = event as ErrorEvent;
     const error =
       typeof detail.message === "string"
-        ? (detail.error ?? new Error(detail.message))
+        ? detail.error instanceof Error
+          ? detail.error
+          : new Error(detail.message)
         : new Error("Note store worker could not deserialize a message");
     this.failure = error;
     this.worker.terminate?.();
@@ -103,14 +105,17 @@ export class NoteStoreClient {
   }
 
   readonly call: NoteStoreCall = async (method, payload, signal) => {
-    if (this.failure) throw this.failure;
-    if (this.closing || this.closed) throw CLOSED;
+    this.ensureOpen();
     await this.ready;
-    if (this.failure) throw this.failure;
-    if (this.closing || this.closed) throw CLOSED;
+    this.ensureOpen();
     if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
     return this.send(method, payload, signal);
   };
+
+  private ensureOpen(): void {
+    if (this.failure) throw this.failure;
+    if (this.closing || this.closed) throw CLOSED;
+  }
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
@@ -185,7 +190,7 @@ export class NoteStoreClient {
             payload: { requestId: id },
           });
         } catch (error) {
-          reject(error);
+          reject(error instanceof Error ? error : new Error(String(error)));
         }
       };
       this.pending.set(id, { resolve, reject, signal, abort });
@@ -195,7 +200,7 @@ export class NoteStoreClient {
       } catch (error) {
         this.pending.delete(id);
         signal?.removeEventListener("abort", abort);
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
