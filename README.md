@@ -195,13 +195,15 @@ Docker or native compiler. CI also tests a clean install in a Node 22 container 
 ```sh
 npm ci
 npm run lint
-npm run lint:community
 npm test
 ```
 
-`lint:community` uses the pinned official Obsidian ESLint plugin and its documented
-scanner-equivalent configuration. CI rejects errors; warnings remain visible for
-review. A successful local check does not establish that the hosted scanner passed.
+The default `eslint.config.mjs` uses the pinned official Obsidian ESLint plugin,
+TypeScript project-service options, and the documented Community scanner baseline.
+`npm run lint` runs that check and the separate repository/tooling checks;
+`npm run lint:community` runs only the Community check. CI rejects errors and keeps
+warnings visible. The hosted scanner has additional submission-age layers and
+file handling, so a successful local check does not establish a hosted review pass.
 Release builds attest `main.js`, `manifest.json`, and `styles.css` through GitHub
 Actions; the ZIP is retained for local installation tooling.
 

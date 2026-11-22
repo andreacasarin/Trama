@@ -17,13 +17,14 @@
     "benchmark:prepare": "node scripts/benchmark/vault.mjs",
     "format": "prettier --write '**/*.{js,mjs,ts,json,md}'",
     "format:check": "prettier --check '**/*.{js,mjs,ts,json,md}'",
-    "lint": "eslint .",
+    "lint": "npm run lint:community && npm run lint:repository",
     "test": "npm run build && vitest run",
     "benchmark:compare": "node scripts/benchmark/compare.mjs",
     "verify:licenses": "node scripts/verify-licenses.mjs",
     "rebuild:sqlite": "node scripts/sqlite-wasm/build.mjs --update-vendored",
     "verify:sqlite:rebuild": "node scripts/sqlite-wasm/build.mjs --clean && node scripts/sqlite-wasm/artifacts.mjs --check-rebuilt",
-    "lint:community": "eslint --config scripts/community-eslint.config.mjs ."
+    "lint:community": "eslint .",
+    "lint:repository": "eslint --config scripts/repository-eslint.config.mjs ."
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
