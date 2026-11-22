@@ -1,4 +1,4 @@
-import { Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { Modal, Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -45,7 +45,7 @@ export class TramaSettingsTab extends PluginSettingTab {
   private folderDropdown?: { setValue(value: string): unknown };
   private selectedFolder = "";
   constructor(
-    app: any,
+    app: App,
     private readonly plugin: TramaPlugin & {
       updateIndex(): Promise<void>;
       rebuildIndex(): Promise<void>;
@@ -210,10 +210,7 @@ export class TramaSettingsTab extends PluginSettingTab {
           .setCta()
           .onClick(() => {
             try {
-              const folder = normalizeStorageFolder(
-                storageInput.value,
-                this.app.vault.configDir || ".obsidian"
-              );
+              const folder = normalizeStorageFolder(storageInput.value, this.app.vault.configDir);
               void this.persistDiscrete((current) => ({ ...current, storageFolder: folder })).then(
                 (saved) => {
                   if (saved) {

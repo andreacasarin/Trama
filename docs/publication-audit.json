@@ -1,0 +1,216 @@
+{
+  "auditedAt": "2026-11-22",
+  "scope": "Unmerged PR #12 candidate; public release 0.7.3 is unchanged",
+  "sources": {
+    "submission": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+    "requirements": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+    "policies": "https://docs.obsidian.md/community-directory/developer-policies",
+    "manifest": "https://docs.obsidian.md/Reference/Manifest",
+    "scanner": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
+    "payments": "https://docs.obsidian.md/community-directory/faq"
+  },
+  "verdict": "Mandatory local checks pass after candidate corrections; hosted acceptance and current native smoke remain unresolved. Do not claim universal compliance or directory installability.",
+  "checks": [
+    {
+      "area": "Repository files",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "pass",
+      "evidence": "README, LICENSE and manifest are tracked at the repository root."
+    },
+    {
+      "area": "Manifest identity",
+      "source": "https://docs.obsidian.md/Reference/Manifest",
+      "status": "pass",
+      "evidence": "trama / Trama / Andrea Casarin; valid ID and basic-Latin name; existing owned listing reserves the identity."
+    },
+    {
+      "area": "Description",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pass",
+      "evidence": "142 ASCII characters, terminal period, no emoji or introductory boilerplate."
+    },
+    {
+      "area": "Version and public tag",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "pass-published-0.7.3",
+      "evidence": "Published 0.7.3 tag and default-branch manifest match. Candidate changes are unmerged and require a new version before another release."
+    },
+    {
+      "area": "Stable tag enforcement",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "fixed-in-candidate",
+      "evidence": "Stable release workflow rejects v-prefixed, metadata-suffixed and mismatched tags; positive/negative checks passed."
+    },
+    {
+      "area": "Release assets",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "pass-published-0.7.3",
+      "evidence": "Exactly main.js, manifest.json and styles.css are public assets; no ZIP-only install or public extra asset."
+    },
+    {
+      "area": "Provenance",
+      "source": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
+      "status": "pass-published-0.7.3",
+      "evidence": "All three attestations verified with gh; directory explicitly verifies main.js and styles.css."
+    },
+    {
+      "area": "README and install",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "pass",
+      "evidence": "Purpose, setup, usage, three-file manual installation, screenshots, costs and privacy are documented."
+    },
+    {
+      "area": "API floor",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "fixed-static-check-pass",
+      "evidence": "Source compiles against exact Obsidian 1.7.2 declarations after views own HoverParent/popover cleanup. Every build now repeats this check; actual 1.7.2 host execution was not performed."
+    },
+    {
+      "area": "Platform declaration",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pass-static-owner-confirmed-history",
+      "evidence": "isDesktopOnly false; runtime has no Node/Electron service dependency. Historical maintainer mobile use confirmed; current corrected UI awaits fresh owner smoke validation."
+    },
+    {
+      "area": "Mobile WebView limits",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "documented",
+      "evidence": "README identifies required OPFS and AbortSignal.any support, and does not promise untested older mobile OS support."
+    },
+    {
+      "area": "Funding metadata",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pass",
+      "evidence": "No fundingUrl is declared, so there is no unrelated link in that field."
+    },
+    {
+      "area": "Command identifiers",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pass",
+      "evidence": "IDs do not repeat trama; newest-submission command-ID rules are enabled."
+    },
+    {
+      "area": "Sample remnants",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pass",
+      "evidence": "No sample-plugin classes/commands/UI remain in owned runtime source."
+    },
+    {
+      "area": "Source transparency",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "Owned TypeScript and build inputs are public. esbuild minification is for packaging; no owned eval/Function obfuscator was found."
+    },
+    {
+      "area": "Advertising",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "No ad service or advertising UI found in source or runtime dependency wiring."
+    },
+    {
+      "area": "Analytics",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass-tested",
+      "evidence": "No owned analytics endpoint/exporter; process isolation blocks host LangSmith activation. Packaged privacy test and isolated tracing test pass."
+    },
+    {
+      "area": "Update ownership",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "The plugin does not install/update itself or dependencies. SQLite/WASM and worker code are embedded, with no startup downloads."
+    },
+    {
+      "area": "Provider and cost disclosures",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "README distinguishes local LM Studio from remote compatible endpoints/gateways, explains accounts, charges, automatic embedding requests and direct-key limitations."
+    },
+    {
+      "area": "Provider data flow",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "README enumerates note content, queries, prompts, skills, attachments and retrieved context sent to configured model servers; provider policies govern remote handling."
+    },
+    {
+      "area": "Local storage boundary",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass",
+      "evidence": "README explains vault-local cache/identity files and device-local OPFS outside vault backups, and why SQLite uses it. No arbitrary host-file reader is exposed."
+    },
+    {
+      "area": "Payments classification",
+      "source": "https://docs.obsidian.md/community-directory/faq",
+      "status": "pass",
+      "evidence": "Listing is Optional payment because remote providers/gateways can charge despite free local alternatives."
+    },
+    {
+      "area": "License and attribution",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass-tested",
+      "evidence": "Project MIT license and generated bundled dependency notices verified. main.js embeds the notices because Community installation fetches only the three standard files."
+    },
+    {
+      "area": "Fork and branding",
+      "source": "https://docs.obsidian.md/community-directory/developer-policies",
+      "status": "pass-with-provenance-scope",
+      "evidence": "GitHub reports a standalone repository (no parent/source fork); history begins with the authored local LM Studio assistant. No first-party Obsidian branding claim. This is repository evidence, not an independent authorship certification."
+    },
+    {
+      "area": "Account ownership and commitments",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "owner-completed-earlier",
+      "evidence": "Owner signed in, connected GitHub and accepted policy/maintenance boxes during submission. No new acceptance was performed by the agent."
+    },
+    {
+      "area": "Compiler-aware default checker",
+      "source": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
+      "status": "fixed-in-candidate",
+      "evidence": "Root config uses official 0.6.0, projectService, explicit tsconfigRootDir, newer-submission critical severities, unsafe advisories, and local manifest/license validation."
+    },
+    {
+      "area": "Runtime resource lifetime",
+      "source": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
+      "status": "pass-tested",
+      "evidence": "Tracked Obsidian events/intervals and cancellation/worker URL cleanup reviewed. Hover popovers are now owned/unloaded by Filo/Lente, with two regression cases."
+    },
+    {
+      "area": "Advisory findings",
+      "source": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
+      "status": "reviewed-not-all-eliminated",
+      "evidence": "91 warnings remain: unsafe-value annotations/SDK and JSON boundaries, worker timers, fetch/crypto globals, pure-helper default config paths, redundant SDK safe() calls, and optional declarative settings search. These are not asserted resolved."
+    },
+    {
+      "area": "Hosted acceptance",
+      "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
+      "status": "blocked",
+      "evidence": "Previous published and preview source reviews returned a generic fatal error. Latest fully audited candidate has not yet been submitted; no staff message is authorized by this audit."
+    },
+    {
+      "area": "Native smoke",
+      "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
+      "status": "pending-owner",
+      "evidence": "Audited build installed in generated Trama Test Vault; owner asked to verify composer, copy, searches, hover lifetime, settings and pop-out behavior. No new native pass is claimed yet."
+    }
+  ],
+  "verification": {
+    "communityFiles": 44,
+    "communityErrors": 0,
+    "communityFatalErrors": 0,
+    "communityWarnings": 91,
+    "regularTestsPassed": 319,
+    "regularTestsSkipped": 1,
+    "isolatedTracingTestsPassed": 8,
+    "productionVulnerabilities": 0,
+    "developmentModerateAffectedPackages": 10,
+    "developmentAdvisory": "minimatch globparts amplification in checker tooling; no high/critical findings and not bundled",
+    "minimumSdk": "Obsidian 1.7.2; tsc against exact public declarations",
+    "minimumSdkToolingPatch": "Development-only old SDK Moment dependency overridden to the already-used fixed 2.31.0; no published runtime dependency version changed",
+    "cleanLinuxCI": "pending fresh audit update",
+    "nativeSmoke": "pending owner",
+    "hostedPreview": "pending fresh audit update"
+  },
+  "evidenceDirectory": ".artifacts/publication/audit-2026-11-22/",
+  "release": "https://github.com/andreacasarin/Trama/releases/tag/0.7.3",
+  "listing": "https://community.obsidian.md/plugins/trama",
+  "pullRequest": "https://github.com/andreacasarin/Trama/pull/12"
+}

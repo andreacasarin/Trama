@@ -17,6 +17,22 @@ import { sha256 } from "@langchain/core/utils/hash";
 import { loadTestSqlite } from "./note-sqlite-test-client";
 
 describe("release review regressions", () => {
+  it.each(["Filo", "Lente"])(
+    "releases the %s hover popover when its owning view closes",
+    async (kind) => {
+      const leaf = { app: {} } as never;
+      const view =
+        kind === "Filo"
+          ? new FiloView(leaf, new IndexStatusController(), undefined)
+          : new LenteView(leaf, {} as never);
+      const unload = vi.fn();
+      view.hoverPopover = { unload } as never;
+      await view.onClose();
+      expect(unload).toHaveBeenCalledOnce();
+      expect(view.hoverPopover).toBeNull();
+    }
+  );
+
   it.each([false, true])(
     "Escape forgets the submitted Lente query (pending: %s)",
     async (pending) => {

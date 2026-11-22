@@ -17,7 +17,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">,
     storageFolder = DEFAULT_STORAGE_FOLDER
   ) {
-    this.hidden = [storageFolder, this.vault.configDir || ".obsidian"];
+    this.hidden = [storageFolder, this.vault.configDir];
   }
 
   async readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote> {

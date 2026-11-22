@@ -1,4 +1,5 @@
-// Documented Community scanner baseline. Hosted scanner layers may add rules.
+// Documented Community baseline plus the stricter checks for new submissions.
+// Metadata validation stays enabled locally rather than relying on a hosted task.
 // https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md
 import { defineConfig, globalIgnores } from "eslint/config";
 import obsidianmd from "eslint-plugin-obsidianmd";
@@ -24,21 +25,31 @@ export default defineConfig([
       "no-unsanitized/property": "error",
       "obsidianmd/regex-lookbehind": "error",
       "obsidianmd/no-forbidden-elements": "error",
+      "obsidianmd/settings-tab/no-manual-html-headings": "error",
+      "obsidianmd/settings-tab/no-problematic-settings-headings": "error",
+      "obsidianmd/sample-names": "error",
+      "obsidianmd/no-sample-code": "error",
+      "obsidianmd/platform": "error",
+      "obsidianmd/no-plugin-as-component": "error",
+      "obsidianmd/detach-leaves": "error",
+      "obsidianmd/no-static-styles-assignment": "error",
+      "obsidianmd/no-view-references-in-plugin": "error",
+      "obsidianmd/no-unsupported-api": "error",
 
-      // Covered by TypeScript or too noisy
+      // New submissions retain the scanner’s unsafe-value advisories.
       "no-undef": "off",
-      "@typescript-eslint/no-unsafe-member-access": "off",
-      "@typescript-eslint/no-unsafe-assignment": "off",
-      "@typescript-eslint/no-unsafe-argument": "off",
-      "@typescript-eslint/no-unsafe-call": "off",
-      "@typescript-eslint/no-unsafe-return": "off",
+      "@typescript-eslint/no-unsafe-member-access": "warn",
+      "@typescript-eslint/no-unsafe-assignment": "warn",
+      "@typescript-eslint/no-unsafe-argument": "warn",
+      "@typescript-eslint/no-unsafe-call": "warn",
+      "@typescript-eslint/no-unsafe-return": "warn",
       "@typescript-eslint/restrict-template-expressions": "off",
       "@typescript-eslint/no-base-to-string": "off",
       "import/no-unresolved": "off",
 
-      // Old plugins should not change their command ids
-      "obsidianmd/commands/no-command-in-command-id": "off",
-      "obsidianmd/commands/no-plugin-id-in-command-id": "off",
+      // New submissions must not repeat the plugin ID in command IDs.
+      "obsidianmd/commands/no-command-in-command-id": "warn",
+      "obsidianmd/commands/no-plugin-id-in-command-id": "error",
     },
   },
 
@@ -60,12 +71,10 @@ export default defineConfig([
   },
 
   {
-    // Scanner handles this separately. It must be switched off under the glob
-    // the rule actually runs on -- manifest.json matches no source glob, so an
-    // "off" in the block above would not reach it.
+    // Validate required release metadata locally as well as in the directory.
     files: ["manifest.json"],
     rules: {
-      "obsidianmd/validate-manifest": "off",
+      "obsidianmd/validate-manifest": "error",
     },
   },
 
@@ -75,7 +84,7 @@ export default defineConfig([
     // in the block above would not reach it.
     files: ["LICENSE", "LICENSE.md", "LICENSE.txt"],
     rules: {
-      "obsidianmd/validate-license": "off",
+      "obsidianmd/validate-license": "error",
     },
   },
 

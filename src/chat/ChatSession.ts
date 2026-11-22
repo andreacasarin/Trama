@@ -6,7 +6,7 @@ import {
   summarizationMiddleware,
   type AnyAgentMiddleware,
 } from "langchain";
-import { AIMessage, HumanMessage, isToolMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, ToolMessage, SystemMessage } from "@langchain/core/messages";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { GraphRecursionError, MemorySaver } from "@langchain/langgraph";
 import { ProvenanceRecord, ReadonlyNote, ReadonlyVault } from "@/domain/vault";
@@ -394,7 +394,7 @@ export class ChatSession {
             });
             try {
               const result = await handler(request);
-              if (!isToolMessage(result)) return result;
+              if (!ToolMessage.isInstance(result)) return result;
               const outcome = result.artifact as VaultToolOutcome | undefined;
               if (!outcome || typeof outcome.ok !== "boolean" || !Array.isArray(outcome.provenance))
                 return result;

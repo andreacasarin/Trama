@@ -161,8 +161,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: {
@@ -1306,8 +1310,12 @@ describe("V1 plugin composition", () => {
             adapter: {
               exists: async (path: string) => files.has(path),
               read: async (path: string) => files.get(path) ?? "",
-              mkdir: async (path: string) => directories.add(path),
-              write: async (path: string, contents: string) => files.set(path, contents),
+              mkdir: async (path: string) => {
+                directories.add(path);
+              },
+              write: async (path: string, contents: string) => {
+                files.set(path, contents);
+              },
             },
           },
         },
@@ -1461,8 +1469,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: { getActiveFile: () => null, getLeavesOfType: () => [], on: () => ({}) },
@@ -1540,8 +1552,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: { getActiveFile: () => null, getLeavesOfType: () => [], on: () => ({}) },

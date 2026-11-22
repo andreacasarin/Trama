@@ -46,13 +46,13 @@ export class VoceComposer {
   }
 
   setSelectionRange(start: number, end: number): void {
-    if (typeof document === "undefined") {
+    if (!this.element.ownerDocument) {
       (this.element as any).setSelectionRange?.(start, end);
       return;
     }
     const [startNode, startOffset] = this.pointAt(start);
     const [endNode, endOffset] = this.pointAt(end);
-    const range = document.createRange();
+    const range = this.element.ownerDocument.createRange();
     range.setStart(startNode, Math.min(startOffset, startNode.textContent?.length ?? 0));
     range.setEnd(endNode, Math.min(endOffset, endNode.textContent?.length ?? 0));
     const selection = this.element.ownerDocument.getSelection();
@@ -61,7 +61,7 @@ export class VoceComposer {
   }
 
   replaceRange(start: number, end: number, replacement: string): void {
-    if (typeof document === "undefined") {
+    if (!this.element.ownerDocument) {
       const text = this.value;
       this.value = `${text.slice(0, start)}${replacement}${text.slice(end)}`;
       this.setSelectionRange(start + replacement.length, start + replacement.length);
@@ -69,7 +69,7 @@ export class VoceComposer {
     }
     const range = this.rangeAt(start, end);
     range.deleteContents();
-    const inserted = document.createTextNode(replacement);
+    const inserted = this.element.ownerDocument.createTextNode(replacement);
     range.insertNode(inserted);
     range.setStartAfter(inserted);
     range.collapse(true);
@@ -80,7 +80,7 @@ export class VoceComposer {
 
   private selection(): { start: number; end: number } {
     const fallback = this.value.length;
-    if (typeof document === "undefined") {
+    if (!this.element.ownerDocument) {
       const input = this.element as any;
       const start = input.selectionStart ?? fallback;
       const end = input.selectionEnd ?? fallback;
@@ -90,7 +90,7 @@ export class VoceComposer {
     if (!selection?.anchorNode || !this.element.contains(selection.anchorNode))
       return { start: fallback, end: fallback };
     const offset = (node: Node, position: number): number => {
-      const range = document.createRange();
+      const range = this.element.ownerDocument.createRange();
       range.selectNodeContents(this.element);
       range.setEnd(node, position);
       return range.toString().length;
@@ -101,7 +101,7 @@ export class VoceComposer {
   }
 
   private rangeAt(start: number, end: number): Range {
-    const range = document.createRange();
+    const range = this.element.ownerDocument.createRange();
     const [startNode, startOffset] = this.pointAt(start);
     const [endNode, endOffset] = this.pointAt(end);
     range.setStart(startNode, startOffset);
@@ -110,7 +110,7 @@ export class VoceComposer {
   }
 
   private pointAt(target: number): [Node, number] {
-    const walker = document.createTreeWalker(this.element, NodeFilter.SHOW_TEXT);
+    const walker = this.element.ownerDocument.createTreeWalker(this.element, NodeFilter.SHOW_TEXT);
     let remaining = target;
     let node = walker.nextNode();
     while (node) {

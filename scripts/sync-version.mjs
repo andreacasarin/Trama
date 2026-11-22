@@ -3,7 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const version = packageJson.version;
+const minimum = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8")).minAppVersion;
+if (packageJson.devDependencies["obsidian-minimum"] !== `npm:obsidian@${minimum}`)
+  throw new Error(`obsidian-minimum must pin the manifest minimum app version (${minimum})`);
 const check = process.argv.includes("--check");
 
 for (const name of ["manifest.json", "package-lock.json"]) {

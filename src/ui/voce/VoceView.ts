@@ -802,7 +802,7 @@ export class VoceView extends ItemView {
       attr: { role: "status", "aria-label": "Response in progress", "aria-live": "polite" },
     });
     for (let index = 0; index < 3; index++)
-      activity.createEl("span", { cls: "trama-voce__activity-dot" });
+      activity.createSpan({ cls: "trama-voce__activity-dot" });
     return activity;
   }
 
@@ -873,7 +873,7 @@ export class VoceView extends ItemView {
   private renderAttachments(catalog: readonly string[] = this.noteCatalog()): void {
     this.attachments.empty();
     const selected = new Set(this.selectedAttachmentPaths);
-    const activePath = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
+    const activePath = this.app?.workspace?.getActiveFile?.()?.path;
     const activeSuggestions = this.noteSuggestions().filter(
       (path) => path === activePath && catalog.includes(path)
     );
@@ -931,7 +931,7 @@ export class VoceView extends ItemView {
     this.relatedSourcePath = undefined;
     if (!this.isViewOpen) return;
     this.renderAttachments();
-    const sourcePath = (this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined;
+    const sourcePath = this.app?.workspace?.getActiveFile?.()?.path;
     const controller = new AbortController();
     this.suggestionController = controller;
     try {
@@ -940,7 +940,7 @@ export class VoceView extends ItemView {
         generation !== this.suggestionGeneration ||
         controller.signal.aborted ||
         !this.isViewOpen ||
-        (this.app as any)?.workspace?.getActiveFile?.()?.path !== sourcePath
+        this.app?.workspace?.getActiveFile?.()?.path !== sourcePath
       )
         return;
       this.relatedSuggestions = [...paths];

@@ -66,8 +66,10 @@ chat and embeddings separately.
 Trama supports desktop and mobile. Mobile use has been validated by the maintainer;
 a model server running on another device needs a reachable network address, because
 `127.0.0.1` always means the device running Obsidian. The SQLite index uses the
-app's browser storage (OPFS), outside the vault folder; it is device-local and
-is not included in ordinary vault backups or sync.
+app's browser storage (OPFS), outside the vault folder, to run the local SQLite
+search engine. It is device-local and is not included in ordinary vault backups
+or sync. Mobile requires a WebView with OPFS and `AbortSignal.any` support; older
+mobile operating systems have not been validated.
 
 ### 1. Install Trama
 
@@ -189,6 +191,9 @@ context window.
 
 Development uses **Node.js 22.23.3**, matching the Community verifier. The project
 version is pinned in `.tool-versions`; dependency installation enforces Node 22.
+Every build checks the plugin against both the current SDK and the exact public
+API typings for the manifest’s minimum app version. This is a static compatibility
+check, not an execution test on that historical app.
 Normal builds use committed, checksum-verified SQLite/WASM inputs and need no
 Docker or native compiler. CI also tests a clean install in a Node 22 container without Docker.
 
@@ -199,7 +204,9 @@ npm test
 ```
 
 The default `eslint.config.mjs` uses the pinned official Obsidian ESLint plugin,
-TypeScript project-service options, and the documented Community scanner baseline.
+TypeScript project-service options, and the documented Community baseline plus
+stricter rules for newer submissions. Manifest and license validation also run
+locally; advisory findings remain visible instead of being silently disabled.
 `npm run lint` runs that check and the separate repository/tooling checks;
 `npm run lint:community` runs only the Community check. CI rejects errors and keeps
 warnings visible. The hosted scanner has additional submission-age layers and
