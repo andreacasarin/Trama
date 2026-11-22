@@ -9,7 +9,7 @@
     "scanner": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
     "payments": "https://docs.obsidian.md/community-directory/faq"
   },
-  "verdict": "Mandatory local checks pass after candidate corrections; hosted acceptance and current native smoke remain unresolved. Do not claim universal compliance or directory installability.",
+  "verdict": "Audited source passes current local mandatory checks and fresh clean Linux CI after candidate corrections. Hosted source review still fails; current native smoke is awaiting owner confirmation. Do not claim directory acceptance or universal runtime compatibility.",
   "checks": [
     {
       "area": "Repository files",
@@ -183,7 +183,7 @@
       "area": "Hosted acceptance",
       "source": "https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin",
       "status": "blocked",
-      "evidence": "Previous published and preview source reviews returned a generic fatal error. Latest fully audited candidate has not yet been submitted; no staff message is authorized by this audit."
+      "evidence": "Fully audited source commit 29f60e6 still returns the generic fatal source-review error; hosted dependency scan passes. No staff message was sent for this audit."
     },
     {
       "area": "Native smoke",
@@ -205,12 +205,23 @@
     "developmentAdvisory": "minimatch globparts amplification in checker tooling; no high/critical findings and not bundled",
     "minimumSdk": "Obsidian 1.7.2; tsc against exact public declarations",
     "minimumSdkToolingPatch": "Development-only old SDK Moment dependency overridden to the already-used fixed 2.31.0; no published runtime dependency version changed",
-    "cleanLinuxCI": "pending fresh audit update",
+    "cleanLinuxCI": {
+      "status": "passed",
+      "url": "https://github.com/andreacasarin/Trama/actions/runs/45006975099",
+      "jobs": ["Quality", "Clean install without Docker", "SQLite runtime"]
+    },
     "nativeSmoke": "pending owner",
-    "hostedPreview": "pending fresh audit update"
+    "hostedPreview": {
+      "commit": "29f60e6",
+      "status": "failed",
+      "sourceReview": "same generic fatal error, no affected file/rule/stack",
+      "dependencies": "passed"
+    },
+    "minimalInstall": "Fresh build bytes verified in the generated vault with only main.js, manifest.json and styles.css as installation assets; existing data.json preserved."
   },
   "evidenceDirectory": ".artifacts/publication/audit-2026-11-22/",
   "release": "https://github.com/andreacasarin/Trama/releases/tag/0.7.3",
   "listing": "https://community.obsidian.md/plugins/trama",
-  "pullRequest": "https://github.com/andreacasarin/Trama/pull/12"
+  "pullRequest": "https://github.com/andreacasarin/Trama/pull/12",
+  "auditedSourceCommit": "29f60e6a044e39842aa0080e5574b360eb11facd"
 }
