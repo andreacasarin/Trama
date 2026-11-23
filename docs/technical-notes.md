@@ -456,7 +456,7 @@ development dependency advisories. Build identities hash source and locked input
 deterministically.
 
 The build bundles the worker, SQLite's JavaScript module, and its WASM bytes into
-`main.js`. Sources remain separate; `.cache/sqlite.worker.js` is a generated
+`main.js`. Sources remain separate; `build/sqlite.worker.js` is a generated
 intermediate. At runtime a module worker starts from a Blob URL, with no sidecar
 file reads or runtime downloads. Worker termination releases that URL. The SQL
 queue, cancellation protocol, and OPFS namespace are unchanged.

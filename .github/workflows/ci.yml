@@ -86,6 +86,7 @@ jobs:
         run: |
           test ! -e main.js
           test ! -d .cache
+          test ! -d build
           if command -v docker; then exit 1; fi
 
       - name: Test

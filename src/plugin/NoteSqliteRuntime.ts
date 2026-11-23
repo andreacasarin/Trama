@@ -1,5 +1,5 @@
 import type { DataAdapter } from "obsidian";
-import workerSource from "../../.cache/sqlite.worker.js?raw";
+import workerSource from "../../build/sqlite.worker.js?raw";
 import type { NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import { DEFAULT_STORAGE_FOLDER, storagePaths } from "@/settings/StorageFolder";
 

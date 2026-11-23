@@ -2,6 +2,7 @@
 # not reformatted by the repository style check.
 .cache/sqlite-wasm/**
 .cache/**
+build/**
 .artifacts/**
 vendor/sqlite-wasm/**
 main.js

@@ -13,6 +13,7 @@ export default tseslint.config(
       "coverage/**",
       ".artifacts/**",
       ".cache/**",
+      "build/**",
       ".ai/bench/**",
     ],
   },
