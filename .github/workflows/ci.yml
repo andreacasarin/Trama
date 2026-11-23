@@ -46,9 +46,8 @@ jobs:
       - name: Check formatting
         run: npm run format:check
 
-      - name: Lint
-        run: |
-          npm run lint
+      - name: Lint repository and tooling
+        run: npm run lint:repository
 
   sqlite-runtime:
     name: SQLite runtime
@@ -91,3 +90,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Run Community lint after the build
+        run: npm run lint:community

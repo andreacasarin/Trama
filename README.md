@@ -199,18 +199,18 @@ Docker or native compiler. CI also tests a clean install in a Node 22 container 
 
 ```sh
 npm ci
-npm run lint
 npm test
+npm run lint
 ```
 
 The default `eslint.config.mjs` uses the pinned official Obsidian ESLint plugin,
 TypeScript project-service options, and the documented Community baseline plus
 stricter rules for newer submissions. Manifest and license validation also run
 locally; advisory findings remain visible instead of being silently disabled.
-`npm run lint` runs that check and the separate repository/tooling checks;
-`npm run lint:community` runs only the Community check. CI rejects errors and keeps
-warnings visible. The hosted scanner has additional submission-age layers and
-file handling, so a successful local check does not establish a hosted review pass.
+`npm run lint` runs the Community and repository checks. CI and the release
+workflow run `npm run lint:community` after the production build so misplaced
+generated files are visible to ESLint. The hosted scanner also applies its own
+submission-age rules and file handling.
 Release builds attest `main.js`, `manifest.json`, and `styles.css` through GitHub
 Actions; the ZIP is retained for local installation tooling.
 

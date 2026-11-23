@@ -8,7 +8,7 @@ export default defineConfig([
   {
     languageOptions: {
       parserOptions: {
-        projectService: { allowDefaultProject: ["eslint.config.*"] },
+        projectService: true,
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -79,9 +79,7 @@ export default defineConfig([
   },
 
   {
-    // Scanner handles this separately. It must be switched off under the glob
-    // the rule actually runs on -- LICENSE matches no source glob, so an "off"
-    // in the block above would not reach it.
+    // Validate the license locally in addition to the directory's own check.
     files: ["LICENSE", "LICENSE.md", "LICENSE.txt"],
     rules: {
       "obsidianmd/validate-license": "error",
@@ -97,9 +95,8 @@ export default defineConfig([
   },
 
   globalIgnores([
-    // Local generated vaults, clean-build copies, and caches are not source.
+    // Local generated vaults and saved build copies are absent from CI checkouts.
     ".artifacts",
-    ".cache",
     ".ai/bench",
     // Not in the scanner's list: the scanner recognises bundled and minified
     // JavaScript by its name and, in a TypeScript project, by its content.
