@@ -1,5 +1,8 @@
 /** Minimal runtime surface for testing plugin composition outside Obsidian. */
 export const Platform = { isDesktopApp: true };
+export function requireApiVersion(_version: string): boolean {
+  return false;
+}
 
 export class TAbstractFile {
   path = "";

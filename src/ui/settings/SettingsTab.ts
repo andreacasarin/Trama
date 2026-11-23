@@ -1,4 +1,4 @@
-import { Modal, Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import { Modal, Notice, PluginSettingTab, Setting, requireApiVersion, type App } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -419,8 +419,10 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
 
   private refreshSettingsForm(): void {
-    if ("update" in this && typeof this.update === "function") this.update();
-    else this.renderLegacySettings();
+    if (requireApiVersion("1.13.0")) {
+      if ("update" in this && typeof this.update === "function") return this.update();
+    }
+    this.renderLegacySettings();
   }
 
   private renderLegacySettings(): void {
