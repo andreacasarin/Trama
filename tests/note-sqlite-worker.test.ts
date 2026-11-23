@@ -50,13 +50,13 @@ class QueuedWorkerHarness implements NoteStoreWorkerLike {
     attachNoteStoreWorker(this.scope, open);
   }
 
-  addEventListener(type: "message" | "error", listener: (event: any) => void): void {
+  addEventListener(type: "message" | "error" | "messageerror", listener: EventListener): void {
     const group = this.listeners.get(type) ?? new Set();
     group.add(listener);
     this.listeners.set(type, group);
   }
 
-  removeEventListener(type: "message" | "error", listener: (event: any) => void): void {
+  removeEventListener(type: "message" | "error" | "messageerror", listener: EventListener): void {
     this.listeners.get(type)?.delete(listener);
   }
 

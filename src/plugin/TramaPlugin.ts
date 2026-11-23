@@ -49,7 +49,7 @@ export class TramaPlugin extends Plugin {
   private indexedNotes = false;
   private automaticReady = false;
   private automaticPending = false;
-  private automaticTimer?: ReturnType<typeof setTimeout>;
+  private automaticTimer?: number;
   private client?: NoteStoreClient;
   private manualIndex?: ManualIndex;
   private retrieval?: VaultRetrieval;
@@ -718,15 +718,15 @@ export class TramaPlugin extends Plugin {
 
   private debounceAutomaticIndex(schedule: () => void): void {
     if (this.disposed) return;
-    if (this.automaticTimer) clearTimeout(this.automaticTimer);
-    this.automaticTimer = setTimeout(() => {
+    this.cancelAutomaticDebounce();
+    this.automaticTimer = window.setTimeout(() => {
       this.automaticTimer = undefined;
       schedule();
     }, 20_000);
   }
 
   private cancelAutomaticDebounce(): void {
-    if (this.automaticTimer) clearTimeout(this.automaticTimer);
+    if (this.automaticTimer !== undefined) window.clearTimeout(this.automaticTimer);
     this.automaticTimer = undefined;
   }
 
@@ -772,7 +772,9 @@ export class TramaPlugin extends Plugin {
     return skillCommandCatalog(
       this.catalog().map((path: string) => {
         const file = app.vault.getFileByPath(path);
-        const frontmatter = file ? app.metadataCache.getFileCache(file)?.frontmatter : null;
+        const frontmatter: Record<string, unknown> | null | undefined = file
+          ? app.metadataCache.getFileCache(file)?.frontmatter
+          : null;
         return {
           path,
           marker: frontmatter?.["trama-voce-skill"],

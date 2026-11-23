@@ -22,9 +22,9 @@ export class NoteSqliteRuntime {
       return this.readNamespace(await adapter.read(identityPath));
     }
     const bytes = new Uint8Array(32);
-    if (!globalThis.crypto?.getRandomValues)
+    if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function")
       throw new Error("Secure vault-local SQLite identity generation is unavailable.");
-    globalThis.crypto.getRandomValues(bytes);
+    crypto.getRandomValues(bytes);
     const namespace = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
     const parts = folder.split("/");
     for (let index = 1; index <= parts.length; index++) {

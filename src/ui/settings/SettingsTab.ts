@@ -60,6 +60,10 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
 
   display(): void {
+    this.renderSettings();
+  }
+
+  private renderSettings(): void {
     const displayGeneration = ++this.displayGeneration;
     this.textGeneration++;
     const { containerEl } = this;
@@ -324,7 +328,7 @@ export class TramaSettingsTab extends PluginSettingTab {
     this.draft = undefined;
     this.pendingText.clear();
     this.flushText.length = 0;
-    this.display();
+    this.renderSettings();
   }
 
   private heading(title: string): void {
@@ -454,7 +458,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       this.discovered[target] = [...models];
       if (!this.discovered[target].length)
         new Notice("No models were returned by the configured endpoint.");
-      this.display();
+      this.renderSettings();
     } catch (error) {
       if (
         this.displayGeneration !== displayGeneration ||

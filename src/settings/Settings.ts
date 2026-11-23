@@ -53,7 +53,7 @@ export function normalizeReasoningEffort(value: unknown): ReasoningEffort | unde
 
 export class SettingsStore {
   private value = DEFAULT_SETTINGS;
-  load(value: unknown, configDir = ".obsidian"): TramaSettings {
+  load(value: unknown, configDir?: string): TramaSettings {
     if (!value || typeof value !== "object") return (this.value = DEFAULT_SETTINGS);
     const data = value as Record<string, unknown>;
     const chat: Record<string, unknown> =

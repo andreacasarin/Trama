@@ -11,6 +11,7 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import { GraphRecursionError, MemorySaver } from "@langchain/langgraph";
 import { ProvenanceRecord, ReadonlyNote, ReadonlyVault } from "@/domain/vault";
 import { StructuredError } from "@/domain/errors";
+import { isArray } from "@/domain/isArray";
 import type { VaultToolFactory, VaultToolOutcome } from "@/tools/VaultTools";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 
@@ -122,11 +123,17 @@ function failedSummary(message: string): boolean {
 function messageTokens(messages: Parameters<typeof countTokensApproximately>[0]): number {
   const textTokens = countTokensApproximately(messages);
   const reasoning = messages.flatMap((message) =>
-    Array.isArray(message.content)
+    isArray(message.content)
       ? message.content.flatMap((block) => {
-          if (!block || typeof block !== "object" || block.type !== "reasoning") return [];
+          if (
+            !block ||
+            typeof block !== "object" ||
+            !("type" in block) ||
+            block.type !== "reasoning"
+          )
+            return [];
           const summary = "summary" in block ? block.summary : undefined;
-          return Array.isArray(summary)
+          return isArray(summary)
             ? summary.flatMap((item) =>
                 item && typeof item === "object" && "text" in item && typeof item.text === "string"
                   ? [item.text]
@@ -396,7 +403,7 @@ export class ChatSession {
               const result = await handler(request);
               if (!ToolMessage.isInstance(result)) return result;
               const outcome = result.artifact as VaultToolOutcome | undefined;
-              if (!outcome || typeof outcome.ok !== "boolean" || !Array.isArray(outcome.provenance))
+              if (!outcome || typeof outcome.ok !== "boolean" || !isArray(outcome.provenance))
                 return result;
               const cancelled =
                 controller.signal.aborted ||

@@ -1,7 +1,9 @@
+import { isArray } from "./isArray";
+
 /** Validate stored Float32 values and return their squared magnitude for normalization. */
 export function validateVector(values: readonly number[], dimensions?: number): number {
   if (
-    !Array.isArray(values) ||
+    !isArray(values) ||
     !values.length ||
     (dimensions !== undefined && values.length !== dimensions)
   )

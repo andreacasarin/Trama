@@ -77,6 +77,8 @@ describe("settings", () => {
       ".obsidian",
       ".obsidian/plugins",
     ])
-      expect(() => normalizeStorageFolder(path)).toThrow();
+      expect(() => normalizeStorageFolder(path, ".obsidian")).toThrow();
+    expect(() => normalizeStorageFolder("config/plugins", "config")).toThrow();
+    expect(normalizeStorageFolder(".obsidian/plugins", "config")).toBe(".obsidian/plugins");
   });
 });

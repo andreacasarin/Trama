@@ -4,7 +4,7 @@ import { Document, type DocumentInterface } from "@langchain/core/documents";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { VectorStore } from "@langchain/core/vectorstores";
 import { NOTE_SPLITTER_ID, prepareNote, type NotePassage, type NoteMetadata } from "./NotePassages";
-import { sha256 } from "@langchain/core/utils/hash";
+import { sha256Hex } from "@/domain/sha256";
 import type { NoteStoreCall, NoteSourceRevision } from "./note-sqlite/protocol";
 
 interface ScopedEmbeddings extends EmbeddingsInterface<number[]> {
@@ -21,7 +21,7 @@ export function embeddingEndpointFingerprint(rawEndpoint: string): string | unde
   const endpoint = new URL(rawEndpoint);
   if (!endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash)
     return undefined;
-  return sha256(endpoint.href);
+  return sha256Hex(endpoint.href);
 }
 
 export function noteEmbeddingProfile(profile: NoteEmbeddingProfile): string {
@@ -272,7 +272,7 @@ export class SqliteNoteVectorStore extends VectorStore {
   }
 
   private notePath(note: DocumentInterface): string {
-    const path = note.metadata.path;
+    const path: unknown = note.metadata.path;
     if (typeof path !== "string" || !path || typeof note.pageContent !== "string")
       throw new TypeError("A note document needs a path and markdown content");
     return path;

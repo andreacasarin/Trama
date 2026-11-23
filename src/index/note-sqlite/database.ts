@@ -1,5 +1,6 @@
 import { decodeVector, validateVector } from "@/domain/vectors";
 import { checkAbort } from "@/domain/errors";
+import { isArray } from "@/domain/isArray";
 import {
   EMBEDDING_ARTIFACT_MAX_ENTRIES,
   EMBEDDING_ARTIFACT_MAX_FILE_BYTES,
@@ -243,7 +244,7 @@ export class NoteSqliteDatabase {
         const { profile, checksums } = payload as NoteStoreRpc["embeddingCacheSqliteReconcile"];
         if (
           !/^[0-9a-f]{64}$/.test(profile) ||
-          !Array.isArray(checksums) ||
+          !isArray(checksums) ||
           checksums.some(
             (checksum) => typeof checksum !== "string" || !/^[0-9a-f]{64}$/.test(checksum)
           )
@@ -297,12 +298,10 @@ export class NoteSqliteDatabase {
               });
             }
             if ((index + 1) % 16 === 0 && index + 1 < uids.length) {
-              await new Promise<void>((resolve) => setTimeout(resolve, 0));
-              checkAbort(signal);
+              await yieldSqlite(signal);
             }
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
-          checkAbort(signal);
+          await yieldSqlite(signal);
           this.db.exec("COMMIT");
           return undefined;
         } catch (error) {
@@ -321,11 +320,9 @@ export class NoteSqliteDatabase {
           this.db.exec("DELETE FROM note_fts");
           this.db.exec("DELETE FROM note_records");
           this.db.exec("UPDATE note_record_clock SET value=0 WHERE id=1");
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
-          checkAbort(signal);
+          await yieldSqlite(signal);
           this.db.exec("DELETE FROM note_index");
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
-          checkAbort(signal);
+          await yieldSqlite(signal);
           this.db.exec("COMMIT");
           return undefined;
         } catch (error) {
@@ -421,7 +418,7 @@ export class NoteSqliteDatabase {
       dimensions < 1 ||
       !Number.isSafeInteger(now) ||
       now < 0 ||
-      !Array.isArray(entries) ||
+      !isArray(entries) ||
       entries.length > 512 ||
       entries.some(
         ({ hash, vector }) =>
@@ -515,7 +512,7 @@ export class NoteSqliteDatabase {
     const { profile, checksums } = input;
     if (
       !/^[0-9a-f]{64}$/.test(profile) ||
-      !Array.isArray(checksums) ||
+      !isArray(checksums) ||
       checksums.length > EMBEDDING_ARTIFACT_MAX_ENTRIES ||
       checksums.some((checksum) => typeof checksum !== "string" || !/^[0-9a-f]{64}$/.test(checksum))
     )
@@ -796,7 +793,7 @@ export class NoteSqliteDatabase {
       !/^[0-9a-f]{64}$/.test(checksum) ||
       !Number.isSafeInteger(now) ||
       now < 0 ||
-      !Array.isArray(hashes) ||
+      !isArray(hashes) ||
       hashes.length < 1 ||
       hashes.length > EMBEDDING_ARTIFACT_MAX_ENTRIES ||
       hashes.some((hash) => typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash))
@@ -996,13 +993,13 @@ export class NoteSqliteDatabase {
       !uid ||
       (profile !== null && typeof profile !== "string") ||
       typeof markdown !== "string" ||
-      !Array.isArray(vectors) ||
-      !Array.isArray(passages) ||
+      !isArray(vectors) ||
+      !isArray(passages) ||
       passages.length !== vectors.length ||
       !metadata ||
       typeof metadata.title !== "string" ||
-      !Array.isArray(metadata.aliases) ||
-      !Array.isArray(metadata.tags) ||
+      !isArray(metadata.aliases) ||
+      !isArray(metadata.tags) ||
       [...metadata.aliases, ...metadata.tags].some((value) => typeof value !== "string") ||
       passages.some(
         (passage, index) =>
@@ -1017,7 +1014,7 @@ export class NoteSqliteDatabase {
             (!Number.isSafeInteger(passage.sectionStartOffset) ||
               passage.sectionStartOffset < 0 ||
               passage.sectionStartOffset > passage.startOffset)) ||
-          !Array.isArray(passage.sectionPath) ||
+          !isArray(passage.sectionPath) ||
           passage.sectionPath.some((value: unknown) => typeof value !== "string")
       )
     )
@@ -1060,8 +1057,7 @@ export class NoteSqliteDatabase {
           ],
         });
         if ((i + 1) % 16 === 0 && i + 1 < normalized.length) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
-          checkAbort(signal);
+          await yieldSqlite(signal);
         }
       }
       if (profile !== null) {
@@ -1086,8 +1082,7 @@ export class NoteSqliteDatabase {
           ON CONFLICT(uid) DO UPDATE SET group_path=excluded.group_path,updated_at=excluded.updated_at`,
         bind: [uid, path, updatedAt],
       });
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      checkAbort(signal);
+      await yieldSqlite(signal);
       this.db.exec("COMMIT");
       return { path };
     } catch (error) {

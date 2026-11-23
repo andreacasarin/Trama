@@ -9,14 +9,8 @@ import type {
 
 export interface NoteStoreWorkerLike {
   postMessage(message: unknown): void;
-  addEventListener(
-    type: "message" | "error" | "messageerror",
-    listener: (event: any) => void
-  ): void;
-  removeEventListener?(
-    type: "message" | "error" | "messageerror",
-    listener: (event: any) => void
-  ): void;
+  addEventListener(type: "message" | "error" | "messageerror", listener: EventListener): void;
+  removeEventListener?(type: "message" | "error" | "messageerror", listener: EventListener): void;
   terminate?(): void;
 }
 
@@ -52,7 +46,8 @@ export class NoteStoreClient {
   private closePromise?: Promise<void>;
   private initTimingsConsumed = false;
   private readonly ready: Promise<unknown>;
-  private readonly onMessage = (event: MessageEvent) => {
+  private readonly onMessage: EventListener = (event) => {
+    if (!("data" in event)) return;
     const message = event.data as {
       id: number;
       ok: boolean;
@@ -66,7 +61,7 @@ export class NoteStoreClient {
     if (message.ok) pending.resolve(message.result);
     else pending.reject(rpcError(message.error));
   };
-  private readonly onError = (event: ErrorEvent | MessageEvent) => {
+  private readonly onError: EventListener = (event) => {
     const detail = event as ErrorEvent;
     const error =
       typeof detail.message === "string"

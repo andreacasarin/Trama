@@ -82,7 +82,8 @@ export function skillBody(content: string, expected: SkillCommand): string {
   const info = getFrontMatterInfo(content);
   let frontmatter: Record<string, unknown> | null = null;
   try {
-    frontmatter = info.exists ? parseYaml(info.frontmatter) : null;
+    const value: unknown = info.exists ? parseYaml(info.frontmatter) : null;
+    if (value && typeof value === "object") frontmatter = value as Record<string, unknown>;
   } catch {
     frontmatter = null;
   }

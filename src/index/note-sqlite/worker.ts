@@ -56,9 +56,9 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
   // eslint-disable-next-line @typescript-eslint/no-require-imports -- esbuild embeds this literal WASM require as a lazy binary initializer.
   const bytes = require("../../../vendor/sqlite-wasm/sqlite3.wasm") as Uint8Array<ArrayBuffer>;
   const loadedAt = startedAt !== undefined ? performance.now() : undefined;
-  (globalThis as any).sqlite3ApiConfig = {
-    disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } },
-  };
+  Object.assign(self, {
+    sqlite3ApiConfig: { disable: { vfs: { kvvfs: true, opfs: true, "opfs-wl": true } } },
+  });
   const compileStarted = diagnostics ? performance.now() : undefined;
   const compiling = WebAssembly.compile(bytes).then((module) => {
     if (startedAt !== undefined && loadedAt !== undefined && compileStarted !== undefined) {
@@ -70,13 +70,16 @@ async function open(namespace: string, diagnostics: boolean): Promise<OpenDataba
     return module;
   });
   const glueStarted = diagnostics ? performance.now() : undefined;
-  const loadingGlue: Promise<{ default: unknown }> =
+  const loadingGlue =
     // @ts-expect-error The pinned generated SQLite module has no TypeScript declarations.
-    import("../../../vendor/sqlite-wasm/sqlite3.mjs").then((module) => {
+    import("../../../vendor/sqlite-wasm/sqlite3.mjs") as Promise<{ default: unknown }>;
+  const [wasm, { default: sqliteInit }] = await Promise.all([
+    compiling,
+    loadingGlue.then((module) => {
       if (glueStarted !== undefined) timings["sqlite-bootstrap"] = performance.now() - glueStarted;
       return module;
-    });
-  const [wasm, { default: sqliteInit }] = await Promise.all([compiling, loadingGlue]);
+    }),
+  ]);
   const init = sqliteInit as Init;
   const initStarted = diagnostics ? performance.now() : undefined;
   const sqlite = await init({

@@ -16,9 +16,12 @@ type InlineSuggestion =
   | { readonly kind: "note"; readonly path: string }
   | { readonly kind: "skill"; readonly command: SkillCommand };
 
+type ComposerElement = HTMLDivElement &
+  Partial<Pick<HTMLTextAreaElement, "selectionStart" | "selectionEnd" | "setSelectionRange">>;
+
 /** Plain-text contenteditable adapter; the DOM remains the only draft store. */
 export class VoceComposer {
-  constructor(readonly element: HTMLDivElement) {}
+  constructor(readonly element: ComposerElement) {}
 
   get value(): string {
     return this.element.innerText.replace(/\r/g, "");
@@ -41,13 +44,16 @@ export class VoceComposer {
     this.element.focus();
   }
 
-  addEventListener(type: string, listener: (event: any) => void): void {
+  addEventListener<K extends keyof HTMLElementEventMap>(
+    type: K,
+    listener: (event: HTMLElementEventMap[K]) => void
+  ): void {
     this.element.addEventListener(type, listener);
   }
 
   setSelectionRange(start: number, end: number): void {
     if (!this.element.ownerDocument) {
-      (this.element as any).setSelectionRange?.(start, end);
+      this.element.setSelectionRange?.(start, end);
       return;
     }
     const [startNode, startOffset] = this.pointAt(start);
@@ -81,9 +87,8 @@ export class VoceComposer {
   private selection(): { start: number; end: number } {
     const fallback = this.value.length;
     if (!this.element.ownerDocument) {
-      const input = this.element as any;
-      const start = input.selectionStart ?? fallback;
-      const end = input.selectionEnd ?? fallback;
+      const start = this.element.selectionStart ?? fallback;
+      const end = this.element.selectionEnd ?? fallback;
       return { start: Math.min(start, end), end: Math.max(start, end) };
     }
     const selection = this.element.ownerDocument.getSelection();
