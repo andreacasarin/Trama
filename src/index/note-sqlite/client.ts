@@ -117,15 +117,17 @@ export class NoteStoreClient {
     this.closing = true;
     this.closePromise = (async () => {
       const deadline = Date.now() + 2_000;
+      // Keep the timeout and its cleanup on the same host.
+      const timers = typeof window === "undefined" ? { setTimeout, clearTimeout } : window;
       const beforeDeadline = <T>(promise: Promise<T>): Promise<T | undefined> => {
-        let timer: ReturnType<typeof setTimeout> | undefined;
+        let timer: ReturnType<typeof timers.setTimeout> | undefined;
         return Promise.race([
           promise,
           new Promise<undefined>((resolve) => {
-            timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+            timer = timers.setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
           }),
         ]).finally(() => {
-          if (timer) clearTimeout(timer);
+          if (timer !== undefined) timers.clearTimeout(timer);
         });
       };
       try {

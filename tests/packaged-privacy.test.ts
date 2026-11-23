@@ -46,6 +46,7 @@ describe("packaged privacy boundary", () => {
       },
       process: hostProcess,
       fetch,
+      window: { fetch, setTimeout, clearTimeout },
       console: { ...console, debug: info },
       crypto: globalThis.crypto,
       performance,

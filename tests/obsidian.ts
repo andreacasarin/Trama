@@ -140,6 +140,7 @@ export class Setting {
   static instances: Setting[] = [];
   name = "";
   controls: TestControl[] = [];
+  readonly settingEl = new SettingsElement();
   constructor(_container: unknown) {
     Setting.instances.push(this);
   }
@@ -252,6 +253,7 @@ class SettingsElement {
   children: SettingsElement[] = [];
   textContent = "";
   attrs = new Map<string, string>();
+  before(_element: SettingsElement): void {}
   empty(): void {
     this.children = [];
   }

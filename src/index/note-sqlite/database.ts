@@ -20,7 +20,9 @@ type Row = Record<string, unknown>;
 const SQLITE_SHARD_APPLICATION_ID = 0x54524d41;
 
 async function yieldSqlite(signal?: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  // SQLite runs in a Web Worker in Obsidian and in Node in the test harness.
+  const timers = typeof self === "undefined" ? { setTimeout } : self;
+  await new Promise<void>((resolve) => timers.setTimeout(resolve, 0));
   checkAbort(signal);
 }
 
