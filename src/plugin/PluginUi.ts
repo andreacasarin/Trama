@@ -1,4 +1,4 @@
-import type { Plugin } from "obsidian";
+import type { App, Plugin } from "obsidian";
 import type { ChatSession } from "@/chat/ChatSession";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
 import type { IndexStatusController } from "@/ui/index/IndexStatus";
@@ -33,7 +33,7 @@ export interface PluginUiDependencies {
 
 export function registerPluginUi(
   plugin: Plugin & TramaPlugin,
-  app: any,
+  app: App,
   ui: Awaited<ReturnType<typeof loadPluginUi>>,
   dependencies: PluginUiDependencies
 ): InstanceType<typeof ui.TramaSettingsTab> {

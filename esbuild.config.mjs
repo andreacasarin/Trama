@@ -21,7 +21,7 @@ const worker = await esbuild.build({
   ...common,
   entryPoints: ["src/index/note-sqlite/worker.ts"],
   format: "esm",
-  outfile: ".cache/sqlite.worker.js",
+  outfile: "build/sqlite.worker.js",
   loader: { ".wasm": "binary" },
 });
 const main = await esbuild.build({

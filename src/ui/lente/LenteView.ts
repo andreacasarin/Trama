@@ -2,14 +2,15 @@ import { ButtonComponent, ItemView, Keymap, SearchComponent, WorkspaceLeaf } fro
 import type { VaultSearchCandidates } from "@/index/VaultRetrieval";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { appendNoteResultRow, renderResultContext } from "@/ui/noteResultRow";
-import type { IconName } from "obsidian";
+import type { HoverParent, HoverPopover, IconName } from "obsidian";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export const LENTE_VIEW_TYPE = "trama-lente";
 type SearchSource = Pick<VaultRetrieval, "searchCandidates" | "searchEvidence">;
 
-export class LenteView extends ItemView {
+export class LenteView extends ItemView implements HoverParent {
+  hoverPopover: HoverPopover | null = null;
   private input!: HTMLInputElement;
   private status!: HTMLDivElement;
   private rows!: HTMLDivElement;
@@ -97,6 +98,8 @@ export class LenteView extends ItemView {
     return Promise.resolve();
   }
   override onClose(): Promise<void> {
+    this.hoverPopover?.unload();
+    this.hoverPopover = null;
     this.opened = false;
     this.cancel();
     return Promise.resolve();
@@ -168,9 +171,9 @@ export class LenteView extends ItemView {
         this.rows,
         this.app,
         path,
-        this.leaf,
+        this,
         (event) => {
-          void (this.app as any).workspace.openLinkText(path, "", Keymap.isModEvent(event));
+          void this.app.workspace.openLinkText(path, "", Keymap.isModEvent(event));
         },
         hit.semanticScore,
         (expanded, metadata) => {

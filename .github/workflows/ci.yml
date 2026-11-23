@@ -46,10 +46,11 @@ jobs:
       - name: Check formatting
         run: npm run format:check
 
-      - name: Lint
-        run: |
-          npm run lint
-          npm run lint:community
+      - name: Lint repository and tooling
+        run: npm run lint:repository
+
+      - name: Lint release stylesheet
+        run: npm run lint:styles
 
   sqlite-runtime:
     name: SQLite runtime
@@ -87,7 +88,24 @@ jobs:
         run: |
           test ! -e main.js
           test ! -d .cache
+          test ! -d build
           if command -v docker; then exit 1; fi
 
       - name: Test
         run: npm test
+
+      # The Action's older checker cannot read the newer checker's API cache.
+      - name: Run Obsidian scanner preflight
+        uses: obsidianmd/obsidian-workflows@8167caed39664214d82c86fdfa32e06d8d55f61d # v1.2.3
+        with:
+          type: plugin
+          mode: pr
+          build: "false"
+          scanner-lint: "true"
+          node-version: "22.23.3"
+
+      - name: Run Community lint after the build
+        run: npm run lint:community
+
+      - name: Record the Community asset checksums
+        run: sha256sum main.js manifest.json styles.css

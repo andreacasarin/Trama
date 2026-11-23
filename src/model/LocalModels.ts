@@ -7,9 +7,11 @@ import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { StructuredError } from "@/domain/errors";
 import { normalizeReasoningEffort, type ChatSettings } from "@/settings/Settings";
 
+const windowFetch: typeof fetch = (input, init) => window.fetch(input, init);
+
 export function createLocalChatModel(
   settings: ChatSettings,
-  fetcher: typeof fetch = globalThis.fetch
+  fetcher: typeof fetch = windowFetch
 ): BaseChatModel {
   const baseURL = settings.endpoint.trim();
   const reasoningEffort = normalizeReasoningEffort(settings.reasoningEffort);
@@ -35,7 +37,7 @@ export function createLocalChatModel(
 
 export async function discoverLocalModels(
   endpoint: string,
-  fetcher: typeof fetch = globalThis.fetch
+  fetcher: typeof fetch = windowFetch
 ): Promise<readonly string[]> {
   const baseURL = endpoint.trim();
   const client = new OpenAI({
@@ -156,7 +158,7 @@ export function createLocalEmbeddings(options: LocalEmbeddingOptions): Embedding
       false
     );
   const baseURL = options.endpoint.trim();
-  const fetcher = (options.fetcher ?? globalThis.fetch).bind(globalThis);
+  const fetcher = options.fetcher ?? windowFetch;
   const make = (signal?: AbortSignal) =>
     new GuardedOpenAIEmbeddings(options, baseURL, signal, fetcher);
   const embeddings = make() as GuardedOpenAIEmbeddings & {

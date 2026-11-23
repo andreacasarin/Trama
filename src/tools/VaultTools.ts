@@ -48,7 +48,6 @@ const DISCOVER_LINKS_ARGUMENT = z
       .number()
       .int()
       .positive()
-      .safe()
       .max(1000)
       .describe("Maximum links to return (default: 25, maximum: 1000).")
       .optional(),
@@ -66,7 +65,6 @@ const SEARCH_ARGUMENT = z
       .number()
       .int()
       .positive()
-      .safe()
       .max(1000)
       .describe("Maximum search results to return (default: 10, maximum: 1000).")
       .optional(),

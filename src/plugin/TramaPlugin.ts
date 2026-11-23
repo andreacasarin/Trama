@@ -1,5 +1,8 @@
 import { isCancelled } from "@/domain/errors";
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, type App, type TAbstractFile } from "obsidian";
+import type { VoceView } from "@/ui/voce/VoceView";
+import type { FiloView } from "@/ui/filo/FiloView";
+import type { LenteView } from "@/ui/lente/LenteView";
 import { ChatSession } from "@/chat/ChatSession";
 import { skillCommandCatalog } from "@/chat/TemplateReferences";
 import { ManualIndex } from "@/index/ManualIndex";
@@ -46,7 +49,7 @@ export class TramaPlugin extends Plugin {
   private indexedNotes = false;
   private automaticReady = false;
   private automaticPending = false;
-  private automaticTimer?: ReturnType<typeof setTimeout>;
+  private automaticTimer?: number;
   private client?: NoteStoreClient;
   private manualIndex?: ManualIndex;
   private retrieval?: VaultRetrieval;
@@ -71,7 +74,7 @@ export class TramaPlugin extends Plugin {
   private ui?: Awaited<ReturnType<typeof loadPluginUi>>;
   private settingsTab?: { refreshExternalSettings(): void };
   private readonly catalog = () =>
-    (this.app as any).vault
+    this.app.vault
       .getMarkdownFiles()
       .map((file: { path: string }) => file.path)
       .filter((path: string) => this.isVisibleMarkdown(path) && !this.isStoragePath(path));
@@ -81,11 +84,11 @@ export class TramaPlugin extends Plugin {
       const startupStartedAt = performance.now();
       this.settingsStore.load(
         await this.loadData().catch(() => undefined),
-        (this.app as any)?.vault?.configDir || ".obsidian"
+        this.app?.vault?.configDir
       );
       this.logStartupElapsed("settings", startupStartedAt);
       if (this.disposed) return;
-      const app = this.app as any;
+      const app = this.app;
       if (!app?.vault || !app.workspace || !app.metadataCache) return;
       this.status = new IndexStatusController();
       this.activeNote = app.workspace.getActiveFile()?.path;
@@ -134,7 +137,7 @@ export class TramaPlugin extends Plugin {
     });
   }
 
-  private async configureServices(app: any): Promise<void> {
+  private async configureServices(app: App): Promise<void> {
     if (this.disposed) return;
     const settings = this.getSettings();
     const previousRun = this.indexRun;
@@ -278,13 +281,13 @@ export class TramaPlugin extends Plugin {
       );
     if (this.ui) {
       for (const leaf of app.workspace.getLeavesOfType("trama-voce")) {
-        const view = leaf.view;
+        const view = leaf.view as VoceView;
         if (view?.isOpen) view.setSession?.(this.getOrCreateSession());
       }
       for (const leaf of app.workspace.getLeavesOfType("trama-filo"))
-        leaf.view?.setRelated?.(this.retrieval);
+        (leaf.view as FiloView)?.setRelated?.(this.retrieval);
       for (const leaf of app.workspace.getLeavesOfType("trama-lente")) {
-        leaf.view?.setSearch?.(this.retrieval);
+        (leaf.view as LenteView)?.setSearch?.(this.retrieval);
       }
     }
     this.refreshVoceSuggestions();
@@ -364,10 +367,7 @@ export class TramaPlugin extends Plugin {
       new URL(embeddingEndpoint);
       const validated = {
         ...next,
-        storageFolder: normalizeStorageFolder(
-          next.storageFolder,
-          (this.app as any)?.vault?.configDir || ".obsidian"
-        ),
+        storageFolder: normalizeStorageFolder(next.storageFolder, this.app?.vault?.configDir),
         chat: {
           ...next.chat,
           endpoint: chatEndpoint,
@@ -389,7 +389,7 @@ export class TramaPlugin extends Plugin {
       await this.saveData(staged);
       if (this.disposed) return;
       this.settingsStore.commit(staged);
-      if (runtimeChanged) await this.configureServices(this.app as any);
+      if (runtimeChanged) await this.configureServices(this.app);
     }).catch((error) => {
       this.consoleDebug.error("Settings update failed", error);
       throw error;
@@ -400,10 +400,7 @@ export class TramaPlugin extends Plugin {
     return this.enqueue(async () => {
       if (this.disposed) return;
       const previous = this.getSettings();
-      this.settingsStore.load(
-        await this.loadData(),
-        (this.app as any)?.vault?.configDir || ".obsidian"
-      );
+      this.settingsStore.load(await this.loadData(), this.app?.vault?.configDir);
       const current = this.getSettings();
       const previousProfile = effectiveEmbeddingProfile(previous);
       const currentProfile = effectiveEmbeddingProfile(current);
@@ -415,7 +412,7 @@ export class TramaPlugin extends Plugin {
         JSON.stringify(previous.chat) !== JSON.stringify(current.chat) ||
         JSON.stringify(previous.embedding) !== JSON.stringify(current.embedding) ||
         previous.storageFolder !== current.storageFolder;
-      if (runtimeChanged && this.app) await this.configureServices(this.app as any);
+      if (runtimeChanged && this.app) await this.configureServices(this.app);
       this.settingsTab?.refreshExternalSettings();
       if (embeddingProfileChanged && this.indexedNotes)
         new Notice(
@@ -479,8 +476,8 @@ export class TramaPlugin extends Plugin {
     const operation = (async () => {
       try {
         this.retrieval?.cancelSearches();
-        for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
-          leaf.view?.clearResults?.();
+        for (const leaf of this.app?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
+          (leaf.view as LenteView)?.clearResults?.();
         await client.call("noteStoreClear", {}, controller.signal);
         if (this.clearRun !== run || this.disposed) return;
         committed = true;
@@ -495,7 +492,7 @@ export class TramaPlugin extends Plugin {
         });
         this.refreshVoceSuggestions();
         this.operationNotice?.setMessage("Clearing shared embedding cache files…");
-        const adapter = (this.app as any)?.vault?.adapter;
+        const adapter = this.app?.vault?.adapter;
         if (!adapter) throw new Error("Vault storage is unavailable for shared cache cleanup.");
         await VaultEmbeddingCache.clearManagedFiles(adapter, controller.signal, run.storageFolder);
         if (this.clearRun !== run || this.disposed) return;
@@ -680,7 +677,7 @@ export class TramaPlugin extends Plugin {
     return completion;
   }
 
-  private startAutomaticIndexing(app: any): void {
+  private startAutomaticIndexing(app: App): void {
     if (this.disposed || this.automaticReady) return;
     this.automaticReady = true;
     const schedule = (vaultEvent = false, verifyContent = false) => {
@@ -699,48 +696,53 @@ export class TramaPlugin extends Plugin {
       if (!this.indexedNotes) return;
       void this.runIndex(false, true, verifyContent);
     };
-    const changed = (file: any) => {
+    const changed = (file: TAbstractFile) => {
       if (this.isVisibleMarkdown(file?.path)) this.debounceAutomaticIndex(() => schedule(true));
     };
-    for (const event of ["create", "modify", "delete"])
-      this.registerEvent(app.vault.on(event, changed));
+    this.registerEvent(app.vault.on("create", changed));
+    this.registerEvent(app.vault.on("modify", changed));
+    this.registerEvent(app.vault.on("delete", changed));
     this.registerEvent(
-      app.vault.on("rename", (file: any, oldPath: string) => {
+      app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
         if (this.isVisibleMarkdown(file?.path) || this.isVisibleMarkdown(oldPath))
           this.debounceAutomaticIndex(() => schedule(true));
       })
     );
-    this.registerInterval(window.setInterval(() => schedule(false, true), 300_000));
+    this.registerInterval(
+      window.setInterval(() => {
+        schedule(false, true);
+      }, 300_000)
+    );
     schedule();
   }
 
   private debounceAutomaticIndex(schedule: () => void): void {
     if (this.disposed) return;
-    if (this.automaticTimer) clearTimeout(this.automaticTimer);
-    this.automaticTimer = setTimeout(() => {
+    this.cancelAutomaticDebounce();
+    this.automaticTimer = window.setTimeout(() => {
       this.automaticTimer = undefined;
       schedule();
     }, 20_000);
   }
 
   private cancelAutomaticDebounce(): void {
-    if (this.automaticTimer) clearTimeout(this.automaticTimer);
+    if (this.automaticTimer !== undefined) window.clearTimeout(this.automaticTimer);
     this.automaticTimer = undefined;
   }
 
   private refreshVoceSuggestions(): void {
-    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-voce") ?? [])
-      void leaf.view?.refreshSuggestions?.();
+    for (const leaf of this.app?.workspace?.getLeavesOfType?.("trama-voce") ?? [])
+      void (leaf.view as VoceView)?.refreshSuggestions?.();
   }
 
   private refreshFiloResults(path: string | undefined): void {
-    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-filo") ?? [])
-      leaf.view?.refreshActiveNote?.(path);
+    for (const leaf of this.app?.workspace?.getLeavesOfType?.("trama-filo") ?? [])
+      (leaf.view as FiloView)?.refreshActiveNote?.(path);
   }
 
   private refreshLenteResults(): void {
-    for (const leaf of (this.app as any)?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
-      leaf.view?.refreshSubmitted?.();
+    for (const leaf of this.app?.workspace?.getLeavesOfType?.("trama-lente") ?? [])
+      (leaf.view as LenteView)?.refreshSubmitted?.();
   }
 
   private showOperationNotice(message: string): void {
@@ -757,7 +759,7 @@ export class TramaPlugin extends Plugin {
     new Notice(message);
   }
 
-  private isVisibleMarkdown(path: string): boolean {
+  private isVisibleMarkdown(path: unknown): boolean {
     return (
       typeof path === "string" &&
       path.toLowerCase().endsWith(".md") &&
@@ -766,11 +768,13 @@ export class TramaPlugin extends Plugin {
   }
 
   private skillCatalog() {
-    const app = this.app as any;
+    const app = this.app;
     return skillCommandCatalog(
       this.catalog().map((path: string) => {
         const file = app.vault.getFileByPath(path);
-        const frontmatter = file ? app.metadataCache.getFileCache(file)?.frontmatter : null;
+        const frontmatter: Record<string, unknown> | null | undefined = file
+          ? app.metadataCache.getFileCache(file)?.frontmatter
+          : null;
         return {
           path,
           marker: frontmatter?.["trama-voce-skill"],

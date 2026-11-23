@@ -12,6 +12,7 @@ coverage/
 .DS_Store
 .artifacts/
 .cache/
+/build/
 test-vaults/**/.obsidian/
 test-vaults/**/.trama/
 

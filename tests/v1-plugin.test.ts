@@ -161,8 +161,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: {
@@ -533,6 +537,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void, delay: number) => {
         expect(delay).toBe(300_000);
         intervalCallback = callback;
@@ -575,6 +581,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
     });
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
@@ -635,6 +643,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
     });
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
@@ -703,6 +713,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
     });
     let databaseHasNotes = true;
@@ -765,6 +777,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
     });
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
@@ -832,6 +846,8 @@ describe("V1 plugin composition", () => {
     const previousWindow = (globalThis as any).window;
     let intervalCallback!: () => void;
     vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
       setInterval: (callback: () => void) => ((intervalCallback = callback), 1),
     });
     let finishFirst!: (result: any) => void;
@@ -877,7 +893,7 @@ describe("V1 plugin composition", () => {
   it("does not retry a pending edit after publication is incomplete", async () => {
     vi.useFakeTimers();
     const previousWindow = (globalThis as any).window;
-    vi.stubGlobal("window", { setInterval: () => 1 });
+    vi.stubGlobal("window", { setInterval: () => 1, setTimeout, clearTimeout });
     const handlers = new Map<string, (file: any, oldPath?: string) => void>();
     let finishFirst!: (result: any) => void;
     const status = new IndexStatusController();
@@ -933,6 +949,8 @@ describe("V1 plugin composition", () => {
       vi.useFakeTimers();
       const previousWindow = (globalThis as any).window;
       vi.stubGlobal("window", {
+        setTimeout,
+        clearTimeout,
         setInterval: () => 1,
       });
       const handlers = new Map<string, (file: any, oldPath?: string) => void>();
@@ -1306,8 +1324,12 @@ describe("V1 plugin composition", () => {
             adapter: {
               exists: async (path: string) => files.has(path),
               read: async (path: string) => files.get(path) ?? "",
-              mkdir: async (path: string) => directories.add(path),
-              write: async (path: string, contents: string) => files.set(path, contents),
+              mkdir: async (path: string) => {
+                directories.add(path);
+              },
+              write: async (path: string, contents: string) => {
+                files.set(path, contents);
+              },
             },
           },
         },
@@ -1461,8 +1483,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: { getActiveFile: () => null, getLeavesOfType: () => [], on: () => ({}) },
@@ -1540,8 +1566,12 @@ describe("V1 plugin composition", () => {
           getResourcePath: (path: string) => `app://vault/${path}`,
           exists: async (path: string) => files.has(path),
           read: async (path: string) => files.get(path) ?? "",
-          mkdir: async (path: string) => directories.add(path),
-          write: async (path: string, contents: string) => files.set(path, contents),
+          mkdir: async (path: string) => {
+            directories.add(path);
+          },
+          write: async (path: string, contents: string) => {
+            files.set(path, contents);
+          },
         },
       },
       workspace: { getActiveFile: () => null, getLeavesOfType: () => [], on: () => ({}) },

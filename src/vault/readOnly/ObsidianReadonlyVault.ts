@@ -17,7 +17,7 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
     private readonly metadataCache: Pick<MetadataCache, "getFirstLinkpathDest" | "getFileCache">,
     storageFolder = DEFAULT_STORAGE_FOLDER
   ) {
-    this.hidden = [storageFolder, this.vault.configDir || ".obsidian"];
+    this.hidden = [storageFolder, this.vault.configDir];
   }
 
   async readNote(path: string, signal: AbortSignal): Promise<ReadonlyNote> {
@@ -78,7 +78,8 @@ export class ObsidianReadonlyVault implements ReadonlyVault {
 
   async resolveLinkDetails(link: string, sourcePath: string, signal: AbortSignal) {
     const source = this.normalizePath(sourcePath);
-    const cache = this.metadataCache.getFileCache(this.vault.getFileByPath(source) as TFile);
+    const file = this.vault.getFileByPath(source);
+    const cache = file ? this.metadataCache.getFileCache(file) : null;
     const text = this.linkText(link);
     const clean = text.split("#", 1)[0].split("^", 1)[0].trim();
     const cached = this.cachedLinks(cache).find(

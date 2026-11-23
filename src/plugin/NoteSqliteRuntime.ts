@@ -1,9 +1,13 @@
-import workerSource from "../../.cache/sqlite.worker.js?raw";
+import type { DataAdapter } from "obsidian";
+import workerSource from "../../build/sqlite.worker.js?raw";
 import type { NoteStoreWorkerLike } from "@/index/note-sqlite/client";
 import { DEFAULT_STORAGE_FOLDER, storagePaths } from "@/settings/StorageFolder";
 
 export class NoteSqliteRuntime {
-  async resolveNamespace(app: any, folder = DEFAULT_STORAGE_FOLDER): Promise<string> {
+  async resolveNamespace(
+    app: { vault: { adapter: Pick<DataAdapter, "exists" | "read" | "mkdir" | "write"> } },
+    folder = DEFAULT_STORAGE_FOLDER
+  ): Promise<string> {
     const adapter = app?.vault?.adapter;
     if (
       !adapter ||
@@ -18,9 +22,9 @@ export class NoteSqliteRuntime {
       return this.readNamespace(await adapter.read(identityPath));
     }
     const bytes = new Uint8Array(32);
-    if (!globalThis.crypto?.getRandomValues)
+    if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function")
       throw new Error("Secure vault-local SQLite identity generation is unavailable.");
-    globalThis.crypto.getRandomValues(bytes);
+    crypto.getRandomValues(bytes);
     const namespace = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
     const parts = folder.split("/");
     for (let index = 1; index <= parts.length; index++) {
@@ -56,9 +60,13 @@ export class NoteSqliteRuntime {
 
   private readNamespace(contents: string): string {
     try {
-      const value = JSON.parse(contents);
+      const value: unknown = JSON.parse(contents);
       if (
-        value?.version === 1 &&
+        value !== null &&
+        typeof value === "object" &&
+        "version" in value &&
+        "namespace" in value &&
+        value.version === 1 &&
         typeof value.namespace === "string" &&
         /^[0-9a-f]{64}$/.test(value.namespace)
       )

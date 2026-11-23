@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, normalizeExcludedFolders, SettingsStore } from "@/settings/Settings";
 import { ConsoleDebug } from "@/plugin/ConsoleDebug";
 import { normalizeStorageFolder } from "@/settings/StorageFolder";
+import { TramaSettingsTab } from "@/ui/settings/SettingsTab";
+import type { TramaPlugin } from "@/plugin/TramaPlugin";
+import type { App, Setting } from "obsidian";
+import { Setting as TestSetting } from "./obsidian";
 
 describe("settings", () => {
   it("normalizes console debugging strictly and suppresses every console level when disabled", () => {
@@ -77,6 +81,47 @@ describe("settings", () => {
       ".obsidian",
       ".obsidian/plugins",
     ])
-      expect(() => normalizeStorageFolder(path)).toThrow();
+      expect(() => normalizeStorageFolder(path, ".obsidian")).toThrow();
+    expect(() => normalizeStorageFolder("config/plugins", "config")).toThrow();
+    expect(normalizeStorageFolder(".obsidian/plugins", "config")).toBe(".obsidian/plugins");
+  });
+
+  it("indexes settings without rendering and uses the same controls on both host APIs", async () => {
+    const getAllFolders = vi.fn(() => []);
+    const app = { vault: { getAllFolders, configDir: ".obsidian" } } as unknown as App;
+    let settings = DEFAULT_SETTINGS;
+    const getSettings = vi.fn(() => settings);
+    const saveSettings = vi.fn(async (update: (current: typeof settings) => typeof settings) => {
+      settings = update(settings);
+    });
+    const plugin = { getSettings, saveSettings } as unknown as TramaPlugin;
+    const tab = new TramaSettingsTab(app, plugin);
+    const definitions = tab.getSettingDefinitions().flatMap((group) => group.items);
+    expect(getSettings).not.toHaveBeenCalled();
+    expect(getAllFolders).not.toHaveBeenCalled();
+
+    const nativeRows = definitions.map((definition) => {
+      const row = new TestSetting(tab.containerEl).setName(definition.name);
+      definition.render(row as unknown as Setting);
+      return row;
+    });
+    const legacyStart = TestSetting.instances.length;
+    tab.display();
+    const legacyRows = TestSetting.instances
+      .slice(legacyStart)
+      .filter((row) => row.controls.length);
+    expect(legacyRows.map(({ name }) => name)).toEqual(nativeRows.map(({ name }) => name));
+    const debug = legacyRows.find(({ name }) => name === "Console debugging")!.controls[0];
+    debug.change(true);
+    await vi.waitFor(() => expect(settings.consoleDebug).toBe(true));
+
+    const reopenedTab = new TramaSettingsTab(app, plugin);
+    const debugDefinition = reopenedTab
+      .getSettingDefinitions()
+      .flatMap((group) => group.items)
+      .find(({ name }) => name === "Console debugging")!;
+    const reopened = new TestSetting(reopenedTab.containerEl);
+    debugDefinition.render(reopened as unknown as Setting);
+    expect(reopened.controls[0].value).toBe(true);
   });
 });

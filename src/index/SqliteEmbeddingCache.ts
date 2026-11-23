@@ -3,7 +3,7 @@ import { checkAbort, isCancelled } from "@/domain/errors";
 import { CacheBackedEmbeddings } from "@langchain/classic/embeddings/cache_backed";
 import { EncoderBackedStore } from "@langchain/classic/storage/encoder_backed";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
-import { sha256 } from "@langchain/core/utils/hash";
+import { sha256Hex as cacheHash } from "@/domain/sha256";
 import { BaseStore } from "@langchain/core/stores";
 import type { NoteStoreCall, SqliteEmbeddingShard } from "./note-sqlite/protocol";
 
@@ -224,8 +224,4 @@ export class SqliteEmbeddingCache implements EmbeddingsInterface<number[]> {
     checkAbort(this.signal);
     return vector;
   }
-}
-
-function cacheHash(value: string): string {
-  return sha256(value);
 }

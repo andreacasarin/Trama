@@ -2,14 +2,15 @@ import { ItemView, Keymap, WorkspaceLeaf } from "obsidian";
 import type { IndexStatus, IndexStatusController } from "@/ui/index/IndexStatus";
 import { TRAMA_ICONS } from "@/ui/icons";
 import { appendNoteResultRow, renderResultContext } from "@/ui/noteResultRow";
-import type { IconName, EventRef } from "obsidian";
+import type { HoverParent, HoverPopover, IconName, EventRef } from "obsidian";
 import type { NoteStoreHit } from "@/index/note-sqlite/protocol";
 import type { VaultRetrieval } from "@/index/VaultRetrieval";
 
 export const FILO_VIEW_TYPE = "trama-filo";
 type RelatedSource = Pick<VaultRetrieval, "related" | "searchEvidence">;
 
-export class FiloView extends ItemView {
+export class FiloView extends ItemView implements HoverParent {
+  hoverPopover: HoverPopover | null = null;
   private status: IndexStatus;
   private unsubscribe?: () => void;
   private event?: EventRef;
@@ -61,6 +62,8 @@ export class FiloView extends ItemView {
     return Promise.resolve();
   }
   override onClose(): Promise<void> {
+    this.hoverPopover?.unload();
+    this.hoverPopover = null;
     this.unsubscribe?.();
     if (this.event) this.app.workspace.offref(this.event);
     this.event = undefined;
@@ -76,7 +79,7 @@ export class FiloView extends ItemView {
   private refresh(pathOverride?: string | null): void {
     const path =
       pathOverride === undefined
-        ? ((this.app as any)?.workspace?.getActiveFile?.()?.path as string | undefined)
+        ? this.app.workspace.getActiveFile()?.path
         : (pathOverride ?? undefined);
     this.activePath = path && path.toLowerCase().endsWith(".md") ? path : undefined;
     this.cancel();
@@ -159,9 +162,9 @@ export class FiloView extends ItemView {
         rows,
         this.app,
         path,
-        this.leaf,
+        this,
         (event) => {
-          void (this.app as any).workspace.openLinkText(
+          void this.app.workspace.openLinkText(
             path,
             this.activePath ?? "",
             Keymap.isModEvent(event)

@@ -1,4 +1,4 @@
-import { Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { Modal, Notice, PluginSettingTab, Setting, requireApiVersion, type App } from "obsidian";
 import { noteEmbeddingProfile } from "@/index/SqliteNoteVectorStore";
 import type { TramaPlugin } from "@/plugin/TramaPlugin";
 import type { ConsoleDebug } from "@/plugin/ConsoleDebug";
@@ -25,6 +25,20 @@ interface ParsedText<T> {
   display: string;
 }
 
+// The Settings definitions use the 1.13 shape. The legacy renderer consumes the
+// same rows using types available in the minimum supported SDK.
+interface SettingsRow {
+  name: string;
+  desc?: string;
+  render(setting: Setting): void | (() => void);
+}
+
+interface SettingsSection {
+  type: "group";
+  heading: string;
+  items: SettingsRow[];
+}
+
 export class TramaSettingsTab extends PluginSettingTab {
   private draft?: SettingsDraft;
   private readonly pendingText = new Map<string, string>();
@@ -45,7 +59,7 @@ export class TramaSettingsTab extends PluginSettingTab {
   private folderDropdown?: { setValue(value: string): unknown };
   private selectedFolder = "";
   constructor(
-    app: any,
+    app: App,
     private readonly plugin: TramaPlugin & {
       updateIndex(): Promise<void>;
       rebuildIndex(): Promise<void>;
@@ -60,19 +74,66 @@ export class TramaSettingsTab extends PluginSettingTab {
   }
 
   display(): void {
-    const displayGeneration = ++this.displayGeneration;
-    this.textGeneration++;
-    const { containerEl } = this;
-    containerEl.empty();
-    this.flushText.length = 0;
-    const settings = (this.draft ??= cloneSettings(this.plugin.getSettings()));
-    this.heading("Voce");
-    this.text(
+    this.renderLegacySettings();
+  }
+
+  getSettingDefinitions(): SettingsSection[] {
+    const sections: SettingsSection[] = [];
+    let generation: number | undefined;
+    const section = (heading: string) => sections.push({ type: "group", heading, items: [] });
+    const row = (
+      name: string,
+      render: (setting: Setting, draft: SettingsDraft, generation: number) => void | (() => void),
+      desc?: string
+    ) => {
+      sections.at(-1)!.items.push({
+        name,
+        desc,
+        render: (setting) => {
+          // Obsidian can collect definitions for search without opening the form.
+          if (generation === undefined || generation !== this.displayGeneration) {
+            generation = ++this.displayGeneration;
+            this.textGeneration++;
+            this.flushText.length = 0;
+          }
+          const draft = (this.draft ??= cloneSettings(this.plugin.getSettings()));
+          return render(setting, draft, generation);
+        },
+      });
+    };
+    const text = <T>(
+      name: string,
+      key: string,
+      persisted: () => string,
+      draftValue: (draft: SettingsDraft) => string,
+      updateDraft: (draft: SettingsDraft, value: string) => void,
+      parse: (raw: string) => ParsedText<T> | undefined,
+      save: (value: T) => Promise<unknown>,
+      desc?: string
+    ) =>
+      row(
+        name,
+        (setting, draft) =>
+          this.renderText(
+            setting,
+            name,
+            key,
+            persisted,
+            draftValue(draft),
+            (raw) => updateDraft(draft, raw),
+            parse,
+            save
+          ),
+        desc
+      );
+
+    section("Voce");
+    text(
       "Chat endpoint",
       "chat.endpoint",
       () => this.plugin.getSettings().chat.endpoint,
-      settings.chat.endpoint,
-      (raw) => {
+      (settings) => settings.chat.endpoint,
+      (settings, raw) => {
         if (settings.chat.endpoint !== raw) this.clearDiscoveredModels("chat");
         settings.chat.endpoint = raw;
       },
@@ -81,13 +142,15 @@ export class TramaSettingsTab extends PluginSettingTab {
         this.persist((current) => ({ ...current, chat: { ...current.chat, endpoint: value } })),
       "OpenAI-compatible base URL."
     );
-    this.modelSetting("chat", settings, displayGeneration);
-    this.text(
+    row("Chat model", (setting, settings, generation) =>
+      this.renderModelSetting(setting, "chat", settings, generation)
+    );
+    text(
       "Temperature",
       "chat.temperature",
       () => String(this.plugin.getSettings().chat.temperature),
-      String(settings.chat.temperature),
-      (raw) => {
+      (settings) => String(settings.chat.temperature),
+      (settings, raw) => {
         const parsed = Number(raw);
         if (Number.isFinite(parsed)) settings.chat.temperature = parsed;
       },
@@ -100,13 +163,12 @@ export class TramaSettingsTab extends PluginSettingTab {
       async (value) =>
         this.persist((current) => ({ ...current, chat: { ...current.chat, temperature: value } }))
     );
-    const tokenValue = String(settings.chat.maxOutputTokens ?? "");
-    this.text(
+    text(
       "Maximum output tokens",
       "chat.maxOutputTokens",
       () => String(this.plugin.getSettings().chat.maxOutputTokens ?? ""),
-      tokenValue,
-      (raw) => {
+      (settings) => String(settings.chat.maxOutputTokens ?? ""),
+      (settings, raw) => {
         const count = Number(raw);
         if (!raw.trim()) delete settings.chat.maxOutputTokens;
         else if (Number.isSafeInteger(count) && count >= 1024)
@@ -128,12 +190,12 @@ export class TramaSettingsTab extends PluginSettingTab {
         }),
       "Leave blank for the model default."
     );
-    this.text(
+    text(
       "Context window tokens",
       "chat.contextWindowTokens",
       () => String(this.plugin.getSettings().chat.contextWindowTokens),
-      String(settings.chat.contextWindowTokens),
-      (raw) => {
+      (settings) => String(settings.chat.contextWindowTokens),
+      (settings, raw) => {
         const count = Number(raw);
         if (Number.isSafeInteger(count) && count > 0) settings.chat.contextWindowTokens = count;
       },
@@ -150,36 +212,37 @@ export class TramaSettingsTab extends PluginSettingTab {
         })),
       "Approximate usable model context, including the reserved output space."
     );
-    new Setting(containerEl).setName("Reasoning effort").addDropdown((dropdown) => {
-      dropdown.addOption("auto", "Auto");
-      for (const value of REASONING_EFFORTS)
-        dropdown.addOption(value, value[0].toUpperCase() + value.slice(1));
-      dropdown.setValue(settings.chat.reasoningEffort ?? "auto");
-      dropdown.onChange((value) => {
-        const effort = value === "auto" ? undefined : normalizeReasoningEffort(value);
-        if (value !== "auto" && effort === undefined) return;
-        void this.persistDiscrete((current) => {
-          const chat = { ...current.chat };
-          if (effort === undefined) delete chat.reasoningEffort;
-          else chat.reasoningEffort = effort;
-          return { ...current, chat };
-        }).then((saved) => {
-          if (saved) {
-            if (saved.chat.reasoningEffort === undefined) delete settings.chat.reasoningEffort;
-            else settings.chat.reasoningEffort = saved.chat.reasoningEffort;
-          }
+    row("Reasoning effort", (setting, settings) => {
+      setting.addDropdown((dropdown) => {
+        dropdown.addOption("auto", "Auto");
+        for (const value of REASONING_EFFORTS)
+          dropdown.addOption(value, value[0].toUpperCase() + value.slice(1));
+        dropdown.setValue(settings.chat.reasoningEffort ?? "auto");
+        dropdown.onChange((value) => {
+          const effort = value === "auto" ? undefined : normalizeReasoningEffort(value);
+          if (value !== "auto" && effort === undefined) return;
+          void this.persistDiscrete((current) => {
+            const chat = { ...current.chat };
+            if (effort === undefined) delete chat.reasoningEffort;
+            else chat.reasoningEffort = effort;
+            return { ...current, chat };
+          }).then((saved) => {
+            if (saved) {
+              if (saved.chat.reasoningEffort === undefined) delete settings.chat.reasoningEffort;
+              else settings.chat.reasoningEffort = saved.chat.reasoningEffort;
+            }
+          });
         });
       });
     });
 
-    this.heading("Lente");
-    this.heading("Filo");
-    this.text(
+    section("Lente and Filo");
+    text(
       "Embedding endpoint",
       "embedding.endpoint",
       () => this.plugin.getSettings().embedding.endpoint,
-      settings.embedding.endpoint,
-      (raw) => {
+      (settings) => settings.embedding.endpoint,
+      (settings, raw) => {
         if (settings.embedding.endpoint !== raw) this.clearDiscoveredModels("embedding");
         settings.embedding.endpoint = raw;
       },
@@ -191,48 +254,53 @@ export class TramaSettingsTab extends PluginSettingTab {
         })),
       "OpenAI-compatible base URL shared by Filo search, related-note suggestions, and Voce."
     );
-    this.modelSetting("embedding", settings, displayGeneration);
+    row("Embedding model", (setting, settings, generation) =>
+      this.renderModelSetting(setting, "embedding", settings, generation)
+    );
 
-    this.heading("Storage");
-    let storageInput: HTMLInputElement;
-    new Setting(containerEl)
-      .setName("Storage folder")
-      .setDesc(
-        "Stores the vault identity and reusable embeddings. The default hidden folder may be excluded from sync. Choose a visible folder, such as Trama, and include it in your sync service to share embeddings across devices."
-      )
-      .addText((text) => {
-        storageInput = text.inputEl;
-        text.setValue(settings.storageFolder);
-      })
-      .addButton((button) =>
-        button
-          .setButtonText("Apply")
-          .setCta()
-          .onClick(() => {
-            try {
-              const folder = normalizeStorageFolder(
-                storageInput.value,
-                this.app.vault.configDir || ".obsidian"
-              );
-              void this.persistDiscrete((current) => ({ ...current, storageFolder: folder })).then(
-                (saved) => {
-                  if (saved) {
-                    settings.storageFolder = saved.storageFolder;
-                    storageInput.value = saved.storageFolder;
-                  }
-                }
-              );
-            } catch (error) {
-              new Notice(error instanceof Error ? error.message : "Invalid storage folder.");
-            }
+    section("Storage");
+    row(
+      "Storage folder",
+      (setting, settings) => {
+        let storageInput: HTMLInputElement;
+        setting
+          .addText((text) => {
+            storageInput = text.inputEl;
+            text.setValue(settings.storageFolder);
           })
-      );
-    this.text(
+          .addButton((button) =>
+            button
+              .setButtonText("Apply")
+              .setCta()
+              .onClick(() => {
+                try {
+                  const folder = normalizeStorageFolder(
+                    storageInput.value,
+                    this.app.vault.configDir
+                  );
+                  void this.persistDiscrete((current) => ({
+                    ...current,
+                    storageFolder: folder,
+                  })).then((saved) => {
+                    if (saved) {
+                      settings.storageFolder = saved.storageFolder;
+                      storageInput.value = saved.storageFolder;
+                    }
+                  });
+                } catch (error) {
+                  new Notice(error instanceof Error ? error.message : "Invalid storage folder.");
+                }
+              })
+          );
+      },
+      "Stores the vault identity and reusable embeddings. The default hidden folder may be excluded from sync. Choose a visible folder, such as Trama, and include it in your sync service to share embeddings across devices."
+    );
+    text(
       "Embedding dimensions",
       "embedding.dimensions",
       () => String(this.plugin.getSettings().embedding.dimensions),
-      String(settings.embedding.dimensions),
-      (raw) => {
+      (settings) => String(settings.embedding.dimensions),
+      (settings, raw) => {
         const value = Number(raw);
         if (Number.isSafeInteger(value)) settings.embedding.dimensions = value;
       },
@@ -249,64 +317,84 @@ export class TramaSettingsTab extends PluginSettingTab {
         }))
     );
 
-    this.heading("Excluded folders");
-    this.folderRows = containerEl.createDiv();
-    this.renderFolders(settings);
-    new Setting(containerEl)
-      .setName("Exclude folder")
-      .addDropdown((dropdown) => {
-        this.folderDropdown = dropdown;
-        dropdown.addOption("", "Select a folder");
-        const folders = this.app.vault.getAllFolders(false) as Array<{ path: string }>;
-        for (const folder of folders) dropdown.addOption(folder.path, folder.path);
-        dropdown.setValue(this.selectedFolder);
-        dropdown.onChange((value) => {
-          this.selectedFolder = value;
-        });
-      })
-      .setDesc("Saved exclusions are applied on the next Update.")
-      .addButton((button) =>
-        button.setButtonText("Add").onClick(() => void this.addFolder(settings))
-      );
+    section("Excluded folders");
+    row(
+      "Exclude folder",
+      (setting, settings) => {
+        const folderRows = setting.settingEl.createDiv();
+        setting.settingEl.before(folderRows);
+        this.folderRows = folderRows;
+        this.renderFolders(settings);
+        setting
+          .addDropdown((dropdown) => {
+            this.folderDropdown = dropdown;
+            dropdown.addOption("", "Select a folder");
+            const folders = this.app.vault.getAllFolders(false) as Array<{ path: string }>;
+            for (const folder of folders) dropdown.addOption(folder.path, folder.path);
+            dropdown.setValue(this.selectedFolder);
+            dropdown.onChange((value) => {
+              this.selectedFolder = value;
+            });
+          })
+          .addButton((button) =>
+            button.setButtonText("Add").onClick(() => void this.addFolder(settings))
+          );
+        return () => folderRows.remove();
+      },
+      "Saved exclusions are applied on the next Update."
+    );
 
-    this.heading("Maintenance");
-    new Setting(containerEl)
-      .setName("Update index")
-      .setDesc("Index current Markdown notes and remove deleted or excluded notes.")
-      .addButton((button) =>
-        button.setButtonText("Update").onClick(() => void this.plugin.updateIndex())
-      );
-    new Setting(containerEl)
-      .setName("Rebuild index")
-      .addButton((button) =>
+    section("Maintenance");
+    row(
+      "Update index",
+      (setting) => {
+        setting.addButton((button) =>
+          button.setButtonText("Update").onClick(() => void this.plugin.updateIndex())
+        );
+      },
+      "Index current Markdown notes and remove deleted or excluded notes."
+    );
+    row("Rebuild index", (setting) => {
+      setting.addButton((button) =>
         button.setButtonText("Rebuild").onClick(() => void this.plugin.rebuildIndex())
       );
-    new Setting(containerEl)
-      .setName("Stop index operation")
-      .setDesc("Stop an active Update, Rebuild, or Clear operation.")
-      .addButton((button) => button.setButtonText("Stop").onClick(() => this.plugin.stopIndex()));
-    new Setting(containerEl)
-      .setName("Clear index and embedding cache")
-      .setDesc(
-        "Remove the local index, SQLite embedding cache, and managed shared embedding cache files."
-      )
-      .addButton((button) =>
-        button.setButtonText("Clear index and cache").onClick(() => void this.plugin.clearIndex())
-      );
-    new Setting(containerEl)
-      .setName("Console debugging")
-      .setDesc("Log operation timings and errors to the developer console.")
-      .addToggle((toggle) => {
-        toggle.setValue(settings.consoleDebug);
-        toggle.onChange((value) => {
-          void this.persistDiscrete((current) => ({ ...current, consoleDebug: value })).then(
-            (saved) => {
-              if (saved) settings.consoleDebug = saved.consoleDebug;
-              else toggle.setValue(this.plugin.getSettings().consoleDebug);
-            }
-          );
+    });
+    row(
+      "Stop index operation",
+      (setting) => {
+        setting.addButton((button) =>
+          button.setButtonText("Stop").onClick(() => this.plugin.stopIndex())
+        );
+      },
+      "Stop an active Update, Rebuild, or Clear operation."
+    );
+    row(
+      "Clear index and embedding cache",
+      (setting) => {
+        setting.addButton((button) =>
+          button.setButtonText("Clear index and cache").onClick(() => void this.plugin.clearIndex())
+        );
+      },
+      "Remove the local index, SQLite embedding cache, and managed shared embedding cache files."
+    );
+    row(
+      "Console debugging",
+      (setting, settings) => {
+        setting.addToggle((toggle) => {
+          toggle.setValue(settings.consoleDebug);
+          toggle.onChange((value) => {
+            void this.persistDiscrete((current) => ({ ...current, consoleDebug: value })).then(
+              (saved) => {
+                if (saved) settings.consoleDebug = saved.consoleDebug;
+                else toggle.setValue(this.plugin.getSettings().consoleDebug);
+              }
+            );
+          });
         });
-      });
+      },
+      "Log operation timings and errors to the developer console."
+    );
+    return sections;
   }
 
   hide(): void {
@@ -327,25 +415,39 @@ export class TramaSettingsTab extends PluginSettingTab {
     this.draft = undefined;
     this.pendingText.clear();
     this.flushText.length = 0;
-    this.display();
+    this.refreshSettingsForm();
   }
 
-  private heading(title: string): void {
-    new Setting(this.containerEl).setName(title).setHeading();
+  private refreshSettingsForm(): void {
+    if (requireApiVersion("1.13.0")) {
+      if ("update" in this && typeof this.update === "function") return this.update();
+    }
+    this.renderLegacySettings();
   }
 
-  private text<T>(
+  private renderLegacySettings(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    for (const section of this.getSettingDefinitions()) {
+      new Setting(containerEl).setName(section.heading).setHeading();
+      for (const row of section.items) {
+        const setting = new Setting(containerEl).setName(row.name);
+        if (row.desc) setting.setDesc(row.desc);
+        row.render(setting);
+      }
+    }
+  }
+
+  private renderText<T>(
+    setting: Setting,
     name: string,
     key: string,
     persisted: () => string,
     draftValue: string,
     updateDraft: (value: string) => void,
     parse: (raw: string) => ParsedText<T> | undefined,
-    save: (value: T) => Promise<unknown>,
-    description?: string
+    save: (value: T) => Promise<unknown>
   ): void {
-    const setting = new Setting(this.containerEl).setName(name);
-    if (description) setting.setDesc(description);
     setting.addText((input) => {
       const generation = this.textGeneration;
       input.setValue(this.pendingText.get(key) ?? draftValue).onChange((raw) => {
@@ -397,14 +499,12 @@ export class TramaSettingsTab extends PluginSettingTab {
     });
   }
 
-  private modelSetting(
+  private renderModelSetting(
+    setting: Setting,
     target: "chat" | "embedding",
     settings: SettingsDraft,
     displayGeneration: number
   ): void {
-    const setting = new Setting(this.containerEl).setName(
-      target === "chat" ? "Chat model" : "Embedding model"
-    );
     const modelId = settings[target].modelId;
     const models = [...new Set([...this.discovered[target], ...(modelId ? [modelId] : [])])];
     setting.addDropdown((dropdown) => {
@@ -457,7 +557,7 @@ export class TramaSettingsTab extends PluginSettingTab {
       this.discovered[target] = [...models];
       if (!this.discovered[target].length)
         new Notice("No models were returned by the configured endpoint.");
-      this.display();
+      this.refreshSettingsForm();
     } catch (error) {
       if (
         this.displayGeneration !== displayGeneration ||

@@ -53,11 +53,15 @@ export function normalizeReasoningEffort(value: unknown): ReasoningEffort | unde
 
 export class SettingsStore {
   private value = DEFAULT_SETTINGS;
-  load(value: unknown, configDir = ".obsidian"): TramaSettings {
+  load(value: unknown, configDir?: string): TramaSettings {
     if (!value || typeof value !== "object") return (this.value = DEFAULT_SETTINGS);
-    const data = value as Record<string, any>;
-    const chat = data.chat && typeof data.chat === "object" ? data.chat : {};
-    const embedding = data.embedding && typeof data.embedding === "object" ? data.embedding : {};
+    const data = value as Record<string, unknown>;
+    const chat: Record<string, unknown> =
+      data.chat && typeof data.chat === "object" ? (data.chat as Record<string, unknown>) : {};
+    const embedding: Record<string, unknown> =
+      data.embedding && typeof data.embedding === "object"
+        ? (data.embedding as Record<string, unknown>)
+        : {};
     const endpoint = (raw: unknown, fallback: string) => {
       if (typeof raw !== "string" || !raw.trim()) return fallback;
       try {
@@ -75,14 +79,21 @@ export class SettingsStore {
         endpoint: endpoint(chat.endpoint, DEFAULT_SETTINGS.chat.endpoint),
         modelId,
         temperature:
-          Number.isFinite(chat.temperature) && chat.temperature >= 0 && chat.temperature <= 1
+          typeof chat.temperature === "number" &&
+          Number.isFinite(chat.temperature) &&
+          chat.temperature >= 0 &&
+          chat.temperature <= 1
             ? chat.temperature
             : 0.2,
         contextWindowTokens:
-          Number.isSafeInteger(chat.contextWindowTokens) && chat.contextWindowTokens > 0
+          typeof chat.contextWindowTokens === "number" &&
+          Number.isSafeInteger(chat.contextWindowTokens) &&
+          chat.contextWindowTokens > 0
             ? chat.contextWindowTokens
             : DEFAULT_SETTINGS.chat.contextWindowTokens,
-        ...(Number.isSafeInteger(chat.maxOutputTokens) && chat.maxOutputTokens >= 1024
+        ...(typeof chat.maxOutputTokens === "number" &&
+        Number.isSafeInteger(chat.maxOutputTokens) &&
+        chat.maxOutputTokens >= 1024
           ? { maxOutputTokens: chat.maxOutputTokens }
           : {}),
         ...(effort ? { reasoningEffort: effort } : {}),
@@ -91,7 +102,9 @@ export class SettingsStore {
         endpoint: endpoint(embedding.endpoint, DEFAULT_SETTINGS.embedding.endpoint),
         modelId: typeof embedding.modelId === "string" ? embedding.modelId : "",
         dimensions:
-          Number.isSafeInteger(embedding.dimensions) && embedding.dimensions > 0
+          typeof embedding.dimensions === "number" &&
+          Number.isSafeInteger(embedding.dimensions) &&
+          embedding.dimensions > 0
             ? embedding.dimensions
             : DEFAULT_SETTINGS.embedding.dimensions,
       },

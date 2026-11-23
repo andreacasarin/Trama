@@ -1,5 +1,8 @@
 /** Minimal runtime surface for testing plugin composition outside Obsidian. */
 export const Platform = { isDesktopApp: true };
+export function requireApiVersion(_version: string): boolean {
+  return false;
+}
 
 export class TAbstractFile {
   path = "";
@@ -140,6 +143,7 @@ export class Setting {
   static instances: Setting[] = [];
   name = "";
   controls: TestControl[] = [];
+  readonly settingEl = new SettingsElement();
   constructor(_container: unknown) {
     Setting.instances.push(this);
   }
@@ -252,6 +256,7 @@ class SettingsElement {
   children: SettingsElement[] = [];
   textContent = "";
   attrs = new Map<string, string>();
+  before(_element: SettingsElement): void {}
   empty(): void {
     this.children = [];
   }

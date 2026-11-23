@@ -1,0 +1,32 @@
+{
+  "plugins": ["stylelint-no-unsupported-browser-features"],
+  "ignoreDisables": true,
+  "rules": {
+    "function-url-scheme-disallowed-list": [["http", "https", "file"], { "severity": "error" }],
+    "function-url-scheme-allowed-list": ["data"],
+    "declaration-no-important": [true, { "severity": "warning" }],
+    "color-named": ["never", { "severity": "warning" }],
+    "declaration-block-no-duplicate-properties": [true, { "severity": "warning" }],
+    "plugin/no-unsupported-browser-features": [
+      true,
+      {
+        "severity": "warning",
+        "browsers": ["electron >= 30"],
+        "ignore": ["css-nesting", "css-cascade-layers"]
+      }
+    ],
+    "selector-pseudo-class-disallowed-list": [["has"], { "severity": "warning" }],
+    "selector-pseudo-class-no-unknown": [
+      true,
+      { "ignorePseudoClasses": ["global", "local"], "severity": "warning" }
+    ],
+    "selector-pseudo-element-no-unknown": [true, { "severity": "warning" }],
+    "selector-type-no-unknown": [true, { "severity": "warning" }],
+    "at-rule-no-unknown": [
+      true,
+      { "ignoreAtRules": ["layer", "property", "container"], "severity": "warning" }
+    ],
+    "unit-no-unknown": [true, { "severity": "warning" }],
+    "property-disallowed-list": [["all"], { "severity": "warning" }]
+  }
+}
