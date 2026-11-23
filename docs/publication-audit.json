@@ -9,7 +9,7 @@
     "scanner": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
     "payments": "https://docs.obsidian.md/community-directory/faq"
   },
-  "verdict": "Audited source passes current local mandatory checks and fresh clean Linux CI after candidate corrections. Hosted source review still fails; current native smoke is awaiting owner confirmation. Do not claim directory acceptance or universal runtime compatibility.",
+  "verdict": "Audited source passes the local mandatory checks, clean Linux CI and owner smoke test. The hosted source-review exception remains unidentified and directory acceptance is pending.",
   "checks": [
     {
       "area": "Repository files",
@@ -168,6 +168,12 @@
       "evidence": "Root config uses official 0.6.0, projectService, explicit tsconfigRootDir, newer-submission critical severities, unsafe advisories, and local manifest/license validation."
     },
     {
+      "area": "Official GitHub Actions preflight",
+      "source": "https://github.com/obsidianmd/obsidian-workflows/tree/v1.2.3#scanner-lint-rulesets",
+      "status": "configured",
+      "evidence": "CI runs Obsidian's scanner preflight in advisory PR mode after the clean build. The action pins eslint-plugin-obsidianmd 0.4.1 and runs before Trama's required lint with 0.6.0 because the older rule cannot read the newer API-version cache. Review branch verifies the deployed scanner."
+    },
+    {
       "area": "Runtime resource lifetime",
       "source": "https://github.com/obsidianmd/eslint-plugin/blob/master/docs/configuration.md",
       "status": "pass-tested",
@@ -188,8 +194,8 @@
     {
       "area": "Native smoke",
       "source": "https://docs.obsidian.md/community-directory/submission-requirements-for-plugins",
-      "status": "pending-owner",
-      "evidence": "Audited build installed in generated Trama Test Vault; owner asked to verify composer, copy, searches, hover lifetime, settings and pop-out behavior. No new native pass is claimed yet."
+      "status": "passed-owner",
+      "evidence": "Owner confirmed the candidate worked in the native smoke test on November 23, before the equivalent timer callback rewrite. Automated tests passed after the rewrite."
     }
   ],
   "verification": {
@@ -210,7 +216,12 @@
       "url": "https://github.com/andreacasarin/Trama/actions/runs/45006975099",
       "jobs": ["Quality", "Clean install without Docker", "SQLite runtime"]
     },
-    "nativeSmoke": "pending owner",
+    "nativeSmoke": "passed by owner on November 23",
+    "sourceReviewReproduction": {
+      "commit": "6291917",
+      "documentedConfig": "The official 0.6.0 example and Trama's CI config scan the same 44 files in a clean checkout. The official example has 29 advisories before and after production build. Both configs report zero errors and zero parse failures.",
+      "officialAction": "With clean installed dependencies and no scanner cache, the v1.2.3 Action's exact ESLint config and pins exit 2 during obsidianmd/no-sample-code on the automatic-index timer callback in src/plugin/TramaPlugin.ts. The 0.7.3 tag reproduces the same exception before any build. Changing that callback to a block body makes the same scanner complete 42 files with zero errors and 95 advisories. Trama's mandatory lint still reports zero errors across 44 files. The hosted scanner version and exception are unknown."
+    },
     "hostedPreview": {
       "commit": "29f60e6",
       "status": "failed",

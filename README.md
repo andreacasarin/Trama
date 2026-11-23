@@ -209,8 +209,11 @@ stricter rules for newer submissions. Manifest and license validation also run
 locally; advisory findings remain visible instead of being silently disabled.
 `npm run lint` runs the Community and repository checks. CI and the release
 workflow run `npm run lint:community` after the production build so misplaced
-generated files are visible to ESLint. The hosted scanner also applies its own
-submission-age rules and file handling.
+generated files are visible to ESLint. CI also runs the
+[Obsidian GitHub Action](https://github.com/obsidianmd/obsidian-workflows/tree/v1.2.3#scanner-lint-rulesets)
+in advisory PR mode to run its pinned scanner rules against the built checkout.
+The action pins an older Obsidian ESLint plugin. The Community directory’s
+Review branch remains the check for the deployed scanner.
 Release builds attest `main.js`, `manifest.json`, and `styles.css` through GitHub
 Actions; the ZIP is retained for local installation tooling.
 

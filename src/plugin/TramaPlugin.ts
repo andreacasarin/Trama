@@ -708,7 +708,11 @@ export class TramaPlugin extends Plugin {
           this.debounceAutomaticIndex(() => schedule(true));
       })
     );
-    this.registerInterval(window.setInterval(() => schedule(false, true), 300_000));
+    this.registerInterval(
+      window.setInterval(() => {
+        schedule(false, true);
+      }, 300_000)
+    );
     schedule();
   }
 
