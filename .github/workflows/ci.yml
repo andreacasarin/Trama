@@ -49,6 +49,9 @@ jobs:
       - name: Lint repository and tooling
         run: npm run lint:repository
 
+      - name: Lint release stylesheet
+        run: npm run lint:styles
+
   sqlite-runtime:
     name: SQLite runtime
     runs-on: ubuntu-latest
@@ -103,3 +106,6 @@ jobs:
 
       - name: Run Community lint after the build
         run: npm run lint:community
+
+      - name: Record the Community asset checksums
+        run: sha256sum main.js manifest.json styles.css

@@ -207,7 +207,9 @@ The default `eslint.config.mjs` uses the pinned official Obsidian ESLint plugin,
 TypeScript project-service options, and the documented Community baseline plus
 stricter rules for newer submissions. Manifest and license validation also run
 locally; advisory findings remain visible instead of being silently disabled.
-`npm run lint` runs the Community and repository checks. CI and the release
+`npm run lint` runs the Community, repository, and stylesheet checks. The
+required `npm run lint:styles` check applies the Obsidian Action's CSS rules to
+`styles.css` and uses its Electron 30 target for Obsidian 1.7.2. CI and the release
 workflow run `npm run lint:community` after the production build so misplaced
 generated files are visible to ESLint. CI also runs the
 [Obsidian GitHub Action](https://github.com/obsidianmd/obsidian-workflows/tree/v1.2.3#scanner-lint-rulesets)

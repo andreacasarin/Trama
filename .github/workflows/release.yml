@@ -90,6 +90,7 @@ jobs:
         run: |
           npm run format:check
           npm run lint:repository
+          npm run lint:styles
 
       - name: Build the clean pinned SQLite assets
         run: npm run verify:sqlite:rebuild

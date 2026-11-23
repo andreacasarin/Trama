@@ -101,7 +101,7 @@
 .trama-voce__message--collapsed {
   max-height: 12rem;
   overflow: hidden;
-  mask-image: linear-gradient(to bottom, black calc(100% - 2rem), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
 }
 
 .trama-voce__message > :first-child {
