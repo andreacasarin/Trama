@@ -15,11 +15,65 @@ half-remembered idea, or the note in front of you.
 Built for local models, with an index that stays on your device and read-only
 tools for exploring your notes.
 
-[Get started](#get-started) · [Explore Trama](#three-ways-into-your-vault) · [Privacy](#your-notes-your-models) · [Technical notes](docs/technical-notes.md)
+[Get started](#get-started) · [Explore Trama](#three-ways-into-your-vault) · [Create a skill](#create-a-voce-skill) · [Privacy](#your-notes-your-models) · [Technical notes](docs/technical-notes.md)
 
-![Trama on desktop and mobile: search, related notes, and AI chat](assets/branding/trama-preview.gif)
+## Get started
+
+### 1. Install Trama
+
+Trama supports desktop and mobile on Obsidian **1.7.2 or newer**. The mobile
+WebView needs OPFS and `AbortSignal.any` support.
+
+1. Open the vault where you want to use Trama. Go to **Settings → Community plugins**
+   and select **Turn on community plugins** if prompted.
+2. Select **Browse**, search for **Trama**, and open the result by **Andrea Casarin**.
+3. Select **Install**, then **Enable**.
+
+You can also open the [Trama listing](https://community.obsidian.md/plugins/trama)
+and select **Add to Obsidian** to open the plugin in the app.
+
+### 2. Connect your models
+
+In **Settings → Trama**, connect a running OpenAI-compatible model server.
+You can set up chat and embeddings separately.
+
+- **Voce.** Set the chat endpoint and choose a chat model that supports the
+  **Responses API** and tool calling.
+- **Lente and Filo.** Set the embedding endpoint and choose an embedding model.
+  In **Storage**, set **Embedding dimensions** to match that model.
+- Use the magnifying-glass button beside each model selector to discover models
+  at that endpoint. Use **Excluded folders** to skip folders during indexing.
+
+The default base URL is `http://127.0.0.1:1234/v1`. Include any prefix your
+server requires, such as `/v1`. If the server runs on another device, use its
+reachable network address. `127.0.0.1` points to the device running Obsidian.
+
+Trama is free and needs no Trama account. Local servers such as LM Studio can
+provide chat and embeddings without a paid API. A remote model provider or
+gateway may require an account and charge for chat, indexing, and search.
+Automatic index updates can also incur provider charges. For services that
+require an API key, use a compatible gateway that handles authentication.
+Trama sends a fixed placeholder bearer token. Your endpoint must allow requests
+from Obsidian, including CORS where applicable.
+
+### 3. Index and explore
+
+In **Settings → Trama → Maintenance**, select **Update** beside **Update index**.
+When it finishes, open Filo or Lente, or ask Voce a question about your notes.
+
+After the first successful index, Trama keeps it up to date on startup, after
+Markdown changes, and through a periodic check for missed changes. These
+updates may send new or changed note content to the embedding server. You can
+also trigger an update or stop an operation from **Maintenance**.
+
+Semantic indexing excludes YAML frontmatter from passage embeddings. Titles, aliases,
+and frontmatter tags remain searchable as metadata. Keyword search also indexes
+the original note text. See [technical notes](docs/technical-notes.md#storage-and-retrieval)
+for passage boundaries, embedding limits, and how existing indexes refresh.
 
 ## Three ways into your vault
+
+![Trama on desktop and mobile: search, related notes, and AI chat](assets/branding/trama-preview.gif)
 
 | View              | What it does                                                                 | Try it when…                                          |
 | ----------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------- |
@@ -42,7 +96,7 @@ response. You can copy answers, edit an earlier prompt to take the conversation
 in a different direction, or start fresh with **New chat**.
 
 Want a repeatable workflow? Write a skill as a Markdown note and invoke it with
-`/` in the composer. [Create your first skill →](docs/technical-notes.md#voce-skills)
+`/` in the composer. [Create your first skill](#create-a-voce-skill).
 
 ### Filo and Lente: follow an idea
 
@@ -56,74 +110,38 @@ otherwise it labels the text **Preview**. The command-palette Lente picker shows
 compact preview under each result. Choose a result title to open the note. With Obsidian's
 **Page preview** enabled for Trama, hover over a result title to peek inside.
 
-## Get started
+## Create a Voce skill
 
-You'll need Obsidian **1.7.2 or newer** and a running model server. Trama connects
-to OpenAI-compatible endpoints; chat requires the **Responses API** and tool
-calling, and semantic search requires an **embedding model**. You can configure
-chat and embeddings separately.
+A skill is a vault note that gives Voce reusable instructions for one message.
+Create a Markdown note such as **Weekly review** in a regular vault folder.
+In Obsidian's Source mode, paste this at the top of the note.
 
-Trama supports desktop and mobile. Mobile use has been validated by the maintainer;
-a model server running on another device needs a reachable network address, because
-`127.0.0.1` always means the device running Obsidian. The SQLite index uses the
-app's browser storage (OPFS), outside the vault folder, to run the local SQLite
-search engine. It is device-local and is not included in ordinary vault backups
-or sync. Mobile requires a WebView with OPFS and `AbortSignal.any` support; older
-mobile operating systems have not been validated.
+```markdown
+---
+trama-voce-skill: true
+trama-voce-command: weekly-review
+trama-voce-description: Find themes and open questions in my weekly notes.
+---
 
-### 1. Install Trama
+Read the notes I attach. Identify recurring themes, unfinished decisions,
+and one useful question for the coming week. Cite the notes behind your answer.
+```
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from
-   [Releases](https://github.com/andreacasarin/trama/releases).
-2. Create `<your-vault>/.obsidian/plugins/trama/` and place all three files directly
-   inside it. If your vault uses a custom configuration folder, use it in place
-   of `.obsidian`.
-3. Reload Obsidian, allow community plugins, and enable **Trama** in Settings.
+Choose a unique command using lowercase letters and digits, with hyphens
+between words. The command property is written without the leading `/`. The
+optional description appears in the picker and helps you find the skill.
 
-The search engine and its worker are bundled into `main.js`; no extra runtime
-files or startup downloads are needed.
+In Voce, type `/` at the start of a message or after a space and select
+`/weekly-review`. Attach any notes you want to use with `[[` or the note picker,
+then send. Use one skill per message. Voce reads the current body of the skill
+note when you send and includes it in the request to your chat model.
 
-### 2. Connect your models
-
-Open **Settings → Trama**:
-
-- Under **Voce**, set the chat endpoint and choose a chat model.
-- Under **Filo**, set the embedding endpoint, model, and matching vector dimensions.
-  You can also exclude folders from indexing here.
-- Use **Discover** beside either model selector to load the models offered by
-  that endpoint.
-
-The default base URL is `http://127.0.0.1:1234/v1`. Use your server's base URL,
-including any required prefix such as `/v1`.
-
-Trama itself is free and needs no Trama account. Local servers such as LM Studio
-can provide chat and embeddings without a paid API. A remote OpenAI-compatible
-server or gateway may require an account and charge for inference, indexing, and
-search; eligible automatic index updates can also incur provider charges.
-Trama currently sends a fixed placeholder bearer token, not a configurable API
-key. Paid APIs such as OpenAI therefore require a compatible gateway that handles
-authentication; a direct API-key connection is not supported. Your server must
-allow requests from Obsidian (including CORS where applicable). Check your
-provider's prices, retention, and privacy terms before connecting it.
-
-### 3. Index and explore
-
-Under **Maintenance**, select **Update index**. Once it finishes, open Filo or
-Lente, or ask Voce a question about your notes.
-
-After that first successful index, Trama keeps it up to date on startup and after
-Markdown changes, with a periodic check for missed changes. New or changed content
-may be sent to your embedding model during these updates. You can update manually
-or stop an operation at any time.
-
-Semantic indexing excludes YAML frontmatter from passage embeddings. Titles, aliases,
-and frontmatter tags remain searchable as metadata; keyword search also indexes
-the original note text. See [technical notes](docs/technical-notes.md#storage-and-retrieval)
-for passage boundaries, embedding limits, and how existing indexes refresh.
+[Read more about skill commands and attachments](docs/technical-notes.md#voce-skills).
 
 ## Your notes, your models
 
-- **Local storage.** The search index lives on your device. Trama stores a vault
+- **Local storage.** The search index lives in Obsidian's browser storage (OPFS),
+  outside the vault folder and ordinary vault backups or sync. Trama stores a vault
   identity and reusable document embeddings in the configured storage folder,
   which defaults to hidden `.trama/`. Embeddings live in
   `<storage-folder>/embeddings/`; choose a visible folder such as `Trama` and
@@ -187,6 +205,23 @@ model. Trama summarizes older history as needed and tells you when it does. This
 setting controls Trama's request budget; it does not enlarge the model's own
 context window.
 
+## License
+
+Trama is [MIT licensed](LICENSE). Dependencies keep their own licenses; see the
+[dependency inventory](vendor/sqlite-wasm/LICENSES.md). Release archives include
+the applicable third-party notices.
+
+## Manual installation from GitHub
+
+To install a specific version manually, download `main.js`, `manifest.json`,
+and `styles.css` from that version's
+[GitHub release](https://github.com/andreacasarin/Trama/releases). Place the three
+files in `<your-vault>/.obsidian/plugins/trama/` and reload Obsidian. If your
+vault uses a custom configuration folder, use it in place of `.obsidian`.
+Enable **Trama** under **Settings → Community plugins**.
+
+The search engine and its worker are bundled into `main.js`.
+
 ## Build and contribute
 
 Development uses **Node.js 22.23.3**, matching the Community verifier. The project
@@ -246,9 +281,3 @@ and the [benchmark guide](docs/obsidian-benchmark.md) for performance checks.
 [Issues](https://github.com/andreacasarin/trama/issues) are welcome—include what
 you expected, what happened, and steps to reproduce it. Remove private note content
 and endpoint credentials from anything you share.
-
-## License
-
-Trama is [MIT licensed](LICENSE). Dependencies keep their own licenses; see the
-[dependency inventory](vendor/sqlite-wasm/LICENSES.md). Release archives include
-the applicable third-party notices.
